@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use BRISK in your work, please cite it as below."
+title: "BRISK: an interior-point solver for semidefinite programming"
+type: software
+authors:
+  - family-names: Korda
+    given-names: Milan
+    affiliation: "LAAS-CNRS, Toulouse"
+version: "1.1"
+url: "https://homepages.laas.fr/mkorda/brisk/"
+license: Apache-2.0
+repository-code: "https://github.com/MilanKorda/brisk"

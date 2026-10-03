@@ -1,0 +1,22 @@
+# build products
+/brisk
+*.o
+*.so
+*.dylib
+*.mex*
+libobj/
+omp/test_omp
+tools/capi_test
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+python/brisk/libbrisk.*
+# Julia
+Manifest.toml
+# editors
+*~
+.DS_Store
+.ipynb_checkpoints/
+python/build/

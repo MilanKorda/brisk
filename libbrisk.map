@@ -1,0 +1,5 @@
+/* libbrisk: export only the brisk_* interface (Linux, GNU ld / lld) */
+{
+  global: brisk_*;
+  local: *;
+};

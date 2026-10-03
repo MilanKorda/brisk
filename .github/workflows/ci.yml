@@ -1,0 +1,62 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: BLAS/LAPACK
+        run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev
+      - name: Build
+        run: make
+      - name: Examples
+        run: |
+          for f in examples/*.dat-s; do
+            ./brisk "$f" -q || { echo "$f failed"; exit 1; }
+          done
+      - name: C library
+        run: make libbrisk capitest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python and CVXPY
+        run: |
+          pip install "./python[cvxpy,test]"
+          python -m pytest -q python/tests
+
+  julia:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev
+      - run: make libbrisk
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.11"
+      - name: Julia tests (without MathOptInterface's own suite)
+        env:
+          BRISK_TEST_MOI: "0"
+        run: cd julia/Brisk && julia --project=. -e 'import Pkg; Pkg.test("Brisk")'
+
+  octave:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev octave liboctave-dev
+      - name: MEX build and tests
+        run: cd matlab && octave-cli --eval "build_brisk_mex; test_brisk"
+
+  macos:
+    # the macOS build (Accelerate, bundled OpenMP runtime) has not yet been validated on a Mac:
+    # this job reports without failing the workflow until it has
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - run: ./brisk examples/theta1.dat-s
+      - run: make omptest
+      - run: make libbrisk capitest

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brisk"
+version = "1.1"
+description = "BRISK SDP solver: Python binding of libbrisk (ctypes) and a CVXPY solver"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+cvxpy = ["cvxpy>=1.9"]
+test = ["pytest", "cvxpy>=1.9", "clarabel"]
+
+[tool.setuptools]
+packages = ["brisk"]
+
+[tool.setuptools.package-data]
+brisk = ["libbrisk.so", "libbrisk.dylib"]
