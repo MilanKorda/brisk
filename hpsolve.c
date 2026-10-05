@@ -1067,6 +1067,7 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     const char *lname[4] = { "double", "double-double", "quad-double", "variable precision" };
     if (J->verbose) {
         printf("BRISK %s high precision: %s\n", BRISK_VERSION, J->method == 1 ? "augmented Lagrangian method with semismooth Newton-CG" : J->method == 2 ? "low-rank augmented Lagrangian method" : "interior-point method");
+        brisk_log_threads(1);
         printf("problem %s: m = %d, %d SDP blocks (max n = %d), %d blocks in all, read %.2fs\n", fname, m, nsdp, maxn, nb, wtime() - J->tstart);
         printf("precision: %s", lname[lk[nl - 1]]);
         if (lk[nl - 1] == 3) printf(" (%d bits, about %d digits)", final_bits, (int)(final_bits * 0.30103));

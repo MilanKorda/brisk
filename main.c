@@ -958,7 +958,7 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
         /* 5.4: the hybrid: the matrix-free method until its CG struggles or the merit is below
          * mf_hand, then the standard method from that iterate (a few factorizations of the
          * Schur complement instead of thirty) */
-        const int ntb = brisk_threads_busy(par->verbose);
+        const int ntb = brisk_threads_busy(par->verbose); brisk_log_threads(par->verbose);
         double **Xi = malloc(sizeof(double *) * (P->nblk + 1)), **Zi = malloc(sizeof(double *) * (P->nblk + 1)), *yi = calloc(P->m + 1, sizeof(double));
         for (int k = 0; k < P->nblk; k++) {
             const size_t len = P->blk[k].type == BLK_SDP ? (size_t)P->blk[k].n * P->blk[k].n : (size_t)P->blk[k].n;
@@ -989,7 +989,7 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
     else if (par->mfipm > 0) {
         /* 4.34: the matrix-free interior-point method (mfipm.c); its result is what the run
          * returns, measured on the file data */
-        const int ntb = brisk_threads_busy(par->verbose);   /* 4.42: only the free cores (solver.c) */
+        const int ntb = brisk_threads_busy(par->verbose); brisk_log_threads(par->verbose);   /* 4.42: only the free cores (solver.c) */
         st_ = mfipm_solve(P, par, R, u->y, u->X);
         if (ntb > 0) omp_set_num_threads(ntb);
     }
@@ -997,7 +997,7 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
         /* 4.31: the first-order engine (fom.c); no interior-point fallback: its result is
          * what the run returns, measured on the file data like any other */
         fom_start_map(par, u, P);
-        const int ntb = brisk_threads_busy(par->verbose);
+        const int ntb = brisk_threads_busy(par->verbose); brisk_log_threads(par->verbose);
         st_ = fom_solve(P, par, R, u->y, u->X);
         if (ntb > 0) omp_set_num_threads(ntb);
         if (par->fom_X0) { for (int k = 0; k < P->nblk; k++) free(par->fom_X0[k]); free(par->fom_X0); par->fom_X0 = NULL; }
@@ -1005,7 +1005,7 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
     }
     else if (par->dual) {
         double t0d = wtime();
-        const int ntb = brisk_threads_busy(par->verbose);
+        const int ntb = brisk_threads_busy(par->verbose); brisk_log_threads(par->verbose);
         st_ = par->dual == 2 ? dual_solve(P, par, R, u->y, u->X) : dsdp_solve(P, par, R, u->y, u->X);
         if (ntb > 0) omp_set_num_threads(ntb);
         tdual = wtime() - t0d;
@@ -1412,6 +1412,7 @@ static int brisk_main_cbf(int argc, char **argv, int ifile) {
 }
 int brisk_main(int argc, char **argv) {
     brisk_threads_init();
+    brisk_log_threads_reset();
     g_threads_user = getenv("OMP_NUM_THREADS") != NULL;   /* 4.42: set also by -threads: the busy-machine rule then stays out */
     if (argc < 2) { usage(); return 1; }
     for (int i = 1; i < argc; i++) {       /* a MAT-file: a problem in SeDuMi format */

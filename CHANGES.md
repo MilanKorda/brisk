@@ -1,5 +1,11 @@
 # BRISK change log
 
+## Version 1.2.1 (October 2026)
+
+- The log states the number of threads the solver uses: a line `Number of threads: k` after
+  the solver's banner, in every interface (not in quiet mode). The cone solver and the solver
+  for linear programs are sequential and report 1.
+
 ## Version 1.2 (October 2026)
 
 - **Second-order cones.** Problems with free variables, linear variables, second-order and

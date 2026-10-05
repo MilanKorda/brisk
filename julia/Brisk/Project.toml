@@ -1,7 +1,7 @@
 name = "Brisk"
 uuid = "d3b741d1-9890-4b0f-9152-b6aeef712190"
 authors = ["Milan Korda and the BRISK developers"]
-version = "1.2.0"
+version = "1.2.1"
 
 [deps]
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"

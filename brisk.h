@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.2"
+#define BRISK_VERSION "1.2.1"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -388,6 +388,8 @@ void problem_from_trips(Problem *P, int m, int nblk, const int *bsz, const doubl
 int  dsdp_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
 int  dual_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
 int  fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);   /* 4.31 fom.c */
+void brisk_log_threads(int verbose);   /* (solver.c) the log line "Number of threads: k", once per run */
+void brisk_log_threads_reset(void);
 int  brisk_threads_busy(int verbose);   /* 4.42 (solver.c): the busy-machine thread rule; returns the count to restore or -1 */
 /* sparse Cholesky of the Schur complement (sparsechol.c) */
 typedef struct SChol SChol;

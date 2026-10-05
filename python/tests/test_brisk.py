@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.2"
+    assert brisk.version() == "1.2.1"
     assert os.path.exists(brisk.library_path())
 
 

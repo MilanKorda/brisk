@@ -609,6 +609,7 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
         long np = 0; for (int q = 0; q < L->ns; q++) np += L->S[q].np;
         int maxn = 0; for (int q = 0; q < L->ns; q++) if (L->S[q].n > maxn) maxn = L->S[q].n;
         printf("BRISK %s low-rank augmented Lagrangian (-lralm)\n", BRISK_VERSION);
+        brisk_log_threads(1);
         printf("problem %s: m = %d, %d SDP blocks (max n = %d), %d LP variables (%d slacks in closed form), read %.2fs\n", fname, m, L->ns, maxn, nlp, nslack, tread);
         printf("lralm: rank %d (max %d), pattern %ld entries, sigma0 %.2g, target %.0e\n", r0, L->ns ? L->S[0].rmax : 0, np, L->sigma, tol);
     }

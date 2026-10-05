@@ -1,4 +1,4 @@
-# BRISK 1.2: the solver in detail
+# BRISK 1.2.1: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 

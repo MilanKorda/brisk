@@ -51,7 +51,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `tol` | the tolerance itself (overrides `acc`) | 1e-8 |
 | `maxit` | iteration limit | 100 |
 | `timelimit` | wall-clock limit in seconds | none |
-| `threads` | OpenMP threads. With the default, tiny problems use one thread and (Linux) the interior-point solve uses only the cores that are free when it starts. | `OMP_NUM_THREADS`, else all cores |
+| `threads` | OpenMP threads. With the default, tiny problems use one thread and (Linux) the interior-point solve uses only the cores that are free when it starts. The log prints the count in use (`Number of threads: k`). | `OMP_NUM_THREADS`, else all cores |
 | `q`, `v` | quiet, verbose (command line) | |
 | `returnx` | library calls (MATLAB, Python, Julia): the dense X of a chordal-decomposed block is returned unless that needs more than 30% of the memory (`-1`), never (`0`; the point is verified on the cliques, fastest), always (`1`). A block that is not returned is empty (`None` in Python). | `-1` |
 

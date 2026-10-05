@@ -10,7 +10,7 @@ verification of the returned point on the data as given).
 2. In MATLAB, once: `mex -setup C` (it should find Xcode's clang).
 3. In MATLAB:
    ```matlab
-   cd brisk-1.2/matlab
+   cd brisk-1.2.1/matlab
    build_brisk_mex            % about a minute; produces brisk_mex.mexmaca64
    test_brisk                 % every line should say PASS
    addpath(pwd); savepath     % keep it on the path

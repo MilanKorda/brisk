@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev octave liboctave-dev
+      - run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev octave && (sudo apt-get install -y octave-dev || sudo apt-get install -y liboctave-dev)
       - name: MEX build and tests
         run: cd matlab && octave-cli --eval "build_brisk_mex; test_brisk"
 

@@ -422,6 +422,7 @@ int lpipm_solve(int m, int n, int nfree, const int *Ap0, const int *Ai0, const d
     if (verbose > 0)
         printf("BRISK LP interior-point solver: %d rows, %d columns (%d with upper bounds), %d nonzeros; normal equations: nnz(L) = %ld, %.2e flops, %d dense column%s; %d corrector%s\n",
                m, n, nbd, nz, info->lnz, schol_flops(F), S->nd, S->nd == 1 ? "" : "s", kcorr, kcorr == 1 ? "" : "s");
+    if (verbose > 0) printf("Number of threads: 1\n");   /* (this solver is sequential) */
     double *x = xz(sizeof(double) * (n + 1)), *s = xz(sizeof(double) * (n + 1)), *z = xz(sizeof(double) * (n + 1)), *w = xz(sizeof(double) * (n + 1)), *y = xz(sizeof(double) * (m + 1));
     double *dx = xz(sizeof(double) * (n + 1)), *ds = xz(sizeof(double) * (n + 1)), *dz = xz(sizeof(double) * (n + 1)), *dw = xz(sizeof(double) * (n + 1)), *dy = xz(sizeof(double) * (m + 1));
     double *dx2 = xz(sizeof(double) * (n + 1)), *ds2 = xz(sizeof(double) * (n + 1)), *dz2 = xz(sizeof(double) * (n + 1)), *dw2 = xz(sizeof(double) * (n + 1)), *dy2 = xz(sizeof(double) * (m + 1));

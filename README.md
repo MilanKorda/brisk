@@ -59,7 +59,7 @@ Details: [SOLVER.md](SOLVER.md) (methods, automatic choices, exit codes) and
 
 ## Status
 
-Version 1.2. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
+Version 1.2.1. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
 benchmark, AC optimal power flow and moment-SOS relaxations) and through the test suites of
 the three interfaces. The macOS build has not yet been validated on a Mac. Please report
 problems through the issue tracker, with the output of `./brisk problem.dat-s -v`.

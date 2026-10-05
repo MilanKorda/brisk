@@ -6270,6 +6270,15 @@ static int free_cores(void) {
 }
 /* the busy-machine rule for the other engines (main.c): lowers the thread count to the free
  * cores and returns the count to restore, or -1 when nothing was changed */
+/* the log line "Number of threads: k": the OpenMP threads the engine that starts now will use.
+ * Printed once per run, and again only if a later solve of the same run uses another count
+ * (brisk_log_threads_reset at the start of a run). */
+static int g_nt_logged = -1;
+void brisk_log_threads_reset(void) { g_nt_logged = -1; }
+void brisk_log_threads(int verbose) {
+    const int nt = nthreads();
+    if (verbose > 0 && nt != g_nt_logged) { printf("Number of threads: %d\n", nt); g_nt_logged = nt; }
+}
 int brisk_threads_busy(int verbose) {
 #ifdef _OPENMP
     const int nt0 = omp_get_max_threads();
@@ -6305,12 +6314,14 @@ int brisk_solve(Problem *P, const Params *par_user, Result *R, double *yout, dou
         }
         if (nt < nt0) {
             omp_set_num_threads(nt);
+            brisk_log_threads(par_user->verbose);
             const int rc = brisk_solve_impl(P, par_user, R, yout, Xout);
             omp_set_num_threads(nt0);
             return rc;
         }
     }
 #endif
+    brisk_log_threads(par_user->verbose);
     return brisk_solve_impl(P, par_user, R, yout, Xout);
 }
 static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, double *yout, double **Xout) {

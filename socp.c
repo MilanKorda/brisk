@@ -1488,6 +1488,7 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
         socp_printf("BRISK second-order cone solver: m = %d, n = %d (free %d, linear %d, cones %d", m, n, S->nf, S->nl, S->nq);
         if (S->nq) { int mx = 0; for (int k = 0; k < S->nq; k++) if (S->q[k] > mx) mx = S->q[k]; socp_printf(", largest %d", mx); }
         socp_printf("), nnz(A) = %d, factor: %d unknowns, nnz(L) = %ld\n", S->Ap[n], S->nk, S->F.lnz);
+        socp_printf("Number of threads: 1\n");   /* (this solver is sequential) */
     }
     if (S->verbose > 1) socp_printf("  it      pobj             dobj         pinf     dinf     gap      mu       tau    step  sigma  ref\n");
     double pobj = 0, dobj = 0, e_p = 1, e_d = 1, e_g = 1, e_c = 1;
