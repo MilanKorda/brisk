@@ -9,7 +9,8 @@ Two levels:
 
   * `Brisk.solve_sdpa(file; options...)` and `Brisk.solve_sdpa_data(m, blocksizes, c, mat,
     blk, i, j, v; options...)`: the problem as an SDPA file or as the numbers of one, the
-    result as a [`Brisk.Result`](@ref).
+    result as a [`Brisk.Result`](@ref); `Brisk.solve_sedumi(A, b, c, K; options...)`: a
+    problem in SeDuMi format (linear, second-order and semidefinite cones).
   * `Brisk.Optimizer`: a MathOptInterface optimizer, so `JuMP.Model(Brisk.Optimizer)` works
     (see `src/MOI_wrapper.jl`).
 
@@ -25,6 +26,7 @@ module Brisk
 
 import Libdl
 import LinearAlgebra
+import SparseArrays
 import MathOptInterface as MOI
 
 const _LIB = Ref{Ptr{Cvoid}}(C_NULL)
@@ -261,7 +263,7 @@ function hp_solution()
             X = [blk(3, k) for k in 1:nb], Z = [blk(4, k) for k in 1:nb], bound = first_or_nothing(get(5)))
 end
 
-function _check(rc, res::Result)
+function _check(rc, res)
     rc < 0 && throw(BriskError(rc, "BRISK stopped (out of memory, or an option it rejected late); see the messages above"))
     rc == 1 && throw(BriskError(rc, "invalid options; see the messages above"))
     rc == 2 && throw(BriskError(rc, "the problem could not be read (invalid data); see the messages above"))
@@ -269,12 +271,12 @@ function _check(rc, res::Result)
     return res
 end
 
-function _with_result(f)
+function _with_result(f, reader = _read_result)
     r = ccall(_fn(:brisk_result_new), Ptr{Cvoid}, ())
     r == C_NULL && throw(OutOfMemoryError())
     try
         rc = f(r)
-        return rc, _read_result(r)
+        return rc, reader(r)
     finally
         ccall(_fn(:brisk_result_delete), Cvoid, (Ptr{Cvoid},), r)
     end
@@ -319,13 +321,13 @@ Stop the running solve as if its time limit were reached now (callable from any 
 """
 interrupt() = ccall(_fn(:brisk_interrupt), Cvoid, ())
 
-function _call(f, args::Vector{String}, output::Symbol)
+function _call(f, args::Vector{String}, output::Symbol, reader = _read_result)
     lock(_LOCK) do
         _set_output(output)
         flush(stdout); flush(stderr)
         cargs = [Base.unsafe_convert(Cstring, a) for a in args]
         GC.@preserve args cargs begin
-            rc, res = _interruptible(() -> _with_result(r -> f(r, cargs)))
+            rc, res = _interruptible(() -> _with_result(r -> f(r, cargs), reader))
         end
         _set_output(:stdout)
         return _check(rc, res)
@@ -401,6 +403,116 @@ function write_sdpa(file::AbstractString, m, blocksizes, c, mat, blk, i, j, v; c
         end
     end
     return file
+end
+
+# ---- problems in SeDuMi format -------------------------------------------------------------------
+
+"""
+    Brisk.ConeResult
+
+The solution of a problem in SeDuMi format (`Brisk.solve_sedumi`): `status`, `status_string`,
+`exit_code`, `iterations`, `primal_objective` (c'x), `dual_objective` (b'y), `dimacs`,
+`solve_time`, and the vectors `x` (primal), `y`, `z = c - A'y` (dual slack), in the order of
+`K`. For an infeasible problem `y` (status 1, b'y = 1) or `x` (status 2, c'x = -1) is the
+certificate. `x` is `nothing` when the engine returned no primal point.
+"""
+struct ConeResult
+    status::Int
+    status_string::String
+    exit_code::Int
+    iterations::Int
+    primal_objective::Float64
+    dual_objective::Float64
+    dimacs::NTuple{6,Float64}
+    solve_time::Float64
+    x::Union{Nothing,Vector{Float64}}
+    y::Vector{Float64}
+    z::Vector{Float64}
+end
+
+function Base.show(io::IO, r::ConeResult)
+    print(io, "Brisk.ConeResult(", r.status_string, ", ", r.iterations, " iterations, c'x = ",
+          r.primal_objective, ", b'y = ", r.dual_objective, ", max error ",
+          maximum(abs, r.dimacs), ", ", round(r.solve_time; digits = 3), " s)")
+end
+
+function _read_cone_result(r::Ptr{Cvoid})
+    st = Int(ccall(_fn(:brisk_result_status), Cint, (Ptr{Cvoid},), r))
+    sstr = unsafe_string(ccall(_fn(:brisk_result_status_str), Cstring, (Ptr{Cvoid},), r))
+    ec = Int(ccall(_fn(:brisk_result_exit_code), Cint, (Ptr{Cvoid},), r))
+    it = Int(ccall(_fn(:brisk_result_iterations), Cint, (Ptr{Cvoid},), r))
+    m = Int(ccall(_fn(:brisk_result_m), Cint, (Ptr{Cvoid},), r))
+    n = Int(ccall(_fn(:brisk_result_sn), Cint, (Ptr{Cvoid},), r))
+    pobj = ccall(_fn(:brisk_result_pobj), Cdouble, (Ptr{Cvoid},), r)
+    dobj = ccall(_fn(:brisk_result_dobj), Cdouble, (Ptr{Cvoid},), r)
+    t = ccall(_fn(:brisk_result_time), Cdouble, (Ptr{Cvoid},), r)
+    err = zeros(6)
+    ccall(_fn(:brisk_result_dimacs), Cvoid, (Ptr{Cvoid}, Ptr{Cdouble}), r, err)
+    vec(p, k) = p == C_NULL ? nothing : copy(unsafe_wrap(Array, p, k))
+    x = vec(ccall(_fn(:brisk_result_sx), Ptr{Cdouble}, (Ptr{Cvoid},), r), n)
+    y = vec(ccall(_fn(:brisk_result_y), Ptr{Cdouble}, (Ptr{Cvoid},), r), m)
+    z = vec(ccall(_fn(:brisk_result_sz), Ptr{Cdouble}, (Ptr{Cvoid},), r), n)
+    return ConeResult(st, sstr, ec, it, pobj, dobj, Tuple(err), t, x, y === nothing ? zeros(m) : y, z === nothing ? zeros(n) : z)
+end
+
+_kget(K, k::Symbol) = K isa AbstractDict ? get(K, k, get(K, String(k), nothing)) : (hasproperty(K, k) ? getproperty(K, k) : nothing)
+_kcount(K, k) = (v = _kget(K, k); v === nothing || isempty(v) ? 0 : Int(sum(v)))
+_klist(K, k) = (v = _kget(K, k); v === nothing ? Cint[] : Cint[Int(d) for d in v if d > 0])
+
+"""
+    Brisk.solve_sedumi(A, b, c, K; output = :julia, options...) -> Brisk.ConeResult
+    Brisk.solve_sedumi(file; output = :julia, options...)
+
+Solve a problem in SeDuMi format,
+
+    min c'x  s.t.  A x = b,  x in K        max b'y  s.t.  c - A'y = z in K*,
+
+with `A` an m x n matrix (sparse or dense) and `K` a named tuple or dictionary with `f` (free
+variables), `l` (nonnegative variables), `q` (second-order cones x0 >= |x(1:)|: a vector of
+dimensions), `r` (rotated cones 2 x0 x1 >= |x(2:)|^2) and `s` (semidefinite blocks, each as
+its d*d entries by columns), in this order: `K = (f = 2, l = 10, q = [4, 7])`. Without
+semidefinite blocks the problem is solved by BRISK's second-order cone solver, with them by
+the semidefinite solver. `file` is a MAT-file (version 5 to 7) with `A` (or `At`), `b`, `c`, `K`.
+"""
+function solve_sedumi(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Real}, c::AbstractVector{<:Real}, K;
+                      output::Symbol = :julia, options...)
+    m, n = length(b), length(c)
+    size(A) == (m, n) || (size(A) == (n, m) && m != n ? (A = permutedims(A)) :
+        throw(DimensionMismatch("A is $(size(A, 1)) x $(size(A, 2)), b has $m entries, c $n")))
+    nf, nl, q, r, s = _kcount(K, :f), _kcount(K, :l), _klist(K, :q), _klist(K, :r), _klist(K, :s)
+    nf + nl + sum(q; init = 0) + sum(r; init = 0) + sum(d -> Int(d)^2, s; init = 0) == n ||
+        throw(DimensionMismatch("K does not match the number of columns of A"))
+    Ap = Cint[0]; Ai = Cint[]; Ax = Cdouble[]
+    if A isa SparseArrays.SparseMatrixCSC
+        Ap = Vector{Cint}(A.colptr .- 1); Ai = Vector{Cint}(A.rowval .- 1); Ax = Vector{Cdouble}(A.nzval)
+    else
+        for j in 1:n
+            for i in 1:m
+                A[i, j] != 0 && (push!(Ai, i - 1); push!(Ax, A[i, j]))
+            end
+            push!(Ap, length(Ai))
+        end
+    end
+    return _solve_sedumi(m, n, Ap, Ai, Ax, Vector{Cdouble}(b), Vector{Cdouble}(c), nf, nl, q, r, s, option_args(options), output)
+end
+
+function _solve_sedumi(m, n, Ap::Vector{Cint}, Ai::Vector{Cint}, Ax::Vector{Cdouble}, b::Vector{Cdouble}, c::Vector{Cdouble},
+                       nf, nl, q::Vector{Cint}, r::Vector{Cint}, s::Vector{Cint}, args::Vector{String}, output::Symbol)
+    return _call(args, output, _read_cone_result) do res, cargs
+        Int(ccall(_fn(:brisk_solve_sedumi), Cint,
+                  (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint,
+                   Cint, Ptr{Cint}, Cint, Ptr{Cint}, Cint, Ptr{Cint}, Cint, Ptr{Cstring}, Ptr{Cvoid}),
+                  m, n, Ap, Ai, Ax, b, c, nf, nl, length(q), q, length(r), r, length(s), s, length(cargs), cargs, res))
+    end
+end
+
+function solve_sedumi(file::AbstractString; output::Symbol = :julia, options...)
+    isfile(file) || throw(ArgumentError("no such file: $file"))
+    args = option_args(options)
+    return _call(args, output, _read_cone_result) do r, cargs
+        Int(ccall(_fn(:brisk_solve_file), Cint, (Cstring, Cint, Ptr{Cstring}, Ptr{Cvoid}),
+                  file, length(cargs), cargs, r))
+    end
 end
 
 include("MOI_wrapper.jl")

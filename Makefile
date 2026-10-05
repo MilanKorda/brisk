@@ -35,7 +35,7 @@ else
   OMPFLAG := -Wno-unknown-pragmas
 endif
 CFLAGS  ?= -O3 $(ARCHFLAG) -funroll-loops $(OMPFLAG) -std=gnu11 -Wall -Wextra -Wno-unused-parameter
-SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c fom.c mfipm.c lralm.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c
+SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c fom.c mfipm.c lralm.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c
 BLAS    ?= system
 
 ifeq ($(BLAS),scipy)
@@ -88,6 +88,8 @@ amd/%.o: amd/%.c
 boundcert.o libobj/boundcert.o: CFLAGS += -frounding-math -fno-fast-math
 hpsolve.o libobj/hpsolve.o: hp.h hpipm.inc hpfom.inc hplr.inc hppre.inc hpcert.inc
 hpmp.o libobj/hpmp.o: hp.h
+socp.o libobj/socp.o: socp.h
+sedumi.o libobj/sedumi.o main.o libobj/main.o: socp.h sedumi.h
 
 # the bundled OpenMP runtime against serial results, 1..8 threads (needs clang)
 omptest: omp/test_omp.c omp/brisk_omp.c omp/omp.h

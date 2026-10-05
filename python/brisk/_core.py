@@ -92,6 +92,12 @@ def load_library(path=None):
         L.brisk_hp_blocksize.argtypes, L.brisk_hp_blocksize.restype = [I], I
         L.brisk_hp_count.argtypes, L.brisk_hp_count.restype = [I, I], ctypes.c_longlong
         L.brisk_hp_text.argtypes, L.brisk_hp_text.restype = [I, I, ctypes.c_char_p, ctypes.c_longlong], ctypes.c_longlong
+    if hasattr(L, "brisk_solve_sedumi"):     # problems in SeDuMi format
+        L.brisk_solve_sedumi.argtypes = [I, I, pi, pi, pd, pd, pd, I, I, I, pi, I, pi, I, pi, I, ppc, P]
+        L.brisk_solve_sedumi.restype = I
+        L.brisk_result_sn.argtypes, L.brisk_result_sn.restype = [P], I
+        L.brisk_result_sx.argtypes, L.brisk_result_sx.restype = [P], pd
+        L.brisk_result_sz.argtypes, L.brisk_result_sz.restype = [P], pd
     L.brisk_interrupt.argtypes, L.brisk_interrupt.restype = [], None
     L.brisk_interrupted.argtypes, L.brisk_interrupted.restype = [], I
     _lib, _lib_path = L, path
@@ -199,7 +205,7 @@ def interrupt():
     load_library().brisk_interrupt()
 
 
-def _run(call, options, verbose):
+def _run(call, options, verbose, collect=None):
     global _worker
     L = load_library()
     av = options_to_argv(options)
@@ -268,7 +274,7 @@ def _run(call, options, verbose):
         sys.stdout.flush()
         if "exc" in state:
             raise state["exc"]
-        res = _collect(L, r, state["rc"])
+        res = (collect or _collect)(L, r, state["rc"])
         res.interrupted = state.get("interrupted", False)
         if res.interrupted:
             res.status_str = "INTERRUPTED"
@@ -322,12 +328,107 @@ def _collect(L, r, rc):
     return res
 
 
+@dataclass
+class ConeResult:
+    """The solution of a problem in SeDuMi format: x (primal), y, z = c - A'y (dual slack), in
+    the order of K. pobj = c'x, dobj = b'y. For an infeasible problem y (status 1, b'y = 1) or
+    x (status 2, c'x = -1) is the certificate."""
+    status: int
+    status_str: str
+    exit_code: int
+    iterations: int
+    pobj: float
+    dobj: float
+    time: float
+    dimacs: np.ndarray
+    x: Optional[np.ndarray] = None
+    y: Optional[np.ndarray] = None
+    z: Optional[np.ndarray] = None
+    interrupted: bool = False
+
+    def __repr__(self):
+        return (f"brisk.ConeResult({self.status_str}, pobj={self.pobj:.10g}, dobj={self.dobj:.10g}, "
+                f"max error={np.max(np.abs(self.dimacs)):.1e}, {self.iterations} iterations, {self.time:.2f}s)")
+
+
+def _collect_sedumi(L, r, rc):
+    err = (ctypes.c_double * 6)()
+    L.brisk_result_dimacs(r, err)
+    status = L.brisk_result_status(r)
+    if rc < 0 or rc in (1, 2) or (status == -1 and rc not in (0, 20)):
+        raise RuntimeError(f"BRISK did not solve the problem (exit code {rc}: "
+                           + {1: "bad options", 2: "invalid problem data"}.get(rc, "aborted") + ")")
+    res = ConeResult(status=status, status_str=L.brisk_result_status_str(r).decode(), exit_code=rc,
+                     iterations=L.brisk_result_iterations(r), pobj=L.brisk_result_pobj(r),
+                     dobj=L.brisk_result_dobj(r), time=L.brisk_result_time(r), dimacs=np.array(err[:]))
+    m, n = L.brisk_result_m(r), L.brisk_result_sn(r)
+    for name, ptr, k in (("x", L.brisk_result_sx(r), n), ("y", L.brisk_result_y(r), m), ("z", L.brisk_result_sz(r), n)):
+        if ptr and k > 0:
+            setattr(res, name, np.ctypeslib.as_array(ptr, shape=(k,)).copy())
+    return res
+
+
+def _is_mat(path):
+    with open(path, "rb") as f:
+        return f.read(6) == b"MATLAB"
+
+
 def solve_file(path, options=None, verbose=True):
-    """Solve an SDPA file (.dat-s, as the command line: ./brisk path options...)."""
+    """Solve a problem file as the command line (./brisk path options...): an SDPA file
+    (.dat-s; returns a Result) or a MAT-file with a problem in SeDuMi format (A or At, b, c,
+    K; returns a ConeResult)."""
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"no such SDPA file: {path}")   # was "exit code 2: invalid problem data"
+        raise FileNotFoundError(f"no such problem file: {path}")   # was "exit code 2: invalid problem data"
     p = os.fsencode(path)
-    return _run(lambda L, n, a, r: L.brisk_solve_file(p, n, a, r), options, verbose)
+    mat = str(path).endswith(".mat") and _is_mat(path)
+    return _run(lambda L, n, a, r: L.brisk_solve_file(p, n, a, r), options, verbose,
+                _collect_sedumi if mat else None)
+
+
+def solve_sedumi(A, b, c, K, options=None, verbose=True):
+    """Solve a problem in SeDuMi format:
+
+        min c'x  s.t.  A x = b,  x in K        max b'y  s.t.  c - A'y = z in K*
+
+    A: m x n (scipy sparse or dense; n x m is accepted when unambiguous). K: a dict (or an
+    object with these attributes) with f (free variables), l (nonnegative variables), q (list:
+    second-order cones x0 >= |x(1:)|), r (list: rotated cones 2 x0 x1 >= |x(2:)|^2), s (list:
+    semidefinite blocks, each as its d*d entries by columns), in this order. Without
+    semidefinite blocks the problem is solved by BRISK's second-order cone solver, with them by
+    the semidefinite solver. Returns a ConeResult."""
+    import scipy.sparse as sp
+    b = np.ascontiguousarray(np.asarray(b, dtype=np.float64).ravel())
+    c = np.ascontiguousarray(np.asarray(c, dtype=np.float64).ravel())
+    A = sp.csc_matrix(A)
+    if A.shape != (b.size, c.size) and A.shape == (c.size, b.size):
+        A = sp.csc_matrix(A.T)
+    if A.shape != (b.size, c.size):
+        raise ValueError(f"A is {A.shape[0]} x {A.shape[1]}, b has {b.size} entries, c {c.size}")
+    A.sum_duplicates()
+    A.sort_indices()
+    get = (lambda k: K.get(k)) if isinstance(K, dict) else (lambda k: getattr(K, k, None))
+
+    def lst(k):
+        v = get(k)
+        v = [] if v is None else np.atleast_1d(np.asarray(v)).ravel()
+        return np.ascontiguousarray([int(d) for d in v if int(d) > 0], dtype=np.intc)
+
+    def cnt(k):
+        v = get(k)
+        return 0 if v is None or np.size(v) == 0 else int(np.sum(v))
+    nf, nl, q, rr, ss = cnt("f"), cnt("l"), lst("q"), lst("r"), lst("s")
+    if nf + nl + int(q.sum()) + int(rr.sum()) + int((ss.astype(np.int64) ** 2).sum()) != c.size:
+        raise ValueError("K does not match the number of columns of A")
+    Ap = np.ascontiguousarray(A.indptr, dtype=np.intc)
+    Ai = np.ascontiguousarray(A.indices, dtype=np.intc)
+    Ax = np.ascontiguousarray(A.data, dtype=np.float64)
+    pi = ctypes.POINTER(ctypes.c_int)
+    pd = ctypes.POINTER(ctypes.c_double)
+    P = lambda a, t: a.ctypes.data_as(t)   # noqa: E731
+    return _run(lambda L, n, a, r: L.brisk_solve_sedumi(
+        int(b.size), int(c.size), P(Ap, pi), P(Ai, pi), P(Ax, pd), P(b, pd), P(c, pd), nf, nl,
+        int(q.size), P(q, pi), int(rr.size), P(rr, pi), int(ss.size), P(ss, pi), n, a, r),
+        options, verbose, _collect_sedumi)
 
 
 def solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True):

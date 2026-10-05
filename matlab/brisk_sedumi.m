@@ -1,5 +1,5 @@
 function [x, y, info, z] = brisk_sedumi(A, b, c, K, opts)
-%BRISK_SEDUMI  Solve an SDP/LP given in SeDuMi format with BRISK.
+%BRISK_SEDUMI  Solve a cone program given in SeDuMi format with BRISK.
 %
 %   [x, y, info] = brisk_sedumi(A, b, c, K)
 %   [x, y, info] = brisk_sedumi(A, b, c, K, opts)
@@ -11,13 +11,18 @@ function [x, y, info, z] = brisk_sedumi(A, b, c, K, opts)
 % with the cone K described as in SeDuMi:
 %   K.f   number of free variables (the first K.f entries of x)
 %   K.l   number of nonnegative variables (next K.l entries)
+%   K.q   dimensions of the second-order cones: x(1) >= norm(x(2:end))
+%   K.r   dimensions of the rotated cones: 2 x(1) x(2) >= norm(x(3:end))^2, x(1), x(2) >= 0
 %   K.s   sizes of the PSD blocks; block j takes K.s(j)^2 entries of x, vec(X_j)
 %         column-major (the symmetric part of the data is used, as in SeDuMi)
-% Not supported: K.q, K.r (second-order cones), K.scomplex / K.xcomplex / K.ycomplex.
+% in this order. Not supported: K.scomplex / K.xcomplex / K.ycomplex.
 %
-% A may be m x N or N x m (N = K.f + K.l + sum(K.s.^2)), sparse or full.
-% Free variables are passed to BRISK as split pairs x = x+ - x-; BRISK detects them and
-% eliminates or handles them natively.
+% A may be m x N or N x m (N = K.f + K.l + sum(K.q) + sum(K.r) + sum(K.s.^2)), sparse or full.
+% A problem without PSD blocks (a linear or second-order cone program) is solved by BRISK's
+% second-order cone solver; opts.conesolver = 0 sends it to the semidefinite solver, as do
+% opts.prec (high precision) and opts.bound. With PSD blocks the semidefinite solver is used
+% (second-order cones as arrow blocks, free variables as split pairs x = x+ - x-, which
+% BRISK detects and eliminates or handles natively).
 %
 % opts: see brisk_opts2args (verbose, acc, tol, maxit, timelimit, args).
 %
@@ -34,11 +39,6 @@ function [x, y, info, z] = brisk_sedumi(A, b, c, K, opts)
 if nargin < 4, error('brisk:input', 'usage: brisk_sedumi(A, b, c, K [, opts])'); end
 if nargin < 5, opts = struct(); end
 if ~isstruct(K), error('brisk:input', 'K must be a struct'); end
-for fn = {'q', 'r'}
-    if isfield(K, fn{1}) && ~isempty(K.(fn{1})) && any(K.(fn{1}) > 0)
-        error('brisk:input', 'second-order cones (K.%s) are not supported by BRISK', fn{1});
-    end
-end
 for fn = {'scomplex', 'xcomplex', 'ycomplex'}
     if isfield(K, fn{1}) && ~isempty(K.(fn{1}))
         error('brisk:input', 'complex data (K.%s) is not supported by BRISK', fn{1});
@@ -48,7 +48,10 @@ nf = 0; nl = 0; ns = [];
 if isfield(K, 'f') && ~isempty(K.f), nf = double(K.f); end
 if isfield(K, 'l') && ~isempty(K.l), nl = double(K.l); end
 if isfield(K, 's') && ~isempty(K.s), ns = double(K.s(:)'); ns = ns(ns > 0); end
-N = nf + nl + sum(ns .^ 2);
+nq = []; nr = [];
+if isfield(K, 'q') && ~isempty(K.q), nq = double(K.q(:)'); nq = nq(nq > 0); end
+if isfield(K, 'r') && ~isempty(K.r), nr = double(K.r(:)'); nr = nr(nr > 0); end
+N = nf + nl + sum(nq) + sum(nr) + sum(ns .^ 2);
 b = full(double(b(:)));
 m = numel(b);
 c = double(c(:));
@@ -57,6 +60,18 @@ if size(A, 1) ~= m && size(A, 2) == m, A = A'; end
 if ~isequal(size(A), [m, N]), error('brisk:input', 'A must be %d x %d (or its transpose)', m, N); end
 if ~issparse(A), A = sparse(double(A)); end
 if m == 0, error('brisk:input', 'no constraints (m = 0)'); end
+
+if ~isempty(nq) || ~isempty(nr) || isempty(ns)
+    % second-order cones, or no PSD block: the problem goes to BRISK in SeDuMi form
+    if N == 0, error('brisk:input', 'empty cone'); end
+    [x, y, zz, bi] = brisk_mex('sedumi', A, b, full(c), nf, nl, nq, nr, ns, brisk_opts2args(opts));
+    if ~bi.have_x
+        warning('brisk:nox', 'BRISK returned no primal solution; x is zero. Set opts.returnx = 1 to force it.');
+    end
+    info = sedumi_info(bi, c, x, b, y);
+    if nargout > 3, z = zz; end
+    return
+end
 
 % ---- column map: SeDuMi column -> (BRISK block, i, j), plus the '-' slot of free columns
 s1 = ns(ns == 1); sb = ns(ns > 1);          % 1x1 PSD blocks go to the LP block
@@ -139,6 +154,11 @@ else
         'x is zero. Set opts.returnx = 1 to force it, or opts.chordal = 0.']);
 end
 y = yb;
+info = sedumi_info(bi, c, x, b, y);
+if nargout > 3, z = c - A' * y; end
+end
+
+function info = sedumi_info(bi, c, x, b, y)
 code = bi.statuscode;
 info = struct();
 info.pinf = double(code == 1);
@@ -158,5 +178,4 @@ info.dimacs = bi.dimacs;
 info.status = bi.status;
 info.statuscode = code;
 info.brisk = bi;
-if nargout > 3, z = c - A' * y; end
 end

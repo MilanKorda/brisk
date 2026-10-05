@@ -1,4 +1,4 @@
-# BRISK 1.1: the solver in detail
+# BRISK 1.2: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -12,9 +12,30 @@ same C code (about 28 000 lines on BLAS/LAPACK).
 
 **Installation: see [INSTALL.md](INSTALL.md).** In short: `make && ./brisk examples/theta1.dat-s`.
 
+## Linear and second-order cone programs, the SeDuMi format
+
+`./brisk problem.mat` reads a problem in SeDuMi format (a MAT-file with `A` or `At`, `b`, `c`
+and `K`): min c'x, A x = b, x in K, with K.f (free), K.l (nonnegative), K.q (second-order
+cones), K.r (rotated second-order cones) and K.s (semidefinite blocks). The same data are
+taken by `brisk.solve_sedumi` (Python), `Brisk.solve_sedumi` (Julia), `brisk_sedumi`
+(MATLAB/Octave) and `brisk_solve_sedumi` (C). A problem without semidefinite blocks is solved
+by a separate cone solver for linear and second-order cone programs; with semidefinite blocks
+(or with `-conesolver 0`, `-prec`, `-bound`, `-certify`) the semidefinite solver takes the
+second-order cones as arrow blocks. CVXPY and JuMP models with second-order cone constraints
+are routed the same way.
+
+## Linear programs (MPS) and CBF files
+
+`./brisk problem.mps` reads a linear program in MPS format (free or fixed), presolves it and
+solves it by an interior-point method for linear programs (upper bounds kept as bounds, normal
+equations); infeasible and unbounded problems are handed to the cone solver, which returns the
+certificate. `-x file` writes x of the problem as read. The solution is an interior one (no
+crossover). `./brisk problem.cbf` (or `.cbf.gz`) reads the conic benchmark format of CBLIB for
+linear and second-order cone problems; integer variables are relaxed.
+
 ## Interfaces
 
-- **Command line:** `./brisk problem.dat-s [options]`. `./brisk` alone lists every option.
+- **Command line:** `./brisk problem.dat-s [options]` (or `problem.mat`, SeDuMi format). `./brisk` alone lists every option.
 - **Python / CVXPY** ([python/README.md](python/README.md)): `pip install "./python[cvxpy]"`.
   Then `prob.solve(solver=brisk.BRISK())` in CVXPY, or `brisk.solve_file` / `brisk.solve_sdpa`
   on SDPA data.
@@ -119,7 +140,11 @@ Every automatic choice below can be overridden from the command line.
   the tolerance was not reached.
 - **`-mfipm 1`:** a matrix-free interior-point method. Its Newton systems are solved by
   preconditioned CG, so the Schur complement is never formed. It suits problems with a
-  low-rank optimal side, e.g. SOS relaxations with a low-rank Gram matrix.
+  low-rank optimal side, e.g. SOS relaxations with a low-rank Gram matrix, or truss topology
+  problems (m = 41,616 in 7 minutes on one core, where a Schur complement would need 14 GB). **`-mfipm 2`** is
+  the hybrid: the matrix-free iteration while its CG is cheap, then the standard method from
+  that iterate (a few Schur factorizations instead of thirty; truss topology problems with
+  m = 7,000–14,000: 2.5–3× faster than the default).
 - **`-lralm 1` (experimental):** a low-rank augmented Lagrangian method (X = R Rᵀ) for very large
   sparse SDPs such as AC-OPF relaxations beyond the interior-point method's reach. Its Newton
   steps use a sparse n × n preconditioner, so its memory stays O(nnz + n·rank). It reports
@@ -143,6 +168,20 @@ Every automatic choice below can be overridden from the command line.
     value), `-x` / `-y` write the certificate with all the digits of its check, and
     `-certify-x` / `-certify-y` with `-prec` check a given one.
 
+## Reproducibility
+
+For a given build, thread count and BLAS library a run is deterministic: no decision depends on
+timings or on random seeds, and the threaded loops give the same result for any schedule. Two
+things outside BRISK can still make two runs differ:
+
+- **A BLAS whose threaded rounding varies from run to run** (reported with macOS/Accelerate). The
+  differences start at the level of a rounding error, and the single-precision Schur
+  factorizations used far from the optimum (m ≥ 1000) amplify them to 1e-7 … 1e-5 in the early
+  iterates; the result is the same to the tolerance, the iteration count can change by a few.
+  `-mixed 0` (`mixed = 0`) keeps every factorization in double; one BLAS thread
+  (`VECLIB_MAXIMUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`) removes the source.
+- **A different thread count or BLAS**: other rounding, same remarks.
+
 ## Files
 
 | path | contents |
@@ -158,4 +197,4 @@ Every automatic choice below can be overridden from the command line.
 | `python/` | Python package: ctypes binding of `libbrisk`, CVXPY solver, examples, tests |
 | `julia/Brisk/` | Julia package: MOI/JuMP optimizer, examples, tests |
 | `matlab/` | MEX gateway, SeDuMi and SDPA wrappers, build script, tests |
-| `examples/` | small SDPLIB problems (theta1, theta3, control1, truss1, arch0, mcp250-1) |
+| `examples/` | small SDPLIB problems (theta1, theta3, control1, truss1, arch0, mcp250-1); `afiro.mps` (a linear program of Netlib), `soc_small.cbf` and `soc_small.mat` (a second-order cone program in CBF and in SeDuMi format) |

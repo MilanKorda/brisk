@@ -10,7 +10,7 @@ verification of the returned point on the data as given).
 2. In MATLAB, once: `mex -setup C` (it should find Xcode's clang).
 3. In MATLAB:
    ```matlab
-   cd brisk-1.1/matlab
+   cd brisk-1.2/matlab
    build_brisk_mex            % about a minute; produces brisk_mex.mexmaca64
    test_brisk                 % every line should say PASS
    addpath(pwd); savepath     % keep it on the path
@@ -35,6 +35,16 @@ runtime (libgomp, part of gcc) is used. GNU Octave: the same script (it uses `mk
 --mex`); with `CC=clang` in the environment, `build_brisk_mex('openmp', 'bundled')` works on
 Linux too (that is how the bundled runtime was tested there).
 
+### Linux: MATLAB's BLAS
+
+On Linux, MATLAB's own BLAS/LAPACK (MKL, 64-bit integers) is what every MEX file ends up calling,
+whatever library it was linked with. `build_brisk_mex` therefore compiles BRISK through an
+integer-widening layer (`../blas64.c`) and links `-lmwblas -lmwlapack` by default
+(`'blas', 'matlab'`); nothing has to be installed, and it is faster than a system OpenBLAS.
+Octave links the system BLAS/LAPACK with 32-bit integers (`'blas', 'system'`); an Octave built
+for a 64-bit-integer BLAS takes `'blas', 'system64'`. (Before version 1.2 the Linux MATLAB build linked the
+system libraries and crashed on the first BLAS call.)
+
 ## Use
 
 ### SeDuMi format
@@ -45,9 +55,12 @@ Linux too (that is how the bundled runtime was tested there).
 [x, y, info, z] = brisk_sedumi(...)              % z = c - A'*y
 ```
 
-`min c'x  s.t.  A x = b, x in K`, with `K.f` (free), `K.l` (nonnegative) and `K.s` (PSD
-blocks, `vec(X)` column-major, the symmetric part of the data is used — as in SeDuMi).
-Second-order cones (`K.q`, `K.r`) and complex data are not supported. `info` has SeDuMi's
+`min c'x  s.t.  A x = b, x in K`, with `K.f` (free), `K.l` (nonnegative), `K.q` (second-order
+cones `x(1) >= norm(x(2:end))`), `K.r` (rotated cones `2*x(1)*x(2) >= norm(x(3:end))^2`) and
+`K.s` (PSD blocks, `vec(X)` column-major, the symmetric part of the data is used — as in
+SeDuMi). A problem without `K.s` is solved by BRISK's cone solver for linear and second-order
+cone programs (`opts.conesolver = 0` forces the semidefinite solver, which takes the cones as
+arrow blocks). Complex data are not supported. `info` has SeDuMi's
 `pinf`, `dinf`, `numerr` (0 solved, 1 reduced accuracy, 2 failure), `iter`, `cpusec`, plus
 `pobj`, `dobj`, `dimacs` (the six DIMACS errors, measured on your data), `status`.
 

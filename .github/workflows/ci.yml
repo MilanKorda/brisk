@@ -14,7 +14,7 @@ jobs:
         run: make
       - name: Examples
         run: |
-          for f in examples/*.dat-s; do
+          for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat; do
             ./brisk "$f" -q || { echo "$f failed"; exit 1; }
           done
       - name: C library

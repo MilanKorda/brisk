@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.1"
+    assert brisk.version() == "1.2"
     assert os.path.exists(brisk.library_path())
 
 
@@ -611,3 +611,185 @@ def test_high_precision_certificates(tmp_path):
     # without a bound option there is no bound
     brisk.solve_file(str(f), {"prec": "dd"}, verbose=False)
     assert brisk.hp_solution()["bound"] is None
+
+
+# ---- problems in SeDuMi format, second-order cones ----------------------------------------------
+def _cone_point(rng, K, slack=False):
+    """A point in the interior of K (zeros on the free part of a slack)."""
+    v = [np.zeros(K.get("f", 0)) if slack else rng.standard_normal(K.get("f", 0)), rng.random(K.get("l", 0)) + 0.1]
+    for d in K.get("q", []):
+        t = rng.standard_normal(d - 1)
+        v.append(np.r_[np.linalg.norm(t) + 0.1 + rng.random(), t])
+    for d in K.get("r", []):
+        t = rng.standard_normal(d - 2)
+        a = 0.5 + rng.random()
+        v.append(np.r_[a, t @ t / (2 * a) + 0.1 + rng.random(), t])
+    for d in K.get("s", []):
+        G = rng.standard_normal((d, d))
+        v.append((G @ G.T / d + 0.1 * np.eye(d)).ravel(order="F"))
+    return np.concatenate(v)
+
+
+def _sedumi_problem(K, m, seed=0):
+    import scipy.sparse as sp
+    rng = np.random.default_rng(seed)
+    x, z = _cone_point(rng, K), _cone_point(rng, K, slack=True)
+    A = sp.random(m, x.size, 0.4, random_state=rng, format="csc", data_rvs=rng.standard_normal)
+    return A, A @ x, A.T @ rng.standard_normal(m) + z
+
+
+def _cone_violation(v, K, dual=False):
+    w, p = 0.0, K.get("f", 0)
+    if dual and p:
+        w = np.abs(v[:p]).max()
+    if K.get("l", 0):
+        w = max(w, -v[p:p + K["l"]].min())
+    p += K.get("l", 0)
+    for d in K.get("q", []):
+        w = max(w, np.linalg.norm(v[p + 1:p + d]) - v[p])
+        p += d
+    for d in K.get("r", []):
+        w = max(w, v[p + 2:p + d] @ v[p + 2:p + d] - 2 * v[p] * v[p + 1], -v[p], -v[p + 1])
+        p += d
+    for d in K.get("s", []):
+        M = v[p:p + d * d].reshape(d, d)
+        w = max(w, -np.linalg.eigvalsh((M + M.T) / 2).min())
+        p += d * d
+    return w
+
+
+@pytest.mark.parametrize("K, m", [(dict(l=30), 10), (dict(f=3, l=5, q=[4, 7, 3], r=[5, 3]), 10),
+                                  (dict(q=[30] * 8), 60), (dict(f=2, l=4, q=[4, 6], r=[4], s=[3, 1, 5]), 12),
+                                  (dict(s=[6, 4]), 8)])
+def test_solve_sedumi(K, m):
+    A, b, c = _sedumi_problem(K, m)
+    r = brisk.solve_sedumi(A, b, c, K, verbose=False)
+    assert isinstance(r, brisk.ConeResult) and r.status == 0
+    z = c - A.T @ r.y
+    assert np.linalg.norm(A @ r.x - b) < 1e-7 * (1 + np.linalg.norm(b))
+    assert abs(c @ r.x - b @ r.y) < 1e-7 * (1 + abs(c @ r.x))
+    assert _cone_violation(r.x, K) < 1e-7 and _cone_violation(z, K, dual=True) < 1e-7
+    assert np.allclose(r.z, z, atol=1e-6 * (1 + np.abs(z).max()))      # the cone solver returns its slack: in the cone, equal to c - A'y within the tolerance
+    assert abs(r.pobj - c @ r.x) < 1e-9 * (1 + abs(r.pobj))
+
+
+def test_solve_sedumi_cone_and_sdp_solver_agree():
+    K = dict(f=3, l=5, q=[4, 7, 3], r=[5, 3])
+    A, b, c = _sedumi_problem(K, 10, seed=3)
+    r1 = brisk.solve_sedumi(A, b, c, K, verbose=False)
+    r2 = brisk.solve_sedumi(A, b, c, K, {"conesolver": 0}, verbose=False)
+    r3 = brisk.solve_sedumi(A, b, c, K, {"prec": "dd"}, verbose=False)
+    assert r1.status == 0 and r2.status in (0, 5) and r3.status == 0
+    assert abs(r1.pobj - r2.pobj) < 1e-6 * (1 + abs(r1.pobj))
+    assert abs(r1.pobj - r3.pobj) < 1e-7 * (1 + abs(r1.pobj)) and np.max(np.abs(r3.dimacs)) < 1e-18
+    assert np.allclose(r1.x, r3.x, atol=1e-5 * (1 + np.abs(r3.x).max()))
+
+
+def test_solve_sedumi_infeasible_and_unbounded():
+    import scipy.sparse as sp
+    # x in the cone of dimension 3 with x1 = -1: primal infeasible, y the certificate (b'y = 1)
+    r = brisk.solve_sedumi(sp.csc_matrix([[1.0, 0, 0]]), [-1.0], [1.0, 0, 0], dict(q=[3]), verbose=False)
+    assert r.status == 1 and abs(-r.y[0] - 1) < 1e-8
+    # min x1 + 2 x3 on the cone with x2 = 0: unbounded along (1, 0, -1), x the ray (c'x = -1)
+    r = brisk.solve_sedumi(sp.csc_matrix([[0.0, 1.0, 0]]), [0.0], [1.0, 0, 2.0], dict(q=[3]), verbose=False)
+    assert r.status == 2 and abs(r.x[0] + 2 * r.x[2] + 1) < 1e-8 and r.x[0] >= np.linalg.norm(r.x[1:]) - 1e-9
+    with pytest.raises(ValueError):
+        brisk.solve_sedumi(sp.csc_matrix([[1.0, 0, 0]]), [1.0], [1.0, 0, 0], dict(q=[4]), verbose=False)
+
+
+@pytest.mark.parametrize("compress", [True, False])
+def test_sedumi_mat_file(tmp_path, compress):
+    import scipy.io as sio
+    K = dict(f=2, l=4, q=[4, 6], r=[4], s=[3, 1, 5])
+    A, b, c = _sedumi_problem(K, 12, seed=1)
+    Kd = {k: np.array(v, dtype=float).reshape(1, -1) for k, v in K.items()}
+    f = str(tmp_path / "p.mat")
+    sio.savemat(f, {"A": A, "b": b.reshape(-1, 1), "c": c.reshape(-1, 1), "K": Kd}, do_compression=compress)
+    r0 = brisk.solve_sedumi(A, b, c, K, verbose=False)
+    r1 = brisk.solve_file(f, verbose=False)
+    assert isinstance(r1, brisk.ConeResult) and r1.status == 0 and np.array_equal(r0.y, r1.y) and np.array_equal(r0.x, r1.x)
+    sio.savemat(f, {"At": A.T.tocsc(), "b": b, "c": c, "K": Kd})
+    r2 = brisk.solve_file(f, verbose=False)
+    assert np.array_equal(r0.y, r2.y)
+    lib = brisk.library_path()
+    exe = os.path.join(os.path.dirname(lib), "brisk")
+    if os.path.exists(exe):                     # the command line on the same file
+        xf = str(tmp_path / "x.txt")
+        out = subprocess.run([exe, f, "-x", xf], capture_output=True, text=True)
+        assert out.returncode == 0 and "SeDuMi problem" in out.stdout
+        assert np.allclose(np.loadtxt(xf), r0.x, atol=1e-6 * (1 + np.abs(r0.x).max()))
+
+
+def test_sedumi_free_variables_substituted():
+    """Free variables determined by short rows are substituted out by the cone solver's presolve
+    (exact postsolve of x and y), also when nothing is left to solve (a square system)."""
+    import scipy.sparse as sp
+    A = sp.csc_matrix(np.array([[1.0, 2.0], [0.0, 1.0]])); b = np.array([5.0, 1.0]); c = np.array([1.0, 1.0])
+    r = brisk.solve_sedumi(A, b, c, dict(f=2, l=0, q=[], r=[]), verbose=False)
+    assert r.status == 0 and r.iterations == 0
+    assert np.allclose(r.x, [3.0, 1.0]) and np.allclose(r.y, [1.0, -1.0]) and abs(r.pobj - 4.0) < 1e-12
+    # a cone problem with its free variable then fixed by a singleton row at its optimal value: the
+    # row is substituted out, the optimum is the same, and the row's multiplier makes c - A'y vanish
+    K = dict(f=1, l=3, q=[3], r=[])
+    A, b, c = _sedumi_problem(K, 5, seed=11)
+    r0 = brisk.solve_sedumi(A, b, c, K, verbose=False)
+    assert r0.status == 0
+    row = np.zeros(A.shape[1]); row[0] = 2.0
+    A2 = sp.vstack([sp.csc_matrix(A), sp.csr_matrix(row)]).tocsc(); b2 = np.r_[b, 2.0 * r0.x[0]]
+    r = brisk.solve_sedumi(A2, b2, c, K, verbose=False)
+    assert r.status == 0 and abs(r.x[0] - r0.x[0]) < 1e-7 * (1 + abs(r0.x[0]))
+    assert abs(r.pobj - r0.pobj) <= 1e-7 * (1 + abs(r0.pobj))
+    assert np.linalg.norm(A2 @ r.x - b2) <= 1e-7 * (1 + np.linalg.norm(b2))
+    z = c - A2.T @ r.y
+    assert abs(z[0]) <= 1e-7 * (1 + np.abs(c).max())           # the free variable's dual slack is zero
+
+
+def test_sedumi_split_free_variables():
+    """Free variables written as differences of nonnegative ones (two columns a, -a with costs
+    c, -c) are merged by the cone solver's presolve; x comes back as the positive and negative
+    parts, and the result is that of the problem with K.f."""
+    import scipy.sparse as sp
+    K = dict(f=3, l=5, q=[4, 3], r=[3])
+    A, b, c = _sedumi_problem(K, 9, seed=5)
+    r0 = brisk.solve_sedumi(A, b, c, K, verbose=False)
+    A = sp.csc_matrix(A)
+    f = K["f"]
+    A2 = sp.hstack([A[:, :f], -A[:, :f], A[:, f:]]).tocsc()
+    c2 = np.r_[c[:f], -c[:f], c[f:]]
+    K2 = dict(K, f=0, l=K["l"] + 2 * f)
+    r1 = brisk.solve_sedumi(A2, b, c2, K2, verbose=False)
+    assert r0.status == 0 and r1.status == 0
+    assert abs(r1.pobj - r0.pobj) <= 1e-6 * (1 + abs(r0.pobj))
+    x = r1.x
+    assert (x[:2 * f] >= 0).all() and (np.minimum(x[:f], x[f:2 * f]) == 0).all()         # the two parts
+    assert np.allclose(x[:f] - x[f:2 * f], r0.x[:f], atol=1e-5 * (1 + np.abs(r0.x).max()))
+    assert np.linalg.norm(A2 @ x - b) <= 1e-7 * (1 + np.linalg.norm(b))
+    assert (r1.z[:2 * f] >= 0).all()
+
+
+def test_cvxpy_cone_solver():
+    cp = pytest.importorskip("cvxpy")
+    rng = np.random.default_rng(0)
+    n = 30
+    A, b = rng.standard_normal((50, n)), rng.standard_normal(50)
+    x = cp.Variable(n)
+    cons = [cp.norm(x[:10]) <= 1, x[10:] >= -1, cp.sum(x) == 0.5, cp.quad_over_lin(x[5:15], 1) <= 2]
+    prob = cp.Problem(cp.Minimize(cp.norm(A @ x - b) + cp.norm1(x)), cons)
+    v1 = prob.solve(solver=brisk.BRISK())
+    assert prob.status == "optimal" and prob.solver_stats.extra_stats["form"] == "cone"
+    x1, d1 = x.value.copy(), [np.atleast_1d(c.dual_value).copy() for c in cons[1:3]]
+    v2 = prob.solve(solver=brisk.BRISK(), conesolver=0)
+    assert prob.solver_stats.extra_stats["form"] != "cone" and abs(v1 - v2) < 1e-6 * (1 + abs(v1))
+    assert np.allclose(x1, x.value, atol=1e-4)
+    for a, c in zip(d1, cons[1:3]):
+        assert np.allclose(a, np.atleast_1d(c.dual_value), atol=1e-4)
+    v3 = prob.solve(solver=cp.CLARABEL)
+    assert abs(v1 - v3) < 1e-6 * (1 + abs(v1))
+    p2 = cp.Problem(cp.Minimize(cp.sum(x)), [cp.norm(x) <= 1, x[0] >= 2])
+    p2.solve(solver=brisk.BRISK())
+    assert p2.status == "infeasible"
+    p3 = cp.Problem(cp.Minimize(cp.sum(x)), [cp.norm(x[1:]) <= x[0]])
+    p3.solve(solver=brisk.BRISK())
+    assert p3.status == "unbounded"
+    p4 = cp.Problem(cp.Minimize(cp.sum(x)), [x >= 1, x[:3] <= 4])       # a linear program
+    assert abs(p4.solve(solver=brisk.BRISK()) - 30) < 1e-6 and p4.solver_stats.extra_stats["form"] == "cone"

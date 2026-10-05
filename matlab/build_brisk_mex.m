@@ -10,13 +10,22 @@ function build_brisk_mex(varargin)
 %                                        %   default on Linux); macOS Homebrew's libomp (brew install libomp)
 %   build_brisk_mex('openmp', false)     % no threads of BRISK's own (BLAS threads only)
 %   build_brisk_mex('verbose', true)     % show the compiler commands
+%   build_brisk_mex('blas', 'matlab')    % Linux MATLAB (the default there): MATLAB's own BLAS/LAPACK
+%                                        %   (libmwblas, libmwlapack: MKL with 64-bit integers)
+%                                        %   through the integer-widening layer blas64.c
+%   build_brisk_mex('blas', 'system')    % the system BLAS/LAPACK with 32-bit integers (-lblas -llapack;
+%                                        %   the default in Octave). On Linux MATLAB this crashes: the
+%                                        %   symbols resolve to MATLAB's 64-bit MKL whatever is linked
+%   build_brisk_mex('blas', 'system64')  % a system BLAS/LAPACK with 64-bit integers (an ILP64 build of
+%                                        %   OpenBLAS; an Octave built with --enable-64 and such a BLAS)
 %
 % macOS (Apple Silicon or Intel): Xcode command-line tools (xcode-select --install) and a
 % MATLAB-supported compiler (mex -setup C). BLAS/LAPACK come from Apple's Accelerate
 % framework, the AMD ordering (../amd) and the OpenMP runtime (../omp) are bundled: no other
 % library is needed. The build takes about a minute.
 %
-% Linux: gcc and a system BLAS/LAPACK (-lblas -llapack, e.g. OpenBLAS); gcc brings libgomp.
+% Linux MATLAB: gcc (gcc brings libgomp); BLAS/LAPACK are MATLAB's own (no library to install).
+% Linux Octave: gcc and a system BLAS/LAPACK (-lblas -llapack, e.g. OpenBLAS).
 %
 % The source files are the ones of the command-line solver, one directory up.
 
@@ -24,13 +33,14 @@ p = inputParser;
 p.addParameter('cpu', 'apple-m1');
 p.addParameter('openmp', 'auto');   % 'auto' | 'bundled' | 'system' | false
 p.addParameter('verbose', false);
+p.addParameter('blas', 'auto');     % 'auto' | 'matlab' | 'system' | 'system64'
 p.parse(varargin{:});
 o = p.Results;
 
 here = fileparts(mfilename('fullpath'));
 src = fullfile(here, '..');
 names = {'problem.c', 'presolve.c', 'postsolve.c', 'dictroute.c', 'chordal.c', 'freeelim.c', ...
-         'dualize.c', 'fom.c', 'mfipm.c', 'lralm.c', 'symred.c', 'symalg.c', 'sparsechol.c', 'dualscale.c', 'ddend.c', 'crossover.c', 'solver.c', 'bound.c', 'boundcert.c', 'hpmp.c', 'hpsolve.c', 'main.c'};
+         'dualize.c', 'fom.c', 'mfipm.c', 'lralm.c', 'symred.c', 'symalg.c', 'sparsechol.c', 'dualscale.c', 'ddend.c', 'crossover.c', 'solver.c', 'bound.c', 'boundcert.c', 'hpmp.c', 'hpsolve.c', 'socp.c', 'sedumi.c', 'lpio.c', 'lpsolve.c', 'nd.c', 'main.c'};
 files = [cellfun(@(f) fullfile(src, f), names, 'UniformOutput', false), {fullfile(here, 'brisk_mex.c')}];
 for k = 1:numel(files)
     if ~exist(files{k}, 'file'), error('brisk:build', 'missing source file %s', files{k}); end
@@ -61,7 +71,27 @@ if ismac
     end
     ldextra = '-framework Accelerate';
 else
-    libs = {'-llapack', '-lblas'};
+    blas = o.blas;
+    if strcmp(blas, 'auto'), blas = ternary(isoct, 'system', 'matlab'); end
+    switch blas
+        case 'matlab'
+            if isoct, error('brisk:build', 'blas ''matlab'' is for MATLAB; Octave uses ''system'' or ''system64'''); end
+            % MATLAB's MKL takes 64-bit integers: the solver calls bk_* (blas64.c), which widen
+            % the integers and call MATLAB's dgemm_ etc. (ptrdiff_t, as in MATLAB's blas.h)
+            defs = [defs, {'-DBLAS_PREFIX=bk_', '-DBLAS64_INT=ptrdiff_t'}];
+            files{end + 1} = fullfile(src, 'blas64.c');
+            libs = {'-lmwlapack', '-lmwblas'};
+            fprintf('BLAS/LAPACK: MATLAB''s (64-bit integers, through blas64.c)\n');
+        case 'system64'
+            defs = [defs, {'-DBLAS_PREFIX=bk_', '-DBLAS64_INT=ptrdiff_t'}];
+            files{end + 1} = fullfile(src, 'blas64.c');
+            libs = {'-llapack', '-lblas'};
+            fprintf('BLAS/LAPACK: the system libraries with 64-bit integers (through blas64.c)\n');
+        case 'system'
+            libs = {'-llapack', '-lblas'};
+        otherwise
+            error('brisk:build', 'blas must be ''auto'', ''matlab'', ''system'' or ''system64''');
+    end
 end
 switch omp
     case 'bundled'

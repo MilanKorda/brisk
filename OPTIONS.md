@@ -62,7 +62,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `chordal` | chordal decomposition of sparse blocks: `-1` automatic (when it lowers the cost per iteration), `0` off, `1` force | `-1` |
 | `cliquemax`, `chordalmin` | largest clique accepted; smallest block tried | 160; 100 |
 | `sym` | exact symmetry reduction: `auto` (sign symmetries and permutation automorphisms found and used), `none`, or a file of generators | `auto` |
-| `symmin` | apply the reduction only when it shrinks the problem by this factor | 1.5 |
+| `symmin` | apply the reduction only when it shrinks the problem by this factor: the constraints, Σn³ of the blocks, or (at most 4 SDP blocks, m ≤ 20,000) the estimated work m³/3 + 30 Σn³ | 1.5 |
 | `symtime`, `symnodes` | caps of the automatic search | 20 s, 500 nodes |
 | `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. | −1 |
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
@@ -81,9 +81,20 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off | 0.2 |
-| `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side) | 0 |
+| `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-5, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
 | `crossover` | SDP crossover after the solve: `0` off, `1` on, `-1` when cheap | 0 |
+
+### Linear and second-order cone programs (SeDuMi format)
+
+| option | meaning | default |
+|---|---|---|
+| `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the cone solver; `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
+
+The cone solver takes `tol`, `acc` (low 1e-6, default 1e-8, high 1e-10), `maxit`, `timelimit`,
+`threads`, `q`, `v`, and on the command line `-x`, `-y`, `-z` (x, y and z = c − A'y, one value
+per line). Its statuses are those of the semidefinite solver (OPTIMAL, SOLVED TO REDUCED
+ACCURACY, PRIMAL/DUAL INFEASIBLE with a certificate, …).
 
 ### High precision
 
@@ -109,13 +120,47 @@ digits (the usual result holds it rounded to doubles).
 | `bound` with `prec` | the certificate is built and checked in high precision on the problem as read; the rigorous bound has all the digits of `prec`, and the certificate is returned (and written by `-x` / `-y`) with all the digits of its check. `certify` is then implied. `-certify-x` / `-certify-y` with `prec` check a given certificate | – |
 | `boundtol`, `boundmargin` | residual and eigenvalue margin required of a certificate | 1e-10, 1e-13 |
 
+
+### Linear programs from MPS files
+
+| option | meaning | default |
+|---|---|---|
+| `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows) | 2 |
+| `lpmethod` | `1` the LP interior-point method (bounds as bounds, normal equations; the cone solver takes over when it gives up), `0` the cone solver directly | 1 |
+| `lpcorr` | centrality correctors per iteration | 0–3 from the cost of a factorization against a solve (flop ratio above 10, 30, 50) |
+
+Also `tol` (1e-8), `maxit` (200), `timelimit`, `q`, `v`, and `-x file` (x of the problem as read).
+The mfipm options `mfproj` (0: no projection of the primal direction; 1: the earlier scheme)
+and `mfeta` (0.1: CG runs until its residual is this fraction of the primal infeasibility)
+belong to `mfipm`.
+
 ## 3. Full list
 
 Generated by `tools/gen_options_md.sh` from `./brisk` (do not edit by hand).
 
 <!-- BEGIN GENERATED -->
 ```text
-usage: brisk problem.dat-s [options]
+usage: brisk problem.dat-s [options]      (an SDPA sparse file)
+       brisk problem.mat [options]        (SeDuMi format: a MAT-file with A (or At), b, c, K;
+                                           K.f, K.l, K.q, K.r, K.s; MAT versions 5 to 7)
+       brisk problem.mps [options]        (a linear program: MPS, free or fixed format)
+       brisk problem.cbf[.gz] [options]   (CBF, the format of CBLIB: linear and second-order cones;
+                                           integer variables are relaxed)
+A linear program read from an MPS file is presolved and solved by the LP interior-point method
+(bounds kept as bounds, normal equations); the cone solver takes over when that method gives up
+(infeasible or unbounded problems: it returns the certificates). Its options: -tol, -maxit,
+-timelimit, -q, -v, -x <file> (x of the problem as read, one value per line), and
+  -lppresolve <k>  0 none, 1 rows and columns (fixed, singleton, redundant, forcing, dual fixing),
+                   2 (default) also substitutions: free column singletons, opposite column pairs,
+                   implied free columns by their equality rows
+  -lpmethod <k>    1 (default) the LP interior-point method, 0 the cone solver directly
+  -lpcorr <k>      centrality correctors per iteration (default: 0-3 from the cost of a
+                   factorization against a solve)
+A problem in SeDuMi format without semidefinite blocks (a linear or second-order cone program)
+is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -timelimit, -q,
+-v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With
+semidefinite blocks, or with -conesolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem
+goes to the semidefinite solver (second-order cones as arrow blocks) with all the options below.
 output
   -q | -v          quiet | verbose   (Ctrl-C: stop and return the current point; twice: abort)
   -y <file>        write y (SDPA primal x = -y), one value per line, original numbering
@@ -136,6 +181,9 @@ termination
                    relaxations of minimisation problems take the lower bound from -bound d.
                    The certificate replaces its side of the returned pair (-x / -y write it);
                    -certify makes the bound rigorous. See README (bound mode).
+  -boundanchor <f> with -bound d: a y (the -y format, as read) whose Z = C - A'y is positive
+                   definite, e.g. from a solve of the problem with the largest margin; a
+                   candidate whose Z is not positive semidefinite is blended with it
   -boundtol <t>    relative residual required of a -bound p certificate (1e-10)
   -boundmargin <e> eigenvalue margin of the certificate, relative to 1 + max diagonal; at least
                    8 n^2 u per block of order n, what a rigorous check needs (1e-13)
@@ -176,6 +224,8 @@ high precision
                    (1e-24 for dd, 1e-48 for qd, 1e-77 for 100 digits) and a result within
                    2^(-0.6 bits) (1e-19, 1e-38, 1e-62) counts as OPTIMAL; -fom / -lralm aim at the latter
 method
+  -conesolver 0    a problem in SeDuMi format without semidefinite blocks: by the semidefinite solver
+                   (second-order cones as arrow blocks) instead of the cone solver (default 1)
   -dual            dual-scaling method (DSDP-style: potential reduction, correctors, verified
                    certificates); falls back to the primal-dual method unless certified
   -hsd | -nohsd    force | forbid the self-dual embedding (default: automatic - the embedding first
@@ -211,9 +261,16 @@ presolve
                    Schur complement is at most half the size: -1 auto, 0 off, 1 force
   -mfipm <k>       matrix-free interior-point method: NT Mehrotra steps, Newton systems
                    by preconditioned CG, no Schur complement (1 on, 0 off); for problems with
-                   a low-rank optimal side (moment-SOS with few atoms). Its options:
+                   a low-rank optimal side (moment-SOS with few atoms). 2: the hybrid - the
+                   matrix-free iteration until its merit is below -mfhand (1e-5) or an
+                   iteration needs more than -mfhandcg (600) CG steps, then the standard
+                   method from that iterate (a few Schur factorizations instead of thirty;
+                   truss topology problems with m = 7,000-14,000: 2.5-3x faster). Its options:
   -mfrho <r>, -mfrmax <k>, -mfdrop <d>, -mfkmax <k>   preconditioner: bulk spread (10), outlier
                    eigenvectors per block (4), dropped pairs (0.5), largest capacitance (8000)
+  -mfproj <k>, -mfeta <e>   0 (default): no projection of the primal direction, CG until its
+                   residual is below e (0.1) times the primal infeasibility; 1: the direction
+                   projected onto A(dX) = Rp by a second CG (the earlier scheme)
   -mfcgmax <k>, -mfcgtol <t>, -mfcgtolmax <t>   CG: steps per solve (3000), tolerance
                    clamp(1e-2 mu/mu0, t, tmax) (1e-10, 1e-3)
   -mfwarm <k>, -mfstall <k>, -mfdiag <k>   corrector CG started from the predictor (1);
@@ -264,8 +321,9 @@ presolve
                    sign pattern, odd constraints dropped (1 on, 0 off)
   -symsigned <k>   ... -sym auto: signed permutations (x_i -> ±x_g(i)): a second search on the
                    absolute values of the data, signs lifted over GF(2), exact (1 on, 0 off)
-  -symmin <f>      ... -sym auto applies the reduction only when the constraints or the block
-                   algebra shrink by this factor (1.5; 1: always search and apply); a file's
+  -symmin <f>      ... -sym auto applies the reduction only when the constraints, the block
+                   algebra or (at most 4 blocks, m <= 20000) the work m^3/3 + 30 sum n^3
+                   shrink by this factor (1.5; 1: always search and apply); a file's
                    generators are always applied
   -symalg <k>      ... then block structure shared by all data matrices of an SDP block: the
                    *-algebra they generate is block-diagonalised numerically (blocks split into

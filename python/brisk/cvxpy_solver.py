@@ -40,7 +40,8 @@ from BRISK's X ray (image) or its y ray and Z - C (kernel). Statuses: in the ima
 
 Options (solver_opts): any command-line option of ./brisk as a keyword, e.g. acc="high",
 timelimit=60, threads=2, tol=1e-9, fomssn=0; options=[...] for raw strings; form, soc,
-soc_arrow_max as above; write_sdpa="f.dat-s" writes the SDPA file handed to BRISK;
+soc_arrow_max as above; conesolver=0 sends a problem without semidefinite cones to the
+semidefinite solver (by default it goes to BRISK's second-order cone solver); write_sdpa="f.dat-s" writes the SDPA file handed to BRISK;
 inaccurate_tol (default 1e-4): iteration/time limits, interrupts and numerical difficulties
 give OPTIMAL_INACCURATE when the largest DIMACS error is at most this, else USER_LIMIT /
 SOLVER_ERROR.
@@ -429,6 +430,20 @@ class BRISK(ConicSolver):
         bound = opts.pop("bound", None)
         do_cert = bool(opts.pop("certify", False))
         opts.pop("use_quad_obj", None)
+        dims = data[ConicSolver.DIMS]
+        cone = opts.pop("conesolver", 1)
+        if (int(cone) != 0 and not list(dims.psd) and not bound and form == "auto" and soc == "auto"
+                and not wfile and not any(k in opts for k in ("prec", "fom", "mfipm", "lralm"))):
+            # no semidefinite cone: BRISK's second-order cone solver, on the SeDuMi form whose
+            # dual is CVXPY's problem (A_s = A', b_s = -c, c_s = b; y = x, x_s = CVXPY's dual)
+            A = sp.csc_matrix(data[s.A]).T
+            K = dict(f=int(dims.zero), l=int(dims.nonneg), q=[int(k) for k in dims.soc])
+            try:
+                res = _core.solve_sedumi(A, -np.asarray(data[s.C], float).ravel(), np.asarray(data[s.B], float).ravel(), K,
+                                         options=_core.options_to_argv(opts) + _core.options_to_argv(raw), verbose=verbose)
+            except RuntimeError as e:
+                raise SolverError(str(e)) from e
+            return {"cone": res, "itol": itol, "c": np.asarray(data[s.C], float).ravel()}
         *sd, info = cone_program_to_sdpa(data[s.A], data[s.B], data[s.C], data[ConicSolver.DIMS],
                                          form=form, soc=soc, soc_arrow_max=amax)
         if info["form"] == "kernel":
@@ -456,6 +471,8 @@ class BRISK(ConicSolver):
                 "b": np.asarray(data[s.B], float).ravel()}
 
     def invert(self, solution, inverse_data):
+        if "cone" in solution:
+            return self._invert_cone(solution, inverse_data)
         res, info = solution["res"], solution["info"]
         attr = {s.SOLVE_TIME: res.time, s.NUM_ITERS: res.iterations,
                 s.EXTRA_STATS: {"status": res.status_str, "dimacs": res.dimacs,
@@ -503,6 +520,31 @@ class BRISK(ConicSolver):
         if status in (s.INFEASIBLE, s.INFEASIBLE_INACCURATE):
             z = self._certificate(res, info, solution["b"])
             return failure_solution(status, attr, dual_dict(z))
+        return failure_solution(status, attr)
+
+    def _invert_cone(self, solution, inverse_data):
+        """The result of the second-order cone solver (the SeDuMi form's dual is CVXPY's problem)."""
+        res = solution["cone"]
+        attr = {s.SOLVE_TIME: res.time, s.NUM_ITERS: res.iterations,
+                s.EXTRA_STATS: {"status": res.status_str, "dimacs": res.dimacs, "exit_code": res.exit_code,
+                                "form": "cone", "interrupted": res.interrupted}}
+        status = self.STATUS_IMAGE.get(res.status, s.SOLVER_ERROR)
+        if status in (s.USER_LIMIT, s.SOLVER_ERROR) and res.y is not None \
+                and np.max(np.abs(res.dimacs)) <= solution["itol"]:
+            status = s.OPTIMAL_INACCURATE
+        nz = inverse_data[ConicSolver.DIMS].zero
+
+        def dual_dict(z):
+            if z is None:
+                return {}
+            d = utilities.get_dual_values(z[:nz], utilities.extract_dual_value, inverse_data[self.EQ_CONSTR])
+            d.update(utilities.get_dual_values(z[nz:], utilities.extract_dual_value, inverse_data[self.NEQ_CONSTR]))
+            return d
+        if status in s.SOLUTION_PRESENT and res.y is not None:
+            opt_val = float(solution["c"] @ res.y) + inverse_data[s.OFFSET]
+            return Solution(status, opt_val, {inverse_data[self.VAR_ID]: res.y}, dual_dict(res.x), attr)
+        if status in (s.INFEASIBLE, s.INFEASIBLE_INACCURATE):
+            return failure_solution(status, attr, dual_dict(res.x))     # A'z = 0, z in K*, b'z = -1
         return failure_solution(status, attr)
 
     @staticmethod

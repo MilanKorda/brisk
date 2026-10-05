@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brisk"
-version = "1.1"
+version = "1.2"
 description = "BRISK SDP solver: Python binding of libbrisk (ctypes) and a CVXPY solver"
 requires-python = ">=3.9"
 dependencies = ["numpy", "scipy"]

@@ -44,8 +44,8 @@ the default `-llapack -lblas` links OpenBLAS.
 interface. A virtual environment keeps things separate:
 
 ```sh
-tar xzf brisk-1.1.tar.gz
-cd brisk-1.1
+tar xzf brisk-1.2.tar.gz
+cd brisk-1.2
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -95,8 +95,8 @@ Homebrew packages are required.
 **2. Python.** Python 3.9 or later: from python.org, Homebrew (`brew install python`) or conda.
 
 ```sh
-tar xzf brisk-1.1.tar.gz
-cd brisk-1.1
+tar xzf brisk-1.2.tar.gz
+cd brisk-1.2
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -259,6 +259,29 @@ so it shows in Jupyter.
 memory: above 30% of the memory, `r.X` and `r.Z` are `None`, the point is verified on the
 cliques, and the status and `r.dimacs` are as usual. `options={"returnx": 0}` never forms the
 dense X (fastest), `"returnx": 1` always does. `r.y` is always returned.
+
+## SeDuMi format, linear and second-order cone programs
+
+```python
+import numpy as np, scipy.sparse as sp, brisk
+# min c'x  s.t.  A x = b,  x in K;   K: f free, l nonnegative, q second-order cones (x0 >= |x(1:)|),
+# r rotated cones (2 x0 x1 >= |x(2:)|^2), s semidefinite blocks (d*d entries by columns), in this order
+A = sp.csc_matrix([[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
+r = brisk.solve_sedumi(A, b=[2.0, 1.0], c=[1.0, 0.0, 0.0, 1.0], K={"l": 1, "q": [3]})
+r.status, r.status_str, r.pobj, r.dobj, r.x, r.y, r.z, r.dimacs, r.iterations, r.time
+r = brisk.solve_file("problem.mat")          # a MAT-file with A (or At), b, c, K
+```
+
+Without semidefinite blocks the problem is solved by BRISK's cone solver (a separate
+interior-point code for linear and second-order cone programs); its options are `tol`, `acc`,
+`maxit`, `timelimit`, `threads`. With semidefinite blocks, or with `conesolver=0`, `prec`,
+`bound`, `certify`, `fom`, `mfipm`, `lralm`, the semidefinite solver is used (second-order
+cones as arrow blocks) with all its options. The result is a `brisk.ConeResult`: `x`, `y`,
+`z = c - A'y` in the SeDuMi order; for an infeasible problem `y` (status 1, b'y = 1) or `x`
+(status 2, c'x = −1) is the certificate.
+
+In CVXPY nothing changes: a model without PSD constraints (LP, QP, SOCP) goes to the cone
+solver, `prob.solve(solver=brisk.BRISK(), conesolver=0)` forces the semidefinite solver.
 
 ## Interrupting a solve
 

@@ -31,7 +31,27 @@ static void usage(void) {
     return;
 #endif
     fprintf(stderr,
-        "usage: brisk problem.dat-s [options]\n"
+        "usage: brisk problem.dat-s [options]      (an SDPA sparse file)\n"
+        "       brisk problem.mat [options]        (SeDuMi format: a MAT-file with A (or At), b, c, K;\n"
+        "                                           K.f, K.l, K.q, K.r, K.s; MAT versions 5 to 7)\n"
+        "       brisk problem.mps [options]        (a linear program: MPS, free or fixed format)\n"
+        "       brisk problem.cbf[.gz] [options]   (CBF, the format of CBLIB: linear and second-order cones;\n"
+        "                                           integer variables are relaxed)\n"
+        "A linear program read from an MPS file is presolved and solved by the LP interior-point method\n"
+        "(bounds kept as bounds, normal equations); the cone solver takes over when that method gives up\n"
+        "(infeasible or unbounded problems: it returns the certificates). Its options: -tol, -maxit,\n"
+        "-timelimit, -q, -v, -x <file> (x of the problem as read, one value per line), and\n"
+        "  -lppresolve <k>  0 none, 1 rows and columns (fixed, singleton, redundant, forcing, dual fixing),\n"
+        "                   2 (default) also substitutions: free column singletons, opposite column pairs,\n"
+        "                   implied free columns by their equality rows\n"
+        "  -lpmethod <k>    1 (default) the LP interior-point method, 0 the cone solver directly\n"
+        "  -lpcorr <k>      centrality correctors per iteration (default: 0-3 from the cost of a\n"
+        "                   factorization against a solve)\n"
+        "A problem in SeDuMi format without semidefinite blocks (a linear or second-order cone program)\n"
+        "is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -timelimit, -q,\n"
+        "-v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With\n"
+        "semidefinite blocks, or with -conesolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem\n"
+        "goes to the semidefinite solver (second-order cones as arrow blocks) with all the options below.\n"
         "output\n"
         "  -q | -v          quiet | verbose   (Ctrl-C: stop and return the current point; twice: abort)\n"
         "  -y <file>        write y (SDPA primal x = -y), one value per line, original numbering\n"
@@ -52,6 +72,9 @@ static void usage(void) {
         "                   relaxations of minimisation problems take the lower bound from -bound d.\n"
         "                   The certificate replaces its side of the returned pair (-x / -y write it);\n"
         "                   -certify makes the bound rigorous. See README (bound mode).\n"
+        "  -boundanchor <f> with -bound d: a y (the -y format, as read) whose Z = C - A'y is positive\n"
+        "                   definite, e.g. from a solve of the problem with the largest margin; a\n"
+        "                   candidate whose Z is not positive semidefinite is blended with it\n"
         "  -boundtol <t>    relative residual required of a -bound p certificate (1e-10)\n"
         "  -boundmargin <e> eigenvalue margin of the certificate, relative to 1 + max diagonal; at least\n"
         "                   8 n^2 u per block of order n, what a rigorous check needs (1e-13)\n"
@@ -92,6 +115,8 @@ static void usage(void) {
         "                   (1e-24 for dd, 1e-48 for qd, 1e-77 for 100 digits) and a result within\n"
         "                   2^(-0.6 bits) (1e-19, 1e-38, 1e-62) counts as OPTIMAL; -fom / -lralm aim at the latter\n"
         "method\n"
+        "  -conesolver 0    a problem in SeDuMi format without semidefinite blocks: by the semidefinite solver\n"
+        "                   (second-order cones as arrow blocks) instead of the cone solver (default 1)\n"
         "  -dual            dual-scaling method (DSDP-style: potential reduction, correctors, verified\n"
         "                   certificates); falls back to the primal-dual method unless certified\n"
         "  -hsd | -nohsd    force | forbid the self-dual embedding (default: automatic - the embedding first\n                   on most problems, the infeasible start first on large dense blocks with a cheap\n                   Schur complement; each method is the other's fallback)\n  -hsdfirst <0|1>  automatic method: the embedding first when its extra dense work is small or the\n                   problem tiny (1; 0: standard first); many split free pairs and the chordal moment\n                   form use the embedding either way\n  -hsdfirstc <c>   ... i.e. when c * sum n^3 <= m^3/3 (12)\n  -stdslow <k>     standard method: stop for the retry when the best score has not halved in k iterations (10; 0 off)\n"
@@ -116,9 +141,16 @@ static void usage(void) {
         "                   Schur complement is at most half the size: -1 auto, 0 off, 1 force\n"
         "  -mfipm <k>       matrix-free interior-point method: NT Mehrotra steps, Newton systems\n"
         "                   by preconditioned CG, no Schur complement (1 on, 0 off); for problems with\n"
-        "                   a low-rank optimal side (moment-SOS with few atoms). Its options:\n"
+        "                   a low-rank optimal side (moment-SOS with few atoms). 2: the hybrid - the\n"
+        "                   matrix-free iteration until its merit is below -mfhand (1e-5) or an\n"
+        "                   iteration needs more than -mfhandcg (600) CG steps, then the standard\n"
+        "                   method from that iterate (a few Schur factorizations instead of thirty;\n"
+        "                   truss topology problems with m = 7,000-14,000: 2.5-3x faster). Its options:\n"
         "  -mfrho <r>, -mfrmax <k>, -mfdrop <d>, -mfkmax <k>   preconditioner: bulk spread (10), outlier\n"
         "                   eigenvectors per block (4), dropped pairs (0.5), largest capacitance (8000)\n"
+        "  -mfproj <k>, -mfeta <e>   0 (default): no projection of the primal direction, CG until its\n"
+        "                   residual is below e (0.1) times the primal infeasibility; 1: the direction\n"
+        "                   projected onto A(dX) = Rp by a second CG (the earlier scheme)\n"
         "  -mfcgmax <k>, -mfcgtol <t>, -mfcgtolmax <t>   CG: steps per solve (3000), tolerance\n"
         "                   clamp(1e-2 mu/mu0, t, tmax) (1e-10, 1e-3)\n"
         "  -mfwarm <k>, -mfstall <k>, -mfdiag <k>   corrector CG started from the predictor (1);\n"
@@ -169,8 +201,9 @@ static void usage(void) {
         "                   sign pattern, odd constraints dropped (1 on, 0 off)\n"
         "  -symsigned <k>   ... -sym auto: signed permutations (x_i -> ±x_g(i)): a second search on the\n"
         "                   absolute values of the data, signs lifted over GF(2), exact (1 on, 0 off)\n"
-        "  -symmin <f>      ... -sym auto applies the reduction only when the constraints or the block\n"
-        "                   algebra shrink by this factor (1.5; 1: always search and apply); a file's\n"
+        "  -symmin <f>      ... -sym auto applies the reduction only when the constraints, the block\n"
+        "                   algebra or (at most 4 blocks, m <= 20000) the work m^3/3 + 30 sum n^3\n"
+        "                   shrink by this factor (1.5; 1: always search and apply); a file's\n"
         "                   generators are always applied\n"
         "  -symalg <k>      ... then block structure shared by all data matrices of an SDP block: the\n"
         "                   *-algebra they generate is block-diagonalised numerically (blocks split into\n"
@@ -921,6 +954,38 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
         }
     }
     if (P->m == 0) { solve_m0(P, R, u->X); st_ = 0; }
+    else if (par->mfipm == 2) {
+        /* 5.4: the hybrid: the matrix-free method until its CG struggles or the merit is below
+         * mf_hand, then the standard method from that iterate (a few factorizations of the
+         * Schur complement instead of thirty) */
+        const int ntb = brisk_threads_busy(par->verbose);
+        double **Xi = malloc(sizeof(double *) * (P->nblk + 1)), **Zi = malloc(sizeof(double *) * (P->nblk + 1)), *yi = calloc(P->m + 1, sizeof(double));
+        for (int k = 0; k < P->nblk; k++) {
+            const size_t len = P->blk[k].type == BLK_SDP ? (size_t)P->blk[k].n * P->blk[k].n : (size_t)P->blk[k].n;
+            Xi[k] = calloc(len + 1, sizeof(double)); Zi[k] = calloc(len + 1, sizeof(double));
+        }
+        const double tm0 = wtime();
+        const int hand = mfipm_solve_hand(P, par, R, Xi, Zi, yi, par->mf_hand, par->mf_handcg);
+        const double tmf = wtime() - tm0;
+        if (ntb > 0) omp_set_num_threads(ntb);
+        if (hand == 2 && par->verbose >= 0) printf("matrix-free IPM: CG gave up far from the optimum; the standard method starts cold\n");
+        if (hand == 1) {
+            par->warm_X = Xi; par->warm_Z = Zi; par->warm_y = yi;
+            if (!(par->warm_lam > 0)) par->warm_lam = 1.0;
+            memset(R, 0, sizeof(*R));
+            brisk_solve(P, par, R, u->y, u->X);
+            R->t_total += tmf;
+            par->warm_X = par->warm_Z = NULL; par->warm_y = NULL;
+            st_ = 0;
+        } else {
+            /* ended by itself (optimal, or no progress): its result stands */
+            if (par->verbose >= 0 && hand == 0) printf("matrix-free IPM: ended without a hand-off (status %d); re-solving by the standard method\n", R->status);
+            if (hand == 0 || hand == 2) { memset(R, 0, sizeof(*R)); brisk_solve(P, par, R, u->y, u->X); R->t_total += tmf; st_ = 0; }
+            else st_ = -1;
+        }
+        for (int k = 0; k < P->nblk; k++) { free(Xi[k]); free(Zi[k]); }
+        free(Xi); free(Zi); free(yi);
+    }
     else if (par->mfipm > 0) {
         /* 4.34: the matrix-free interior-point method (mfipm.c); its result is what the run
          * returns, measured on the file data */
@@ -1002,6 +1067,18 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
             else { XA[na] = Xm; YA[na] = ym; nXA[na] = nX; na++; }
         }
         PSOrig *Of = u->Ofin ? u->Ofin : u->O;
+        if (par->bound_anchor && par->bound_side == 2 && na < BOUND_NANCHOR) {
+            /* a y given by the user as the anchor of the dual side (the problem as read) */
+            FILE *fa = fopen(par->bound_anchor, "r");
+            if (!fa) fprintf(stderr, "brisk: cannot read %s\n", par->bound_anchor);
+            else {
+                double *ya = calloc(Of->m + 1, sizeof(double)); int k = 0;
+                while (k < Of->m && fscanf(fa, "%lf", &ya[k]) == 1) k++;
+                fclose(fa);
+                if (k < Of->m) { fprintf(stderr, "brisk: %s has %d values, the problem %d rows: anchor ignored\n", par->bound_anchor, k, Of->m); free(ya); }
+                else { XA[na] = NULL; YA[na] = ya; nXA[na] = 0; na++; }
+            }
+        }
         BoundCert c1, c2;
         memset(&c1, 0, sizeof(c1)); memset(&c2, 0, sizeof(c2));
         char src[48];
@@ -1122,10 +1199,231 @@ static void hp_mute_end(int fd, int (*hook)(const char *, int)) {
     if (fd >= 0) { dup2(fd, 1); close(fd); }
     brisk_print_hook = hook;
 }
+
+/* ---- problems in SeDuMi format (sedumi.c) ------------------------------------------------ */
+#include "sedumi.h"
+#include "lpio.h"
+#include "lpsolve.h"
+/* the semidefinite solver on the SDPA form of a SeDuMi problem, by a direct call of the command
+ * line (argv: the option words) */
+static int sedumi_inner_sdp(const BriskData *d, int argc, char **argv, BriskResult *res) {
+    char **av = malloc(sizeof(char *) * ((size_t)argc + 6));
+    int ac = 0, hasrx = 0;
+    av[ac++] = "brisk"; av[ac++] = (char *)g_brisk_data_name;
+    for (int i = 0; i < argc; i++) { av[ac++] = argv[i]; if (argv[i] && !strcmp(argv[i], "-returnx")) hasrx = 1; }
+    if (!hasrx) { av[ac++] = "-returnx"; av[ac++] = "1"; }
+    av[ac] = NULL;
+    memset(res, 0, sizeof(*res)); res->status = -1;
+    const BriskData *sd = g_brisk_data; BriskResult *sr = g_brisk_result;
+    g_brisk_data = d; g_brisk_result = res;
+    const int rc = brisk_main(ac, av);
+    g_brisk_data = sd; g_brisk_result = sr;
+    free(av);
+    return rc;
+}
+#ifdef BRISK_LIBRARY
+static int sedumi_lib_sdp(const BriskData *d, int argc, char **argv, BriskResult *res) {
+    char **av = malloc(sizeof(char *) * ((size_t)argc + 6));
+    int ac = 0, hasrx = 0;
+    av[ac++] = "brisk";
+    for (int i = 0; i < argc; i++) { av[ac++] = argv[i]; if (argv[i] && !strcmp(argv[i], "-returnx")) hasrx = 1; }
+    if (!hasrx) { av[ac++] = "-returnx"; av[ac++] = "1"; }
+    av[ac] = NULL;
+    const int rc = brisk_run_data(d, ac, av, res);
+    free(av);
+    return rc;
+}
+int brisk_run_sedumi(const SedumiProb *P, int argc, char **argv, SedumiRes *R) { return sedumi_solve(P, argc, argv, R, sedumi_lib_sdp); }
+#else
+int brisk_run_sedumi(const SedumiProb *P, int argc, char **argv, SedumiRes *R) { return sedumi_solve(P, argc, argv, R, sedumi_inner_sdp); }
+#endif
+static void sedumi_write_vec(const char *fname, const double *v, int n) {
+    FILE *f = fopen(fname, "w");
+    if (!f) { fprintf(stderr, "brisk: cannot write %s\n", fname); return; }
+    for (int i = 0; i < n; i++) fprintf(f, "%.17g\n", v[i]);
+    fclose(f);
+}
+/* the command line on a MAT-file with A (or At), b, c, K: argv[ifile] is the file */
+static int brisk_main_sedumi(int argc, char **argv, int ifile) {
+    SedumiProb P; char msg[400];
+    if (sedumi_read_mat(argv[ifile], &P, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
+    char **av = malloc(sizeof(char *) * ((size_t)argc + 1));
+    int ac = 0, quiet = 0;
+    const char *xf = NULL, *yf = NULL, *zf = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (i == ifile) continue;
+        if (i + 1 < argc && (!strcmp(argv[i], "-x") || !strcmp(argv[i], "-y") || !strcmp(argv[i], "-z"))) {
+            if (argv[i][1] == 'x') xf = argv[i + 1]; else if (argv[i][1] == 'y') yf = argv[i + 1]; else zf = argv[i + 1];
+            i++; continue;
+        }
+        if (!strcmp(argv[i], "-q")) quiet = 1;
+        av[ac++] = argv[i];
+    }
+    if (!quiet) {
+        long sd = 0; int smax = 0, qmax = 0;
+        for (int k = 0; k < P.ns; k++) { sd += (long)P.s[k] * P.s[k]; if (P.s[k] > smax) smax = P.s[k]; }
+        for (int k = 0; k < P.nq; k++) if (P.q[k] > qmax) qmax = P.q[k];
+        for (int k = 0; k < P.nr; k++) if (P.r[k] > qmax) qmax = P.r[k];
+        printf("SeDuMi problem %s: m = %d, n = %d; K.f = %d, K.l = %d, K.q: %d, K.r: %d (largest %d), K.s: %d (largest %d)\n",
+               argv[ifile], P.m, P.n, P.nf, P.nl, P.nq, P.nr, qmax, P.ns, smax);
+    }
+    SedumiRes R;
+    const int rc = sedumi_solve(&P, ac, av, &R, sedumi_inner_sdp);
+    if (R.status >= 0) {
+        if (!quiet && P.ns > 0) printf("SeDuMi form: c'x = %+.12e   b'y = %+.12e\n", R.pobj, R.dobj);
+        if (xf && R.x && (P.ns == 0 || R.have_x)) sedumi_write_vec(xf, R.x, P.n);
+        if (yf && R.y) sedumi_write_vec(yf, R.y, P.m);
+        if (zf && R.z) sedumi_write_vec(zf, R.z, P.n);
+        if (g_brisk_result) {       /* a library call on the file: status, values and y */
+            BriskResult *res = g_brisk_result;
+            res->status = R.status; snprintf(res->status_str, sizeof res->status_str, "%s", R.status_str);
+            res->exit_code = rc; res->iters = R.iters; res->m = P.m; res->pobj = R.pobj; res->dobj = R.dobj; res->time = R.time;
+            for (int i = 0; i < 6; i++) res->err[i + 1] = R.err[i];
+            res->y = R.y; R.y = NULL;
+            res->sn = P.n; res->have_x = P.ns == 0 || R.have_x; res->sx = R.x; R.x = NULL; res->sz = R.z; R.z = NULL;
+        }
+    }
+    sedumi_result_free(&R); sedumi_free(&P); free(av);
+    return rc;
+}
+/* the command line on an MPS file (a linear program): presolve, standard form, the cone solver */
+static int brisk_main_lp(int argc, char **argv, int ifile) {
+    LpProb L; char msg[400];
+    const double t0 = wtime();
+    if (lp_read_mps(argv[ifile], &L, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
+    char **av = malloc(sizeof(char *) * ((size_t)argc + 1));
+    int ac = 0, quiet = 0, pre = 2, lpm = 1, lpcorr = -1;
+    const char *xf = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (i == ifile) continue;
+        if (i + 1 < argc && !strcmp(argv[i], "-x")) { xf = argv[i + 1]; i++; continue; }
+        if (i + 1 < argc && !strcmp(argv[i], "-lppresolve")) { pre = atoi(argv[i + 1]); i++; continue; }
+        if (i + 1 < argc && !strcmp(argv[i], "-lpmethod")) { lpm = atoi(argv[i + 1]); i++; continue; }
+        if (i + 1 < argc && !strcmp(argv[i], "-lpcorr")) { lpcorr = atoi(argv[i + 1]); i++; continue; }
+        if (!strcmp(argv[i], "-q")) quiet = 1;
+        av[ac++] = argv[i];
+    }
+    if (!quiet) printf("LP %s (%s): %d rows, %d columns, %d nonzeros, read %.2fs\n", argv[ifile], L.name[0] ? L.name : "no name", L.m, L.n, L.Ap[L.n], wtime() - t0);
+    SedumiProb P; LpMap M;
+    const double tp0 = wtime();
+    double *ub = NULL;
+    if (lpm) lp_to_std(&L, pre, quiet ? 0 : 1, &P, &M, &ub); else lp_to_sedumi(&L, pre, quiet ? 0 : 1, &P, &M);
+    const double tpre = wtime() - tp0;
+    int rc = 0;
+    double *x = calloc((size_t)L.n + 1, sizeof(double));
+    if (M.status) {
+        if (!quiet) printf("status: %s   iterations: 0   time: %.3fs\n", M.status == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE", wtime() - t0);
+        rc = M.status == 1 ? 11 : 12;
+        if (g_brisk_result) { g_brisk_result->status = M.status; snprintf(g_brisk_result->status_str, sizeof g_brisk_result->status_str, "%s", M.status == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE"); g_brisk_result->exit_code = rc; }
+    } else {
+        SedumiRes R;
+        if (P.n == 0) {          /* everything was fixed by the presolve */
+            memset(&R, 0, sizeof R); R.status = 0; snprintf(R.status_str, sizeof R.status_str, "OPTIMAL");
+            R.x = calloc(1, sizeof(double)); R.y = calloc((size_t)P.m + 1, sizeof(double)); R.z = calloc(1, sizeof(double));
+            if (!quiet) printf("status: OPTIMAL (solved by the presolve)   iterations: 0\n");
+        } else {
+            int done = 0;
+            if (lpm) {
+                /* the dedicated interior-point method on the bounded form; the cone solver when it gives up */
+                LpIpmOpts o; LpIpmInfo inf; memset(&o, 0, sizeof o);
+                o.tol = 1e-8; o.kcorr = lpcorr; o.verbose = quiet ? 0 : 1;
+                for (int i = 0; i < ac; i++) {
+                    if (i + 1 < ac && !strcmp(av[i], "-tol")) o.tol = atof(av[i + 1]);
+                    if (i + 1 < ac && !strcmp(av[i], "-maxit")) o.maxit = atoi(av[i + 1]);
+                    if (i + 1 < ac && !strcmp(av[i], "-timelimit")) o.timelimit = atof(av[i + 1]);
+                    if (!strcmp(av[i], "-v") || !strcmp(av[i], "-vv")) o.verbose = 2;
+                }
+                memset(&R, 0, sizeof R);
+                R.x = calloc((size_t)P.n + 1, sizeof(double)); R.y = calloc((size_t)P.m + 1, sizeof(double)); R.z = calloc((size_t)P.n + 1, sizeof(double));
+                const int st = lpipm_solve(P.m, P.n, P.nf, P.Ap, P.Ai, P.Ax, P.b, P.c, ub, &o, R.x, R.y, R.z, &inf);
+                if (st == 0 || st == 3 || st == 6) {
+                    done = 1; R.status = st; R.iters = inf.iters; R.pobj = inf.pobj; R.dobj = inf.dobj; R.have_x = 1; R.m = P.m; R.n = P.n;
+                    const double e = fmax(fmax(inf.pinf, inf.dinf), inf.gap);
+                    if (st == 0) snprintf(R.status_str, sizeof R.status_str, "OPTIMAL (max rel error %.1e)", e);
+                    else snprintf(R.status_str, sizeof R.status_str, "%s", st == 3 ? "ITERATION LIMIT" : "TIME LIMIT");
+                    rc = st == 0 ? 0 : st == 3 ? 3 : 6;
+                    if (!quiet) {
+                        printf("status: %s   iterations: %d   time: %.3fs\n", R.status_str, inf.iters, inf.time);
+                        printf("  primal obj c'x = %.12e   dual obj b'y - u'w = %.12e\n", inf.pobj, inf.dobj);
+                        printf("  errors: pinf %.1e  dinf %.1e  gap %.1e;  %ld factorizations %.3fs, %ld solves %.3fs (%ld CG steps), %d correctors\n",
+                               inf.pinf, inf.dinf, inf.gap, inf.nfact, inf.t_fact, inf.nsolve, inf.t_solve, inf.ncg, inf.ncorr);
+                    }
+                } else {
+                    if (!quiet) printf("  the LP interior-point method stopped after %d iterations (%s): solving with the cone solver (homogeneous model)\n", inf.iters, inf.why);
+                    free(R.x); free(R.y); free(R.z); memset(&R, 0, sizeof R);
+                    sedumi_free(&P); lp_map_free(&M); free(ub); ub = NULL;
+                    lp_to_sedumi(&L, pre, 0, &P, &M);
+                }
+            }
+            if (!done) rc = sedumi_solve(&P, ac, av, &R, sedumi_inner_sdp);
+        }
+        if (R.status >= 0 && R.x) {
+            const double obj = lp_recover(&L, &M, R.x, x);
+            if (R.status == 0 || R.status == 5 || R.status == 3 || R.status == 4 || R.status == 6) {
+                double eb, er; lp_errors(&L, x, &eb, &er);
+                if (!quiet) {
+                    printf("objective value (as in the file, %s): %.12e\n", L.maxim ? "maximized" : "minimized", obj);
+                    printf("  on the problem as read: bound violation %.1e, row violation %.1e (relative); presolve %.3fs, total %.3fs\n", eb, er, tpre, wtime() - t0);
+                }
+            }
+            if (xf) sedumi_write_vec(xf, x, L.n);
+            if (g_brisk_result) {
+                BriskResult *res = g_brisk_result;
+                res->status = R.status; snprintf(res->status_str, sizeof res->status_str, "%s", R.status_str);
+                res->exit_code = rc; res->iters = R.iters; res->m = L.m; res->pobj = obj; res->dobj = obj; res->time = wtime() - t0;
+                res->sn = L.n; res->have_x = 1; res->sx = x; x = NULL;
+            }
+        }
+        sedumi_result_free(&R);
+    }
+    free(x); free(ub); sedumi_free(&P); lp_map_free(&M); lp_free(&L); free(av);
+    return rc;
+}
+/* the command line on a CBF file (CBLIB): linear and second-order cones */
+static int brisk_main_cbf(int argc, char **argv, int ifile) {
+    SedumiProb P; char msg[400]; double c0 = 0; int maxim = 0, nint = 0;
+    const double t0 = wtime();
+    if (cbf_read(argv[ifile], &P, &c0, &maxim, &nint, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
+    if (maxim) for (int j = 0; j < P.n; j++) P.c[j] = -P.c[j];
+    char **av = malloc(sizeof(char *) * ((size_t)argc + 1));
+    int ac = 0, quiet = 0;
+    for (int i = 1; i < argc; i++) { if (i == ifile) continue; if (!strcmp(argv[i], "-q")) quiet = 1; av[ac++] = argv[i]; }
+    if (!quiet) {
+        int qmax = 0; for (int k = 0; k < P.nq; k++) if (P.q[k] > qmax) qmax = P.q[k];
+        for (int k = 0; k < P.nr; k++) if (P.r[k] > qmax) qmax = P.r[k];
+        printf("CBF problem %s: m = %d, n = %d; free %d, nonnegative %d, second-order cones %d, rotated %d (largest %d), read %.2fs\n", argv[ifile], P.m, P.n, P.nf, P.nl, P.nq, P.nr, qmax, wtime() - t0);
+        if (nint) printf("  %d integer variables: relaxed (the continuous relaxation is solved)\n", nint);
+    }
+    SedumiRes R;
+    const int rc = sedumi_solve(&P, ac, av, &R, sedumi_inner_sdp);
+    if (R.status >= 0) {
+        const double obj = (maxim ? -R.pobj : R.pobj) + c0;
+        if (!quiet && R.status != 1 && R.status != 2) printf("objective value (as in the file, %s): %.12e\n", maxim ? "maximized" : "minimized", obj);
+        if (g_brisk_result) {
+            BriskResult *res = g_brisk_result;
+            res->status = R.status; snprintf(res->status_str, sizeof res->status_str, "%s", R.status_str);
+            res->exit_code = rc; res->iters = R.iters; res->m = P.m; res->pobj = obj; res->dobj = (maxim ? -R.dobj : R.dobj) + c0; res->time = R.time;
+            for (int i = 0; i < 6; i++) res->err[i + 1] = R.err[i];
+            res->y = R.y; R.y = NULL; res->sn = P.n; res->have_x = 1; res->sx = R.x; R.x = NULL; res->sz = R.z; R.z = NULL;
+        }
+    }
+    sedumi_result_free(&R); sedumi_free(&P); free(av);
+    return rc;
+}
 int brisk_main(int argc, char **argv) {
     brisk_threads_init();
     g_threads_user = getenv("OMP_NUM_THREADS") != NULL;   /* 4.42: set also by -threads: the busy-machine rule then stays out */
     if (argc < 2) { usage(); return 1; }
+    for (int i = 1; i < argc; i++) {       /* a MAT-file: a problem in SeDuMi format */
+        const size_t l = argv[i] ? strlen(argv[i]) : 0;
+        if (l > 4 && argv[i][0] != '-' && !strcmp(argv[i] + l - 4, ".mat")
+            && !(i > 1 && (!strcmp(argv[i - 1], "-x") || !strcmp(argv[i - 1], "-y") || !strcmp(argv[i - 1], "-z"))) && sedumi_is_mat(argv[i]))
+            return brisk_main_sedumi(argc, argv, i);
+        if (l > 4 && argv[i][0] != '-' && lp_is_mps(argv[i]) && !(i > 1 && !strcmp(argv[i - 1], "-x")))
+            return brisk_main_lp(argc, argv, i);
+        if (l > 4 && argv[i][0] != '-' && cbf_is_file(argv[i]))
+            return brisk_main_cbf(argc, argv, i);
+    }
     Params par;
     params_default(&par);
     const char *fname = NULL, *yfile = NULL, *xfile = NULL, *zfile = NULL;
@@ -1198,7 +1496,9 @@ int brisk_main(int argc, char **argv) {
         else if (!strcmp(a, "-dual")) par.dual = 1;
         else if (!strcmp(a, "-dualold")) par.dual = 2;
         else if (!strcmp(a, "-fomstart-x")) { i = need(i, argc, a); par.fom_start_x = argv[i]; }
+        else if (!strcmp(a, "-conesolver")) { i = need(i, argc, a); }   /* problems in SeDuMi format (sedumi.c); no effect on an SDPA problem */
         else if (!strcmp(a, "-fomstart-y")) { i = need(i, argc, a); par.fom_start_y = argv[i]; }
+        else if (!strcmp(a, "-boundanchor")) { i = need(i, argc, a); par.bound_anchor = argv[i]; }
         else if (!strcmp(a, "-prec")) {       /* 5.0: high precision */
             i = need(i, argc, a);
             const char *s = argv[i];
@@ -1226,7 +1526,7 @@ int brisk_main(int argc, char **argv) {
             else { fprintf(stderr, "brisk: -bound must be p or d\n"); return 1; }
         }
         OPT_D("-boundtol", bound_tol) OPT_D("-boundmargin", bound_margin) OPT_D("-boundtrack", bound_track_tol)
-        OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle)
+        OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle) OPT_D("-mfhand", mf_hand) OPT_I("-mfhandcg", mf_handcg) OPT_I("-mfproj", mf_proj) OPT_D("-mfeta", mf_eta)
         else if (!strcmp(a, "-threads")) { i = need(i, argc, a); const int nt = (int)num(argv[i], a); if (nt >= 1) { omp_set_num_threads(nt); g_threads_user = 1; } }   /* 4.32: BRISK's OpenMP threads (default OMP_NUM_THREADS / all cores) */
         else if (!strcmp(a, "-route")) { i = need(i, argc, a); force_route = (int)num(argv[i], a); }
         else if (!strcmp(a, "-densemem")) { i = need(i, argc, a); par.dense_mem = num(argv[i], a) * 1048576.0; }
@@ -1712,16 +2012,18 @@ int brisk_main(int argc, char **argv) {
     int status = u->status, measured = u->measured;
     double acc = u->acc, tread = u->tread, tpre = u->tpre;
     double **Xo = u->Xo, *yo = u->yo;
-    /* 4.37 (B2a): a result within 100 x red_acc is reduced accuracy (with the qualifier), not
-     * a numerical failure; applied to the label only, after every decision above */
+    /* 4.37 (B2a): a result within 100 x red_acc was labelled reduced accuracy with a qualifier.
+     * 5.4: the label, the status and the exit code say NUMERICAL DIFFICULTIES again (reduced
+     * accuracy promises a max error <= red_acc, and the interfaces report the status without the
+     * qualifier); the qualifier stays in the text */
     int near_miss = 0;
-    if (status == ST_NUMERIC && acc > par.red_acc && acc <= 100.0 * par.red_acc) { status = ST_REDUCED; near_miss = 1; }
+    if (status == ST_NUMERIC && acc > par.red_acc && acc <= 100.0 * par.red_acc) near_miss = 1;
     /* 4.37 (B2b): the likely cause of a result that misses the tolerance */
     char cause[320] = "";
     if ((status == ST_REDUCED || status == ST_NUMERIC || status == ST_MAXIT || status == ST_TIME) && acc > 10.0 * par.tol)
         diagnose_cause(u, &par, O, Xo, yo, &pr, acc, cause, sizeof(cause));
     if (near_miss)
-        printf("status: %s (max rel error %.1e, above the %.0e reduced-accuracy level)   iterations: %d\n", status_str[status], acc, par.red_acc, R.iters);
+        printf("status: %s (max rel error %.1e, within 100x the %.0e reduced-accuracy level)   iterations: %d\n", status_str[status], acc, par.red_acc, R.iters);
     else if (status == ST_REDUCED || status == ST_NUMERIC || status == ST_MAXIT || status == ST_TIME)
         printf("status: %s (max rel error %.1e)   iterations: %d\n", status_str[status], acc, R.iters);
     else
@@ -1996,7 +2298,7 @@ void brisk_result_free(BriskResult *res) {
     if (!res) return;
     if (res->X) { for (int k = 0; k < res->nblk; k++) free(res->X[k]); free(res->X); }
     if (res->Z) { for (int k = 0; k < res->nblk; k++) free(res->Z[k]); free(res->Z); }
-    free(res->y); free(res->bs);
+    free(res->y); free(res->bs); free(res->sx); free(res->sz);
     memset(res, 0, sizeof(*res));
     res->status = -1;
 }

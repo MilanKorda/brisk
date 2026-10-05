@@ -3,9 +3,13 @@
 # The model, after MOI's bridges, is
 #
 #     min / max  a0'x + c0   s.t.  A_k x + b_k in K_k,
-#     K_k in {Zeros, Nonnegatives, PositiveSemidefiniteConeTriangle},
+#     K_k in {Zeros, Nonnegatives, SecondOrderCone, RotatedSecondOrderCone,
+#             PositiveSemidefiniteConeTriangle}.
 #
-# and it is handed to BRISK in one of two SDPA forms (`_build_image`, `_build_kernel`; the
+# A model with second-order cones, or with linear constraints only, is passed in SeDuMi form
+# (`_build_cone`, `Brisk.ConeData`): BRISK's second-order cone solver takes it when there is no
+# semidefinite constraint, the semidefinite solver otherwise (second-order cones as arrow
+# blocks). A model with Zeros, Nonnegatives and semidefinite constraints only is handed to BRISK in one of two SDPA forms (`_build_image`, `_build_kernel`; the
 # optimizer attribute "form" = "auto" (default), "image" or "kernel"):
 #
 # IMAGE form - x free, the SDPA primal  min c'x  s.t.  F(x) = sum_j x_j F_j - F0 >= 0: one SDP
@@ -52,9 +56,12 @@ MOI.Utilities.@product_of_sets(
     MOI.Zeros,
     MOI.Nonnegatives,
     MOI.PositiveSemidefiniteConeTriangle,
+    MOI.SecondOrderCone,
+    MOI.RotatedSecondOrderCone,
 )
 
-const _SUPPORTED_SETS = Union{MOI.Zeros,MOI.Nonnegatives,MOI.PositiveSemidefiniteConeTriangle}
+const _SUPPORTED_SETS = Union{MOI.Zeros,MOI.Nonnegatives,MOI.PositiveSemidefiniteConeTriangle,
+                              MOI.SecondOrderCone,MOI.RotatedSecondOrderCone}
 
 const OptimizerCache = MOI.Utilities.GenericModel{
     Float64,
@@ -104,6 +111,34 @@ struct SDPAData
     cvar::Vector{Float64}           # kernel: C at the variable's entry (for ray duals)
 end
 
+"""
+    Brisk.ConeData
+
+The SeDuMi form of an MOI model with second-order cones, or of one without semidefinite
+constraints (the arguments of `Brisk.solve_sedumi`): the model  min a0'x  s.t.  A x + b in K
+is the SeDuMi dual  max b_s'y  s.t.  c_s - A_s'y in K  with y = x (the variables in some
+constraint, `col`), A_s' = -A, c_s = b, b_s = -a0 (a0 when maximizing); the SeDuMi primal
+variable is the model's dual. `rowcol[r]` is the SeDuMi column of row r (a semidefinite
+triangle entry (i, j): the entry (i, j) of its d x d block, which also has (j, i)).
+"""
+struct ConeData
+    m::Int
+    n::Int
+    Ap::Vector{Cint}
+    Ai::Vector{Cint}
+    Ax::Vector{Cdouble}
+    b::Vector{Cdouble}
+    c::Vector{Cdouble}
+    nf::Int
+    nl::Int
+    q::Vector{Cint}
+    r::Vector{Cint}
+    s::Vector{Cint}
+    col::Vector{Int}
+    rowcol::Vector{Int}
+    roww::Vector{Float64}
+end
+
 mutable struct _Solution
     termination::MOI.TerminationStatusCode
     primal_status::MOI.ResultStatusCode
@@ -117,7 +152,7 @@ mutable struct _Solution
     solve_time::Float64
     iterations::Int
     dimacs::NTuple{6,Float64}
-    result::Union{Nothing,Result}
+    result::Union{Nothing,Result,ConeResult}
 end
 
 """
@@ -134,6 +169,10 @@ Attributes: `MOI.Silent`, `MOI.TimeLimitSec` (BRISK's `-timelimit`), `MOI.Number
     (written by C), `:silent`;
   * `"form"`: `"auto"` (default), `"image"` or `"kernel"`: the SDPA form the model is
     passed in (see `src/MOI_wrapper.jl`);
+  * `"conesolver"`: `1` (default) or `0`. A model without semidefinite constraints (linear
+    and second-order cone constraints only) is solved by BRISK's second-order cone solver;
+    `0` sends it to the semidefinite solver. Models with `MOI.SecondOrderCone` or
+    `MOI.RotatedSecondOrderCone` constraints are passed in SeDuMi form (`Brisk.ConeData`);
   * `"write_sdpa"`: a file name; the SDPA file of the model is written there before each
     solve, so that `./brisk file` reproduces it.
 
@@ -147,12 +186,13 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     threads::Union{Nothing,Int}
     cache::Union{Nothing,OptimizerCache}
     data::Union{Nothing,SDPAData}
+    cone::Union{Nothing,ConeData}
     sense::MOI.OptimizationSense
     a0::Vector{Float64}
     c0::Float64
     solution::Union{Nothing,_Solution}
     function Optimizer()
-        return new(Dict{String,Any}(), false, nothing, nothing, nothing, nothing,
+        return new(Dict{String,Any}(), false, nothing, nothing, nothing, nothing, nothing,
                    MOI.FEASIBILITY_SENSE, Float64[], 0.0, nothing)
     end
 end
@@ -167,6 +207,7 @@ end
 function MOI.empty!(o::Optimizer)
     o.cache = nothing
     o.data = nothing
+    o.cone = nothing
     o.solution = nothing
     o.sense = MOI.FEASIBILITY_SENSE
     o.a0 = Float64[]
@@ -531,6 +572,74 @@ function _build(cache::OptimizerCache, sense::MOI.OptimizationSense, a0::Vector{
     return _build_kernel(cache, S, sense, a0, rp, ci, cv, claimed, isvar_psd, isvar_nn)
 end
 
+# the SeDuMi form (ConeData) of the model
+function _build_cone(cache::OptimizerCache, sense::MOI.OptimizationSense, a0::Vector{Float64})
+    Ab = cache.constraints
+    A = Ab.coefficients
+    b = Ab.constants
+    nrow, nvar = A.m, A.n
+    F = MOI.VectorAffineFunction{Float64}
+    nz = MOI.Utilities.num_rows(Ab.sets, MOI.Zeros)
+    nn = MOI.Utilities.num_rows(Ab.sets, MOI.Nonnegatives)
+    seq = collect(1:nz+nn)                      # the row of each SeDuMi column
+    rowcol = zeros(Int, nrow); roww = ones(Float64, nrow)
+    rowcol[1:nz+nn] .= 1:nz+nn
+    q = Cint[]; r = Cint[]; sd = Cint[]
+    for (T, dims) in ((MOI.SecondOrderCone, q), (MOI.RotatedSecondOrderCone, r))
+        for ci in MOI.get(cache, MOI.ListOfConstraintIndices{F,T}())
+            rows = MOI.Utilities.rows(Ab.sets, ci)
+            push!(dims, length(rows))
+            for rr in rows
+                push!(seq, rr); rowcol[rr] = length(seq)
+            end
+        end
+    end
+    for ci in MOI.get(cache, MOI.ListOfConstraintIndices{F,MOI.PositiveSemidefiniteConeTriangle}())
+        d = MOI.get(cache, MOI.ConstraintSet(), ci).side_dimension
+        rows = MOI.Utilities.rows(Ab.sets, ci)
+        push!(sd, d)
+        for jj in 1:d, ii in 1:d                 # the d x d block by columns; MOI's triangle: (i <= j) at j(j-1)/2 + i
+            lo, hi = minmax(ii, jj)
+            rr = rows[div(hi * (hi - 1), 2) + lo]
+            push!(seq, rr)
+            ii <= jj && (rowcol[rr] = length(seq))
+            ii < jj && (roww[rr] = 2.0)
+        end
+    end
+    col = zeros(Int, nvar); m = 0
+    for j in 1:nvar
+        A.colptr[j+1] > A.colptr[j] && (m += 1; col[j] = m)
+    end
+    rp, ci, cv = _rows_of(A)
+    Ap = Cint[0]; Ai = Cint[]; Ax = Cdouble[]; c = Cdouble[]
+    for rr in seq
+        for p in rp[rr]+1:rp[rr+1]
+            push!(Ai, col[ci[p]] - 1); push!(Ax, -cv[p])
+        end
+        push!(Ap, length(Ai)); push!(c, b[rr])
+    end
+    σ = sense == MOI.MAX_SENSE ? 1.0 : -1.0
+    bs = zeros(max(m, 1))                        # no variable in the constraints: one empty row
+    for j in 1:nvar
+        col[j] > 0 && (bs[col[j]] = σ * a0[j])
+    end
+    return ConeData(max(m, 1), length(seq), Ap, Ai, Ax, bs, c, nz, nn, q, r, sd, col, rowcol, roww)
+end
+
+# the cone solver takes a model without semidefinite constraints unless the options ask for
+# features of the semidefinite solver
+function _wants_cone(o, cache::OptimizerCache)
+    F = MOI.VectorAffineFunction{Float64}
+    nsoc = MOI.get(cache, MOI.NumberOfConstraints{F,MOI.SecondOrderCone}()) +
+           MOI.get(cache, MOI.NumberOfConstraints{F,MOI.RotatedSecondOrderCone}())
+    nsoc > 0 && return true
+    MOI.get(cache, MOI.NumberOfConstraints{F,MOI.PositiveSemidefiniteConeTriangle}()) > 0 && return false
+    MOI.get(cache, MOI.NumberOfConstraints{F,MOI.Zeros}()) + MOI.get(cache, MOI.NumberOfConstraints{F,MOI.Nonnegatives}()) == 0 && return false
+    string(get(o.options, "conesolver", 1)) in ("0", "false") && return false
+    any(k -> haskey(o.options, k), ("prec", "bound", "fom", "mfipm", "lralm", "form", "write_sdpa")) && return false
+    return true
+end
+
 function MOI.copy_to(dest::Optimizer, src::MOI.ModelLike)
     MOI.empty!(dest)
     cache = OptimizerCache()
@@ -550,7 +659,11 @@ function MOI.copy_to(dest::Optimizer, src::MOI.ModelLike)
     dest.sense = sense
     dest.a0 = a0
     dest.c0 = c0
-    dest.data = _build(cache, sense, a0, String(get(dest.options, "form", "auto")))
+    if _wants_cone(dest, cache)
+        dest.cone = _build_cone(cache, sense, a0)
+    else
+        dest.data = _build(cache, sense, a0, String(get(dest.options, "form", "auto")))
+    end
     return index_map
 end
 
@@ -568,6 +681,7 @@ function _run_options(o::Optimizer)
     opts = Pair{String,Any}[]
     for (k, v) in o.options
         k in ("output", "write_sdpa", "form") && continue
+        k == "conesolver" && o.cone === nothing && continue
         if k == "bound"
             # 4.38 (untested here: no Julia in the build environment): "primal"/"sos" is the
             # side of the model's variables (the SOS Gram matrices), "dual" the other; MOI's
@@ -576,7 +690,7 @@ function _run_options(o::Optimizer)
             if !(s in ("p", "d"))
                 s in ("primal", "dual", "sos") || throw(ArgumentError("bound must be \"primal\", \"dual\" or \"sos\""))
                 prim = s != "dual"
-                img = o.data !== nothing && o.data.form == :image
+                img = o.cone !== nothing || (o.data !== nothing && o.data.form == :image)
                 s = img ? (prim ? "d" : "p") : (prim ? "p" : "d")
             end
             push!(opts, "bound" => s)
@@ -712,7 +826,7 @@ function MOI.optimize!(o::Optimizer)
     b = o.cache.constraints.constants
     nvar, nrow = A.n, A.m
     t0 = time()
-    haskey(o.options, "write_sdpa") &&
+    D !== nothing && haskey(o.options, "write_sdpa") &&
         write_sdpa(String(o.options["write_sdpa"]), D.m, D.blocksizes, D.c, D.mat, D.blk, D.i, D.j, D.v;
                    comment = "Brisk.jl: SDPA form ($(D.form)) of a MathOptInterface model")
     # objective terms on variables in no constraint: unbounded unless the rest is infeasible
@@ -722,7 +836,22 @@ function MOI.optimize!(o::Optimizer)
         A.colptr[j+1] == A.colptr[j] && o.a0[j] != 0 && (free_ray[j] = -σ * sign(o.a0[j]))
     end
     local sol::_Solution
-    if isempty(D.blocksizes) || D.m == 0
+    roww = D === nothing ? o.cone.roww : D.roww
+    if D === nothing
+        C = o.cone
+        res = _solve_sedumi(C.m, C.n, C.Ap, C.Ai, C.Ax, C.b, C.c, C.nf, C.nl, C.q, C.r, C.s,
+                            option_args(_run_options(o)), _output(o))
+        term, pst, dst = _statuses(res.status, res.dimacs, res.x !== nothing, false)
+        x = zeros(nvar)
+        for j in 1:nvar
+            C.col[j] > 0 && (x[j] = res.y[C.col[j]])
+        end
+        dual = res.x === nothing ? zeros(nrow) : res.x[C.rowcol]
+        s = _Ax(A, x)
+        pst == MOI.INFEASIBILITY_CERTIFICATE || (s .+= b)
+        sol = _Solution(term, pst, dst, res.status_string, x, s, dual, 0.0, 0.0, res.solve_time,
+                        res.iterations, res.dimacs, res)
+    elseif isempty(D.blocksizes) || D.m == 0
         sol = isempty(D.blocksizes) ?
             _Solution(MOI.OPTIMAL, MOI.FEASIBLE_POINT, MOI.FEASIBLE_POINT, "OPTIMAL (no constraints)",
                       Float64[], Float64[], Float64[], 0.0, 0.0, 0.0, 0, ntuple(_ -> 0.0, 6), nothing) :
@@ -763,7 +892,7 @@ function MOI.optimize!(o::Optimizer)
     # ray has <b, dual> < 0: dual objective -<b, dual> > 0 when minimizing, <b, dual> when
     # maximizing, as for a dual point)
     sol.objective = LinearAlgebra.dot(o.a0, sol.x) + (ray_p ? 0.0 : o.c0)
-    wbd = sum(D.roww[r] * b[r] * sol.dual[r] for r in eachindex(b); init = 0.0)
+    wbd = sum(roww[r] * b[r] * sol.dual[r] for r in eachindex(b); init = 0.0)
     sol.dual_objective = (o.sense == MOI.MAX_SENSE ? wbd : -wbd) + (ray_d ? 0.0 : o.c0)
     sol.solve_time = time() - t0
     o.solution = sol
@@ -779,10 +908,10 @@ MOI.get(o::Optimizer, ::MOI.BarrierIterations) = o.solution === nothing ? 0 : o.
 MOI.get(o::Optimizer, ::DIMACSErrors) = o.solution === nothing ? nothing : o.solution.dimacs
 MOI.get(o::Optimizer, ::RawResult) = o.solution === nothing ? nothing : o.solution.result
 # (the caching layers map indices in attribute values: these hold none)
-MOI.Utilities.map_indices(::Function, r::Result) = r
-MOI.Utilities.map_indices(::AbstractDict{T,T}, r::Result) where {T<:Union{MOI.VariableIndex,MOI.ConstraintIndex}} = r
+MOI.Utilities.map_indices(::Function, r::Union{Result,ConeResult}) = r
+MOI.Utilities.map_indices(::AbstractDict{T,T}, r::Union{Result,ConeResult}) where {T<:Union{MOI.VariableIndex,MOI.ConstraintIndex}} = r
 # (and the bridge layer would try to substitute bridged variables in it)
-MOI.Bridges.unbridged_function(::MOI.Bridges.AbstractBridgeOptimizer, r::Result) = r
+MOI.Bridges.unbridged_function(::MOI.Bridges.AbstractBridgeOptimizer, r::Union{Result,ConeResult}) = r
 
 function MOI.get(o::Optimizer, ::MOI.ResultCount)
     s = o.solution

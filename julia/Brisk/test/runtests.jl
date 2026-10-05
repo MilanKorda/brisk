@@ -106,6 +106,70 @@ end
     @test_throws Brisk.BriskError Brisk.solve_sdpa_data(1, [2], [1.0], [1], [1], [1], [1], [1.0]; output = :silent, nosuchoption = 1)
 end
 
+@testset "SeDuMi format and second-order cones" begin
+    A = [1.0 1 0 0; 0 0 1 1]
+    r = Brisk.solve_sedumi(A, [1.0, 1.0], [1.0, 2, 3, 4], (l = 4,); output = :silent)
+    @test r isa Brisk.ConeResult && r.status == 0
+    @test r.primal_objective ≈ 4 atol = 1e-6
+    @test r.x ≈ [1, 0, 1, 0] atol = 1e-6
+    # x in the cone with x1 - x2 = 1, min x1: optimum 0.5 at (0.5, -0.5, 0)
+    r = Brisk.solve_sedumi([1.0 -1.0 0.0], [1.0], [1.0, 0, 0], Dict(:q => [3]); output = :silent)
+    @test r.status == 0
+    @test r.x ≈ [0.5, -0.5, 0] atol = 1e-6
+    r = Brisk.solve_sedumi([0.0 1.0 0.0], [0.0], [1.0, 0, 2.0], (q = [3],); output = :silent)
+    @test r.status == 2
+    @test r.x[1] + 2r.x[3] ≈ -1 atol = 1e-8    # unbounded along (1, 0, -1): x is the ray
+    # a semidefinite block: lambda_min of a symmetric matrix
+    M = [2.0 1 0; 1 2 1; 0 1 2]
+    r = Brisk.solve_sedumi(reshape(vec([1.0 0 0; 0 1 0; 0 0 1]), 1, 9), [1.0], vec(M), (s = [3],); output = :silent)
+    @test r.primal_objective ≈ 2 - sqrt(2) atol = 1e-6
+    @test_throws DimensionMismatch Brisk.solve_sedumi(A, [1.0, 1.0], [1.0, 2, 3, 4], (l = 3,); output = :silent)
+    # JuMP: second-order and rotated cones go to the cone solver; conesolver = 0: the semidefinite solver
+    n = 12
+    M = [sin(i * j) for i in 1:20, j in 1:n]; d = [cos(3i) for i in 1:20]
+    model = Model(Brisk.Optimizer); set_silent(model)
+    @variable(model, x[1:n]); @variable(model, t)
+    @constraint(model, c1, [t; M * x - d] in SecondOrderCone())
+    @constraint(model, c2, [1.0; x[1:5]] in SecondOrderCone())
+    @constraint(model, c3, [1.0; 2.0; x[6:10]] in RotatedSecondOrderCone())
+    @constraint(model, c4, x[11:n] .>= -0.1)
+    @constraint(model, c5, sum(x) == 0.3)
+    @objective(model, Min, t + 0.1 * sum(x[1:3]))
+    optimize!(model)
+    @test termination_status(model) == MOI.OPTIMAL
+    @test MOI.get(model, Brisk.RawResult()) isa Brisk.ConeResult
+    @test objective_value(model) ≈ dual_objective_value(model) atol = 1e-6
+    v1 = objective_value(model); x1 = value.(x); d5 = dual(c5); d1 = dual(c1)
+    @test value(t) ≈ norm(M * x1 - d) atol = 1e-6
+    @test norm(x1[1:5]) <= 1 + 1e-7 && sum(abs2, x1[6:10]) <= 4 + 1e-7
+    set_attribute(model, "conesolver", 0); optimize!(model)
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL)
+    @test objective_value(model) ≈ v1 atol = 1e-6
+    @test dual(c5) ≈ d5 atol = 1e-4
+    @test dual(c1) ≈ d1 atol = 1e-4
+    # second-order cone and a PSD variable in one model
+    m2 = Model(Brisk.Optimizer); set_silent(m2)
+    @variable(m2, X[1:4, 1:4], PSD); @variable(m2, y[1:3])
+    @constraint(m2, [1.0; y] in SecondOrderCone())
+    @constraint(m2, tr(X) == 1); @constraint(m2, X[1, 2] == y[1]); @constraint(m2, X[2, 3] >= y[2] + 0.1)
+    @objective(m2, Max, X[1, 2] + X[3, 4] + y[3])
+    optimize!(m2)
+    @test termination_status(m2) in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL)
+    @test objective_value(m2) ≈ dual_objective_value(m2) atol = 1e-6
+    @test minimum(eigvals(Symmetric(value.(X)))) > -1e-7 && norm(value.(y)) <= 1 + 1e-7
+    # infeasible, unbounded, a linear program
+    m3 = Model(Brisk.Optimizer); set_silent(m3); @variable(m3, z[1:3])
+    @constraint(m3, [1.0; z] in SecondOrderCone()); @constraint(m3, z[1] >= 2); @objective(m3, Min, sum(z)); optimize!(m3)
+    @test termination_status(m3) == MOI.INFEASIBLE && dual_status(m3) == MOI.INFEASIBILITY_CERTIFICATE
+    m4 = Model(Brisk.Optimizer); set_silent(m4); @variable(m4, z[1:3])
+    @constraint(m4, z in SecondOrderCone()); @objective(m4, Min, -z[1]); optimize!(m4)
+    @test termination_status(m4) == MOI.DUAL_INFEASIBLE && primal_status(m4) == MOI.INFEASIBILITY_CERTIFICATE
+    m5 = Model(Brisk.Optimizer); set_silent(m5); @variable(m5, 0 <= z[1:3] <= 2)
+    @constraint(m5, sum(z) >= 1); @objective(m5, Min, z[1] + 2z[2] + 3z[3]); optimize!(m5)
+    @test objective_value(m5) ≈ 1 atol = 1e-6
+    @test MOI.get(m5, Brisk.RawResult()) isa Brisk.ConeResult
+end
+
 @testset "JuMP models, form = $form" for form in FORMS
     # lambda_max as an SDP over a PSD variable, a constant in the objective
     C = [2.0 1 0; 1 3 1; 0 1 1]

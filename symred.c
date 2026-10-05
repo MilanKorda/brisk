@@ -412,6 +412,18 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
 }
 
 /* returns generators (ngen x NI, malloc) of a subgroup of the automorphism group */
+/* 5.5: the gain of a reduction in work when the dense Schur complement dominates: with few
+ * blocks and m far above their orders an iteration costs m^3/3 (the factorization) plus about
+ * 30 sum n^3 (the block operations), and constraints shrinking by 1.2 are worth 1.7 there
+ * (a moment relaxation of order 2 in 15 variables: m = 3,739, n = 135). Zero when the rule
+ * does not apply (many blocks: the Schur complement is sparse and m^3 is not its cost). */
+static double sym_cost_gain(const Problem *P, int m, int mr, double c0, double c1) {
+    int nsdp = 0;
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) nsdp++;
+    if (nsdp > 4 || m > 20000 || mr <= 0 || getenv("BRISK_NOSYMCOST")) return 0.0;
+    const double t0 = (double)m * m * m / 3.0 + 30.0 * c0, t1 = (double)mr * mr * mr / 3.0 + 30.0 * c1;
+    return t0 / fmax(t1, 1.0);
+}
 static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const SEnt *E, size_t ne, int *ngen_out, int **gcps_out, int verbose, double tmax, long maxnodes, double symmin, int absval) {
     const int m = P->m, nb = P->nblk;
     ASearch A; memset(&A, 0, sizeof(A)); A.absval = absval;
@@ -1174,6 +1186,10 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
             if (pow((double)P->blk[k].n / o, 3.0) >= symmin) can = 1;
         }
         free(pi);
+        if (!can) {     /* (5.5: or the factorization of the Schur complement alone gains that much, the blocks unchanged) */
+            double c0b = 0; for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) c0b += (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
+            if (sym_cost_gain(P, m, mr, c0b, c0b) >= symmin) can = 1;
+        }
         if (!can) {
             if (verbose >= 0) printf("presolve: symmetry reduction not applied: too small a gain (%d -> %d constraints, no block can shrink by %g)\n", m, mr, symmin);
             for (int t = 0; t < ng; t++) free(CP[t]);
@@ -1203,7 +1219,7 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
         double c0 = 0, c1 = 0;
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) c0 += (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
         for (int k = 0; k < nbq; k++) if (bsz[k] > 0) c1 += (double)bsz[k] * bsz[k] * bsz[k];
-        const double gain = fmax((double)m / (mr > 0 ? mr : 1), c0 / (c1 > 0 ? c1 : 1));
+        const double gain = fmax(fmax((double)m / (mr > 0 ? mr : 1), c0 / (c1 > 0 ? c1 : 1)), sym_cost_gain(P, m, mr, c0, c1));
         int conflict = 0;
         if (gain >= symmin) {
             int *nr = sx(sizeof(int) * (nbq + 1)), *parent = sx(sizeof(int) * (nbq + 1)), nred = 0;
@@ -1528,7 +1544,7 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) c0 += (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
         for (int q = 0; q < ncls; q++) c1 += (double)csz[q] * csz[q] * csz[q];
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP) c1 -= (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
-        const double gain = fmax((double)m / (mk > 0 ? mk : 1), c0 / (c1 > 0 ? c1 : 1));
+        const double gain = fmax(fmax((double)m / (mk > 0 ? mk : 1), c0 / (c1 > 0 ? c1 : 1)), sym_cost_gain(P, m, mk, c0, c1));
         int conflict = 0;
         if (auto_mode && gain >= symmin) {
             int *nr = sx(sizeof(int) * (ncls + 1)), *parent = sx(sizeof(int) * (ncls + 1)), nred = 0;

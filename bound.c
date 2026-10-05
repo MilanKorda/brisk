@@ -783,7 +783,9 @@ int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na
             int done = 0;
             for (int a = na - 1; a >= 0 && !done; a--) {
                 if (!YA[a]) continue;
-                const double *ya = YA[a];
+                double *ya = malloc(sizeof(double) * (O->m + 1));       /* the anchor with the equalities of (D) projected, as the candidate */
+                memcpy(ya, YA[a], sizeof(double) * O->m);
+                if (np > 0) project_pairs(O, np, P1, PK, ya);
                 double **Za = bound_alloc_blocks(O);
                 build_Z(O, ya, Za);
                 if (margin_ok(O, Za, margin, work)) {
@@ -793,6 +795,7 @@ int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na
                     done = margin_ok(O, Z, 0.5 * margin, work);
                     how = "blended with an anchor";
                 }
+                free(ya);
                 bound_free_blocks(Za, O->nblk);
             }
             if (!done && !bound_late(O)) {   /* 4.42: not past the time limit when m > 2000 (each costs an m x m factorization) */

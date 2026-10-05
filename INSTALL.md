@@ -16,7 +16,7 @@ Contents:
 6. [Troubleshooting](#6-troubleshooting)
 7. [Reporting a problem](#7-reporting-a-problem)
 
-All commands below are run from the top directory of the unpacked package (`brisk-1.1/`).
+All commands below are run from the top directory of the unpacked package (`brisk-1.2/`).
 
 ## 1. Requirements
 
@@ -46,6 +46,15 @@ The last lines of the output should read `status: OPTIMAL` and the optimal value
 
 ```sh
 for f in examples/*.dat-s; do ./brisk "$f" -q; echo "$f: exit code $?"; done
+```
+
+The other input formats have an example each: a linear program in MPS format, and a
+second-order cone program in CBF and in SeDuMi format (optimal value 1.41421356):
+
+```sh
+./brisk examples/afiro.mps
+./brisk examples/soc_small.cbf
+./brisk examples/soc_small.mat
 ```
 
 Exit code 0 means optimal. The other codes are listed in SOLVER.md ("Exit codes").
@@ -106,12 +115,12 @@ Full documentation: [python/README.md](python/README.md).
 
 Requirements: Julia 1.9 or later.
 
-1. In a terminal, build the library (section 2) in the `brisk-1.1` directory: `make libbrisk`.
+1. In a terminal, build the library (section 2) in the `brisk-1.2` directory: `make libbrisk`.
 2. In Julia, add the package by its **full path**:
 
    ```julia
    using Pkg
-   Pkg.develop(path = "/path/to/brisk-1.1/julia/Brisk")
+   Pkg.develop(path = "/path/to/brisk-1.2/julia/Brisk")
    Pkg.add("JuMP")                        # for the JuMP interface
    using Brisk
    Brisk.version()
@@ -121,7 +130,7 @@ Requirements: Julia 1.9 or later.
    - A relative path such as `julia/Brisk` is read from the directory Julia was started in,
      and fails elsewhere.
    - Julia records the path and does not copy the package, and the package loads `libbrisk`
-     from the `brisk-1.1` directory: keep that directory in place. If you move it, run
+     from the `brisk-1.2` directory: keep that directory in place. If you move it, run
      `Pkg.develop` once more with the new path.
    - The installation belongs to the active Julia environment; in another environment, run
      the two `Pkg` lines again.
@@ -168,7 +177,7 @@ liboctave-dev`) and BLAS/LAPACK (section 1).
 Then, in MATLAB or Octave:
 
 ```matlab
-cd brisk-1.1/matlab
+cd brisk-1.2/matlab
 build_brisk_mex            % about a minute
 test_brisk                 % every line should say PASS
 addpath(pwd); savepath     % keeps it on the path

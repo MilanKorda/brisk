@@ -25,6 +25,7 @@
 #include <string.h>
 #define BRISK_NO_IO_MACROS
 #include "brisk.h"
+#include "sedumi.h"
 
 #if defined(__GNUC__)
 #define BRISK_API __attribute__((visibility("default")))
@@ -97,6 +98,12 @@ BRISK_API int brisk_result_resolves(const BriskResult *r, double *t) { if (t) *t
 /* 4.37: the likely cause of a result that misses the tolerance ("" when none) */
 BRISK_API const char *brisk_result_cause(const BriskResult *r) { return r ? r->cause : ""; }
 
+/* a problem in SeDuMi format (brisk_solve_sedumi, brisk_solve_file on a MAT-file): n, x (n) and
+ * z = c - A'y (n); y is brisk_result_y */
+BRISK_API int brisk_result_sn(const BriskResult *r) { return r ? r->sn : 0; }
+BRISK_API const double *brisk_result_sx(const BriskResult *r) { return r && r->have_x ? r->sx : NULL; }
+BRISK_API const double *brisk_result_sz(const BriskResult *r) { return r ? r->sz : NULL; }
+
 /* pointers into the result (valid until brisk_result_delete or the next solve with r):
  * y (m), X and Z block k (0-based; n*n column-major or n for LP); NULL when absent */
 BRISK_API const double *brisk_result_y(const BriskResult *r) { return r ? r->y : NULL; }
@@ -164,5 +171,42 @@ BRISK_API int brisk_solve_file(const char *fname, int nopt, const char *const *o
     const int rc = brisk_run(argc, av, res);
     finish();
     free(av);
+    return rc;
+}
+
+/* A problem in SeDuMi format:  min c'x  s.t.  A x = b,  x in K;  max b'y  s.t.  c - A'y = z in K*.
+ * A is m x n by columns (Ap: n + 1 column starts, Ai: rows, 0-based, Ax); K = nf free variables,
+ * nl nonnegative ones, second-order cones q[0..nq-1] (x0 >= |x(1:)|), rotated cones r[0..nr-1]
+ * (2 x0 x1 >= |x(2:)|^2), semidefinite blocks s[0..ns-1] (each as its d*d entries by columns),
+ * in this order. Without semidefinite blocks the problem goes to the cone solver (socp.c), with
+ * them to the semidefinite solver. The result: brisk_result_sx (x), brisk_result_y, brisk_result_sz
+ * (z), status, values (pobj = c'x, dobj = b'y) and errors as for the other calls. */
+BRISK_API int brisk_solve_sedumi(int m, int n, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c,
+                                 int nf, int nl, int nq, const int *q, int nr, const int *r, int ns, const int *s,
+                                 int nopt, const char *const *opts, BriskResult *res) {
+    if (!res) return -1;
+    brisk_result_free(res);
+    if (m < 0 || n < 0 || nf < 0 || nl < 0 || nq < 0 || nr < 0 || ns < 0) return 2;
+    long tot = (long)nf + nl;
+    for (int k = 0; k < nq; k++) { if (q[k] < 1) return 2; tot += q[k]; }
+    for (int k = 0; k < nr; k++) { if (r[k] < 2) return 2; tot += r[k]; }
+    for (int k = 0; k < ns; k++) { if (s[k] < 1) return 2; tot += (long)s[k] * s[k]; }
+    if (tot != n) return 2;
+    for (int j = 0; j < n; j++) for (int p = Ap[j]; p < Ap[j + 1]; p++) if (Ai[p] < 0 || Ai[p] >= m) return 2;
+    SedumiProb P = { m, n, (int *)Ap, (int *)Ai, (double *)Ax, (double *)b, (double *)c, nf, nl, nq, (int *)q, nr, (int *)r, ns, (int *)s };
+    SedumiRes R;
+    g_caller = pthread_self();
+    brisk_stop_flag = 0;
+    brisk_print_hook = capi_print;
+    const int rc = brisk_run_sedumi(&P, nopt, (char **)opts, &R);
+    finish();
+    if (R.status >= 0) {
+        res->status = R.status; snprintf(res->status_str, sizeof res->status_str, "%s", R.status_str);
+        res->exit_code = rc; res->iters = R.iters; res->m = m; res->pobj = R.pobj; res->dobj = R.dobj; res->time = R.time;
+        for (int i = 0; i < 6; i++) res->err[i + 1] = R.err[i];
+        res->y = R.y; res->sn = n; res->sx = R.x; res->sz = R.z; res->have_x = ns == 0 || R.have_x;
+        R.x = R.y = R.z = NULL;
+    }
+    sedumi_result_free(&R);
     return rc;
 }

@@ -63,13 +63,36 @@ catch err
     ok = ~isempty(strfind(err.identifier, 'brisk')); %#ok<STREMP>
 end
 nfail = nfail + check('an invalid option raises an error (and MATLAB keeps running)', ok);
+% second-order cones (K.q, K.r): the cone solver, the semidefinite solver (mixed), high precision
+Kq = struct('f', 2, 'l', 3, 'q', [4 3], 'r', 4);
+Aq = sprandn(5, 16, 0.6);
+pt = @() [3; 0.5 * randn(3, 1); 2; 0.5 * randn(2, 1); 1; 1; 0.3 * randn(2, 1)];
+xq = [randn(2, 1); rand(3, 1) + 0.1; pt()]; zq = [zeros(2, 1); rand(3, 1) + 0.1; pt()];
+bq = Aq * xq; cq = Aq' * randn(5, 1) + zq;
+[x, y, info, z] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0));
+nfail = nfail + check('SeDuMi second-order cone program (K.q, K.r): cone solver', strcmp(info.status, 'OPTIMAL') && ...
+    norm(Aq * x - bq) < 1e-7 * (1 + norm(bq)) && abs(info.pobj - info.dobj) < 1e-7 * (1 + abs(info.pobj)) && ...
+    x(6) >= norm(x(7:9)) - 1e-8 && 2 * x(13) * x(14) >= norm(x(15:16))^2 - 1e-8 && norm(z - (cq - Aq' * y)) < 1e-6 * (1 + norm(cq)));    % z is the solver's slack (in K); c - A'y up to the dual residual
+pq = info.pobj;
+[~, ~, info] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0, 'conesolver', 0));
+nfail = nfail + check('the same through the semidefinite solver (conesolver = 0)', info.numerr <= 1 && abs(info.pobj - pq) < 1e-6 * (1 + abs(pq)));
+[~, ~, info] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0, 'prec', 'dd'));
+nfail = nfail + check('the same in double-double', strcmp(info.status, 'OPTIMAL') && max(abs(info.dimacs)) < 1e-18 && abs(info.pobj - pq) < 1e-7 * (1 + abs(pq)));
+Km = Kq; Km.s = 3;
+Sx = randn(3); Sx = Sx * Sx' + eye(3); Sz = randn(3); Sz = Sz * Sz' + eye(3);
+Am = [Aq, sprandn(5, 9, 0.5)]; bm = Am * [xq; Sx(:)]; cm = Am' * randn(5, 1) + [zq; Sz(:)];
+[x, ~, info] = brisk_sedumi(Am, bm, cm, Km, struct('verbose', 0));
+nfail = nfail + check('SeDuMi second-order cones with a PSD block', info.numerr <= 1 && norm(Am * x - bm) < 1e-6 * (1 + norm(bm)) && ...
+    abs(info.pobj - info.dobj) < 1e-6 * (1 + abs(info.pobj)) && x(6) >= norm(x(7:9)) - 1e-7 && min(eig(reshape(x(17:25), 3, 3))) > -1e-7);
+[~, ~, info] = brisk_sedumi(sparse([0 1 0]), 0, [1; 0; 2], struct('q', 3), struct('verbose', 0));   % x2 = 0 on the cone, min x1 + 2 x3: unbounded along (1, 0, -1)
+nfail = nfail + check('an unbounded second-order cone program is reported (dinf)', info.dinf == 1);
 ok = false;
 try
-    brisk_sedumi(A, b, c, struct('f', 3, 'l', 4, 's', [1 3 5], 'q', 3));
+    brisk_sedumi(Aq, bq, cq, struct('f', 2, 'l', 3, 'q', [4 4], 'r', 4));
 catch err
-    ok = ~isempty(strfind(err.message, 'second-order')); %#ok<STREMP>
+    ok = ~isempty(strfind(err.identifier, 'brisk')); %#ok<STREMP>
 end
-nfail = nfail + check('K.q is rejected with a clear message', ok);
+nfail = nfail + check('a K that does not match A is rejected', ok);
 [~, ~, ~, ~, I3] = brisk_sdpa(ex1);
 nfail = nfail + check('a second solve in the same session works', strcmp(I3.status, 'OPTIMAL'));
 

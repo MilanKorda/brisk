@@ -1,0 +1,27 @@
+# minimize t subject to x1 + x2 = 2, t >= |(x1, x2)|: the optimal value is sqrt(2)
+VER
+1
+
+OBJSENSE
+MIN
+
+VAR
+3 1
+Q 3
+
+CON
+1 1
+L= 1
+
+OBJACOORD
+1
+0 1.0
+
+ACOORD
+2
+0 1 1.0
+0 2 1.0
+
+BCOORD
+1
+0 -2.0

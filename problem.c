@@ -731,6 +731,67 @@ double analyze_sdp_block(Block *B, const Params *par) {
         B->route[B->slist[a]] = (c3 <= cr && c3 <= cu) ? 0 : (cr <= cu ? 1 : 3);
     }
 
+    /* 5.5: the live region of the row products. X A_a Zi is read only at the entries of the
+     * constraints b >= a. An index whose last constraint is before a is dead for a: with the
+     * indices in the order of their death (the longest-lived first) the live ones are a prefix,
+     * and the rows that the entries of a column still need are a prefix too (lv_ch). The product
+     * is then formed panel by panel on that staircase (solver.c). Kept when the staircases of
+     * the row-product constraints hold at most 2/3 of nr n^2 (moment matrices in the order of
+     * the moments: about 55 %) and the block has order 128 or more: measured gains at n = 204 ... 441
+     * with shares of 53-58 %, losses of 8 % at a share of 74 % (n = 135) and of 15 % on blocks of
+     * 55-66 (small products run at a lower rate, the gather is not reduced). */
+    B->live = 0; B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL;
+    {
+        int n1 = 0;
+        for (int a = 0; a < B->ns; a++) n1 += B->route[B->slist[a]] == 1;
+        if (n1 > 0 && n >= 128 && fe > 0 && fe < ((size_t)1 << 28) && !ENV_ON("BRISK_NOLIVE")) {
+            const int ns = B->ns;
+            int *death = xmalloc(sizeof(int) * n), *cnt = xcalloc((size_t)ns + 2, sizeof(int));
+            for (int i = 0; i < n; i++) death[i] = -1;
+            for (int a = 0; a < ns; a++) { const SpSym *S = &B->A[B->slist[a]]; for (int k = 0; k < S->nr; k++) death[S->rows[k]] = a; }
+            /* the order: by death, the last first (a counting sort; never-used indices at the end) */
+            B->lv_perm = xmalloc(sizeof(int) * n); B->lv_rank = xmalloc(sizeof(int) * n); B->lv_u = xmalloc(sizeof(int) * (ns + 1));
+            for (int i = 0; i < n; i++) cnt[death[i] + 1]++;             /* cnt[d + 1]: indices with death d */
+            { int live = n - cnt[0];                                     /* indices used at all */
+              for (int a = 0; a < ns; a++) { B->lv_u[a] = live; live -= cnt[a + 1]; } }
+            { int *start = xmalloc(sizeof(int) * (ns + 2)); int o = 0;
+              for (int d = ns - 1; d >= -1; d--) { start[d + 1] = o; o += cnt[d + 1]; }
+              for (int i = 0; i < n; i++) { const int q = start[death[i] + 1]++; B->lv_perm[q] = i; B->lv_rank[i] = q; }
+              free(start); }
+            B->lv_cp = xcalloc((size_t)n + 2, sizeof(int));
+            B->lv_ca = xmalloc(sizeof(int) * fe); B->lv_cr = xmalloc(sizeof(int) * fe); B->lv_ch = xmalloc(sizeof(int) * fe); B->lv_cv = xmalloc(sizeof(double) * fe);
+            for (size_t k = 0; k < fe; k++) B->lv_cp[B->lv_rank[B->ffc[k]] + 2]++;
+            for (int q = 0; q < n; q++) B->lv_cp[q + 2] += B->lv_cp[q + 1];
+            for (int a = 0; a < ns; a++)
+                for (int k = B->foff[a]; k < B->foff[a + 1]; k++) {
+                    const int t = B->lv_cp[B->lv_rank[B->ffc[k]] + 1]++;
+                    B->lv_ca[t] = a; B->lv_cr[t] = B->lv_rank[B->ffr[k]]; B->lv_cv[t] = B->ffv[k];
+                }
+            for (int q = 0; q < n; q++) {
+                int hmax = 0;
+                for (int t = B->lv_cp[q + 1] - 1; t >= B->lv_cp[q]; t--) { if (B->lv_cr[t] + 1 > hmax) hmax = B->lv_cr[t] + 1; B->lv_ch[t] = hmax; }
+            }
+            /* the staircases against the full products */
+            double full = 0, area = 0;
+            for (int a = 0; a < ns; a++) {
+                if (B->route[B->slist[a]] != 1) continue;
+                const SpSym *S = &B->A[B->slist[a]];
+                double ar = 0;
+                for (int q = 0; q < B->lv_u[a]; q++) {
+                    int lo = B->lv_cp[q], hi = B->lv_cp[q + 1];
+                    while (lo < hi) { const int mid = (lo + hi) >> 1; if (B->lv_ca[mid] < a) lo = mid + 1; else hi = mid; }
+                    if (lo < B->lv_cp[q + 1]) ar += B->lv_ch[lo];
+                }
+                full += (double)S->nr * n2; area += (double)S->nr * ar;
+            }
+            B->live = area <= 0.67 * full;
+            if (ENV_ON("BRISK_ROUTEDBG")) printf("   [block n %d: live region of the row products: %.0f %% of nr n^2 (%s)]\n", n, 100.0 * area / fmax(full, 1.0), B->live ? "used" : "not used");
+            free(death); free(cnt);
+            if (!B->live) { free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
+                            B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL; }
+        }
+    }
+
     if (ENV_ON("BRISK_ROUTEDBG")) {
         double sef = 0, snr = 0; int n1 = 0;
         for (int a = 0; a < B->ns; a++) { const SpSym *S = &B->A[B->slist[a]]; sef += S->ef; snr += S->nr; n1 += B->route[B->slist[a]] != 0; }
@@ -833,6 +894,7 @@ void block_free_contents(Block *B) {
     free(B->route); free(B->urows); free(B->ufr); free(B->ufc);
     free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad);
     free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv);
+    free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
     free(B->lfoff); free(B->lfr); free(B->lfc); free(B->lfv);
     free(B->lr_off); free(B->lr_W); free(B->lr_sig);
     free(B->lp_ptr); free(B->lp_con); free(B->lp_val);

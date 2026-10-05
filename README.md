@@ -8,9 +8,13 @@ BRISK is an interior-point solver for semidefinite programs (SDPs) with linear b
 (P)  min <C,X>  s.t. <A_i,X> = b_i,  X in K        (D)  max b'y  s.t.  sum y_i A_i + Z = C,  Z in K
 ```
 
-It is written in C on BLAS/LAPACK, reads SDPA sparse files (`.dat-s`), and is called from the
-command line, Python (CVXPY), Julia (JuMP), MATLAB and GNU Octave. All interfaces run the same
-code.
+Since version 1.2 it also solves problems with second-order cones and free variables (a
+cone solver of its own when there is no semidefinite block) and linear programs from MPS
+files.
+
+It is written in C on BLAS/LAPACK, reads SDPA sparse files (`.dat-s`), SeDuMi MAT-files, MPS
+and CBF files, and is called from the command line, Python (CVXPY), Julia (JuMP), MATLAB and
+GNU Octave. All interfaces run the same code.
 
 **Website and documentation:** https://homepages.laas.fr/mkorda/brisk/
 
@@ -55,7 +59,7 @@ Details: [SOLVER.md](SOLVER.md) (methods, automatic choices, exit codes) and
 
 ## Status
 
-Version 1.1. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
+Version 1.2. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
 benchmark, AC optimal power flow and moment-SOS relaxations) and through the test suites of
 the three interfaces. The macOS build has not yet been validated on a Mac. Please report
 problems through the issue tracker, with the output of `./brisk problem.dat-s -v`.

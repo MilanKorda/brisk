@@ -109,12 +109,153 @@ static double fro_up(size_t len, const double *M) {
     return s;
 }
 
+/* The same bound for a large sparse G (all rows; m > 6000): G and the error matrix |A| W |A'|
+ * are formed by rows on their sparsity pattern, lambda_min is estimated by inverse iteration with
+ * a sparse Cholesky factor (sparsechol.c: fill-reducing order, supernodes, BLAS panels) and the
+ * bound is the dense one: the factorization of fl(G~ - c I) runs to completion without any pivot
+ * replacement, so G~ - c I + E is positive semidefinite with ||E||_2 <= g tr / (1 - g),
+ * g = gamma_{3m} (the bound on |E| <= g |R'||R| holds for any order of the operations and any
+ * elimination order). Returns -inf when the factor does not fit (fill above 3e8 entries). */
+static double gram_lammin_lower_sparse(const PSOrig *O, int exact) {
+    const int m = O->m;
+    size_t na = 0, *idx = malloc(sizeof(size_t) * (O->nnz + 1));
+    for (size_t q = 0; q < O->nnz; q++) if (O->con[q] >= 0) idx[na++] = q;
+    long long *key = malloc(sizeof(long long) * (na + 1));
+    size_t *ord = malloc(sizeof(size_t) * (na + 1));
+    for (size_t t = 0; t < na; t++) {
+        const size_t q = idx[t];
+        key[t] = ((long long)O->blk[q] << 42) ^ ((long long)O->jj[q] << 21) ^ (long long)O->ii[q];
+        ord[t] = t;
+    }
+    {
+        size_t gap = 1;
+        while (gap < na / 3) gap = 3 * gap + 1;
+        for (; gap > 0; gap /= 3)
+            for (size_t i = gap; i < na; i++) {
+                const size_t v = ord[i]; size_t j = i;
+                while (j >= gap && key[ord[j - gap]] > key[v]) { ord[j] = ord[j - gap]; j -= gap; }
+                ord[j] = v;
+            }
+    }
+    /* groups (positions): gs[p] .. gs[p+1] in ord; the entries of a row: (group, value) */
+    size_t ng = 0, *gs = malloc(sizeof(size_t) * (na + 2)), *gof = malloc(sizeof(size_t) * (na + 1));
+    for (size_t s = 0; s < na;) {
+        size_t e = s + 1;
+        while (e < na && key[ord[e]] == key[ord[s]]) e++;
+        for (size_t a = s; a < e; a++) gof[ord[a]] = ng;
+        gs[ng++] = s; s = e;
+    }
+    gs[ng] = na;
+    free(key);
+    size_t *rp = calloc((size_t)m + 2, sizeof(size_t)), *rt = malloc(sizeof(size_t) * (na + 1));
+    for (size_t t = 0; t < na; t++) rp[O->con[idx[t]] + 2]++;
+    int kmax = 1;
+    for (int i = 0; i < m; i++) { if ((long long)rp[i + 2] > kmax) kmax = (int)rp[i + 2]; rp[i + 2] += rp[i + 1]; }
+    for (size_t t = 0; t < na; t++) rt[rp[O->con[idx[t]] + 1]++] = t;
+    /* the lower triangle by rows: columns b < a, values of G and of |A| W |A'|; the diagonal apart */
+    size_t cap = 4 * (size_t)m + 1024, nz = 0;
+    size_t *lp = malloc(sizeof(size_t) * ((size_t)m + 1));
+    int *lj = malloc(sizeof(int) * cap);
+    double *lv = malloc(sizeof(double) * cap), *dg = calloc((size_t)m + 1, sizeof(double));
+    double *acc = calloc((size_t)m + 1, sizeof(double)), *aca = calloc((size_t)m + 1, sizeof(double));
+    int *mark = malloc(sizeof(int) * ((size_t)m + 1)), *list = malloc(sizeof(int) * ((size_t)m + 1));
+    for (int i = 0; i < m; i++) mark[i] = -1;
+    double fa2 = 0;                       /* ||(|A| W |A'|)||_F^2, rounded up (the sums of each entry to nearest: covered by the factor below) */
+    for (int a = 0; a < m; a++) {
+        lp[a] = nz;
+        int nl = 0;
+        for (size_t u = rp[a]; u < rp[a + 1]; u++) {
+            const size_t t = rt[u], q = idx[t], g = gof[t];
+            const double w = (O->bs[O->blk[q]] > 0 && O->ii[q] != O->jj[q]) ? 2.0 : 1.0, va = O->v[q];
+            for (size_t e = gs[g]; e < gs[g + 1]; e++) {
+                const size_t qb = idx[ord[e]];
+                const int b = O->con[qb];
+                if (b > a) continue;
+                if (mark[b] != a) { mark[b] = a; list[nl++] = b; acc[b] = 0; aca[b] = 0; }
+                acc[b] += w * va * O->v[qb]; aca[b] += w * fabs(va) * fabs(O->v[qb]);
+            }
+        }
+        if (nz + (size_t)nl + 1 > cap) { cap = 2 * cap + (size_t)nl; lj = realloc(lj, sizeof(int) * cap); lv = realloc(lv, sizeof(double) * cap); }
+        fesetround(FE_UPWARD);
+        for (int c = 0; c < nl; c++) {
+            const int b = list[c];
+            if (b == a) { dg[a] = acc[b]; fa2 += aca[b] * aca[b]; }
+            else { lj[nz] = b; lv[nz] = acc[b]; nz++; fa2 += 2.0 * (aca[b] * aca[b]); }
+        }
+        fesetround(FE_TONEAREST);
+    }
+    lp[m] = nz;
+    free(acc); free(aca); free(mark); free(list); free(rp); free(rt); free(gs); free(gof); free(idx); free(ord);
+    fesetround(FE_UPWARD);
+    const double faF = sqrt(fa2) * (1 + 2 * U) + 1e-300;
+    fesetround(FE_TONEAREST);
+    const double gk = (kmax + 2.0) * U / (1 - (kmax + 2.0) * U);
+    const double dG = (gk + 6 * U + (exact ? 0 : 4 * U)) * faF * 1.01;
+    /* the adjacency (both triangles) and the analysis */
+    int *deg = calloc((size_t)m + 1, sizeof(int)), **nbr = malloc(sizeof(int *) * ((size_t)m + 1));
+    for (int a = 0; a < m; a++) for (size_t u = lp[a]; u < lp[a + 1]; u++) { deg[a]++; deg[lj[u]]++; }
+    int *pool = malloc(sizeof(int) * (2 * nz + 1));
+    { size_t o = 0; for (int a = 0; a < m; a++) { nbr[a] = pool + o; o += (size_t)deg[a]; deg[a] = 0; } }
+    for (int a = 0; a < m; a++) for (size_t u = lp[a]; u < lp[a + 1]; u++) { const int b = lj[u]; nbr[a][deg[a]++] = b; nbr[b][deg[b]++] = a; }
+    SChol *S = schol_analyze_adj(m, deg, nbr, (size_t)3e8);
+    free(deg); free(nbr); free(pool);
+    double best = -INFINITY;
+    if (S) {
+        schol_set_tinypiv(S, 0.0);
+        double dmax0 = 0, lam = 0;
+        for (int i = 0; i < m; i++) dmax0 = fmax(dmax0, fabs(dg[i]));
+        const double g = 3.0 * m * U / (1 - 3.0 * m * U);
+        static const double fr[] = { 0.0, 0.5, 0.2, 0.05 };       /* 0: the factor for the estimate */
+        for (int t = 0; t < 4; t++) {
+            const double c = lam * fr[t];
+            if (t > 0 && !(c > 0)) break;
+            schol_zero(S);
+            for (int a = 0; a < m; a++) {
+                schol_add(S, (size_t)a, (size_t)a, dg[a] - c);
+                for (size_t u = lp[a]; u < lp[a + 1]; u++) schol_add(S, (size_t)a, (size_t)lj[u], lv[u]);
+            }
+            if (schol_factor(S, 0.0) != 0 || schol_ntiny(S) != 0) { if (t == 0) break; continue; }
+            if (t == 0) {       /* inverse iteration: lam ~ lambda_min (an estimate; nothing below relies on it) */
+                double *x = malloc(sizeof(double) * ((size_t)m + 1)), *wk = malloc(sizeof(double) * ((size_t)m + 1));
+                unsigned long long sd = 88172645463325252ULL;
+                for (int i = 0; i < m; i++) { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; x[i] = (double)(sd % 2001) / 1000.0 - 1.0; }
+                for (int it = 0; it < 40; it++) {
+                    double nx = 0; for (int i = 0; i < m; i++) nx += x[i] * x[i];
+                    nx = sqrt(nx); if (!(nx > 0)) break;
+                    for (int i = 0; i < m; i++) x[i] /= nx;
+                    schol_solve(S, x, wk);
+                    double ny = 0; for (int i = 0; i < m; i++) ny += x[i] * x[i];
+                    lam = 1.0 / sqrt(ny);
+                }
+                free(x); free(wk);
+                if (!(lam > 0) || !isfinite(lam)) break;
+                continue;
+            }
+            double tr = 0, dm = 0;
+            fesetround(FE_UPWARD);
+            for (int i = 0; i < m; i++) { const double a = dg[i] - c; tr += fabs(a); dm = fmax(dm, fabs(a)); }
+            tr = tr * (1 + 4 * U) + 1e-300;
+            const double e1 = g * tr / (1 - g), e2 = U * dm * (1 + 4 * U) + 1e-300;
+            const double err = e1 + e2 + dG;
+            fesetround(FE_DOWNWARD);
+            const double bnd = c - err;
+            fesetround(FE_TONEAREST);
+            if (getenv("BRISK_BOUNDDBG")) printf("   [sparse Gram bound: m %d, nnz(G) %zu, nnz(L) %zu, lambda_min ~ %.3e, shift %.3e, error terms %.2e %.2e %.2e -> %.3e]\n", m, nz + (size_t)m, schol_nnz(S), lam, c, e1, e2, dG, bnd);
+            if (bnd > best) best = bnd;
+            if (bnd > 0) break;
+        }
+        schol_free(S);
+    }
+    free(lp); free(lj); free(lv); free(dg);
+    return best;
+}
+
 /* a lower bound on lambda_min(G) for G = A W A' (W = 2 on off-diagonal SDP entries), over the
  * constraints listed in rows (all when rows == NULL), from a double G and an entrywise error
  * bound that covers the data intervals. Returns -inf when too large (m > 8000). */
 static double gram_lammin_lower(const PSOrig *O, int exact, int nr, const int *rows) {
     const int m = O->m;
-    if (nr > 6000) return -INFINITY;
+    if (nr > 6000 || (getenv("BRISK_GRAMSPARSE") && rows == NULL && nr == m)) return rows == NULL && nr == m ? gram_lammin_lower_sparse(O, exact) : -INFINITY;
     int *pos = malloc(sizeof(int) * (m + 1));
     for (int i = 0; i < m; i++) pos[i] = -1;
     if (rows) for (int a = 0; a < nr; a++) pos[rows[a]] = a;
@@ -294,7 +435,7 @@ int brisk_certify_orig(const PSOrig *O, int side, double **X, const double *y, i
         if (rn > 0) {
             const double lg = gram_lammin_lower(O, exact, m, NULL);
             if (!(lg > 0)) {
-                if (reason) snprintf(reason, rlen, "lambda_min(A A*) not bounded away from 0 (dependent constraints, or m > 6000)");
+                if (reason) snprintf(reason, rlen, "lambda_min(A A*) not bounded away from 0 (dependent constraints, or a sparse factor that does not fit)");
                 fesetround(rm0);
                 bound_free_blocks(Xs, O->nblk);
                 return 0;

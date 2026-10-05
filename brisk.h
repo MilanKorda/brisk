@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.1"
+#define BRISK_VERSION "1.2"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +40,8 @@ typedef struct {
     int n_resolves;         /* 4.37: re-solves run (method retry, fallbacks) and their time */
     double t_resolves;
     char cause[320];        /* 4.37: the likely cause when the tolerance is missed ("" otherwise) */
+    int sn;                 /* a problem in SeDuMi format: its n, x (n) and z = c - A'y (n); y above */
+    double *sx, *sz;
 } BriskResult;
 /* 4.37: a problem given in memory instead of a file: the numbers of an SDPA sparse file.
  * c has m entries; the nnz entries (mat[q], blk[q], i[q], j[q], v[q]) are the lines of the
@@ -107,6 +109,12 @@ typedef struct Block {
     int *urows;
     int unf;             /* union pattern, full symmetric expansion */
     int *ufr, *ufc;
+    /* 5.5: the live region of the row products (problem.c): indices in the order of their last
+     * sparse constraint (lv_perm[new] = old, lv_rank its inverse), the number of live indices at
+     * each sparse constraint, and the full entries of the sparse constraints by permuted column,
+     * sorted by constraint (lv_ca: position in slist, lv_cr: permuted row, lv_ch: one more than
+     * the largest row from this entry to the end of the column) */
+    int live; int *lv_perm, *lv_rank, *lv_u, *lv_cp, *lv_ca, *lv_cr, *lv_ch; double *lv_cv;
     int prod_route;      /* Zi*(A'y)*R: 0 row-subset, 1 sparse-left, 2 dense */
     /* low-rank Schur route (whole block): A_t = W_t diag(sig_t) W_t' */
     int lowrank;
@@ -280,7 +288,9 @@ typedef struct {
     int symalg;          /* 4.41: *-algebra block diagonalisation (symalg.c): -1 auto (blocks up to symalgmax), 0 off, 1 every block */
     int symalgmax;       /* 4.41: ... -symalg -1: largest block size tried (1000) */
     int symsigned;       /* 4.37: -sym auto: signed permutations (a search on |data|, signs lifted over GF(2)) (1) */
-    int mfipm;           /* 4.34: matrix-free interior-point method (mfipm.c): 1 on, 0 off */
+    int mfipm;           /* 4.34: matrix-free interior-point method (mfipm.c): 1 on, 0 off; 5.4: 2 the hybrid (hand-off to the standard method) */
+    int mf_proj; double mf_eta;      /* 5.5: 1 = exact primal projection of dX and CG to the P^-1-norm tolerance (the 4.34 scheme); 0 = residual-controlled CG, no projection; eta: the share of |Rp| CG may leave (0.1) */
+    double mf_hand; int mf_handcg;   /* 5.4: hand-off rule of the hybrid: merit (1e-5), CG steps of an iteration (600) */
     int lralm;           /* 4.40: low-rank augmented Lagrangian (lralm.c): 1 on, 0 off (default) */
     int chordal_need;    /* 4.40 (internal): a chordal re-solve; skip it when the form does not convert and the unconverted problem does not fit */
     int lr_rank, lr_rmax, lr_outer, lr_inner, lr_escape, lr_prec, lr_newton;   /* 4.40: ... starting rank (1), largest rank (32), outer (500) and inner (2000) iteration caps, rank escape (1) */
@@ -298,6 +308,7 @@ typedef struct {
     double fom_single;   /* 4.37: projections in single precision while the residual is above this (1e-4; 0: never) */
     double fom_sigma0;   /* 4.35: starting penalty of the splitting phase when adaptive (1) */
     const char *fom_start_x, *fom_start_y;   /* 4.39: -fomstart-x / -fomstart-y: a starting point (the -x / -y formats) */
+    const char *bound_anchor;   /* -boundanchor: a y with Z = C - A'y positive definite, for -bound d */
     double **fom_X0, *fom_y0;                /* 4.39: ... mapped to the engine's problem by run_pipeline (NULL: none) */
     double mf_cgtime;    /* 4.35: time cap of one CG solve in seconds (0: none) */
     int mf_stall;        /* 4.35: stop after this many iterations without a 20% improvement once CG hit its budget (5) */
@@ -384,6 +395,8 @@ int chol_tiny_blocked(int nr, int w, double *P, int ld, const double *d0, int d0
 int schol_clique_offsets(const SChol *S, int nl, const int *con, size_t *pos, size_t *soff, int *sidx);
 long schol_uid(const SChol *S);
 void schol_set_tinypiv(SChol *S, double t);
+void schol_set_dynpiv(SChol *S, double p);       /* signed factorization: wrong-sign pivots replaced by sign * p */
+int schol_ndyn(const SChol *S);
 int schol_ntiny(const SChol *S);
 typedef struct SAdj SAdj;
 SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap);
@@ -600,6 +613,13 @@ void  fom_gram_solve(const Gram *G, double *x);
 void  fom_gram_free(Gram *G);
 /* 4.34 matrix-free interior-point method (mfipm.c) */
 int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
+/* 5.4: the hybrid (-mfipm 2): the matrix-free iteration to a merit of mf_hand or until a solve
+ * needs more than mf_handcg CG steps, then the standard method from its iterate (warm start).
+ * The internal (scaled) iterate is returned in Xint, Zint (per block, allocated by the caller)
+ * and yint; mfipm_solve stops on the hand-off rule when they are given. Returns 1 at a hand-off,
+ * 2 when CG gave up with the merit above 1e-2 (the point is no use as a start), 0 when the
+ * matrix-free method ended by itself, < 0 on an error. */
+int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, double **Zint, double *yint, double hand_merit, int hand_cg);
 /* 4.40 low-rank augmented Lagrangian (lralm.c): reads, solves, reports; returns the exit code */
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);
 extern int g_read_maxn;   /* 4.40: largest SDP block the reader accepts (46340; lralm lifts it) */

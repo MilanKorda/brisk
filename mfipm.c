@@ -52,6 +52,7 @@ typedef struct {
     double *X, *Z, *dX, *dZ, *dXa, *dZa, *Rd, *E0, *Rc;   /* iterate, directions, residual, W Rd W, complementarity rhs */
     double *L, *G, *Y, *W, *ev, *dv;                  /* NT: X = L L', G = L U ev^-1/4, Y = Gi' (dXt = Y' dX Y), W = G G' */
     double *T1, *T2, *T3;                             /* work */
+    double *Zc;                                       /* the complementarity right-hand side in the scaled space (Rc = G Zc G') */
     /* preconditioner */
     double *dg, *Q, *wt;           /* diag(W), D^1/2 (eigvecs of Wt), eigenvalues of Wt (ascending) */
     double tau2, kbulk;
@@ -107,7 +108,7 @@ static void mb_init(MF *S, const Problem *P) {
         b->T1 = mz(sizeof(double) * len); b->T2 = mz(sizeof(double) * len); b->T3 = mz(sizeof(double) * len);
         if (b->type == BLK_LP) continue;
         b->L = mx(sizeof(double) * len); b->G = mx(sizeof(double) * len); b->Y = mx(sizeof(double) * len);
-        b->Q = mx(sizeof(double) * len); b->wt = mz(sizeof(double) * n);
+        b->Q = mx(sizeof(double) * len); b->wt = mz(sizeof(double) * n); b->Zc = mz(sizeof(double) * len);
         /* A* by columns */
         size_t ef = 0;
         for (int t = 0; t < B->ncon; t++) ef += B->A[t].ef;
@@ -277,6 +278,7 @@ static void prec_free_outl(MF *S) {
 static void prec_setup(MF *S, const Params *par, double *lamp_out_kmax) {
     const double t0 = wtime();
     const double rho = par->mf_rho, drop = par->mf_drop;
+    static int wide_on = -1; if (wide_on < 0) wide_on = getenv("BRISK_MFNOWIDE") == NULL;
     const int rmax = par->mf_rmax, kmax = par->mf_kmax;
     const int m = S->m;
     prec_free_outl(S);
@@ -285,13 +287,26 @@ static void prec_setup(MF *S, const Params *par, double *lamp_out_kmax) {
     for (int k = 0; k < S->nb; k++) {
         MB *b = &S->b[k]; const int n = b->n;
         if (b->type == BLK_LP) { for (int i = 0; i < n; i++) b->dg[i] = b->W[i] * b->W[i]; b->tau2 = 1; b->rlo = b->rhi = 0; continue; }
-        for (int i = 0; i < n; i++) { double d = b->W[i + (size_t)i * n]; b->dg[i] = d > 1e-300 ? d : 1e-300; }
+        static int nojac = -1; if (nojac < 0) nojac = getenv("BRISK_MFNOJACOBI") != NULL;
+        for (int i = 0; i < n; i++) { double d = nojac ? 1.0 : b->W[i + (size_t)i * n]; b->dg[i] = d > 1e-300 ? d : 1e-300; }
         for (int j = 0; j < n; j++) for (int i = 0; i < n; i++) b->Q[i + (size_t)j * n] = b->W[i + (size_t)j * n] / sqrt(b->dg[i] * b->dg[j]);
         int info = 0, lw = b->lwork, liw = b->liwork;
         if (rmax > 0) BL(dsyevd_)("V", "L", &n, b->Q, &n, b->wt, b->work, &lw, b->iwork, &liw, &info);
         else { BL(dsyevd_)("N", "L", &n, b->Q, &n, b->wt, b->work, &lw, b->iwork, &liw, &info); }
         for (int i = 0; i < n; i++) if (!(b->wt[i] > 1e-300)) b->wt[i] = 1e-300;
         split_spectrum(b->wt, n, rho, rmax, &b->rlo, &b->rhi);
+        if (getenv("BRISK_MFSPEC")) { printf("   [spec blk %d n %d:", k, n); for (int i = 0; i < n; i += (n > 24 ? n / 12 : 1)) printf(" %.1e", b->wt[i]); printf(" | top:"); for (int i = n - 6 > 0 ? n - 6 : 0; i < n; i++) printf(" %.2e", b->wt[i]); printf(" | rlo %d rhi %d]\n", b->rlo, b->rhi); }
+        /* 5.5: a bulk that no rmax outliers make tight (spread above rho^4: truss problems, one
+         * eigenvalue of 1e2 over a continuum from 2 down to 1e-8). Outliers at the small end then
+         * model nothing (their pairs' eigenvalues are ~0, as the base's tau^2), and those at the top
+         * that are not separated from the rest buy little for their cost (each outlier adds n pairs to
+         * the capacitance matrix, applied at every CG step): only the top eigenvalues above a gap of
+         * sqrt(rho) are kept, at least one. */
+        if (wide_on && rmax > 0 && b->wt[n - 1 - b->rhi] > rho * rho * rho * rho * b->wt[b->rlo]) {
+            int r = 0; const double g = sqrt(rho);
+            for (int q = 1; q <= rmax && q < n; q++) if (b->wt[n - q] > g * b->wt[n - q - 1]) r = q;
+            b->rlo = 0; b->rhi = r > 0 ? r : 1;
+        }
         const double wlo = b->wt[b->rlo], whi = b->wt[n - 1 - b->rhi];
         b->tau2 = wlo * whi; b->kbulk = (whi / wlo) * (whi / wlo);
         if (rmax > 0) for (int j = 0; j < n; j++) { for (int i = 0; i < n; i++) b->Q[i + (size_t)j * n] *= sqrt(b->dg[i]); }
@@ -458,7 +473,7 @@ static void prec_setup(MF *S, const Params *par, double *lamp_out_kmax) {
     const int kk = S->k;
     free(S->cap); S->cap = mx(sizeof(double) * (size_t)kk * kk);
     memset(S->cap, 0, sizeof(double) * (size_t)kk * kk);
-    int maxn = 0; for (int k = 0; k < S->nb; k++) if (S->b[k].n > maxn) maxn = S->b[k].n;
+    int maxn = 1; for (int k = 0; k < S->nb; k++) if (S->b[k].type == BLK_SDP && S->b[k].n > maxn) maxn = S->b[k].n;   /* (SDP blocks only: an LP block of 28,392 made this 6.4 GB) */
     double *Sm = mx(sizeof(double) * (size_t)maxn * maxn), *Ym = mx(sizeof(double) * (size_t)maxn * (kk + 1));
     for (int a = 0; a < nout; a++) {
         const Outl *oa = &S->o[a]; const MB *ba = &S->b[oa->b]; const int na = ba->n;
@@ -518,7 +533,7 @@ static void prec_setup(MF *S, const Params *par, double *lamp_out_kmax) {
       BL(dsytrf_)("L", &kk, S->cap, &kk, S->ipiv, S->capwork, &lw, &info);
       if (info < 0) { fprintf(stderr, "brisk: matrix-free IPM: capacitance factorization failed (%d)\n", info); exit(1); } }
     free(S->tk); free(S->tk2); S->tk = mx(sizeof(double) * (kk + 1)); S->tk2 = mx(sizeof(double) * (kk + 1));
-    S->t_prec += wtime() - t0;
+    S->t_prec += wtime() - t0; S->t_setup += wtime() - t0;
     if (lamp_out_kmax) *lamp_out_kmax = kk;
 }
 
@@ -554,7 +569,10 @@ static void prec_apply(MF *S, const double *r, double *z) {
 }
 
 /* PCG on M x = h; stop on the P^-1-norm residual relative to that of h */
-static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double tmax, double *res_out, int warm) {
+/* rabs > 0: the residual-controlled rule (5.5): stop when the true residual |h - M x|_2 <= rabs
+ * and the P^-1-norm residual is below tol (tol is then the loose 1e-2: a direction, not a guess);
+ * rabs = 0: stop on the P^-1-norm residual alone. *r2_out: the final |h - M x|_2. */
+static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double tmax, double *res_out, int warm, double rabs, double *r2_out) {
     const int m = S->m;
     double *r = mx(sizeof(double) * m), *z = mx(sizeof(double) * m), *p = mx(sizeof(double) * m), *q = mx(sizeof(double) * m);
     memcpy(r, h, sizeof(double) * m);
@@ -569,7 +587,7 @@ static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double 
         prec_apply(S, r, z); rz = dotn(m, r, z);
         res = sqrt(fabs(rz)) / nb;
         if (res >= 1.0) { memset(x, 0, sizeof(double) * m); memcpy(r, h, sizeof(double) * m); prec_apply(S, r, z); rz = dotn(m, r, z); res = 1.0; }
-        else if (res < tol) { S->ncg += 0; free(r); free(z); free(p); free(q); *res_out = res; return 0; }
+        else if (res < tol && (rabs <= 0 || sqrt(dotn(m, r, r)) <= rabs)) { S->ncg += 0; if (r2_out) *r2_out = sqrt(dotn(m, r, r)); free(r); free(z); free(p); free(q); *res_out = res; return 0; }
     } else memset(x, 0, sizeof(double) * m);
     memcpy(p, z, sizeof(double) * m);
     const double t0 = wtime();
@@ -582,13 +600,14 @@ static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double 
         prec_apply(S, r, z);
         const double rz2 = dotn(m, r, z);
         res = sqrt(fabs(rz2)) / nb;
-        if (res < tol) break;
+        if (res < tol && (rabs <= 0 || sqrt(dotn(m, r, r)) <= rabs)) break;
         if (tmax > 0 && wtime() - t0 > tmax) break;
         const double be = rz2 / rz; rz = rz2;
         for (int i = 0; i < m; i++) p[i] = z[i] + be * p[i];
     }
     if (k > maxit) k = maxit;
     S->ncg += k;
+    if (r2_out) *r2_out = sqrt(dotn(m, r, r));
     free(r); free(z); free(p); free(q);
     *res_out = res;
     return k;
@@ -604,6 +623,13 @@ static double **blk_arrays(MF *S, int which) {
     return a;
 }
 
+static double **hand_X = NULL, **hand_Z = NULL, *hand_y = NULL; static double hand_merit = 0; static int hand_cg = 0, hand_done = 0;
+int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, double **Zint, double *yint, double merit, int cg) {
+    hand_X = Xint; hand_Z = Zint; hand_y = yint; hand_merit = merit; hand_cg = cg; hand_done = 0;
+    const int rc = mfipm_solve(P, par, R, NULL, NULL);
+    hand_X = hand_Z = NULL; hand_y = NULL;
+    return rc < 0 ? rc : hand_done;
+}
 int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout) {
     const double t0 = wtime();
     memset(R, 0, sizeof(*R));
@@ -613,7 +639,8 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
     mb_init(&S, P);
     S.Dg = mx(sizeof(double) * m); S.Dgi = mx(sizeof(double) * m);
     double tg = 0;
-    S.G = fom_gram_build(P, verbose > 1, &tg);
+    const int proj = getenv("BRISK_MFNOPROJ") ? 0 : par->mf_proj;
+    S.G = proj ? fom_gram_build(P, verbose > 1, &tg) : NULL;       /* A A* is needed by the projection only */
     double *y = mz(sizeof(double) * m), *dy = mz(sizeof(double) * m), *dya = mz(sizeof(double) * m);
     double *Rp = mx(sizeof(double) * m), *h = mx(sizeof(double) * m), *tmp = mx(sizeof(double) * m), *tmp2 = mx(sizeof(double) * m);
     double **Xs = blk_arrays(&S, 0), **dXs = blk_arrays(&S, 1), **Ts = blk_arrays(&S, 2), **dXas = blk_arrays(&S, 3);
@@ -635,7 +662,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
     if (verbose > 0) {
         size_t nnz = 0; double s3 = 0; for (int k = 0; k < nb; k++) { for (int t = 0; t < S.b[k].ncon; t++) nnz += P->blk[k].A[t].nnz; if (S.b[k].type == BLK_SDP) s3 += pow(S.b[k].n, 3); }
         printf("matrix-free IPM: m = %d, %d block(s), sum n^3 %.2e (M v %.2e flops), %zu nonzeros; A A' %s (%.2fs); rho %g, rmax %d, kmax %d\n",
-               m, nb, s3, 4 * s3, nnz, S.G->dense ? "dense" : "sparse", tg, par->mf_rho, par->mf_rmax, par->mf_kmax);
+               m, nb, s3, 4 * s3, nnz, !S.G ? "not formed" : S.G->dense ? "dense" : "sparse", tg, par->mf_rho, par->mf_rmax, par->mf_kmax);
         printf(" it   pobj            dobj            pinf     dinf     gap      mu       alp   ald   sigma   cg(pred,corr) k     kbulk    time\n");
     }
     double mu0 = -1, pobj = 0, dobj = 0, pinf = 1, dinf = 1, gap = 1;
@@ -648,7 +675,8 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
     double best_merit = 1e300, best_pobj = 0, best_dobj = 0, best_pinf = 0, best_dinf = 0, best_gap = 0;
     double *best_y = mx(sizeof(double) * m), **best_X = mx(sizeof(double *) * nb);
     for (int k = 0; k < nb; k++) best_X[k] = mx(sizeof(double) * blen(&S.b[k]));
-    int nstall = 0, cg_capped = 0, best_it = 0;
+    int nstall = 0, cg_capped = 0, best_it = 0, last_cg[2] = { 0, 0 };
+    const int sdir = !proj && getenv("BRISK_MFNOSDIR") == NULL;
     for (it = 0; it < par->maxit; it++) {
         /* residuals */
         op_A(&S, Xs, Rp);
@@ -673,6 +701,15 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 for (int k = 0; k < nb; k++) memcpy(best_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k]));
             }
             if (merit < tol) { status = ST_OPTIMAL; break; }
+            if (hand_X && (merit <= hand_merit || hand_done)) {
+                /* the hybrid: hand this iterate to the standard method (hand_done: the last
+                 * iteration's solves were too long for CG) */
+                for (int k = 0; k < nb; k++) { memcpy(hand_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k])); memcpy(hand_Z[k], S.b[k].Z, sizeof(double) * blen(&S.b[k])); }
+                memcpy(hand_y, y, sizeof(double) * m);
+                hand_done = merit <= 1e-2 ? 1 : 2; status = ST_MAXIT;      /* 2: CG gave up early, the point is far from optimal (a warm start from it is no use) */
+                if (verbose > 0) printf("matrix-free IPM: hand-off to the standard method at iteration %d (merit %.1e, last solves %d + %d CG steps)\n", it, merit, last_cg[0], last_cg[1]);
+                break;
+            }
             if (brisk_time_up(par)) { status = ST_TIME; break; }
             if (nstall >= par->mf_stall) {
                 if (verbose > 0) printf("matrix-free IPM: no progress in %d iterations with the CG budget exhausted (best %.1e at iteration %d): stopping\n", nstall, best_merit, best_it);
@@ -700,7 +737,11 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             for (int k = 0; k < nb; k++) {
                 MB *b = &S.b[k]; const int n = b->n; const size_t len = blen(b);
                 double *Rc = b->Rc;
-                if (stage == 0) { for (size_t i = 0; i < len; i++) Rc[i] = -b->X[i]; continue; }
+                if (stage == 0) {
+                    for (size_t i = 0; i < len; i++) Rc[i] = -b->X[i];
+                    if (b->type == BLK_SDP) { memset(b->Zc, 0, sizeof(double) * len); for (int i = 0; i < n; i++) b->Zc[i + (size_t)i * n] = -b->dv[i]; }
+                    continue;
+                }
                 double *Xt = b->dX, *Zt = b->dZ;    /* scratch: scaled predictor directions */
                 scaled_dirs(b, b->dXa, b->dZa, Xt, Zt);
                 const double smu = sigma * mu;
@@ -715,6 +756,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                     if (i == j) v += 2 * smu - 2 * b->dv[i] * b->dv[i];
                     b->T2[i + (size_t)j * n] = v / (b->dv[i] + b->dv[j]);
                 }
+                memcpy(b->Zc, b->T2, sizeof(double) * len);
                 BL(dsymm_)("R", "L", &n, &n, &DONE, b->T2, &n, b->G, &n, &DZERO, b->T1, &n);   /* G Zc */
                 BL(dgemm_)("N", "T", &n, &n, &n, &DONE, b->T1, &n, b->G, &n, &DZERO, Rc, &n);  /* (G Zc) G' */
                 symmetrize(n, Rc);
@@ -726,8 +768,14 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             for (int k = 0; k < nb; k++) { MB *b = &S.b[k]; const size_t len = blen(b); for (size_t i = 0; i < len; i++) b->Rc[i] += b->E0[i]; }
             double *dyv = stage == 0 ? dya : dy;
             if (stage == 1) memcpy(dy, dya, sizeof(double) * m);
-            cgk[stage] = pcg(&S, h, dyv, cgtol, par->mf_cgmax, tleft > 0 ? tleft : 0, &cgres[stage], stage == 1 && par->mf_warm);
-            if (cgres[stage] > cgtol) cg_capped = 1;
+            /* 5.5, mf_proj = 0: no projection of dX; the CG residual r is then exactly the miss of the
+             * primal equation (A dX = Rp - r: dZ and dX follow from dy exactly), so CG is run until
+             * |r| <= max(0.1 |Rp|, 0.1 tol (1 + |b|)) - a tenth of the residual to remove, or of the
+             * target - and at least to 1e-2 in the P^-1 norm. */
+            double rabs = 0, r2 = 0;
+            if (!proj) rabs = fmax(par->mf_eta * sqrt(dotn(m, Rp, Rp)), 0.1 * tol * (1.0 + nbv));
+            cgk[stage] = pcg(&S, h, dyv, proj ? cgtol : 1e-2, par->mf_cgmax, tleft > 0 ? tleft : 0, &cgres[stage], stage == 1 && par->mf_warm, rabs, &r2);
+            if (proj ? cgres[stage] > cgtol : r2 > rabs) cg_capped = 1;
             tot_cg += cgk[stage];
             /* dZ = Rd - A*(dy); dX = Rc - W dZ W; exact projection */
             for (int k = 0; k < nb; k++) {
@@ -739,6 +787,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 for (size_t i = 0; i < len; i++) dX[i] = b->Rc[i] - dX[i];
                 if (b->type == BLK_SDP) symmetrize(b->n, dX);
             }
+            if (proj) {
             op_A(&S, stage == 0 ? dXas : dXs, tmp);
             for (int c = 0; c < m; c++) tmp[c] = Rp[c] - tmp[c];
             fom_gram_solve(S.G, tmp);
@@ -747,6 +796,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 double *dX = stage == 0 ? b->dXa : b->dX;
                 op_At(b, tmp, b->T1);
                 for (size_t i = 0; i < len; i++) dX[i] += b->T1[i];
+            }
             }
             if (getenv("BRISK_MFDBG")) {
                 /* checks: W Z W = X, A(dX) = Rp, dX + W dZ W = Rc */
@@ -769,6 +819,10 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 double *dX = stage == 0 ? b->dXa : b->dX, *dZ = stage == 0 ? b->dZa : b->dZ;
                 double *Xt = b->T2, *Zt = b->T3;
                 scaled_dirs(b, dX, dZ, Xt, Zt);
+                /* the scaled primal direction without cancellation: Y' dX Y = Zc - G' dZ G exactly (dX =
+                 * G Zc G' - W dZ W); from dX itself it carries eps |W|^2 |dZ| times |Y|^2, which near the
+                 * end is larger than the direction in the small eigenspace of X (the step collapsed) */
+                if (b->type == BLK_SDP && sdir) { const size_t len = blen(b); for (size_t i = 0; i < len; i++) Xt[i] = b->Zc[i] - Zt[i]; }
                 ap = fmin(ap, max_step(b, Xt)); ad = fmin(ad, max_step(b, Zt));
             }
             if (stage == 0) {
@@ -796,6 +850,8 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                    it, sc * pobj, sc * dobj, pinf, dinf, gap, mu, alp, ald, sigma, cgk[0], cgk[1], S.k, kbulk, wtime() - t0);
         if (verbose > 0) fflush(stdout);
         if (alp < 1e-6 && ald < 1e-6) { status = ST_NUMERIC; it++; break; }
+        last_cg[0] = cgk[0]; last_cg[1] = cgk[1];
+        if (hand_X && it >= 3 && cgk[0] + cgk[1] > hand_cg) hand_done = 1;      /* (the hand-off itself at the top of the next iteration, with the residuals of the new point) */
     }
 done:
     if (status != ST_OPTIMAL && best_merit < fmax(gap, fmax(pinf, dinf))) {
@@ -812,8 +868,8 @@ done:
     R->direction = 1;
     R->t_total = wtime() - t0; R->t_chol = S.t_prec; R->t_dense = S.t_nt; R->t_schur = S.t_mv;
     if (verbose > 0)
-        printf("matrix-free IPM: %d iterations, %ld CG steps (%.1f per solve), %ld products M v (%.1fs), preconditioner %.1fs, NT %.1fs, total %.1fs\n",
-               it, S.ncg, it > 0 ? S.ncg / (2.0 * it) : 0.0, S.nmv, S.t_mv, S.t_prec, S.t_nt, R->t_total);
+        printf("matrix-free IPM: %d iterations, %ld CG steps (%.1f per solve), %ld products M v (%.1fs), preconditioner %.1fs (setup %.1fs), NT %.1fs, total %.1fs\n",
+               it, S.ncg, it > 0 ? S.ncg / (2.0 * it) : 0.0, S.nmv, S.t_mv, S.t_prec, S.t_setup, S.t_nt, R->t_total);
     if (yout) for (int i = 0; i < m; i++) yout[i] = P->cs * P->d[i] * y[i];
     if (Xout) for (int k = 0; k < nb; k++) { const size_t len = blen(&S.b[k]); for (size_t i = 0; i < len; i++) Xout[k][i] = P->bs * S.b[k].X[i]; }
     /* free */
@@ -821,12 +877,12 @@ done:
         MB *b = &S.b[k];
         free(b->C); free(b->X); free(b->Z); free(b->dX); free(b->dZ); free(b->dXa); free(b->dZa); free(b->Rd); free(b->E0); free(b->Rc);
         free(b->W); free(b->dg); free(b->ev); free(b->dv); free(b->L); free(b->G); free(b->Y); free(b->T1); free(b->T2); free(b->T3);
-        free(b->Q); free(b->wt); free(b->colp); free(b->crow); free(b->ccon); free(b->cval); free(b->work); free(b->iwork);
+        free(b->Q); free(b->wt); free(b->Zc); free(b->colp); free(b->crow); free(b->ccon); free(b->cval); free(b->work); free(b->iwork);
         free(S.pos[k]);
     }
     prec_free_outl(&S);
     free(S.b); free(S.pos); free(S.Dg); free(S.Dgi); free(S.cap); free(S.lamp); free(S.ipiv); free(S.capwork); free(S.tk); free(S.tk2);
-    fom_gram_free(S.G);
+    if (S.G) fom_gram_free(S.G);
     free(y); free(dy); free(dya); free(Rp); free(h); free(tmp); free(tmp2); free(Xs); free(dXs); free(Ts); free(dXas);
     (void)tot_cg; (void)DMONE;
     return 0;

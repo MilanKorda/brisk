@@ -63,6 +63,9 @@ struct SChol {
     double tinypiv;                  /* > 0: pivots below tinypiv * original diagonal are
                                       * replaced by a huge value (that direction is dropped) */
     int ntiny;
+    double dynpiv;                   /* > 0 (signed factorization): a pivot of the wrong sign is replaced by
+                                      * sign * dynpiv and counted, instead of failing */
+    int ndyn;
     double *mval;                    /* compact copy of the M values (valid if mval_ok) */
     int mval_ok;
     int *mrun, nrun;                 /* runs of consecutive rows in the off-diagonal pattern: (q0, i0, len) triples (4.20) */
@@ -108,6 +111,15 @@ static int cmp_i(const void *a, const void *b) { return *(const int *)a - *(cons
  * only to be rejected (e_moment_stable_17: 0.8 s per analysis) */
 static double g_flopcap = 0;
 void schol_set_flopcap(double cap) { g_flopcap = cap; }
+/* the ordering mode of the next analyses (BRISK_AMD: 0 own, 1 automatic, 2 AMD alone); returns the previous one (-1: not yet set) */
+static int g_amd;
+int schol_set_amd(int mode) { const int old = g_amd; g_amd = mode; return old; }
+/* AMD's dense-row parameter for the next analyses (0: its default, 10): rows with more than this times sqrt(n) entries are ordered last */
+static double g_amd_dense = 0;
+/* an ordering given by the caller for the next analysis in AMD mode (perm[new] = old; NULL: AMD) */
+static const int *g_force_perm = NULL;
+void schol_set_perm(const int *perm) { g_force_perm = perm; }
+void schol_set_amd_dense(double d) { g_amd_dense = d; }
 
 /* Minimum degree on supervariables. Nodes with identical closed neighbourhoods are
  * indistinguishable and are eliminated together (the Gram entries of one SOS multiplier,
@@ -509,8 +521,11 @@ static int schol_order_amd(int m, SAdj *adj, size_t fillcap, int **perm_out, int
     for (int i = 0; i < m; i++) { memcpy(Ai + Ap[i], adj[i].a, sizeof(int) * adj[i].n); Ap[i + 1] = Ap[i] + adj[i].n; }
     double Control[AMD_CONTROL], Info[AMD_INFO];
     amd_defaults(Control);
+    if (g_amd_dense != 0) Control[AMD_DENSE] = g_amd_dense;
     Control[AMD_AGGRESSIVE] = 1;
-    const int st = amd_order(m, Ap, Ai, P, Control, Info);
+    int st = AMD_OK;
+    if (g_force_perm) memcpy(P, g_force_perm, sizeof(int) * (size_t)m);       /* the caller's ordering */
+    else st = amd_order(m, Ap, Ai, P, Control, Info);
     free(Ap); free(Ai);
     if (st != AMD_OK && st != AMD_OK_BUT_JUMBLED) { free(P); return 1; }
     return schol_symb_perm(m, adj, fillcap, P, perm_out, cpat_len, cpat, flops_out, nnz_out);
@@ -621,6 +636,29 @@ static int schol_order_metis(int m, SAdj *adj, size_t fillcap, int **perm_out, i
 }
 #endif
 
+/* 5.5: the own nested dissection (nd.c); the order is kept when its factorization is cheaper than AMD's */
+int nd_order(int n, const int *xadj, const int *adjncy, int *perm);
+static int g_nd_try = 0, g_nd_used = 0;
+void schol_set_nd(int on) { g_nd_try = on; }
+int schol_nd_used(void) { return g_nd_used; }
+static int schol_order_nd(int m, SAdj *adj, size_t fillcap, int **perm_out, int **cpat_len,
+                          int ***cpat, double *flops_out, size_t *nnz_out) {
+    size_t nz = 0;
+    for (int i = 0; i < m; i++) nz += adj[i].n;
+    if (nz >= (size_t)INT32_MAX) return 1;
+    int *xadj = malloc(sizeof(int) * (m + 1)), *adjncy = malloc(sizeof(int) * (nz + 1)), *P = malloc(sizeof(int) * (m + 1));
+    if (!xadj || !adjncy || !P) { free(xadj); free(adjncy); free(P); return 1; }
+    size_t w = 0;
+    xadj[0] = 0;
+    for (int i = 0; i < m; i++) {
+        for (int q = 0; q < adj[i].n; q++) if (adj[i].a[q] != i) adjncy[w++] = adj[i].a[q];
+        xadj[i + 1] = (int)w;
+    }
+    const int st = nd_order(m, xadj, adjncy, P);
+    free(xadj); free(adjncy);
+    if (st) { free(P); return 1; }
+    return schol_symb_perm(m, adj, fillcap, P, perm_out, cpat_len, cpat, flops_out, nnz_out);
+}
 #ifdef HAVE_AMD
 static int g_amd_big = -1;
 #endif
@@ -634,6 +672,23 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
     if (g_amd < 0) { const char *e = getenv("BRISK_AMD"); g_amd = e ? atoi(e) : 1; }
     if (g_amd_big < 0) { const char *e = getenv("BRISK_AMDBIG"); g_amd_big = e ? atoi(e) : 20000; }
     if (g_amd == 2 && m >= 64 && !schol_order_amd(m, adj, fillcap, &perm, &plen, &pat, &flops, &nnz)) ord_ok = 1;
+    g_nd_used = 0;
+    /* (only where the factorization costs: the dissection itself takes the time of a few of them) */
+    if (ord_ok && g_nd_try && m >= 1000 && flops >= (getenv("BRISK_NDMINFLOPS") ? atof(getenv("BRISK_NDMINFLOPS")) : 2e8) && !g_force_perm) {
+        int *perm2 = NULL, *plen2 = NULL, **pat2 = NULL;
+        double flops2 = 0; size_t nnz2 = 0;
+        const double tm = (double)clock() / CLOCKS_PER_SEC;
+        const int rs = schol_order_nd(m, adj, (size_t)(1.2 * (double)nnz) + (size_t)m, &perm2, &plen2, &pat2, &flops2, &nnz2);
+        if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; nested dissection %s %.3g flops %zu nnz (%.2fs)]\n", m, flops, nnz, rs ? "failed/over" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - tm);
+        if (rs == 0 && flops2 < 0.9 * flops) {
+            for (int j = 0; j < m; j++) free(pat[j]);
+            free(pat); free(plen); free(perm);
+            perm = perm2; plen = plen2; pat = pat2; flops = flops2; nnz = nnz2; g_nd_used = 1;
+        } else if (rs == 0) {
+            for (int j = 0; j < m; j++) free(pat2[j]);
+            free(pat2); free(plen2); free(perm2);
+        }
+    }
     /* auto (4.22): AMD first (fast); on large patterns it is kept (TSSOS case2869: 0.89 against
      * 1.3 GF per factorization, and the own ordering took 1.6 s), on small ones the own
      * ordering runs as well, capped at AMD's fill, and the cheaper factorization wins */
@@ -1198,6 +1253,98 @@ static int panel_sign_uniform(const SChol *S, int j0, int w) {
 static int g_fstat = -1; static long g_nupd = 0, g_nsmall = 0; static double g_updfl = 0;
 void schol_fstat_print(void) { if (g_fstat > 0) printf("   [factor updates: %ld (%ld with tot*a < 256), %.2e update flops]\n", g_nupd, g_nsmall, g_updfl); }
 
+
+/* Cholesky of the w x w diagonal block (lower, leading dimension ld) with replacement of the
+ * pivots that are not positive (the dynamic regularization of the signed factorization) */
+static int chol_dyn_block(double *P, int ld, int w, double piv) {
+    int nrep = 0;
+    for (int c = 0; c < w; c++) {
+        double *col = P + (size_t)c * ld;
+        for (int k2 = 0; k2 < c; k2++) {
+            const double *ck = P + (size_t)k2 * ld;
+            const double f = ck[c];
+            if (f == 0) continue;
+            for (int r = c; r < w; r++) col[r] -= f * ck[r];
+        }
+        double d = col[c];
+        if (!(d > 0)) { d = piv; nrep++; }
+        const double l = sqrt(d), il = 1.0 / l;
+        col[c] = l;
+        for (int r = c + 1; r < w; r++) col[r] *= il;
+    }
+    return nrep;
+}
+/* dpotrf of the diagonal block of a panel; with dynpiv a failed factorization is repeated from a
+ * copy with replaced pivots. 0: done */
+static int panel_potrf_dyn(SChol *S, double *Pk, int nr, int w, double **buf, size_t *cap) {
+    int info = 0;
+    if (!(S->dynpiv > 0)) { BL(dpotrf_)("L", &w, Pk, &nr, &info); return info != 0; }
+    const size_t nw = (size_t)w * w;
+    if (nw > *cap) { *cap = 2 * nw; free(*buf); *buf = (double *)malloc(sizeof(double) * *cap); }
+    double *T = *buf;
+    for (int c = 0; c < w; c++) memcpy(T + (size_t)c * w + c, Pk + (size_t)c * nr + c, sizeof(double) * (size_t)(w - c));
+    BL(dpotrf_)("L", &w, Pk, &nr, &info);
+    if (info == 0) return 0;
+    for (int c = 0; c < w; c++) memcpy(Pk + (size_t)c * nr + c, T + (size_t)c * w + c, sizeof(double) * (size_t)(w - c));
+    const int nrep = chol_dyn_block(Pk, nr, w, S->dynpiv);
+#pragma omp atomic
+    S->ndyn += nrep;
+    return 0;
+}
+
+
+/* Signed Cholesky P = L S L' of the w x w diagonal block of a panel with columns of both signs
+ * (lower triangle, leading dimension ld; sg: the signs), by blocks: the diagonal block of SB columns
+ * by the column loop, the rows below by dtrsm and a sign scaling, the trailing update by two dsyrk
+ * (the positive and the negative columns). A pivot of the wrong sign is replaced by sign * dynpiv
+ * when dynpiv > 0 (counted in *nrep); otherwise 1 is returned. */
+#define SIGNED_SB 48
+static int signed_chol_blocked(double *P, int ld, int w, const signed char *sg, double dynpiv, int *nrep) {
+    double *buf = NULL;
+    if (w > 2 * SIGNED_SB && dynpiv > 0) buf = (double *)malloc(sizeof(double) * (size_t)w * SIGNED_SB);   /* (blocks for the cone solver; the column loop, as before, otherwise) */
+    const int sb = buf ? SIGNED_SB : w;
+    for (int j0 = 0; j0 < w; j0 += sb) {
+        const int jb = w - j0 < sb ? w - j0 : sb, j1 = j0 + jb;
+        for (int c = j0; c < j1; c++) {
+            double *col = P + (size_t)c * ld;
+            for (int k2 = j0; k2 < c; k2++) {
+                const double *ck = P + (size_t)k2 * ld;
+                const double f = ck[c] * sg[k2];
+                if (f == 0) continue;
+                for (int r = c; r < j1; r++) col[r] -= f * ck[r];
+            }
+            double d = col[c]; const double sc = sg[c];
+            if (!(d * sc > 0)) { if (!(dynpiv > 0)) { free(buf); return 1; } d = sc * dynpiv; (*nrep)++; }
+            const double l = sqrt(fabs(d)), il = 1.0 / (l * sc);
+            col[c] = l;
+            for (int r = c + 1; r < j1; r++) col[r] *= il;
+        }
+        const int below = w - j1;
+        if (below <= 0) continue;
+        double *L11 = P + (size_t)j0 * ld + j0, *P21 = P + (size_t)j0 * ld + j1;
+        BL(dtrsm_)("R", "L", "T", "N", &below, &jb, &DONE, L11, &ld, P21, &ld);
+        int npos = 0, nneg = 0;
+        for (int c = 0; c < jb; c++) {
+            double *col = P21 + (size_t)c * ld;
+            if (sg[j0 + c] < 0) { for (int r = 0; r < below; r++) col[r] = -col[r]; nneg++; } else npos++;
+        }
+        double *P22 = P + (size_t)j1 * ld + j1;
+        const double mone = -1.0, one = 1.0;
+        if (npos == jb) BL(dsyrk_)("L", "N", &below, &jb, &mone, P21, &ld, &one, P22, &ld);
+        else if (nneg == jb) BL(dsyrk_)("L", "N", &below, &jb, &one, P21, &ld, &one, P22, &ld);
+        else {
+            int a = 0;
+            for (int c = 0; c < jb; c++) if (sg[j0 + c] > 0) memcpy(buf + (size_t)(a++) * below, P21 + (size_t)c * ld, sizeof(double) * (size_t)below);
+            BL(dsyrk_)("L", "N", &below, &npos, &mone, buf, &below, &one, P22, &ld);
+            a = 0;
+            for (int c = 0; c < jb; c++) if (sg[j0 + c] < 0) memcpy(buf + (size_t)(a++) * below, P21 + (size_t)c * ld, sizeof(double) * (size_t)below);
+            BL(dsyrk_)("L", "N", &below, &nneg, &one, buf, &below, &one, P22, &ld);
+        }
+    }
+    free(buf);
+    return 0;
+}
+
 /* Blocked Cholesky of a column panel (nr x w, leading dimension ld, lower part used) with
  * tiny-pivot replacement (4.20): a pivot that has lost all but tinypiv of its original
  * diagonal d0[c] becomes 1e128 and its column of L is zeroed. Diagonal blocks of nb
@@ -1366,7 +1513,7 @@ static int schol_factor_ll(SChol *S, double shift) {
             j = jnext;
         }
         /* factor the panel */
-        int info = 0, neg = 0;
+        int neg = 0;
         if (S->sgn) for (int c = 0; c < w; c++) if (S->sgn[j0 + c] < 0) { neg = 1; break; }
         int rest = nr - w;
         if (!neg && S->tinypiv > 0) {
@@ -1395,8 +1542,7 @@ static int schol_factor_ll(SChol *S, double shift) {
                 for (int r = c + 1; r < nr; r++) col[r] *= il;
             }
         } else if (!neg) {
-            BL(dpotrf_)("L", &w, Pk, &nr, &info);
-            if (info != 0) return 1;
+            if (panel_potrf_dyn(S, Pk, nr, w, &S->sw, &S->swcap)) return 1;
             if (rest > 0)
                 BL(dtrsm_)("R", "L", "T", "N", &rest, &w, &DONE, Pk, &nr, Pk + w, &nr);
         } else if (panel_sign_uniform(S, j0, w) < 0) {
@@ -1404,27 +1550,13 @@ static int schol_factor_ll(SChol *S, double shift) {
              * factor as the signed column loop (l_cc = sqrt(|d|), L_rc = -P_rc / l_cc), at
              * the BLAS rate (the loop made the bordered factorization 2.3x slower) */
             for (int c = 0; c < w; c++) { double *col = Pk + (size_t)c * nr; for (int r = c; r < nr; r++) col[r] = -col[r]; }
-            BL(dpotrf_)("L", &w, Pk, &nr, &info);
-            if (info != 0) return 1;
+            if (panel_potrf_dyn(S, Pk, nr, w, &S->sw, &S->swcap)) return 1;
             if (rest > 0) BL(dtrsm_)("R", "L", "T", "N", &rest, &w, &DONE, Pk, &nr, Pk + w, &nr);
         } else {
             /* signed column Cholesky of the whole panel: l_cc = sqrt(|d|), sign prescribed */
             /* diagonal block by the column loop, the rows below by one dtrsm and a column
              * sign scaling: P21 = L21 S L11' gives L21 = P21 L11^{-T} S */
-            for (int c = 0; c < w; c++) {
-                double *col = Pk + (size_t)c * nr;
-                for (int k2 = 0; k2 < c; k2++) {
-                    const double *ck = Pk + (size_t)k2 * nr;
-                    const double f = ck[c] * S->sgn[j0 + k2];
-                    if (f == 0) continue;
-                    for (int r = c; r < w; r++) col[r] -= f * ck[r];
-                }
-                const double d = col[c], sc = S->sgn[j0 + c];
-                if (!(d * sc > 0)) return 1;
-                const double l = sqrt(fabs(d)), il = 1.0 / (l * sc);
-                col[c] = l;
-                for (int r = c + 1; r < w; r++) col[r] *= il;
-            }
+            { int nrep = 0; if (signed_chol_blocked(Pk, nr, w, S->sgn + j0, S->dynpiv, &nrep)) return 1; S->ndyn += nrep; }
             if (rest > 0) {
                 /* L11 (lower part of the diagonal block) copied to a square buffer */
                 size_t nw = (size_t)w * w;
@@ -1470,7 +1602,7 @@ static int (*const BL(openblas_get_num_threads))(void) = 0;
 extern void BL(openblas_set_num_threads)(int) __attribute__((weak));
 extern int BL(openblas_get_num_threads)(void) __attribute__((weak));
 #endif
-typedef struct { int *relind; double *upd; size_t updcap; double *sw; size_t swcap; } FScr;
+typedef struct { int *relind; double *upd; size_t updcap; double *sw; size_t swcap; double *ib; size_t ibcap; double *br; size_t brcap; double *bc; size_t bccap; double *ism; size_t ismcap; } FScr;
 static FScr *g_fscr = NULL; static int g_nfscr = 0, g_fscr_m = 0;
 static int g_fpar = -1;             /* BRISK_FACTLL=1: the previous left-looking code */
 static double g_fcut = -1;
@@ -1483,7 +1615,7 @@ static FScr *fscr_get(void) {
 }
 static void fscr_ensure(int nt, int m) {
     if (nt > g_nfscr || m > g_fscr_m) {
-        for (int t = 0; t < g_nfscr; t++) { free(g_fscr[t].relind); free(g_fscr[t].upd); free(g_fscr[t].sw); }
+        for (int t = 0; t < g_nfscr; t++) { free(g_fscr[t].relind); free(g_fscr[t].upd); free(g_fscr[t].sw); free(g_fscr[t].ib); free(g_fscr[t].br); free(g_fscr[t].bc); free(g_fscr[t].ism); }
         free(g_fscr);
         g_nfscr = nt > g_nfscr ? nt : g_nfscr; g_fscr_m = m > g_fscr_m ? m : g_fscr_m;
         g_fscr = sx(sizeof(FScr) * g_nfscr);
@@ -1529,6 +1661,8 @@ static void sc_build_tree(SChol *S) {
     free(cnt);
 }
 /* updates of target k from all its sources, restricted to local rows [R0, R1) */
+#define SMALL_CB 256
+#define BATCH_K 512
 static void fnode_upd(SChol *S, int k, int R0, int R1, FScr *w) {
     const int j0 = S->ss[k], nr = S->pnr[k];
     const int *rw = S->prow + S->prp[k];
@@ -1536,6 +1670,8 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, FScr *w) {
     int *relind = w->relind;
     for (int q = 0; q < nr; q++) relind[rw[q]] = q;
     const double mone = -1.0;
+    int *small = NULL, nsmall = 0, *batch = NULL, nbatch = 0, nbcols = 0;
+    const int wk = S->ss[k + 1] - j0;
     for (int u = S->ul_ptr[k]; u < S->ul_ptr[k + 1]; u++) {
         const int j = S->ul_j[u], p = S->ul_p[u], a = S->ul_a[u];
         const int nrj = S->pnr[j], wj = S->ss[j + 1] - S->ss[j], tot = nrj - p;
@@ -1562,8 +1698,30 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, FScr *w) {
         }
         const int r0 = relind[rwj[q0]], c0 = rwj[0];
         int contig = (rwj[a - 1] == c0 + a - 1) && (relind[rwj[q1 - 1]] == r0 + nq - 1);
+        /* a source of a few columns that is dense into the target tile: its columns go to a batch
+         * and the whole batch is one dgemm (a dense block of order w fed by thousands of rows of
+         * the data: 20,000 rank-one updates of a 200 x 200 block cost 0.2 s as scatter or as
+         * dgemm with k = 1, and 0.01 s as one product) */
+        if (wj <= 4 && S->dynpiv > 0 && a >= 8 && nq >= 8 && (double)a * nq >= 0.08 * (double)wk * (R1 - R0)) {
+            if (!batch) batch = (int *)fscr_buf(&w->ib, &w->ibcap, 4 * (size_t)(S->ul_ptr[k + 1] - S->ul_ptr[k]) + 8);
+            batch[4 * nbatch] = u; batch[4 * nbatch + 1] = q0; batch[4 * nbatch + 2] = q1; batch[4 * nbatch + 3] = 0;
+            nbatch++; nbcols += wj;
+            continue;
+        }
         if (contig) {
             BL(dgemm_)("N", "T", &nq, &a, &wj, &mone, U + q0, &nrj, V, &ldv, &DONE, Pk + (size_t)(c0 - j0) * nr + r0, &nr);
+            continue;
+        }
+        if (wj <= 4 && S->dynpiv > 0) {
+            /* (the cone solver's factorizations only: the order of the updates, and so the rounding, of
+             * the SDP solver's factorizations is left as it was)
+             * a few columns: the update straight into the target (lower part only), without the
+             * product and its scatter (a linear variable, or a variable and its row, in the cone
+             * solver's systems: tens of thousands of such updates of a few hundred rows each).
+             * They are done after the loop, by blocks of target columns. */
+            if (!small) { small = (int *)fscr_buf(&w->ism, &w->ismcap, 2 * (size_t)(S->ul_ptr[k + 1] - S->ul_ptr[k]) + 2); }
+            small[4 * nsmall] = u; small[4 * nsmall + 1] = q0; small[4 * nsmall + 2] = q1; small[4 * nsmall + 3] = 0;
+            nsmall++;
             continue;
         }
         double *upd = fscr_buf(&w->upd, &w->updcap, (size_t)nq * a);
@@ -1572,6 +1730,79 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, FScr *w) {
             double *dst = Pk + (size_t)(rwj[cc] - j0) * nr;
             const double *src = upd + (size_t)cc * nq;
             for (int q = (q0 > cc ? q0 : cc); q < q1; q++) dst[relind[rwj[q]]] -= src[q - q0];
+        }
+    }
+    if (nsmall) {
+        /* the small sources, by blocks of target columns: the block of the target (rows of the tile
+         * x SMALL_CB columns) stays in the cache while the sources pass over it (the scatter into a
+         * wide panel was bound by the memory: 4 ns per entry on the dense block of a lasso problem) */
+        const int wk = S->ss[k + 1] - j0;
+        const int cbw = (double)(R1 - R0) * wk * 8.0 > 1.5e6 ? SMALL_CB : wk;
+        for (int cb0 = 0; cb0 < wk; cb0 += cbw) {
+            const int chi = j0 + (cb0 + cbw < wk ? cb0 + cbw : wk);          /* target columns below chi */
+            for (int t = 0; t < nsmall; t++) {
+                int *e = small + 4 * t;
+                const int u = e[0], q0 = e[1], q1 = e[2];
+                const int j = S->ul_j[u], p = S->ul_p[u], a = S->ul_a[u];
+                int cc = e[3];
+                if (cc >= a) continue;
+                const int nrj = S->pnr[j], wj = S->ss[j + 1] - S->ss[j];
+                const int *rwj = S->prow + S->prp[j] + p;
+                if (rwj[cc] >= chi) continue;
+                const double *U = S->pan + S->pbase[j] + p;
+                const double *U1 = U + nrj, *U2 = U + 2 * (size_t)nrj, *U3 = U + 3 * (size_t)nrj;
+                double sg[4] = { 1.0, 1.0, 1.0, 1.0 };
+                if (S->sgn) for (int c = 0; c < wj; c++) sg[c] = S->sgn[S->ss[j] + c];
+                for (; cc < a && rwj[cc] < chi; cc++) {
+                    double *dst = Pk + (size_t)(rwj[cc] - j0) * nr;
+                    const int qs = q0 > cc ? q0 : cc;
+                    const double f0 = sg[0] * U[cc];
+                    if (wj == 1) {
+                        if (f0 == 0) continue;
+                        for (int q = qs; q < q1; q++) dst[relind[rwj[q]]] -= f0 * U[q];
+                    } else if (wj == 2) {
+                        const double f1 = sg[1] * U1[cc];
+                        for (int q = qs; q < q1; q++) dst[relind[rwj[q]]] -= f0 * U[q] + f1 * U1[q];
+                    } else if (wj == 3) {
+                        const double f1 = sg[1] * U1[cc], f2 = sg[2] * U2[cc];
+                        for (int q = qs; q < q1; q++) dst[relind[rwj[q]]] -= f0 * U[q] + f1 * U1[q] + f2 * U2[q];
+                    } else {
+                        const double f1 = sg[1] * U1[cc], f2 = sg[2] * U2[cc], f3 = sg[3] * U3[cc];
+                        for (int q = qs; q < q1; q++) dst[relind[rwj[q]]] -= f0 * U[q] + f1 * U1[q] + f2 * U2[q] + f3 * U3[q];
+                    }
+                }
+                e[3] = cc;
+            }
+        }
+    }
+    if (nbatch) {
+        /* the batch: Urow (tile rows x K) and Ucol (w x K) zero-padded, signs on Ucol, one dgemm per
+         * chunk of K <= BATCH_K columns: P[R0:R1, :] -= Urow Ucol' */
+        const int ntile = R1 - R0;
+        int t = 0;
+        while (t < nbatch) {
+            int K = 0, t1 = t;
+            while (t1 < nbatch && K + (S->ss[S->ul_j[batch[4 * t1]] + 1] - S->ss[S->ul_j[batch[4 * t1]]]) <= BATCH_K) { K += S->ss[S->ul_j[batch[4 * t1]] + 1] - S->ss[S->ul_j[batch[4 * t1]]]; t1++; }
+            if (t1 == t) { K = S->ss[S->ul_j[batch[4 * t]] + 1] - S->ss[S->ul_j[batch[4 * t]]]; t1 = t + 1; }
+            double *Ur = fscr_buf(&w->br, &w->brcap, (size_t)ntile * K), *Uc = fscr_buf(&w->bc, &w->bccap, (size_t)wk * K);
+            memset(Ur, 0, sizeof(double) * (size_t)ntile * K); memset(Uc, 0, sizeof(double) * (size_t)wk * K);
+            int col = 0;
+            for (int b_ = t; b_ < t1; b_++) {
+                const int u = batch[4 * b_], q0 = batch[4 * b_ + 1], q1 = batch[4 * b_ + 2];
+                const int j = S->ul_j[u], p = S->ul_p[u], a = S->ul_a[u];
+                const int nrj = S->pnr[j], wj = S->ss[j + 1] - S->ss[j];
+                const int *rwj = S->prow + S->prp[j] + p;
+                const double *U = S->pan + S->pbase[j] + p;
+                for (int c = 0; c < wj; c++, col++) {
+                    const double *Uj = U + (size_t)c * nrj;
+                    const double sg = S->sgn ? (double)S->sgn[S->ss[j] + c] : 1.0;
+                    double *ur = Ur + (size_t)col * ntile, *uc = Uc + (size_t)col * wk;
+                    for (int q = q0; q < q1; q++) ur[relind[rwj[q]] - R0] = Uj[q];
+                    for (int cc = 0; cc < a; cc++) uc[rwj[cc] - j0] = sg * Uj[cc];
+                }
+            }
+            BL(dgemm_)("N", "T", &ntile, &wk, &K, &mone, Ur, &ntile, Uc, &wk, &DONE, Pk + R0, &nr);
+            t = t1;
         }
     }
 }
@@ -1626,7 +1857,7 @@ static int fpanel_tiled(double *P, int nr, int w, int par) {
 static int fnode_factor(SChol *S, int k, FScr *wsc, int par) {
     const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k], rest = nr - w;
     double *Pk = S->pan + S->pbase[k];
-    int info = 0, neg = 0;
+    int neg = 0;
     if (S->sgn) for (int c = 0; c < w; c++) if (S->sgn[j0 + c] < 0) { neg = 1; break; }
     if (!neg && S->tinypiv > 0) {
         const double *P0 = S->pmat + S->pbase[k];
@@ -1657,27 +1888,18 @@ static int fnode_factor(SChol *S, int k, FScr *wsc, int par) {
     const int uni = neg ? panel_sign_uniform(S, j0, w) : 1;
     if (uni != 0) {
         if (uni < 0) for (int c = 0; c < w; c++) { double *col = Pk + (size_t)c * nr; for (int r = c; r < nr; r++) col[r] = -col[r]; }
-        if (w > FB_NB) return fpanel_tiled(Pk, nr, w, par);
-        BL(dpotrf_)("L", &w, Pk, &nr, &info);
-        if (info != 0) return 1;
+        if (w > FB_NB && !(S->dynpiv > 0)) return fpanel_tiled(Pk, nr, w, par);
+        if (panel_potrf_dyn(S, Pk, nr, w, &wsc->sw, &wsc->swcap)) return 1;
         if (rest > 0) BL(dtrsm_)("R", "L", "T", "N", &rest, &w, &DONE, Pk, &nr, Pk + w, &nr);
         return 0;
     }
-    /* mixed signs: signed column Cholesky (as in the left-looking code) */
-    for (int c = 0; c < w; c++) {
-        double *col = Pk + (size_t)c * nr;
-        for (int k2 = 0; k2 < c; k2++) {
-            const double *ck = Pk + (size_t)k2 * nr;
-            const double f = ck[c] * S->sgn[j0 + k2];
-            if (f == 0) continue;
-            for (int r = c; r < w; r++) col[r] -= f * ck[r];
-        }
-        const double d = col[c], sc = S->sgn[j0 + c];
-        if (!(d * sc > 0)) return 1;
-        const double l = sqrt(fabs(d)), il = 1.0 / (l * sc);
-        col[c] = l;
-        for (int r = c + 1; r < w; r++) col[r] *= il;
-    }
+    /* mixed signs: signed Cholesky by blocks */
+    { int nrep = 0;
+      if (signed_chol_blocked(Pk, nr, w, S->sgn + j0, S->dynpiv, &nrep)) return 1;
+      if (nrep) {
+#pragma omp atomic
+          S->ndyn += nrep;
+      } }
     if (rest > 0) {
         double *T = fscr_buf(&wsc->sw, &wsc->swcap, (size_t)w * w);
         for (int c = 0; c < w; c++)
@@ -1688,7 +1910,6 @@ static int fnode_factor(SChol *S, int k, FScr *wsc, int par) {
             if (sc < 0) { double *col = Pk + (size_t)c * nr + w; for (int r = 0; r < rest; r++) col[r] = -col[r]; }
         }
     }
-    (void)info;
     return 0;
 }
 
@@ -2301,10 +2522,13 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
 
 static size_t g_solve_blas = 0;     /* panels above this many entries use BLAS in the solve */
 /* solve M x = b in place (original indexing) */
+/* 1: single right-hand sides by the sequential supernode loops (the cone solver: 1.2 to 1.5 times faster on one thread) */
+static int g_solve_seq = 0;
+void schol_set_solve_seq(int on) { g_solve_seq = on; }
 void schol_solve(const SChol *S, double *b, double *work) {
     if (!S->pan) { static int w = 0; if (!w++) fprintf(stderr, "brisk: internal: sparse solve without a factor\n"); memset(b, 0, sizeof(double) * S->m); return; }
     if (g_tps < 0) g_tps = getenv("BRISK_SOLVEOLD") == NULL;
-    if (g_tps && S->spar) { schol_solve_tp(S, b, 1); return; }
+    if (g_tps && S->spar && !g_solve_seq) { schol_solve_tp(S, b, 1); return; }
     const int m = S->m;
     double *x = work;
     for (int i = 0; i < m; i++) x[i] = b[S->perm[i]];
@@ -2326,6 +2550,13 @@ void schol_solve(const SChol *S, double *b, double *work) {
             }
             continue;
         }
+        if (w == 1) {                                                /* one column: scatter directly (no pass over t) */
+            const double xc = xs[0] / Pk[0];
+            xs[0] = xc;
+            const double *restrict lo = Pk + 1; const int *restrict rwr = rw + 1;
+            for (int q = 0; q < rest; q++) x[rwr[q]] -= lo[q] * xc;
+            continue;
+        }
         for (int q = 0; q < rest; q++) t[q] = 0;
         for (int c = 0; c < w; c++) {
             const double *restrict col = Pk + (size_t)c * nr;
@@ -2343,6 +2574,13 @@ void schol_solve(const SChol *S, double *b, double *work) {
         const int *rw = S->prow + S->prp[k];
         const double *restrict Pk = S->pan + S->pbase[k];
         double *restrict xs = x + j0;
+        if (w == 1 && (size_t)nr <= g_solve_blas) {                 /* one column: the dot directly */
+            double v = xs[0];
+            const double *restrict lo = Pk + 1; const int *restrict rwr = rw + 1;
+            for (int q = 0; q < rest; q++) v -= lo[q] * x[rwr[q]];
+            xs[0] = v / Pk[0];
+            continue;
+        }
         for (int q = 0; q < rest; q++) t[q] = x[rw[w + q]];
         if ((size_t)w * nr > g_solve_blas) {
             double mone = -1.0;
@@ -2580,7 +2818,10 @@ double schol_logdet(const SChol *S) {
     return 2.0 * ld;
 }
 long schol_uid(const SChol *S) { return S ? S->uid : 0; }
+const int *schol_perm(const SChol *S) { return S->perm; }      /* perm[new] = old */
 void schol_set_tinypiv(SChol *S, double t) { S->tinypiv = t; S->ntiny = 0; }
+void schol_set_dynpiv(SChol *S, double p) { S->dynpiv = p; S->ndyn = 0; }
+int schol_ndyn(const SChol *S) { return S->ndyn; }
 int schol_ntiny(const SChol *S) { return S->ntiny; }
 size_t schol_nnz(const SChol *S) { return S ? S->nnz : 0; }
 int schol_nsuper(const SChol *S) { return S ? S->ns : 0; }

@@ -2,6 +2,7 @@
  *
  *   [y, X, Z, info] = brisk_mex(filename, args)
  *   [y, X, Z, info] = brisk_mex(m, blocksizes, b, T, args)
+ *   [x, y, z, info] = brisk_mex('sedumi', A, b, c, Kf, Kl, Kq, Kr, Ks, args)
  *
  * filename   an SDPA sparse file (.dat-s)
  * m          number of constraints
@@ -15,6 +16,9 @@
  * Problem solved (BRISK convention):
  *   (P) min <C,X> s.t. <A_i,X> = b_i, X in K     (D) max b'y s.t. C - sum_i y_i A_i = Z in K
  * Outputs: y (m x 1); X, Z cell arrays (SDP block: n x n; LP block: n x 1); info struct.
+ * 'sedumi': the problem in SeDuMi format, min c'x s.t. A x = b, x in K: A sparse m x n, the
+ * cone as K.f, K.l (scalars) and K.q, K.r, K.s (vectors of dimensions); x, y and z = c - A'y
+ * are returned. Problems without semidefinite blocks go to the second-order cone solver.
  * The MATLAB wrappers brisk_sdpa.m and brisk_sedumi.m build these arguments.
  *
  * The data goes to brisk_run_data in memory (4.39; until 4.38 a temporary SDPA file) and is
@@ -28,6 +32,7 @@
 #include <unistd.h>
 #define BRISK_NO_IO_MACROS
 #include "brisk.h"
+#include "sedumi.h"
 
 static int g_silent = 0;
 static int mex_print(const char *s, int is_err) { if (!g_silent || is_err) mexPrintf("%s", s); return 0; }
@@ -103,8 +108,92 @@ static mxArray *block_cell(const BriskResult *r, double **B) {
     return c;
 }
 
+static int *int_list(const mxArray *a, int *n, const char *name) {
+    if (!mxIsDouble(a) || mxIsComplex(a) || mxIsSparse(a)) { char msg[128]; snprintf(msg, sizeof msg, "brisk_mex: %s must be a real full vector", name); fail("brisk:input", msg); }
+    const size_t k = mxGetNumberOfElements(a);
+    int *v = mxCalloc(k + 1, sizeof(int)); int c = 0;
+    for (size_t i = 0; i < k; i++) if (mxGetPr(a)[i] > 0) v[c++] = (int)mxGetPr(a)[i];
+    *n = c;
+    return v;
+}
+/* [x, y, z, info] = brisk_mex('sedumi', A, b, c, Kf, Kl, Kq, Kr, Ks, args) */
+static void mex_sedumi(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
+    if (nrhs < 9 || nrhs > 10) fail("brisk:input", "brisk_mex: usage brisk_mex('sedumi', A, b, c, Kf, Kl, Kq, Kr, Ks, args)");
+    const mxArray *A = prhs[1];
+    if (!mxIsSparse(A) || !mxIsDouble(A) || mxIsComplex(A)) fail("brisk:input", "brisk_mex: A must be a real sparse matrix");
+    SedumiProb P; memset(&P, 0, sizeof P);
+    P.m = (int)mxGetM(A); P.n = (int)mxGetN(A);
+    if ((int)mxGetNumberOfElements(prhs[2]) != P.m || (int)mxGetNumberOfElements(prhs[3]) != P.n || mxIsSparse(prhs[2]) || mxIsSparse(prhs[3]) || !mxIsDouble(prhs[2]) || !mxIsDouble(prhs[3]))
+        fail("brisk:input", "brisk_mex: b and c must be full real vectors matching A");
+    const mwIndex *jc = mxGetJc(A), *ir = mxGetIr(A);
+    const size_t nnz = (size_t)jc[P.n];
+    P.Ap = mxCalloc((size_t)P.n + 2, sizeof(int)); P.Ai = mxCalloc(nnz + 1, sizeof(int));
+    for (int j = 0; j <= P.n; j++) P.Ap[j] = (int)jc[j];
+    for (size_t p = 0; p < nnz; p++) P.Ai[p] = (int)ir[p];
+    P.Ax = mxGetPr(A); P.b = mxGetPr(prhs[2]); P.c = mxGetPr(prhs[3]);
+    P.nf = (int)scalar_arg(prhs[4], "K.f"); P.nl = (int)scalar_arg(prhs[5], "K.l");
+    P.q = int_list(prhs[6], &P.nq, "K.q"); P.r = int_list(prhs[7], &P.nr, "K.r"); P.s = int_list(prhs[8], &P.ns, "K.s");
+    long tot = (long)P.nf + P.nl;
+    for (int k = 0; k < P.nq; k++) tot += P.q[k];
+    for (int k = 0; k < P.nr; k++) { if (P.r[k] < 2) fail("brisk:input", "brisk_mex: a rotated cone (K.r) has at least 2 entries"); tot += P.r[k]; }
+    for (int k = 0; k < P.ns; k++) tot += (long)P.s[k] * P.s[k];
+    if (P.nf < 0 || P.nl < 0 || tot != P.n) fail("brisk:input", "brisk_mex: K does not match the number of columns of A");
+    int nargs = 0;
+    const mxArray *acell = nrhs == 10 ? prhs[9] : NULL;
+    if (acell) { if (!mxIsCell(acell)) fail("brisk:input", "brisk_mex: args must be a cell array of strings"); nargs = (int)mxGetNumberOfElements(acell); }
+    char **argv = mxCalloc((size_t)nargs + 2, sizeof(char *));
+    int na = 0;
+    g_silent = 0;
+    for (int i = 0; i < nargs; i++) {
+        const mxArray *e = mxGetCell(acell, (mwIndex)i);
+        if (!e || !mxIsChar(e)) fail("brisk:input", "brisk_mex: every element of args must be a string");
+        char *s = mxArrayToString(e);
+        if (!strcmp(s, "-silent")) { g_silent = 1; mxFree(s); continue; }
+        argv[na++] = s;
+    }
+    if (g_silent) argv[na++] = "-q";
+    SedumiRes R;
+    brisk_print_hook = mex_print;
+    const int rc = brisk_run_sedumi(&P, na, argv, &R);
+    brisk_print_hook = NULL;
+    if (rc < 0 || R.status < 0) {
+        sedumi_result_free(&R);
+        if (rc < 0) mexErrMsgIdAndTxt("brisk:aborted", "BRISK stopped (code %d): an invalid option or out of memory; see the messages above", -rc == 1000 ? 0 : -rc);
+        mexErrMsgIdAndTxt("brisk:input", "BRISK could not solve the problem (code %d): see the messages above", rc);
+    }
+    const int have_x = P.ns == 0 || R.have_x;
+    plhs[0] = mxCreateDoubleMatrix((mwSize)P.n, 1, mxREAL);
+    if (R.x && have_x) memcpy(mxGetPr(plhs[0]), R.x, sizeof(double) * (size_t)P.n);
+    if (nlhs > 1) { plhs[1] = mxCreateDoubleMatrix((mwSize)P.m, 1, mxREAL); if (R.y) memcpy(mxGetPr(plhs[1]), R.y, sizeof(double) * (size_t)P.m); }
+    if (nlhs > 2) { plhs[2] = mxCreateDoubleMatrix((mwSize)P.n, 1, mxREAL); if (R.z) memcpy(mxGetPr(plhs[2]), R.z, sizeof(double) * (size_t)P.n); }
+    if (nlhs > 3) {
+        const char *fields[] = { "status", "statuscode", "exitcode", "iter", "pobj", "dobj", "dimacs", "time", "have_x", "version" };
+        mxArray *info = mxCreateStructMatrix(1, 1, 10, fields);
+        mxSetField(info, 0, "status", mxCreateString(R.status_str));
+        mxSetField(info, 0, "statuscode", mxCreateDoubleScalar(R.status));
+        mxSetField(info, 0, "exitcode", mxCreateDoubleScalar(rc));
+        mxSetField(info, 0, "iter", mxCreateDoubleScalar(R.iters));
+        mxSetField(info, 0, "pobj", mxCreateDoubleScalar(R.pobj));
+        mxSetField(info, 0, "dobj", mxCreateDoubleScalar(R.dobj));
+        mxArray *d = mxCreateDoubleMatrix(1, 6, mxREAL);
+        for (int e = 0; e < 6; e++) mxGetPr(d)[e] = R.err[e];
+        mxSetField(info, 0, "dimacs", d);
+        mxSetField(info, 0, "time", mxCreateDoubleScalar(R.time));
+        mxSetField(info, 0, "have_x", mxCreateDoubleScalar(have_x));
+        mxSetField(info, 0, "version", mxCreateString(BRISK_VERSION));
+        plhs[3] = info;
+    }
+    sedumi_result_free(&R);
+}
+
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     const mxArray *acell = NULL;
+    if (nrhs > 2 && mxIsChar(prhs[0])) {
+        char *mode = mxArrayToString(prhs[0]);
+        const int sd = mode && !strcmp(mode, "sedumi");
+        mxFree(mode);
+        if (sd) { mex_sedumi(nlhs, plhs, nrhs, prhs); return; }
+    }
     char *fname = NULL;
     int own_file = 0;
     if (nrhs >= 1 && mxIsChar(prhs[0])) {

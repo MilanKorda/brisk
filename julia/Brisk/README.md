@@ -99,6 +99,22 @@ Brisk.write_sdpa("same.dat-s", m, blocksizes, c, mat, blk, i, j, v)
 (D) max b'y s.t. C − Σ y_i A_i = Z ∈ K, with C = −F0, A_i = F_i and b = c of the SDPA
 file. The SDPA x is −y, and "primal/dual infeasible" refer to (P)/(D).
 
+**SeDuMi format; linear and second-order cone programs.**
+
+```julia
+using SparseArrays
+# min c'x  s.t.  A x = b,  x in K;  K: f free, l nonnegative, q second-order cones, r rotated cones, s PSD blocks
+r = Brisk.solve_sedumi(sparse([1.0 1 0 0; 0 0 1 0]), [2.0, 1.0], [1.0, 0, 0, 1], (l = 1, q = [3]))
+r.status, r.status_string, r.primal_objective, r.dual_objective, r.x, r.y, r.z, r.dimacs
+r = Brisk.solve_sedumi("problem.mat")        # a MAT-file with A (or At), b, c, K
+```
+
+Without semidefinite blocks the problem is solved by BRISK's cone solver; with them, or with
+`conesolver = 0`, `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm`, by the semidefinite
+solver (second-order cones as arrow blocks). In JuMP, `SecondOrderCone` and
+`RotatedSecondOrderCone` constraints are supported; a model without PSD constraints goes to
+the cone solver (`set_attribute(model, "conesolver", 0)` forces the semidefinite solver).
+
 **Very large chordal problems.** When BRISK decomposes a large sparse block into cliques
 (AC-OPF relaxations), the dense `X` and `Z` of that block are returned only if they fit in
 memory. Above 30% of the memory, `X` is `nothing`, the large blocks of `Z` are empty matrices,
