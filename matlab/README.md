@@ -10,7 +10,7 @@ verification of the returned point on the data as given).
 2. In MATLAB, once: `mex -setup C` (it should find Xcode's clang).
 3. In MATLAB:
    ```matlab
-   cd brisk-1.2.1/matlab
+   cd brisk-1.3.2/matlab
    build_brisk_mex            % about a minute; produces brisk_mex.mexmaca64
    test_brisk                 % every line should say PASS
    addpath(pwd); savepath     % keep it on the path
@@ -84,7 +84,8 @@ Y psd`. `F` is the SDPA-M cell array `F{k, i+1}` (block `k` of `F_i`; LP blocks 
 ### Options
 
 ```matlab
-opts.verbose   = 0;          % 0 quiet (default), 1 summary, 2 iteration log
+opts.verbose   = 0;          % 0 quiet (default), 1 summary, 2 iteration log; the log ends with how to get
+                             % more accuracy and a guaranteed bound, as fields of opts (opts.prec = 'dd', ...)
 opts.acc       = 'high';     % 'low' | 'default' | 'high'  (1e-6 / 1e-8 / 1e-10)
 opts.tol       = 1e-9;       % overrides acc
 opts.maxit     = 200;

@@ -232,6 +232,7 @@ static int cmp_pair(const void *a, const void *b) {
  * phase II preconditioner from the diagonal of the projection's Jacobian); NULL: A A* */
 static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int verbose, double *t_gram);
 Gram *fom_gram_build(const Problem *P, int verbose, double *t_gram) { return gram_build(P, NULL, 0.0, verbose, t_gram); }
+int g_fom_gram_nofit = 0;     /* 5.7: set when fom_gram_build returned NULL because the factor does not fit in memory */
 static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int verbose, double *t_gram) {
     const double t0 = wtime();
     const int m = P->m;
@@ -317,6 +318,13 @@ static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int v
     /* regularization: the rows may be dependent (a tiny multiple of the diagonal) */
     double dmax = 0; for (int i = 0; i < m; i++) dmax = fmax(dmax, diag[i]);
     G->reg = 1e-12 * (dmax > 0 ? dmax : 1.0) + shift;
+    /* 5.7: a Gram matrix whose factor does not fit in memory (the truss problem tru15, m = 25,200:
+     * A A' has a sparse factor of 2.0 GB, held twice; the run ended in a segmentation
+     * fault in the copy). The caller then turns to the matrix-free method (main.c). */
+    if (!Dw && G->dense && 8.0 * (double)m * m > 0.6 * brisk_mem_limit()) {
+        if (verbose) printf("first-order: the dense Gram matrix A A' (%.1f GB) does not fit in memory\n", 8.0 * (double)m * m / 1e9);
+        g_fom_gram_nofit = 1; free(pr); free(diag); free(G); return NULL;
+    }
     if (G->dense) {
         G->M = fo_malloc(sizeof(double) * (size_t)m * m);
         memset(G->M, 0, sizeof(double) * (size_t)m * m);
@@ -342,9 +350,13 @@ static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int v
         int **nbr = fo_malloc(sizeof(int *) * m); int *pool = fo_malloc(sizeof(int) * (2 * np + 1)); int *cnt = calloc(m, sizeof(int));
         size_t off = 0; for (int i = 0; i < m; i++) { nbr[i] = pool + off; off += deg[i]; }
         for (size_t p = 0; p < np; p++) { nbr[pr[p].i][cnt[pr[p].i]++] = pr[p].j; nbr[pr[p].j][cnt[pr[p].j]++] = pr[p].i; }
-        G->S = schol_analyze_adj(m, deg, nbr, (size_t)4e9);
+        G->S = schol_analyze_adj(m, deg, nbr, (size_t)(4e9 * brisk_mem_scale()));
         free(nbr); free(pool); free(cnt); free(deg);
         if (!G->S) { fprintf(stderr, "brisk: first-order engine: the Gram matrix A A' is too dense to factor\n"); exit(1); }
+        if (!Dw && 16.0 * (double)schol_pansz(G->S) > 0.6 * brisk_mem_limit()) {
+            if (verbose) printf("first-order: the factor of the Gram matrix A A' (two copies of %.1f GB) does not fit in memory\n", 8.0 * (double)schol_pansz(G->S) / 1e9);
+            g_fom_gram_nofit = 1; schol_free(G->S); free(pr); free(diag); free(G); return NULL;
+        }
         schol_zero(G->S);
         for (int i = 0; i < m; i++) schol_add(G->S, i, i, diag[i] + G->reg);
         for (size_t p = 0; p < np; p++) schol_add(G->S, pr[p].i, pr[p].j, pr[p].v);   /* one slot per unordered pair */
@@ -653,7 +665,7 @@ static void fb_project(FB *f, const Block *B, const double *W, double *Pos, doub
         const int sp = f->npos <= f->nneg;
         const float big = 3.0e38f, vl = sp ? 0.0f : -big, vu = sp ? big : 0.0f, abst = 0.0f;
         int mf = 0, il = 1, iu = n;
-        if (getenv("BRISK_DUMPW") && f->n_single >= atoi(getenv("BRISK_DUMPW")) && f->n_single < atoi(getenv("BRISK_DUMPW")) + 3 && n >= 1000) { char fn[128]; snprintf(fn, sizeof fn, "/tmp/claude-0/wdump_%ld.bin", f->n_single); FILE *fw = fopen(fn, "wb"); if (fw) { fwrite(&n, sizeof(int), 1, fw); fwrite(f->Vf, sizeof(float), len, fw); fclose(fw); } }
+        if (getenv("BRISK_DUMPW") && f->n_single >= atoi(getenv("BRISK_DUMPW")) && f->n_single < atoi(getenv("BRISK_DUMPW")) + 3 && n >= 1000) { char fn[128]; snprintf(fn, sizeof fn, "/tmp/wdump_%ld.bin", f->n_single); FILE *fw = fopen(fn, "wb"); if (fw) { fwrite(&n, sizeof(int), 1, fw); fwrite(f->Vf, sizeof(float), len, fw); fclose(fw); } }
         const double tc = wtime();
         BL(ssyevr_)("V", "V", "L", &n, f->Vf, &n, &vl, &vu, &il, &iu, &abst, &mf, f->evf, f->srZ, &n, f->srsup, f->srwork, &f->srlw, f->sriwork, &f->srliw, &info);
         f->t_core += wtime() - tc;
@@ -1669,6 +1681,11 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
     const double t0 = wtime();
     memset(R, 0, sizeof(*R));
     const int m = P->m, nb = P->nblk, verbose = par->verbose;
+    /* the Gram matrix first: when its factor does not fit, nothing else is set up (5.7) */
+    double t_gram = 0;
+    g_fom_gram_nofit = 0;
+    Gram *G = fom_gram_build(P, verbose, &t_gram);
+    if (!G && g_fom_gram_nofit) return -7;
     const double sc = P->bs * P->cs;
     const int halpern = par->fom_halpern;
     { const char *e = getenv("BRISK_FOMPARTIAL"); if (e) g_fom_partial = atoi(e); }
@@ -1739,8 +1756,6 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
         free(fp);
         if (verbose && nf) printf("first-order: %d split free pair(s) handled as free variables\n", nf);
     }
-    double t_gram = 0;
-    Gram *G = fom_gram_build(P, verbose, &t_gram);
     {   const double tf = wtime(); g_fop = fop_build(P);
         if (verbose) printf("first-order: operators by position: %zu positions, %zu entries, %.2fs\n", g_fop->np, g_fop->pp[g_fop->np], wtime() - tf); }
     double **Xa = fo_malloc(sizeof(double *) * (nb + 1)), **Wa = fo_malloc(sizeof(double *) * (nb + 1)), **Ta = fo_malloc(sizeof(double *) * (nb + 1));
@@ -1827,7 +1842,7 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
         { size_t o = 0; for (int k = 0; k < nb; k++) { free(F[k].W); F[k].W = Wall + o; Wa[k] = F[k].W; o += fbsz(&P->blk[k]); } }
     }
     if (aa_mem > AA_MAX) aa_mem = AA_MAX;
-    if (aa_mem > 0) { double budget = 1.5e9; { const char *e = getenv("BRISK_AABUDGET"); if (e) budget = atof(e) * 1e9; } const int fit = (int)(budget / (8.0 * N2) - 4) / 2; if (fit < aa_mem) aa_mem = fit; if (aa_mem < 2) aa_mem = 0; }
+    if (aa_mem > 0) { double budget = 1.5e9 * brisk_mem_scale(); { const char *e = getenv("BRISK_AABUDGET"); if (e) budget = atof(e) * 1e9; } const int fit = (int)(budget / (8.0 * N2) - 4) / 2; if (fit < aa_mem) aa_mem = fit; if (aa_mem < 2) aa_mem = 0; }
     double *aa_w = NULL, *aa_g = NULL, *aa_r = NULL, *aa_rlast = NULL; double *aa_dR = NULL, *aa_dG = NULL;   /* 4.35: memory up to AA_MAX (single-precision history was tried: it changes the extrapolation and loses) */
     int aa_n = 0, aa_head = 0, aa_used = 0, aa_naccel = 0, aa_nrej = 0;
     double aa_Gm[AA_MAX * AA_MAX]; memset(aa_Gm, 0, sizeof aa_Gm);
@@ -1844,6 +1859,7 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
     { for (int k = 0; k < nb; k++) bord[k] = k;
       for (int a = 1; a < nb; a++) { const int t = bord[a]; int q = a - 1; while (q >= 0 && P->blk[bord[q]].n < P->blk[t].n) { bord[q + 1] = bord[q]; q--; } bord[q + 1] = t; } }
     int single_off = par->fom_single <= 0;
+    double sg_best = 1e300; int sg_it = 0;   /* 5.8: the single-precision phase ends too when the residual stops falling */
     double prof[8] = { 0 };
     int sig_cur = par->fom_sigint, sig_next = par->fom_sigint; const int sig_double = getenv("BRISK_SIGDOUBLE") ? atoi(getenv("BRISK_SIGDOUBLE")) : 1;   /* 4.37: default on */
     const int aa_keep = getenv("BRISK_AAKEEP") ? atoi(getenv("BRISK_AAKEEP")) : 0;
@@ -1888,6 +1904,14 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
 resume_splitting:
     for (; it <= maxit; it++) {
         if (!single_off && best <= par->fom_single) single_off = 1;       /* double precision from here on */
+        if (!single_off) {
+            /* 5.8 (a user's benchmark): the single-precision projections cannot take the residual
+             * below their own rounding level, which on some problems lies above the switch
+             * (sos_planted_n30_d2: the primal residual sat at 1e-3 for thousands of iterations):
+             * no gain of 10 % in 150 iterations ends the phase */
+            if (best < 0.9 * sg_best) { sg_best = best; sg_it = it; }
+            else if (it - sg_it >= 150) { single_off = 1; if (par->verbose > 0) printf("first-order: the residual has not fallen in %d iterations (%.1e): double precision from iteration %d\n", it - sg_it, best, it); }
+        }
         g_rr_tol = fmax(1e-11, fmin(1e-5, rr_c * fmin(best, 1.0)));      /* 4.39: Rayleigh-Ritz accuracy follows the residual */
         g_fom_single_now = !single_off;
         if (aa_mem > 0) {    /* w_k = (X, Z) */

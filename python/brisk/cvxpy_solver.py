@@ -440,7 +440,8 @@ class BRISK(ConicSolver):
             K = dict(f=int(dims.zero), l=int(dims.nonneg), q=[int(k) for k in dims.soc])
             try:
                 res = _core.solve_sedumi(A, -np.asarray(data[s.C], float).ravel(), np.asarray(data[s.B], float).ravel(), K,
-                                         options=_core.options_to_argv(opts) + _core.options_to_argv(raw), verbose=verbose)
+                                         options=_core.options_to_argv(opts) + _core.options_to_argv(raw), verbose=verbose,
+                                         _caller="cvxpy")
             except RuntimeError as e:
                 raise SolverError(str(e)) from e
             return {"cone": res, "itol": itol, "c": np.asarray(data[s.C], float).ravel()}
@@ -464,7 +465,7 @@ class BRISK(ConicSolver):
             argv += ["-bound", side] + (["-certify"] if do_cert else [])
         info["bound_side"] = side
         try:
-            res = _core.solve_sdpa(*sd, options=argv, verbose=verbose)
+            res = _core.solve_sdpa(*sd, options=argv, verbose=verbose, _caller="cvxpy")
         except RuntimeError as e:
             raise SolverError(str(e)) from e
         return {"res": res, "info": info, "c": np.asarray(data[s.C], float).ravel(), "itol": itol,

@@ -447,7 +447,12 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
     int *col = sx(sizeof(int) * A.N);
     {   KN *kn = sx(sizeof(KN) * A.N);
         uint64_t *ch = calloc(NI, sizeof(uint64_t));
-        for (size_t q = 0; q < ne; q++) if (E[q].con < 0) { ch[A.ea[q]] = h64(ch[A.ea[q]] ^ hval(A.ev[q])); ch[A.eb[q]] = h64(ch[A.eb[q]] ^ hval(A.ev[q]) ^ 0x77); }
+        /* 5.9: a sum over the entries, the same for both indices of an off-diagonal entry. (The
+         * chained hash with a different term for the larger index gave an index a colour that
+         * depended on how many of its C entries pair it with a smaller index: with a dense C
+         * every index had its own colour and no permutation was ever found - the theta problem
+         * of a cycle, or any problem with C = J.) */
+        for (size_t q = 0; q < ne; q++) if (E[q].con < 0) { const uint64_t h = h64(hval(A.ev[q]) + (A.ea[q] == A.eb[q] ? 0x1111ull : 0x77ull)); ch[A.ea[q]] += h; if (A.eb[q] != A.ea[q]) ch[A.eb[q]] += h; }
         for (int k = 0; k < nb; k++) for (int i = off[k]; i < off[k + 1]; i++) { kn[i].key = h64((uint64_t)P->blk[k].n * 3 + (P->blk[k].type == BLK_LP)) ^ ch[i]; kn[i].node = i; }
         for (int c = 0; c < m; c++) { kn[NI + c].key = 0x8000000000000000ull | (hval(absval ? fabs(P->b[c]) : P->b[c]) >> 1); kn[NI + c].node = NI + c; }
         qsort(kn, A.N, sizeof(KN), cmp_kn);
@@ -685,8 +690,10 @@ static const char *bd_block(int k, int n, int nh, int **hg, signed char **hs, BD
                 c->t = t;
                 j0 = j1;
             }
-            if (!ok) for (int q = ncp0; q < *ncp; q++) { free((*cpp)[q].U); free((*cpp)[q].idx); }
-            if (!ok) for (int u = ntype0; u < ntype; u++) { for (int g = 0; g < nh; g++) free(Rref[u][g]); free(Rref[u]); }
+            /* 5.8 (a user's fix): the counters go back too, or the caller frees cp[ncp0 .. ncp) a
+             * second time (a double free on three POEMA relaxations) */
+            if (!ok) { for (int q = ncp0; q < *ncp; q++) { free((*cpp)[q].U); free((*cpp)[q].idx); } *ncp = ncp0; }
+            if (!ok) { for (int u = ntype0; u < ntype; u++) { for (int g = 0; g < nh; g++) free(Rref[u][g]); free(Rref[u]); } ntype = ntype0; }
         }
         if (!ok && !why) why = "no generic decomposition of an orbit was found";
     }
@@ -917,6 +924,8 @@ static size_t sym_merge_trips(size_t nt, int *tc, int *tb, int *ti, int *tj, dou
     return w;
 }
 
+double g_sym_est_cap = 0;
+int g_sym_cap_bound = 0;      /* the last search stopped on the capped budget without a generator */
 PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, long symnodes, int symbd, double symmin, int chordal_minn, double chordal_density, int symsigned) {
     const int m = P->m, nb = P->nblk;
     const int auto_mode = !strcmp(fname, "auto");
@@ -960,6 +969,8 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
         if (pow(sp, 1.5) < est) est = pow(sp, 1.5);     /* a sparse Schur complement (many small blocks) factors for about nnz^1.5 */
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) est += 20.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
         est /= 1e9;
+        const double est_full = est;
+        if (g_sym_est_cap > 0 && est > g_sym_est_cap) est = g_sym_est_cap;   /* 5.7: the matrix-free method was asked for (main.c) */
         /* 4.34: at least symtime, more on problems whose solve is long (Example 8.1.3 d = 5:
          * 7 search nodes of 12 s each on 15 255 indices and 1.35 M rows) */
         const double tb = fmin(fmax(symtime, fmin(900.0, 0.01 * est)), fmax(0.05, 0.15 * est));
@@ -970,6 +981,10 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
         if (verbose > 0) printf("   symmetry search: time budget %.2f s (expected solve ~%.1f s)\n", tb, est);
         const double tsearch0 = wtime();
         int *ga = sym_auto(P, off, NI, nsdp, E, ne, &na, &gc, verbose, tb, symnodes, auto_mode ? symmin : 0.0, 0);
+        /* a search that ran into the budget of the matrix-free estimate and found nothing: with the
+         * standard method's budget it might have (main.c runs the pipeline again if the matrix-free
+         * attempt is not made after all) */
+        g_sym_cap_bound = est < est_full && na == 0 && wtime() - tsearch0 >= 0.5 * tb;
         autocp = sx(sizeof(int *) * cap);
         for (int s = 0; s < na; s++) { GEN_GROW(); gen[ngen] = sx(sizeof(int) * NI); memcpy(gen[ngen], ga + (size_t)s * NI, sizeof(int) * NI);
                                        autocp[ngen] = sx(sizeof(int) * (m + 1)); memcpy(autocp[ngen], gc + (size_t)s * (m + 1), sizeof(int) * m); ngen++; }
@@ -983,6 +998,7 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
             const double tb2 = fmax(0.05, tb - 0.5 * (wtime() - tsearch0));
             int nab = 0, *gcb = NULL;
             int *gab = sym_auto(P, off, NI, nsdp, E, ne, &nab, &gcb, verbose, tb2, symnodes, auto_mode ? symmin : 0.0, 1);
+            if (est < est_full && na == 0 && nab == 0 && wtime() - tsearch0 >= 0.5 * tb) g_sym_cap_bound = 1;      /* (the same for the signed search) */
             char *islp = sx(NI + 1); for (int k = 0; k < nb; k++) for (int i = off[k]; i < off[k + 1]; i++) islp[i] = P->blk[k].type == BLK_LP;
             signed char *sg = sx(NI + 1), *ce = sx(m + 1);
             int *nl = sx(sizeof(int) * (nab + 1)), nnl = 0, nlift = 0, nsgn = 0;

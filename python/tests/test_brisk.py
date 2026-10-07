@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.2.1"
+    assert brisk.version() == "1.3.2"
     assert os.path.exists(brisk.library_path())
 
 
@@ -63,6 +63,40 @@ def test_output(capsys):
     assert "OPTIMAL" in capsys.readouterr().out
     brisk.solve_sdpa(**EX1, verbose=False)
     assert capsys.readouterr().out == ""
+
+
+def test_advice_in_the_callers_syntax(capsys):
+    """1.3.2: the last lines of the log say how to get more accuracy and a guaranteed bound, in
+    the syntax of the command that was called."""
+    brisk.solve_sdpa(**EX1, verbose=True)
+    out = capsys.readouterr().out
+    assert "For higher accuracy, in brisk.solve_sdpa(..., options={...}):" in out
+    assert '"acc": "high"' in out and '"prec": "dd"' in out
+    assert "For a guaranteed bound on the optimal value" in out and '"bound": "d"' in out and '"certify": True' in out
+    brisk.solve_sdpa(**EX1, options={"acc": "high", "bound": "d"}, verbose=True)   # what was asked for is not advised
+    out = capsys.readouterr().out
+    assert '"acc": "high"' not in out and "For a guaranteed bound" not in out and "For a rigorous check of the bound" in out
+    brisk.solve_sdpa(**EX1, options={"prec": "dd"}, verbose=True)                  # high precision: the bound only
+    out = capsys.readouterr().out
+    assert "For higher accuracy" not in out and '"bound": "d"' in out and "in brisk.solve_sdpa(" in out
+    import scipy.sparse as sp                                                      # the cone solver ends the same way
+    brisk.solve_sedumi(sp.csc_matrix(np.array([[1.0, 1.0, 1.0]])), [1.0], [1.0, 2.0, 3.0], dict(l=3), verbose=True)
+    out = capsys.readouterr().out
+    assert out.count("Summary") == 1 and "in brisk.solve_sedumi(..., options={...}):" in out
+
+
+def test_advice_cvxpy(capsys):
+    cp = pytest.importorskip("cvxpy")
+    X = cp.Variable((3, 3), PSD=True)
+    prob = cp.Problem(cp.Minimize(cp.trace(X)), [X[0, 1] == 1])
+    prob.solve(solver=brisk.BRISK(), verbose=True)
+    out = capsys.readouterr().out
+    assert "For higher accuracy, in prob.solve(solver=brisk.BRISK(), ...):" in out
+    assert 'acc="high"' in out and 'prec="dd"' in out and 'bound="dual"' in out and "certify=True" in out
+    x = cp.Variable(3)                                                             # a second-order cone program
+    cp.Problem(cp.Minimize(cp.norm(x, 2)), [cp.sum(x) == 1]).solve(solver=brisk.BRISK(), verbose=True)
+    out = capsys.readouterr().out
+    assert "in prob.solve(solver=brisk.BRISK(), ...):" in out and 'acc="high"' in out
 
 
 def test_bad_option():
@@ -136,6 +170,11 @@ def test_option_flags_and_values():
         assert r.status == 0, opts
     r = brisk.solve_sdpa(**maxcut_sdpa(60), options={"maxit": 2, "nodd": True}, verbose=False)
     assert r.status in (3, 6) or r.iterations <= 2 * 3
+    # 1.3.2: the restoration switch and the first-method rule's fraction reach the solver
+    r0 = brisk.solve_sdpa(**maxcut_sdpa(60), verbose=False)
+    for opts in ({"nopolishr": True}, {"hsdfirstasm": 0}, {"hsdfirstasm": 0.5}):
+        r = brisk.solve_sdpa(**maxcut_sdpa(60), options=opts, verbose=False)
+        assert r.status == 0 and abs(r.pobj - r0.pobj) <= 1e-7 * (1 + abs(r0.pobj)), opts
     with pytest.raises(RuntimeError):
         brisk.solve_sdpa(**EX1, options={"chordal": "notanumber"}, verbose=False)
 
@@ -463,6 +502,38 @@ def test_high_precision_first_order(method):
     r = brisk.solve_sdpa(**p, options={"prec": "dd", method: 1}, verbose=False)
     assert r.status == 0 and np.max(np.abs(r.dimacs)) < 1e-17
     assert abs(r.dobj - r0.dobj) < 1e-12 * (1 + abs(r0.dobj))
+
+
+def test_high_precision_reductions(monkeypatch):
+    """Theta of the odd cycle C_n is n cos(pi/n) / (1 + cos(pi/n)): the permutation symmetry (a
+    dihedral group) and the block structure of the data are used in high precision, and the
+    value of the problem as read has all the digits."""
+    n = 41
+    mat, i, j = [], [], []
+    for a in range(1, n + 1):
+        for b in range(a, n + 1):
+            mat.append(0); i.append(a); j.append(b)                     # F0 = J
+    for a in range(1, n + 1):
+        mat.append(1); i.append(a); j.append(a)                         # trace
+    for a in range(1, n + 1):
+        b = a % n + 1
+        mat.append(a + 1); i.append(min(a, b)); j.append(max(a, b))     # the edges of the cycle
+    c = np.zeros(n + 1); c[0] = 1.0
+    p = dict(blocksizes=[n], c=c, mat=mat, blk=[1] * len(mat), i=i, j=j, v=np.ones(len(mat)))
+    import decimal
+    exact = decimal.Decimal("20.46988027350041917143212453303")
+    monkeypatch.setenv("BRISK_HPREDSMALL", "1")                         # (a problem this small skips the analysis otherwise)
+    r = brisk.solve_sdpa(**p, options={"prec": "dd", "threads": 1}, verbose=False)
+    assert r.status == 0 and np.max(np.abs(r.dimacs)) < 1e-22
+    h = brisk.hp_solution()
+    assert abs(abs(h["dobj"]) - exact) < decimal.Decimal("1e-20")
+    assert h["X"][0].shape == (n, n) and abs(float(np.trace(r.X[0])) - 1.0) < 1e-12
+    # X of the problem as read is invariant under the rotation of the cycle
+    X = r.X[0]
+    assert np.max(np.abs(X - np.roll(np.roll(X, 1, 0), 1, 1))) < 1e-12
+    monkeypatch.setenv("BRISK_HPNORED", "all")
+    brisk.solve_sdpa(**p, options={"prec": "dd", "threads": 1}, verbose=False)
+    assert abs(abs(brisk.hp_solution()["dobj"]) - exact) < decimal.Decimal("1e-20")
 
 
 def test_high_precision_cleared_by_double_solve():

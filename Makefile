@@ -86,7 +86,7 @@ amd/%.o: amd/%.c
 
 # 4.39: the rigorous certifier changes the rounding mode
 boundcert.o libobj/boundcert.o: CFLAGS += -frounding-math -fno-fast-math
-hpsolve.o libobj/hpsolve.o: hp.h hpipm.inc hpfom.inc hplr.inc hppre.inc hpcert.inc
+hpsolve.o libobj/hpsolve.o: hp.h hpipm.inc hpfom.inc hplr.inc hppre.inc hpcert.inc hpred.inc
 hpmp.o libobj/hpmp.o: hp.h
 socp.o libobj/socp.o: socp.h
 sedumi.o libobj/sedumi.o main.o libobj/main.o: socp.h sedumi.h
@@ -127,6 +127,22 @@ libobj/%.o: %.c brisk.h
 capitest: $(LIBBRISK) tools/capi_test.c
 	$(CC) -O1 -std=gnu11 -Wall -I. -o tools/capi_test tools/capi_test.c -L. -lbrisk -Wl,-rpath,$(CURDIR) -lm
 	./tools/capi_test
+
+# bound OpenMP threads on the command line (Linux): one processor per thread
+bindtest: brisk
+	tools/bind_test.sh ./brisk
+
+# the reductions of the high-precision solver on a problem with a known value (theta of an odd cycle)
+hpredtest: brisk
+	tools/hpred_test.sh ./brisk
+
+# the restoration of the primal feasibility at the end of a solve, and the options of the first-method rule
+restoretest: brisk
+	tools/restore_test.sh ./brisk
+
+# the advice at the end of the log (more accuracy, a guaranteed bound) on the command line
+advicetest: brisk
+	tools/advice_test.sh ./brisk
 
 pytest: $(LIBBRISK)
 	cd python && python3 -m pytest -q tests

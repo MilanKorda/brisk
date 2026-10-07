@@ -41,6 +41,7 @@ int    schol_ntiny(const SChol *S);
 void   schol_set_solve_seq(int on);
 void   schol_set_perm(const int *perm);
 void   schol_set_nd(int on);
+double schol_set_amalg(double f);
 
 static double lp_time(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP solver)\n"); exit(1); } return p; }
@@ -253,7 +254,9 @@ static int ne_setup(LpS *S, int usedense) {
     }
     const int om = schol_set_amd(getenv("BRISK_LPAMD") ? atoi(getenv("BRISK_LPAMD")) : 2);
     schol_set_nd(getenv("BRISK_LPND") ? atoi(getenv("BRISK_LPND")) : 1);
+    const double oa = schol_set_amalg(0.3);      /* 5.7: relaxed supernodes (30 % explicit zeros at most, 64 columns) */
     S->sc = schol_analyze_adj(m, deg, nbr, (size_t)1 << 31);
+    schol_set_amalg(oa);
     schol_set_nd(0);
     if (fperm) { schol_set_perm(NULL); free(fperm); }
     schol_set_amd(om);

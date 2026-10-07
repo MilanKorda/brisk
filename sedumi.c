@@ -443,6 +443,7 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
         const int st = socp_solve(&Q, &o, &S);
         if (st == SOCP_INPUT) { fprintf(stderr, "brisk: the cone dimensions (K) do not match the number of columns of A\n"); R->exit_code = 2; return 2; }
         R->status = st; snprintf(R->status_str, sizeof R->status_str, "%s", socp_status_str(st));
+        R->cone = 1;
         R->x = S.x; R->y = S.y; R->z = S.z; R->pobj = S.pobj; R->dobj = S.dobj; R->iters = S.iters; R->time = S.time;
         R->err[0] = S.err[0]; R->err[2] = S.err[1]; R->err[4] = S.err[2]; R->err[5] = S.err[3];
         R->exit_code = g_exit_of_status[st];

@@ -895,7 +895,7 @@ double g_fillmax = 6e7;
 static double g_ic_t0;
 static double iter_cost(const Problem *P, double *sp_flops, double budget) {
     g_ic_t0 = wtime();
-    { const char *e = getenv("BRISK_FILLMAX"); if (e) g_fillmax = atof(e); }
+    { const char *e = getenv("BRISK_FILLMAX"); g_fillmax = e ? atof(e) : 6e7 * brisk_mem_scale(); }   /* 5.7: 6e7 per 8 GB */
     const int m = P->m;
     double dense = 0;
     for (int k = 0; k < P->nblk; k++) {
@@ -919,9 +919,9 @@ static double iter_cost(const Problem *P, double *sp_flops, double budget) {
             if (pat > 0.6 * (double)m * m) break;
         }
     }
-    if (pat <= 0.6 * (double)m * m && pat <= 2e8) {
+    if (pat <= 0.6 * (double)m * m && pat <= 2e8 * brisk_mem_scale()) {
         /* 4.42: the LP variables' cliques count too (they were left out of the 2e8 cap of 4.40) */
-        for (int k = 0; k < P->nblk && pat <= 2e8; k++) {
+        for (int k = 0; k < P->nblk && pat <= 2e8 * brisk_mem_scale(); k++) {
             const Block *B = &P->blk[k];
             if (B->type != BLK_LP || B->n <= 0) continue;
             int *cntv = calloc(B->n + 1, sizeof(int));
@@ -962,7 +962,7 @@ static double iter_cost(const Problem *P, double *sp_flops, double budget) {
     /* 4.40: at most 2e8 adjacency entries (0.8 GB): the dense pglib AC-OPF block (49 000
      * constraints) asked for 2.4e9 and crashed on the failed allocation; a pattern that full
      * factors densely anyway */
-    if (pat <= 0.6 * (double)m * m && pat <= 2e8 && m >= 200) {
+    if (pat <= 0.6 * (double)m * m && pat <= 2e8 * brisk_mem_scale() && m >= 200) {
         /* cliques of constraints: SDP blocks, and per LP variable the constraints touching
          * it; node -> cliques, then each node's neighbours deduplicated with a marker */
         int ncq = 0; size_t totq = 0;

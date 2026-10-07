@@ -437,6 +437,25 @@ PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose) {
         if (nc == 0) continue;
         double c0 = (double)B->n * B->n * B->n, c1 = 0;
         for (int c = 0; c < nc; c++) c1 += (double)cmp[k][c].d * cmp[k][c].d * cmp[k][c].d;
+        if (!getenv("BRISK_ALGGAIN0")) {
+            /* 5.8 (a user's benchmark): the gain counts the Schur assembly too. The transformed
+             * data U' A_t U are dense on every component, and a block with sparse constraints
+             * (ex813_d3_red: 17,138 nonzeros, 547 constraints, blocks 130 and 105) becomes one
+             * with 4.6 million: block algebra 30 n^3 against 30 sum d^3, but the assembly
+             * 2 min(nnz_t, n) n^2 + (m/2) nnz_t per constraint against 2 sum d^3 + (m/2) sum d^2
+             * (row products / dense route, and the gather over the later constraints); the
+             * factorization m^3/3 is common. ex813_d3_red: 14.7 -> 1.1 s. */
+            const double n = B->n, F = (double)m * m * m / 3.0;
+            double sd2 = 0, sd3 = 0;
+            for (int c = 0; c < nc; c++) { const double d = cmp[k][c].d; sd2 += d * (d + 1) / 2; sd3 += d * d * d; }
+            double w0 = 30.0 * c0, w1 = 30.0 * c1;
+            for (int t = 0; t < B->ncon; t++) {
+                const double nz = B->A[t].nnz; if (nz <= 0) continue;
+                w0 += 2.0 * fmin(nz, n) * n * n + 0.5 * m * nz;
+                w1 += 2.0 * sd3 + 0.5 * m * sd2;
+            }
+            c0 = F + w0; c1 = F + w1;
+        }
         if (c0 / fmax(c1, 1.0) < (mode > 0 ? 1.0 + 1e-9 : symmin)) {
             if (verbose > 0) printf("   algebra symmetry: block %d (n = %d): %d component(s), gain %.2f below %g: not applied\n", k + 1, B->n, nc, c0 / fmax(c1, 1.0), symmin);
             for (int c = 0; c < nc; c++) free(cmp[k][c].Q);

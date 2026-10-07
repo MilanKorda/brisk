@@ -321,6 +321,15 @@ Stop the running solve as if its time limit were reached now (callable from any 
 """
 interrupt() = ccall(_fn(:brisk_interrupt), Cvoid, ())
 
+# The option pair that tells libbrisk which interface and command called it: the advice at the
+# end of the log (more accuracy, a guaranteed bound) is then written in that command's syntax.
+# Libraries before 1.3.2 do not know the option and are not given it.
+function _tagged(args::Vector{String}, tag::String)
+    v = tryparse(VersionNumber, version())
+    (v === nothing || v < v"1.3.2") && return args
+    return vcat(args, ["-caller", tag])
+end
+
 function _call(f, args::Vector{String}, output::Symbol, reader = _read_result)
     lock(_LOCK) do
         _set_output(output)
@@ -343,7 +352,7 @@ C directly) or `:silent`. Other keywords are BRISK options (`acc = "high"`, `fom
 """
 function solve_sdpa(file::AbstractString; output::Symbol = :julia, options...)
     isfile(file) || throw(ArgumentError("no such file: $file"))
-    args = option_args(options)
+    args = _tagged(option_args(options), "julia:solve_sdpa")
     return _call(args, output) do r, cargs
         Int(ccall(_fn(:brisk_solve_file), Cint, (Cstring, Cint, Ptr{Cstring}, Ptr{Cvoid}),
                   file, length(cargs), cargs, r))
@@ -366,7 +375,7 @@ function solve_sdpa_data(m::Integer, blocksizes::AbstractVector{<:Integer}, c::A
     length(c) == m || throw(DimensionMismatch("length(c) = $(length(c)) != m = $m"))
     nnz = length(v)
     all(x -> length(x) == nnz, (mat, blk, i, j)) || throw(DimensionMismatch("mat, blk, i, j, v must have the same length"))
-    return _solve_data(m, blocksizes, c, mat, blk, i, j, v, option_args(options), output)
+    return _solve_data(m, blocksizes, c, mat, blk, i, j, v, _tagged(option_args(options), "julia:solve_sdpa_data"), output)
 end
 
 # the same with the options already as command-line arguments (the MOI wrapper)
@@ -493,7 +502,8 @@ function solve_sedumi(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Real}, c::A
             push!(Ap, length(Ai))
         end
     end
-    return _solve_sedumi(m, n, Ap, Ai, Ax, Vector{Cdouble}(b), Vector{Cdouble}(c), nf, nl, q, r, s, option_args(options), output)
+    return _solve_sedumi(m, n, Ap, Ai, Ax, Vector{Cdouble}(b), Vector{Cdouble}(c), nf, nl, q, r, s,
+                         _tagged(option_args(options), "julia:solve_sedumi"), output)
 end
 
 function _solve_sedumi(m, n, Ap::Vector{Cint}, Ai::Vector{Cint}, Ax::Vector{Cdouble}, b::Vector{Cdouble}, c::Vector{Cdouble},
@@ -508,7 +518,7 @@ end
 
 function solve_sedumi(file::AbstractString; output::Symbol = :julia, options...)
     isfile(file) || throw(ArgumentError("no such file: $file"))
-    args = option_args(options)
+    args = _tagged(option_args(options), "julia:solve_sedumi")
     return _call(args, output, _read_cone_result) do r, cargs
         Int(ccall(_fn(:brisk_solve_file), Cint, (Cstring, Cint, Ptr{Cstring}, Ptr{Cvoid}),
                   file, length(cargs), cargs, r))

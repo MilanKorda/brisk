@@ -128,7 +128,9 @@ void params_default(Params *p) {
     p->dual_gamma = 0;       /* phase-1 objective eps b'y - r with eps = 1/gamma (0: off; tried, no gain) */
     p->hsd = -1;             /* automatic: retry a stalled run with the embedding */
     p->no_retry = 0;
-    p->hsd_first = 1; p->hsd_first_c = 12.0; p->hsd_first_on = 0; p->std_slow = 10; p->crossover = 0; p->fr_gain = 4.0;
+    p->hsd_hoc = 4;          /* 5.7: second-order passes at the chosen direction (kept only when the predicted reduction is not smaller) */
+    p->hsd_nb = 0.3;         /* 5.7: after kept passes the step may go to 0.9995 of the boundary while lambda_min(XZ) >= 0.3 mu */
+    p->hsd_first = 1; p->hsd_first_c = 12.0; p->hsd_first_asm = 0.5; p->hsd_first_on = 0; p->std_slow = 10; p->crossover = 0; p->fr_gain = 4.0;
     p->hsd_sig = 3;          /* candidates in the sigma search (0 = Mehrotra only) */
     p->hsd_beta = 1e-3;
     p->hsd_batch = 1;        /* embedding: paired Schur solves as one multi-rhs PCG */
@@ -155,6 +157,7 @@ void params_default(Params *p) {
     p->dd_time = 60.0;
     p->polish = 1;
     p->polish_x = 1;
+    p->polish_r = 1;         /* the restoration of the primal feasibility in the square-root metric before the other corrections */
     p->polish_mem = 512.0 * 1024 * 1024;
     p->reg_ill = 1e-10;
     p->sigma_rule = -1;   /* auto: cubic for pure LP, adaptive otherwise */
@@ -173,7 +176,7 @@ void params_default(Params *p) {
     p->symfile = "auto"; p->symtime = 20.0; p->symnodes = 500; p->symbd = 1; p->symmin = 1.5; p->symsign = 1; p->symsigned = 1; p->returnx = -1; p->fom_race = 0.2; p->fom_race_budget = 0; p->hp_kind = 0; p->hp_digits = 0; p->hp_tol = 0; p->hp_ext = 2; p->symalg = -1; p->symalgmax = 1000;
     p->chordal_need = 0;
     p->lralm = 0; p->lr_rank = 1; p->lr_rmax = 32; p->lr_outer = 500; p->lr_inner = 2000; p->lr_escape = 1; p->lr_prec = 1; p->lr_newton = 1; p->lr_sigma = 10.0; p->lr_tol = 1e-6; p->lr_trace = 0;
-    p->mfipm = 0; p->mf_rho = 10; p->mf_rmax = 4; p->mf_drop = 0.5; p->mf_kmax = 8000; p->mf_cgmax = 3000; p->mf_cgtol_min = 1e-10; p->mf_cgtol_max = 1e-3; p->mf_diag = 0; p->mf_warm = 1; p->mf_stall = 5; p->mf_cgtime = 0; p->mf_hand = 1e-5; p->mf_handcg = 600; p->mf_proj = 0; p->mf_eta = 0.1; p->fom_sigma0 = 1.0; p->fom_aadr = 1; p->fom_single = 1e-4; p->fom_ssn_stall = 6; p->mf_recycle = 0;
+    p->mfipm = 0; p->mf_rho = 10; p->mf_rmax = 4; p->mf_drop = 0.5; p->mf_kmax = 8000; p->mf_cgmax = 3000; p->mf_cgtol_min = 1e-10; p->mf_cgtol_max = 1e-3; p->mf_diag = 0; p->mf_warm = 1; p->mf_stall = 5; p->mf_cgtime = 0; p->mf_hand = 1e-3; p->mf_handcg = 600; p->mf_try = 1; p->mf_trial = 0; p->mf_trial_total = 0; p->mf_try_tl = 0; p->mf_try_fits = 1; p->mf_proj = 0; p->mf_eta = 0.1; p->fom_sigma0 = 1.0; p->fom_aadr = 1; p->fom_single = 1e-4; p->fom_ssn_stall = 6; p->mf_recycle = 0;
     p->mixed_frac = 0.4;
     p->fom = -1; p->fom_halpern = 0; p->fom_maxit = 100000; p->fom_tol = 0; p->fom_sigma = 0; p->fom_sigrule = 2; p->fom_sigint = 20; p->fom_aa = 25; p->fom_bm = 0; p->fom_bm_rank0 = 10; p->fom_bm_outer = 100; p->fom_bm_inner = 300; p->fom_bm_rho = 1.0; p->fom_bm_gtol = 1e-7; p->fom_bm_negtol = 1e-6; p->fom_ssn = 1; p->fom_ssn_after = 300; p->fom_ssn_res = 1e-3; p->fom_ssn_rho = 3.0; p->fom_ssn_prec = 1; p->fom_ssn_sig0 = 10.0; p->fom_ssn_eta = 0.1; p->fom_ssn_warm = 0; p->fom_ssn_outer = 200; p->fom_ssn_newton = 30; p->fom_ssn_cg = 200; p->fom_aasafe = 2.0; p->fom_sigmax = 2.0;
     p->warm_lam = 0;
@@ -253,6 +256,7 @@ typedef struct BS {
     struct BS *vbs;      /* dictionary route: state of the virtual q x q block (X = P, Zi = Q) */
     double *dW;          /* n x dnv workspace (X * V) */
     double *Xb, *Zb;     /* best iterate (for polishing), if memory allows */
+    double *Xr, *Zr;     /* the iterate the primal feasibility is restored from (RCand), if memory allows */
     SChol *dzs, *dzt;    /* dual method: sparse Cholesky of Z (iterate, tests), or NULL */
     /* NT direction: W = G G' is stored in Zi; lam = diag of the scaled point */
     double *ntG;         /* set only in the NT "view" (NULL in the block's own state) */
@@ -979,8 +983,8 @@ static void dict_form(const Block *B, int n, const double *M, double *out, doubl
 
 static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity);
 static int g_asmdbg = 0; static double g_asmf[4], g_asmr[6];
-static double g_split[4]; static int g_split_on = -1;
-static void split_print(void) { fprintf(stderr, "   [assembly split: sparse-sparse %.2fs; row-product: setup %.2fs, dgemm %.2fs, gather %.2fs]\n", g_split[0], g_split[1], g_split[2], g_split[3]); }
+static double g_split[8]; static int g_split_on = -1;
+static void split_print(void) { fprintf(stderr, "   [assembly split: sparse-sparse %.2fs; row-product: setup %.2fs, dgemm %.2fs (%.3g flops, %.0f calls, %.1f GF/s), gather %.2fs (%.3g entries, %.2f ns each)]\n", g_split[0], g_split[1], g_split[2], g_split[4], g_split[5], g_split[4] / (g_split[2] + 1e-30) / 1e9, g_split[3], g_split[6], 1e9 * g_split[3] / (g_split[6] + 1e-30)); }
 static __thread const Block *g_cur_blk = NULL; static int g_nofastl = 0;   /* 4.23: the block whose local buffer g_lbuf is active */
 static void schur_sdp(const Block *B, BS *s, int m, double *M) {
     if (g_bpos && g_schol) {
@@ -1032,7 +1036,7 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
     const int n = B->n, ns = B->ns, nd = B->nd;
     const size_t n2 = (size_t)n * n;
     const double *X = s->X, *Zi = s->Zi;
-    const int *foff = B->foff, *ffr = B->ffr, *ffc = B->ffc;
+    const int *foff = B->foff, *ffr = B->ffr, *ffc = B->ffc, *ffp = B->ffp;
     const double *ffv = B->ffv;
     const int fend = foff[ns];
 
@@ -1124,8 +1128,9 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                     const int *rank = B->lv_rank, *cp = B->lv_cp, *ca = B->lv_ca, *cr = B->lv_cr, *chh = B->lv_ch;
                     const double *cv = B->lv_cv;
                     /* Xp (r x u): column p holds X[p, rows] - by the symmetry of X a gather from one column of XP */
-                    for (int k = 0; k < r; k++) { rmap[At->rows[k]] = k; cptr[k] = rank[At->rows[k]]; }
-                    for (int p = 0; p < u; p++) { const double *xc = XP + (size_t)p * n; double *xo = Xp + (size_t)p * r; for (int k = 0; k < r; k++) xo[k] = xc[cptr[k]]; }
+                    /* 5.7: Xp (u x r, leading dimension n): column k is the column rank[rows[k]] of XP
+                     * (X is symmetric), copied whole instead of gathered entry by entry */
+                    for (int k = 0; k < r; k++) { rmap[At->rows[k]] = k; memcpy(Xp + (size_t)k * n, XP + (size_t)rank[At->rows[k]] * n, sizeof(double) * (size_t)u); }
                     memset(Tm, 0, sizeof(double) * (size_t)r * u);
                     for (int e = 0; e < At->ef; e++) {
                         const double v = At->fv[e];
@@ -1153,14 +1158,19 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                         while (q1 < u && (q1 - q0 < 24 || hq[q1] >= pfrac * h)) q1++;
                         const int ww = q1 - q0;
                         const double tp0 = g_split_on ? wtime() : 0;
-                        /* G[q - q0, p] = sum_k Tm[q, k] Xp[k, p]: the entry (p, q) of X A Zi */
-                        pdgemm("N", "N", &ww, &h, &r, &DONE, Tm + q0, &u, Xp, &r, &DZERO, G, &ww);
+                        /* G[p, q - q0] = sum_k Xp[p, k] Tm[q, k]: the entry (p, q) of X A Zi */
+                        /* 5.7: the panel as h x ww (column q contiguous): the gather reads one column of
+                         * h doubles at a time (in the first-level cache) instead of striding across the panel */
+                        pdgemm("N", "T", &h, &ww, &r, &DONE, Xp, &n, Tm + q0, &u, &DZERO, G, &h);
                         const double tp1 = g_split_on ? wtime() : 0;
                         for (int q = q0; q < q1; q++) {
-                            const double *gq = G + (q - q0);
-                            for (int e = cq[q]; e < cp[q + 1]; e++) acc[ca[e] - a] += cv[e] * gq[(size_t)cr[e] * ww];
+                            const double *gq = G + (size_t)(q - q0) * h;
+                            for (int e = cq[q]; e < cp[q + 1]; e++) acc[ca[e] - a] += cv[e] * gq[cr[e]];
                         }
-                        if (g_split_on) { tg += tp1 - tp0; tq += wtime() - tp1; }
+                        if (g_split_on) { tg += tp1 - tp0; tq += wtime() - tp1;
+                            double ne = 0; for (int q = q0; q < q1; q++) ne += cp[q + 1] - cq[q];
+                            #pragma omp critical(split)
+                            { g_split[4] += 2.0 * ww * (double)h * r; g_split[5] += 1; g_split[6] += ne; } }
                         q0 = q1;
                     }
                     if (getenv("BRISK_LIVECHECK")) {       /* (test: the full product as before, and the largest difference) */
@@ -1225,7 +1235,8 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                 const double ts3 = g_split_on ? wtime() : 0;
                 for (int b = a; b < ns; b++) {
                     double sum = 0;
-                    for (int k = foff[b]; k < foff[b + 1]; k++) sum += ffv[k] * G[ffr[k] + (size_t)ffc[k] * n];
+                    if (ffp) for (int k = foff[b]; k < foff[b + 1]; k++) sum += ffv[k] * G[ffp[k]];
+                    else for (int k = foff[b]; k < foff[b + 1]; k++) sum += ffv[k] * G[ffr[k] + (size_t)ffc[k] * n];
                     if (lbuf) lbuf[(size_t)sl[a] * lnl + sl[b]] += sum; else MADDL(scon[b], ci, sum);
                 }
                 if (g_split_on) {
@@ -1260,7 +1271,8 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                 const int ci = B->con[B->dlist[a]];
                 for (int b = 0; b < ns; b++) {
                     double sum = 0;
-                    for (int k = foff[b]; k < foff[b + 1]; k++) sum += ffv[k] * G[ffr[k] + (size_t)ffc[k] * n];
+                    if (ffp) for (int k = foff[b]; k < foff[b + 1]; k++) sum += ffv[k] * G[ffp[k]];
+                    else for (int k = foff[b]; k < foff[b + 1]; k++) sum += ffv[k] * G[ffr[k] + (size_t)ffc[k] * n];
                     MADD(ci, B->con[B->slist[b]], sum);
                 }
             }
@@ -1466,8 +1478,29 @@ static int schur_pattern(const Problem *P, long **aptr_out, int **adj_out) {
 /* Fill-reducing sparse Cholesky of the Schur complement, chosen when its exact
  * factorization cost (from the symbolic phase) beats both the dense path and the
  * envelope. */
+static SChol *g_sb_cache = NULL; static const Problem *g_sb_cache_P = NULL; static int g_sb_cache_m = 0;
+static Envelope *envelope_build(const Problem *P, const Params *par, int verbose);
+static void envelope_free(Envelope *E);
+static SChol *sparse_build(const Problem *P, const Params *par, int verbose);
+/* 5.8 (a user's report): does the standard method need a dense Schur complement? The early
+ * routing (main.c) tests the pattern of the problem as read; the sparse factorization and the
+ * envelope can still be rejected inside brisk_solve, which then exited with advice when the
+ * dense matrix does not fit (pglib case89 at minimal order, m = 34,898, after 4 s). Called by
+ * run_pipeline for large m; the sparse analysis it makes is kept for the solve. */
+int schur_dense_needed(const Problem *P, const Params *par) {
+    SChol *SC = sparse_build(P, par, 0);
+    if (SC) { schol_free(g_sb_cache); g_sb_cache = SC; g_sb_cache_P = P; g_sb_cache_m = P->m; return 0; }
+    Envelope *E = envelope_build(P, par, 0);
+    if (E) { envelope_free(E); return 0; }
+    return 1;
+}
 static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
     const int m = P->m;
+    if (g_sb_cache && g_sb_cache_P == P && g_sb_cache_m == m) {
+        SChol *SC = g_sb_cache; g_sb_cache = NULL; g_sb_cache_P = NULL;
+        if (verbose) printf("Schur pattern: sparse Cholesky (analysis from the routing check), %zu nonzeros in L, %.1e flops, %d supernodes\n", schol_nnz(SC), schol_flops(SC), schol_nsuper(SC));
+        return SC;
+    }
     if (m < 200 || par->sparse_schur == 0) return NULL;
     long *aptr = NULL;
     int *adj = NULL;
@@ -1493,14 +1526,17 @@ static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
     /* fill cap: a factor with more than ~half of the lower triangle cannot win; below
      * m = 8000 the analysis may look that far (moment-SOS image forms: 30% dense patterns
      * made of a few overlapping cliques factor in a tenth of the dense flops) */
-    size_t cap = (size_t)((m <= 8000 ? 0.45 : 0.25) * (double)m * m) + 1000;
+    static double fillfrac = -1;
+    if (fillfrac < 0) { const char *e = getenv("BRISK_FILLFRAC"); fillfrac = e ? atof(e) : 0.25; }   /* test: the fraction above m = 8000 */
+    size_t cap = (size_t)((m <= 8000 ? 0.45 : fillfrac) * (double)m * m) + 1000;
     /* memory: L costs ~48 bytes per entry (factor, assembled copy, assembly hash); 2e7
      * entries is about 1 GB. L holds at least the lower half of the pattern, so a pattern
      * beyond the cap is rejected before the analysis (whose per-row lists would stay in
      * the heap: roa_vdp_inner_d12, m = 15327 with a 45% dense pattern, then exceeded the
      * address-space limit when the dense Schur matrix was allocated) */
-    { extern double g_fillmax; if (cap > (size_t)g_fillmax) cap = (size_t)g_fillmax; }
+    { extern double g_fillmax; if (!getenv("BRISK_FILLMAX")) g_fillmax = 6e7 * brisk_mem_scale(); if (cap > (size_t)g_fillmax) cap = (size_t)g_fillmax; }
     if ((double)aptr[m] * 0.5 > (double)cap) {
+        if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: %.3g entries in the lower triangle (%.0f %% of it), above the cap of %.3g for a sparse factorization: not analysed\n", 0.5 * (double)aptr[m], 100.0 * (double)aptr[m] / ((double)m * m), (double)cap);
         free(deg); free(nbr); free(aptr); free(adj);
         return NULL;
     }
@@ -1510,10 +1546,14 @@ static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
     static double wide = -1, spfrac = -1;
     if (wide < 0) { const char *e = getenv("BRISK_SPWIDE"); wide = e ? atof(e) : 1.3; e = getenv("BRISK_SPFRAC"); spfrac = e ? atof(e) : 0.75; }
     if (par->sparse_schur < 0) schol_set_flopcap((double)m * m * m / 3.0 * spfrac / wide);
+    const double pat_lower = 0.5 * (double)aptr[m];
     SChol *SC = schol_analyze_adj(m, deg, nbr, cap);
     schol_set_flopcap(0);
     free(deg); free(nbr); free(aptr); free(adj);
-    if (!SC) return NULL;
+    if (!SC) {
+        if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: %.3g entries in the lower triangle (%.0f %%): the analysis of a sparse factorization stopped at its fill or flop cap\n", pat_lower, 200.0 * pat_lower / ((double)m * m));
+        return NULL;
+    }
     double dense = par->c_blas * (double)m * m * m / 3.0;
     /* wide supernodes (the dense cliques of SOS/moment constraints) run at BLAS-3 speed:
      * charge them 3x the dense rate for the scatter and the panel overheads */
@@ -1807,7 +1847,56 @@ long g_sc_cnt[8]; long g_pcgh[12];   /* debug (BRISK_SOLDBG): single trusted/ok/
 static void bord_mv(Schur *S, const double *x, double *y);
 static double bord_solve(Schur *S, const double *rhs, double *x, double tol_rel);
 static int g_looseskip = 0; static long g_multiskip = 0;   /* 4.23: loose solves on a factor already verified far below their tolerance skip the residual check */
-static void schur_mv(Schur *S, double alpha, const double *x, double beta, double *y) {
+/* 5.7: y = alpha M x + beta y for a symmetric M stored in one triangle, on the OpenMP threads: the BLAS
+ * is single-threaded here and dsymv was the larger part of the solves with a dense Schur complement
+ * (m = 3,739: 325 products, 1.2 of 2.4 s). The index range is cut into T parts of equal area; part b
+ * owns its diagonal block and the rectangle that joins it to the earlier indices, and adds both of
+ * the rectangle's products into a vector of its own. The result does not depend on the thread
+ * count only up to rounding (the parts are summed in order); T comes from the thread count. */
+static void par_symv(char uplo, int m, double alpha, const double *M, const double *x, double beta, double *y) {
+    const int T0 = nthreads();
+    const int T = (T0 > 1 && m >= 1024 && !in_par() && !ENV_ON("BRISK_SYMVSER")) ? (T0 > 16 ? 16 : T0) : 1;
+    if (T == 1) { BL(dsymv_)(uplo == 'L' ? "L" : "U", &m, &alpha, M, &m, x, &IONE, &beta, y, &IONE); return; }
+    int cut[18];
+    for (int b = 0; b <= T; b++) cut[b] = (int)(m * sqrt((double)b / T) + 0.5);
+    cut[0] = 0; cut[T] = m;
+    double *W = amalloc(sizeof(double) * (size_t)m * T);
+    blas_serial_begin();
+    #pragma omp parallel for schedule(static, 1) num_threads(T)
+    for (int b = 0; b < T; b++) {
+        const int r0 = cut[b], r1 = cut[b + 1], nr = r1 - r0;
+        double *w = W + (size_t)b * m;
+        memset(w, 0, sizeof(double) * (size_t)m);
+        if (nr <= 0) continue;
+        const double one = 1.0;
+        /* diagonal block */
+        BL(dsymv_)(uplo == 'L' ? "L" : "U", &nr, &one, M + r0 + (size_t)r0 * m, &m, x + r0, &IONE, &one, w + r0, &IONE);
+        if (r0 > 0) {
+            if (uplo == 'L') {
+                /* R = M[r0:r1, 0:r0] */
+                const double *Rm = M + r0;
+                BL(dgemv_)("N", &nr, &r0, &one, Rm, &m, x, &IONE, &one, w + r0, &IONE);
+                BL(dgemv_)("T", &nr, &r0, &one, Rm, &m, x + r0, &IONE, &one, w, &IONE);
+            } else {
+                /* R = M[0:r0, r0:r1] */
+                const double *Rm = M + (size_t)r0 * m;
+                BL(dgemv_)("N", &r0, &nr, &one, Rm, &m, x + r0, &IONE, &one, w, &IONE);
+                BL(dgemv_)("T", &r0, &nr, &one, Rm, &m, x, &IONE, &one, w + r0, &IONE);
+            }
+        }
+    }
+    blas_serial_end();
+    for (int i = 0; i < m; i++) {
+        double t = 0;
+        for (int b = 0; b < T; b++) t += W[i + (size_t)b * m];
+        y[i] = alpha * t + (beta == 0 ? 0.0 : beta * y[i]);
+    }
+    free(W);
+}
+static double g_solprof_p[4];
+static void schur_mv_(Schur *S, double alpha, const double *x, double beta, double *y);
+static void schur_mv(Schur *S, double alpha, const double *x, double beta, double *y) { const double t0 = wtime(); schur_mv_(S, alpha, x, beta, y); g_solprof_p[2] += wtime() - t0; g_solprof_p[3] += 1; }
+static void schur_mv_(Schur *S, double alpha, const double *x, double beta, double *y) {
     const int m = S->m;
     if (S->bF) {
         bord_mv(S, x, S->e2);
@@ -1817,10 +1906,10 @@ static void schur_mv(Schur *S, double alpha, const double *x, double beta, doubl
         schol_mv(S->SC, x, S->e2);
         for (int i = 0; i < m; i++) y[i] = alpha * S->e2[i] + (beta == 0 ? 0.0 : beta * y[i]);
     } else if (S->E) env_mv(S->E, alpha, x, beta, y, S->e2, S->e3);
-    else if (!S->mT_ok || S->low_M) BL(dsymv_)("L", &m, &alpha, S->M, &m, x, &IONE, &beta, y, &IONE);
+    else if (!S->mT_ok || S->low_M) par_symv('L', m, alpha, S->M, x, beta, y);
     else {
         /* M from the strict upper copy; the array diagonal is the factor's, so correct it */
-        BL(dsymv_)("U", &m, &alpha, S->M, &m, x, &IONE, &beta, y, &IONE);
+        par_symv('U', m, alpha, S->M, x, beta, y);
         for (int i = 0; i < m; i++) y[i] += alpha * (S->Md[i] - S->M[i + (size_t)i * m]) * x[i];
     }
 }
@@ -1954,7 +2043,7 @@ static void schur_pos_setup(Schur *S, const Problem *P) {
     if (!S->SC || S->Masm) return;
     double tot = 0;
     for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) tot += (double)P->blk[k].ncon * P->blk[k].ncon;
-    if (tot * sizeof(size_t) > 1.5e9) return;
+    if (tot * sizeof(size_t) > 1.5e9 * brisk_mem_scale()) return;
     S->bpos = calloc(P->nblk + 1, sizeof(size_t *));
     S->loc = malloc(sizeof(int) * (S->m + 1));
     for (int i = 0; i < S->m; i++) S->loc[i] = -1;
@@ -2221,8 +2310,10 @@ static int schur_factor_(Schur *S) {
     return info;
 }
 
-static inline void schur_prec(Schur *S, const double *r, double *z) {
-    int m = S->m, info;
+static inline void schur_prec_(Schur *S, const double *r, double *z);
+static inline void schur_prec(Schur *S, const double *r, double *z) { const double t0 = wtime(); schur_prec_(S, r, z); g_solprof_p[0] += wtime() - t0; g_solprof_p[1] += 1; }
+static inline void schur_prec_(Schur *S, const double *r, double *z) {
+    int m = S->m, info; (void)info;
     if (S->SC) {
         memcpy(z, r, sizeof(double) * m);
         schol_solve(S->SC, z, S->e1);
@@ -2237,12 +2328,19 @@ static inline void schur_prec(Schur *S, const double *r, double *z) {
     }
     if (S->is_float) {
         for (int i = 0; i < m; i++) S->fw[i] = (float)(r[i] * S->D[i]);
-        BL(spotrs_)("L", &m, &IONE, S->Mf, &m, S->fw, &m, &info);
+        /* 5.7: two triangular solves of level 2 for one right-hand side: (s/d)potrs goes through the
+         * level-3 solve, which for a single column is 6 times slower in single precision and 1.5 times
+         * in double (OpenBLAS, m = 1,000 ... 8,000) */
+        if (ENV_ON("BRISK_POTRS")) BL(spotrs_)("L", &m, &IONE, S->Mf, &m, S->fw, &m, &info); else {
+        BL(strsv_)("L", "N", "N", &m, S->Mf, &m, S->fw, &IONE);
+        BL(strsv_)("L", "T", "N", &m, S->Mf, &m, S->fw, &IONE); }
         for (int i = 0; i < m; i++) z[i] = S->fw[i] * S->D[i];
         return;
     }
     for (int i = 0; i < m; i++) z[i] = r[i] * S->D[i];
-    BL(dpotrs_)("L", &m, &IONE, S->Mc, &m, z, &m, &info);
+    if (ENV_ON("BRISK_POTRS")) BL(dpotrs_)("L", &m, &IONE, S->Mc, &m, z, &m, &info); else {
+    BL(dtrsv_)("L", "N", "N", &m, S->Mc, &m, z, &IONE);
+    BL(dtrsv_)("L", "T", "N", &m, S->Mc, &m, z, &IONE); }
     for (int i = 0; i < m; i++) z[i] *= S->D[i];
 }
 
@@ -2265,7 +2363,9 @@ static double schur_dmax(Schur *S) {
 static int g_resdbg = -1;
 static double schur_solve_(Schur *S, const double *rhs, double *x, double tol_rel);
 /* tol_rel = 0: full accuracy (1e-13; 1e-10 with a single-precision factor) */
+static void solprof_print(void) { fprintf(stderr, "   [solve profile: prec %.3f s in %.0f calls, mv %.3f s in %.0f calls]\n", g_solprof_p[0], g_solprof_p[1], g_solprof_p[2], g_solprof_p[3]); }
 static double schur_solve(Schur *S, const double *rhs, double *x, double tol_rel) {
+    static int pr = -1; if (pr < 0) { pr = getenv("BRISK_SOLPROF") != NULL; if (pr) atexit(solprof_print); }
     double t = wtime();
     double r = schur_solve_(S, rhs, x, tol_rel);
     S->t_solve += wtime() - t;
@@ -2404,13 +2504,20 @@ static void schur_prec_multi(Schur *S, int k, const double *R, double *Zo) {
     if (S->is_float) {
         float *fw = malloc(sizeof(float) * (size_t)m * k);
         for (int c = 0; c < k; c++) for (int i = 0; i < m; i++) fw[i + (size_t)c * m] = (float)(R[i + (size_t)c * m] * S->D[i]);
-        BL(spotrs_)("L", &m, &k, S->Mf, &m, fw, &m, &info);
+        if (ENV_ON("BRISK_POTRS")) BL(spotrs_)("L", &m, &k, S->Mf, &m, fw, &m, &info); else
+        for (int c = 0; c < k; c++) {                 /* (per column: see schur_prec) */
+            BL(strsv_)("L", "N", "N", &m, S->Mf, &m, fw + (size_t)c * m, &IONE);
+            BL(strsv_)("L", "T", "N", &m, S->Mf, &m, fw + (size_t)c * m, &IONE);
+        }
         for (int c = 0; c < k; c++) for (int i = 0; i < m; i++) Zo[i + (size_t)c * m] = fw[i + (size_t)c * m] * S->D[i];
         free(fw);
         return;
     }
     for (int c = 0; c < k; c++) for (int i = 0; i < m; i++) Zo[i + (size_t)c * m] = R[i + (size_t)c * m] * S->D[i];
-    BL(dpotrs_)("L", &m, &k, S->Mc, &m, Zo, &m, &info);
+    if (k <= 2 && !ENV_ON("BRISK_POTRS")) for (int c = 0; c < k; c++) {
+        BL(dtrsv_)("L", "N", "N", &m, S->Mc, &m, Zo + (size_t)c * m, &IONE);
+        BL(dtrsv_)("L", "T", "N", &m, S->Mc, &m, Zo + (size_t)c * m, &IONE);
+    } else BL(dpotrs_)("L", &m, &k, S->Mc, &m, Zo, &m, &info);
     for (int c = 0; c < k; c++) for (int i = 0; i < m; i++) Zo[i + (size_t)c * m] *= S->D[i];
 }
 static void schur_mv_multi(Schur *S, int k, double alpha, const double *X, double beta, double *Y) {
@@ -3039,6 +3146,34 @@ static void step_undo(const Problem *P, BS *S, int primal) {
  * [bmin*mu_t, bmax*mu_t] are pushed back; the correction solves
  *   M dyc = -A(Zi T),  dZc = -A'dyc,  dXc = sym(Zi T) + sym(Zi A'dyc X).
  * Returns 1 if the corrected direction was accepted (dX, dZ, dy updated). */
+/* The neighbourhood test of the long step: 1 when lambda_min((X + a dX)(Z + a dZ)) >= thr in every
+ * SDP block (three Cholesky-type operations of order n per block: L L' = X + a dX, then
+ * L'(Z + a dZ)L - thr I positive definite), and x z >= thr for the LP variables. */
+static int sdp_nb_ok(const Problem *P, BS *S, double al, double thr) {
+    int ok = 1;
+    for (int k = 0; k < P->nblk && ok; k++) {
+        const Block *B = &P->blk[k];
+        BS *s = &S[k];
+        int n = B->n, info = 0;
+        if (B->type == BLK_LP) {
+            for (int i = 0; i < n; i++) { if (s->fm && s->fm[i]) continue; if (!((s->X[i] + al * s->dX[i]) * (s->Z[i] + al * s->dZ[i]) >= thr)) { ok = 0; break; } }
+            continue;
+        }
+        const size_t n2 = (size_t)n * n;
+        double *L = amalloc(sizeof(double) * n2), *T = amalloc(sizeof(double) * n2);
+        for (size_t i = 0; i < n2; i++) { L[i] = s->X[i] + al * s->dX[i]; T[i] = s->Z[i] + al * s->dZ[i]; }
+        BL(dpotrf_)("L", &n, L, &n, &info);
+        if (!info) {
+            BL(dtrmm_)("L", "L", "T", "N", &n, &n, &DONE, L, &n, T, &n);
+            BL(dtrmm_)("R", "L", "N", "N", &n, &n, &DONE, L, &n, T, &n);
+            for (int i = 0; i < n; i++) T[i + (size_t)i * n] -= thr;
+            BL(dpotrf_)("L", &n, T, &n, &info);
+        }
+        if (info) ok = 0;
+        free(L); free(T);
+    }
+    return ok;
+}
 static int centrality_corrector(const Problem *P, BS *S, Schur *Sc, const Params *par,
                                 double mu_t, double *dy, double *ap, double *ad,
                                 double *rhs, double *dyc, Result *R) {
@@ -3469,6 +3604,108 @@ static double probe_polish(const Problem *P, BS *S, double tau, const double *y,
     return sp;
 }
 
+/* Restoration of the primal feasibility in the square-root metric of X:
+ *   X <- X + D W D,  D = X^{1/2},  W = A'(w),  A (D (x) D) A' w = bt - A(X).
+ * The correction is multiplicative, X^{1/2} (I + W) X^{1/2}: X stays positive semidefinite
+ * while I + W is, its small eigenvalues stay small and <X, Z> changes by <W, D Z D>, of the
+ * order of the complementarity. The matrix is the Schur complement with X^{1/2} in the place
+ * of both X and Z^{-1} (assembled and factored by the usual routes); its condition number is
+ * the square root of that of the X-metric matrix A (X (x) X) A', to which the Schur complement
+ * of an interior-point iteration is close: where that one is numerically singular (the last
+ * iterations on problems without an interior: its solve leaves a residual of order one) this
+ * one is solved to 1e-8. A step that would leave the cone is halved; further passes take
+ * what a shortened step or the solve left. Xc is corrected in place;
+ * returns the smallest step of the passes, 0 on failure (Xc is then partly corrected: callers
+ * work on a copy). */
+#define RST_MARGIN 0.01
+static double sqrt_restore(const Problem *P, BS *S, double **Xc, const double *bt, Schur *Sc, int maxpass, double *rres_out, const char **why) {
+    const int m = P->m, nb = P->nblk;
+    double **D = malloc(sizeof(double *) * nb), **Wk = malloc(sizeof(double *) * nb), **Fk = malloc(sizeof(double *) * nb);
+    for (int k = 0; k < nb; k++) {
+        const size_t len = bsz(&P->blk[k]);
+        D[k] = amalloc(sizeof(double) * (len + 1)); Wk[k] = amalloc(sizeof(double) * (len + 1));
+        Fk[k] = P->blk[k].type == BLK_LP ? NULL : amalloc(sizeof(double) * (len + 1));
+    }
+    double *rp = malloc(sizeof(double) * (m + 1)), *w = malloc(sizeof(double) * (m + 1));
+    double rres = 0, alpha_min = 1, nr0 = 0;
+    int ok = 1;
+    *why = "";
+    for (int pass = 0; pass < maxpass && ok; pass++) {
+        memcpy(rp, bt, sizeof(double) * m);
+        for (int k = 0; k < nb; k++) blk_Aop(&P->blk[k], &S[k], Xc[k], rp, -1.0);
+        const double nr = sqrt(ddot_n(m, rp, rp));
+        if (pass == 0) nr0 = nr; else if (nr <= 1e-6 * nr0) break;
+        /* D = X^{1/2} by the eigenvalue decomposition (negative eigenvalues of the rounding set to 0) */
+        for (int k = 0; k < nb && ok; k++) {
+            const Block *B = &P->blk[k];
+            const int n = B->n;
+            if (B->type == BLK_LP) { for (int i = 0; i < n; i++) D[k][i] = 1.0; continue; }
+            double *Q = Wk[k], *ev = malloc(sizeof(double) * (n + 1)), wq; int lwork = -1, liwork = -1, iwq, info = 0;
+            memcpy(Q, Xc[k], sizeof(double) * (size_t)n * n);
+            BL(dsyevd_)("V", "L", &n, Q, &n, ev, &wq, &lwork, &iwq, &liwork, &info);
+            lwork = (int)wq + 1; liwork = iwq;
+            double *work = malloc(sizeof(double) * lwork); int *iwork = malloc(sizeof(int) * (liwork + 1));
+            BL(dsyevd_)("V", "L", &n, Q, &n, ev, work, &lwork, iwork, &liwork, &info);
+            free(work); free(iwork);
+            if (info) { ok = 0; *why = " (eigenvalue decomposition)"; free(ev); break; }
+            for (int j = 0; j < n; j++) { const double f = ev[j] > 0 ? sqrt(sqrt(ev[j])) : 0.0; for (int i = 0; i < n; i++) Q[i + (size_t)j * n] *= f; }
+            BL(dsyrk_)("L", "N", &n, &n, &DONE, Q, &n, &DZERO, D[k], &n);
+            lower_to_full(n, D[k]);
+            free(ev);
+        }
+        if (!ok) break;
+        double *Ma = schur_asm_begin(Sc);
+        for (int k = 0; k < nb; k++) {
+            BS v = S[k];
+            if (P->blk[k].type == BLK_LP) { v.X = Xc[k]; v.Zi = D[k]; schur_lp(&P->blk[k], &v, m, Ma); }
+            else { v.X = D[k]; v.Zi = D[k]; schur_sdp(&P->blk[k], &v, m, Ma); }
+        }
+        schur_asm_end(Sc);
+        if (schur_factor(Sc)) { ok = 0; *why = " (factorization)"; break; }
+        rres = schur_solve(Sc, rp, w, 1e-14);
+        for (int k = 0; k < nb && ok; k++) {
+            const Block *B = &P->blk[k];
+            const int n = B->n;
+            blk_ATy(B, &S[k], w, Wk[k]);
+            /* the step: X^{1/2} (I + a W) X^{1/2} stays in the cone while I + a W does. The test is
+             * made on I + a W, with a margin (its eigenvalues stay above RST_MARGIN, so no
+             * eigenvalue of X shrinks by more than that factor in a pass), not on the new X: a
+             * Cholesky factorization of X itself breaks down on the numerically singular X of
+             * the last iterations whatever the step. */
+            double a = 1;
+            if (B->type == BLK_LP) {
+                double wmin = 0;
+                for (int i = 0; i < n; i++) if (Wk[k][i] < wmin) wmin = Wk[k][i];
+                if (a * wmin < -(1.0 - RST_MARGIN)) a = -(1.0 - RST_MARGIN) / wmin;
+                for (int i = 0; i < n; i++) Xc[k][i] += a * Xc[k][i] * Wk[k][i];
+                alpha_min = fmin(alpha_min, a);
+                continue;
+            }
+            const size_t len = (size_t)n * n;
+            int info = 1;
+            for (int h = 0; h < 8; h++, a *= 0.5) {
+                for (int j = 0; j < n; j++) {
+                    for (int i = j; i < n; i++) Fk[k][i + (size_t)j * n] = a * 0.5 * (Wk[k][i + (size_t)j * n] + Wk[k][j + (size_t)i * n]);
+                    Fk[k][j + (size_t)j * n] += 1.0 - RST_MARGIN;
+                }
+                BL(dpotrf_)("L", &n, Fk[k], &n, &info);
+                if (info == 0) break;
+            }
+            if (info != 0) { ok = 0; *why = " (no step keeps X positive semidefinite)"; break; }
+            /* dX = D W D */
+            xsymm("R", "L", &n, &n, &DONE, D[k], &n, Wk[k], &n, &DZERO, Fk[k], &n);
+            xsymm("L", "L", &n, &n, &DONE, D[k], &n, Fk[k], &n, &DZERO, Wk[k], &n);
+            for (size_t i = 0; i < len; i++) Fk[k][i] = Xc[k][i] + a * 0.5 * (Wk[k][i] + Wk[k][(i % n) * n + i / n]);
+            memcpy(Xc[k], Fk[k], sizeof(double) * len);
+            alpha_min = fmin(alpha_min, a);
+        }
+    }
+    for (int k = 0; k < nb; k++) { free(D[k]); free(Wk[k]); free(Fk[k]); }
+    free(D); free(Wk); free(Fk); free(rp); free(w);
+    if (rres_out) *rres_out = rres;
+    return ok ? alpha_min : 0.0;
+}
+
 /* Polishing in the metric of the iterate: X <- X + sym(X (A'w) Z^-1) with
  * A (X (x) Z^-1) A' w = b - A(X) (the primal half of an HKM step; at a central point
  * Z^-1 = X / mu, so this is the correction of minimal norm in ||X^-1/2 dX X^-1/2||). Unlike the Euclidean
@@ -3479,7 +3716,7 @@ static double probe_polish(const Problem *P, BS *S, double tau, const double *y,
  * at the 1e-8 level, which the positive semidefinite completion then has to clip.
  * Two passes (the residual after one is second order). Candidates as in polish_solution. */
 static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, const double *yb,
-                          Result *R, double score_now, Schur *Sc, double *w, int verbose) {
+                          Result *R, double score_now, Schur *Sc, double *w, int verbose, int half) {
     const int m = P->m, nb = P->nblk;
     double **Xc = malloc(sizeof(double *) * nb), **Zi = malloc(sizeof(double *) * nb);
     int zok = 1;
@@ -3488,6 +3725,8 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
         size_t len = bsz(B);
         Xc[k] = malloc(sizeof(double) * (len + 1));
         memcpy(Xc[k], Xb[k], sizeof(double) * len);
+        Zi[k] = NULL;
+        if (half) continue;                       /* (sqrt_restore has its own weights) */
         Zi[k] = malloc(sizeof(double) * (len + 1));
         memcpy(Zi[k], Zb[k], sizeof(double) * len);
         if (B->type == BLK_LP) { for (int i = 0; i < B->n; i++) { if (Zi[k][i] > 0) Zi[k][i] = 1.0 / Zi[k][i]; else zok = 0; } continue; }
@@ -3498,9 +3737,14 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
         for (int j = 0; j < n; j++) for (int i = j + 1; i < n; i++) Zi[k][j + (size_t)i * n] = Zi[k][i + (size_t)j * n];
     }
     double rres = 0, alpha_min = 1;
-    int ok = zok;
+    int ok = zok || half;
+    const char *why = (zok || half) ? "" : " (Z is not positive definite)";
     double *rp = malloc(sizeof(double) * (m + 1));      /* Sc->t is PCG scratch */
-    for (int pass = 0; pass < 2 && ok; pass++) {
+    if (half) {
+        alpha_min = sqrt_restore(P, S, Xc, P->b, Sc, 3, &rres, &why);
+        ok = alpha_min > 0;
+    }
+    for (int pass = 0; pass < 2 && ok && !half; pass++) {
         memcpy(rp, P->b, sizeof(double) * m);
         for (int k = 0; k < nb; k++) blk_Aop(&P->blk[k], &S[k], Xc[k], rp, -1.0);
         double *Ma = schur_asm_begin(Sc);
@@ -3511,7 +3755,7 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
             else schur_sdp(&P->blk[k], &v, m, Ma);
         }
         schur_asm_end(Sc);
-        if (schur_factor(Sc)) { ok = 0; break; }
+        if (schur_factor(Sc)) { ok = 0; why = " (factorization)"; break; }
         rres = schur_solve(Sc, rp, w, 1e-14);
         for (int k = 0; k < nb && ok; k++) {
             const Block *B = &P->blk[k];
@@ -3542,7 +3786,7 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
                 free(T);
                 if (info == 0) memcpy(Xc[k], s->F, sizeof(double) * len);
             }
-            if (info != 0) { ok = 0; break; }
+            if (info != 0) { ok = 0; why = " (no step keeps X positive definite)"; break; }
             alpha_min = fmin(alpha_min, 2 * a);
         }
     }
@@ -3577,8 +3821,9 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
         const int conv = (P->ps && P->ps->mom) || g_free_hsd;
         const int take = sp < score_now && (rres <= xres_max || !conv);
         if (verbose > 0)
-            printf("   X-metric polishing: score %.2e -> %.2e (solve residual %.1e, step %.2f) %s\n",
+            printf("   %s polishing: score %.2e -> %.2e (solve residual %.1e, step %.2f) %s\n", half ? "square-root-metric" : "X-metric",
                    score_now, sp, rres, alpha_min, take ? "accepted" : sp < score_now ? "rejected (solve residual)" : "rejected");
+        if (half && ENV_ON("BRISK_POLDBG")) printf("     [candidate: pinf %.2e dinf %.2e gap %.2e comp %.2e err %.1e %.1e]\n", Rp.pinf, Rp.dinf, Rp.relgap, Rp.relcomp, Rp.err[2], Rp.err[4]);
         if (take) {
             double tt[6] = { R->t_setup, R->t_schur, R->t_chol, R->t_dense, R->t_step, R->t_total };
             int it = R->iters;
@@ -3587,7 +3832,7 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
             R->t_total = tt[5]; R->iters = it;
             acc = 1;
         }
-    } else if (verbose > 0) printf("   X-metric polishing: failed\n");
+    } else if (verbose > 0) printf("   %s polishing: failed%s\n", half ? "square-root-metric" : "X-metric", why);
     free(rp);
     for (int k = 0; k < nb; k++) { free(Xc[k]); free(Zi[k]); }
     free(Xc); free(Zi);
@@ -4098,7 +4343,7 @@ static int free_ks_setup(const Problem *P, Schur *Sc, FreeVars *F) {
             nbr[m + f][deg[m + f]++] = c;
         }
     }
-    const size_t cap = (size_t)fmin(3e7, 0.45 * (double)N * N) + 1000;
+    const size_t cap = (size_t)fmin(3e7 * brisk_mem_scale(), 0.45 * (double)N * N) + 1000;
     { extern int g_nd_block; g_nd_block = !getenv("BRISK_NDKS"); }
     F->KS = schol_analyze_adj(N, deg, nbr, cap);
     { extern int g_nd_block; g_nd_block = 0; }
@@ -4827,10 +5072,34 @@ static int time_up(const Params *par, int it, double t0) {
     const double now = wtime(), dt = (now - t0) / (it + 1);
     return now - par->t_start + 0.5 * dt > par->timelimit;
 }
+/* The iterate from which the primal feasibility is restored at the end (polish_xmetric with
+ * half = 1). In the last iterations the Schur complement is numerically singular and the Newton
+ * direction misses the primal equations by more than the residual it should remove: the
+ * complementarity and the dual residual go on falling (the dual direction is exact by
+ * construction) while the primal residual rises to 1e-6 and the best iterate by the largest
+ * error is an early one. The restoration removes the primal residual and leaves the
+ * complementarity where it is, so the iterate worth restoring is the one with the smallest
+ * max(dual residual, complementarity) among those whose primal residual is still moderate
+ * (RC_PMAX: the correction X^1/2 W X^1/2 keeps X positive definite only while |W| < 1). */
+#define RC_PMAX 1e-3
+typedef struct { double *y; double score; int it, have; } RCand;
+static void rcand_offer(RCand *rc, const Problem *P, BS *S, const double *y, double tau, const Result *R, int it) {
+    if (!rc || !rc->y) return;
+    const double rs = fmax(nan_inf(R->dinf), nan_inf(fabs(R->relcomp)));
+    if (!(R->pinf <= RC_PMAX) || !(rs < rc->score)) return;
+    rc->score = rs; rc->it = it; rc->have = 1;
+    const double f = 1.0 / tau;
+    for (int i = 0; i < P->m; i++) rc->y[i] = y[i] * f;
+    for (int k = 0; k < P->nblk; k++) {
+        const size_t len = bsz(&P->blk[k]);
+        const double *X = S[k].X, *Z = S[k].Z; double *Xr = S[k].Xr, *Zr = S[k].Zr;
+        for (size_t i = 0; i < len; i++) { Xr[i] = X[i] * f; Zr[i] = Z[i] * f; }
+    }
+}
 static const char *g_hsd_why = NULL;      /* why the embedding stopped short (printed with the retry: user reports must be diagnosable) */
 static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, double *y,
                    double *ybest, double *best_score, int *it_out, int *it_best, Result *best,
-                   int keep_best) {
+                   int keep_best, RCand *rc) {
     const int m = P->m, nb = P->nblk;
     g_hsd_why = NULL;
     { const char *e = getenv("BRISK_KFIX0"); if (e) g_kfix0 = atof(e); if (getenv("BRISK_NOCBOX")) g_cbox = 0; }
@@ -5034,7 +5303,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     double *a0 = malloc(sizeof(double) * m), *hc = malloc(sizeof(double) * m);
     double *hd = malloc(sizeof(double) * m), *qv = malloc(sizeof(double) * m);
     double *dyd = malloc(sizeof(double) * m);
-    int ncorr = 0, nrefine = 0, ntry_c = 0;
+    int ncorr = 0, nrefine = 0, ntry_c = 0, hoc_nfail = 0, hoc_nkept = 0;
     double tc_avg = 0, tc_sum = 0, t_iter_prev = 0, t_iter_start = wtime(), mu_at_best = INFINITY, mu_best_it = INFINITY;
     double score_prog = INFINITY;
     double *shist = malloc(sizeof(double) * 4096), *phist = calloc(4096, sizeof(double));
@@ -5045,7 +5314,8 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     int kfix = 0, kf_n = 0, tiny_steps = 0, small_steps = 0;
     static int epolish_on = -1; if (epolish_on < 0) { const char *e = getenv("BRISK_EPOLISH"); epolish_on = e ? atoi(e) : 1; }
     int n_epol = 0;
-    int n_xprobe = 0;
+    int n_xprobe = 0, n_rprobe = 0; double rprobe_last = INFINITY, pinf_lo = INFINITY;
+    static int rprobe_on = -1; if (rprobe_on < 0) rprobe_on = getenv("BRISK_NORPROBE") == NULL;
     static int xprobe_on = -1; if (xprobe_on < 0) xprobe_on = getenv("BRISK_NOXPROBE") == NULL;
     static double xprobe_gap = -1; if (xprobe_gap < 0) xprobe_gap = getenv("BRISK_XPROBEGAP") ? atof(getenv("BRISK_XPROBEGAP")) : 0.5;
     EndRules ER; endrules_init(&ER, dd_small_problem(P, par), (par->hsd_first_on && !par->no_retry) ? par->retry_hsd1 : 0.0);
@@ -5269,6 +5539,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                    sqrt(ddot_n(m, y, y)) / tau, R->relcomp, score);
         }
         btrack_offer(par, P, S, y, tau, mu, R, it);
+        rcand_offer(rc, P, S, y, tau, R, it);
         const int improved_er = score < *best_score;
         if (score < *best_score) {
             *best_score = score; *it_best = it; *best = *R;
@@ -5346,7 +5617,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 double **Xb2 = malloc(sizeof(double *) * nb), **Zb2 = malloc(sizeof(double *) * nb), **Wsave = malloc(sizeof(double *) * nb);
                 for (int k = 0; k < nb; k++) { Xb2[k] = S[k].Xb; Zb2[k] = S[k].Zb; const size_t len = bsz(&P->blk[k]); Wsave[k] = malloc(sizeof(double) * (len + 1)); memcpy(Wsave[k], S[k].W, sizeof(double) * len); }
                 Result Rx = *R;
-                const int okx = polish_xmetric(P, S, Xb2, Zb2, ybest, &Rx, score, Sc, dy, par->verbose);
+                const int okx = polish_xmetric(P, S, Xb2, Zb2, ybest, &Rx, score, Sc, dy, par->verbose, 0);
                 for (int k = 0; k < nb; k++) { memcpy(S[k].W, Wsave[k], sizeof(double) * bsz(&P->blk[k])); free(Wsave[k]); }
                 free(Xb2); free(Zb2); free(Wsave);
                 if (okx && fmax(res_score(&Rx), fmax(Rx.err[2], Rx.err[4])) <= par->tol) {
@@ -5369,6 +5640,41 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 sp_add(B, &B->C, tau, s->F);
             }
         }
+        /* 5.10: the restoration probe. The dual residual and the complementarity are within
+         * half the tolerance and only the primal residual (and the gap with it) is not: the
+         * primal residual is above four times its lowest value so far - the sign that the
+         * direction no longer satisfies the primal equations, which the iterations that follow
+         * cannot repair and the restoration of the end of the solve can. (Without that sign
+         * the run is converging and the next iteration ends it: thetaG51, where X is of low
+         * rank and the restoration fails, paid 7 of 64 s for a probe at a primal residual
+         * that was still falling.) The restoration is applied to
+         * this iterate now (it is the one just stored for it) and the run stops if the
+         * restored point passes; at most twice, the second time only after the two measures
+         * have fallen by four more. A user's relaxation with a block of order 473: stop at
+         * iteration 33 with 1e-10 instead of six more iterations at steps below 0.3.
+         * BRISK_NORPROBE turns it off. */
+        if (rprobe_on && par->polish_r && rc && rc->have && rc->it == it && keep_best && !nf && !bord && n_rprobe < 2 && score > par->tol) {
+            const double rs = fmax(R->dinf, fabs(R->relcomp));
+            if (rs <= 0.5 * par->tol && rs <= 0.25 * rprobe_last && R->pinf >= 4.0 * pinf_lo) {
+                n_rprobe++; rprobe_last = rs;
+                double **Xr2 = malloc(sizeof(double *) * nb), **Zr2 = malloc(sizeof(double *) * nb), **Wsave = malloc(sizeof(double *) * nb);
+                for (int k = 0; k < nb; k++) { Xr2[k] = S[k].Xr; Zr2[k] = S[k].Zr; const size_t len = bsz(&P->blk[k]); Wsave[k] = malloc(sizeof(double) * (len + 1)); memcpy(Wsave[k], S[k].W, sizeof(double) * len); }
+                Result Rx = *R;
+                const int okr = polish_xmetric(P, S, Xr2, Zr2, rc->y, &Rx, score, Sc, dy, par->verbose > 1, 1);
+                for (int k = 0; k < nb; k++) { memcpy(S[k].W, Wsave[k], sizeof(double) * bsz(&P->blk[k])); free(Wsave[k]); }
+                free(Xr2); free(Zr2); free(Wsave);
+                if (okr && fmax(res_score(&Rx), fmax(Rx.err[2], Rx.err[4])) <= par->tol) {
+                    if (par->verbose > 1) printf("   HSD: the restored iterate %d meets the tolerance, stopping\n", it);
+                    g_epol_R = Rx;
+                    *best_score = score; *it_best = it; *best = *R;
+                    memcpy(ybest, rc->y, sizeof(double) * m);
+                    for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]) * sizeof(double); memcpy(S[k].Xb, S[k].Xr, len); memcpy(S[k].Zb, S[k].Zr, len); }
+                    g_epol_stop = 1;
+                    status = 0; break;
+                }
+            }
+        }
+        if (R->pinf < pinf_lo) pinf_lo = R->pinf;
         if (time_up(par, it, t_loop0)) { status = ST_TIME; break; }
         double nAX = 0;
         for (int i = 0; i < m; i++) { double w = tau * P->b[i] - rp[i]; nAX += w * w; }
@@ -5728,13 +6034,79 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         double expon = R->relgap > 1e-6 ? fmax(1.0, 3.0 * aa * aa) : 3.0;
         double sig_m = fmin(1.0, pow(fmax(mua / mu, 0.0), expon));
 
+        /* the sigma search on the family d0 + sigma (d1 - d0) at hand: the candidate with the largest predicted
+         * reduction alpha (1 - sigma); leaves the last candidate's direction in S[k].dX, S[k].dZ */
+#define HSD_SIGSEARCH(BM, BSIG, BAL, BAM) do { \
+        double cand_[6]; int nc_ = 0; \
+        cand_[nc_++] = sig_m; \
+        if (par->hsd_sig > 0) { \
+            cand_[nc_++] = fmin(0.95, fmax(1e-4, sig_m * 0.2)); \
+            cand_[nc_++] = fmin(0.95, fmax(1e-3, sig_m * 3.0)); \
+            if (par->hsd_sig > 3) { cand_[nc_++] = 0.05; cand_[nc_++] = 0.4; } \
+        } \
+        for (int c_ = 0; c_ < nc_; c_++) { \
+            double sg_ = cand_[c_], dt_ = dt0 + sg_ * (dt1 - dt0), dk_ = dk0 + sg_ * (dk1 - dk0); \
+            HPAR_FOR \
+            for (int k = 0; k < nb; k++) { \
+                size_t len = bsz(&P->blk[k]); \
+                for (size_t i = 0; i < len; i++) { \
+                    S[k].dX[i] = dX0[k][i] + sg_ * (dX1[k][i] - dX0[k][i]); \
+                    S[k].dZ[i] = dZ0[k][i] + sg_ * (dZ1[k][i] - dZ0[k][i]); \
+                } \
+            } \
+            tst = wtime(); \
+            const double amX_ = maxstep(P, S, 1, par->lanczos_k), amZ_ = maxstep(P, S, 0, par->lanczos_k); \
+            double am_ = fmin(amX_, amZ_); \
+            R->t_step += wtime() - tst; \
+            if (dt_ < 0) am_ = fmin(am_, -tau / dt_); \
+            if (dk_ < 0) am_ = fmin(am_, -kap / dk_); \
+            if (ENV_ON("BRISK_HSDDBG")) \
+                printf("     [sigma %.3g: aX %.3f aZ %.3f atau %.3g akap %.3g -> %.3f]\n", sg_, amX_, amZ_, \
+                       dt_ < 0 ? -tau / dt_ : 1e30, dk_ < 0 ? -kap / dk_ : 1e30, am_); \
+            double gam_ = 0.9 + (par->gamma_max - 0.9) * fmin(1.0, am_); \
+            double al_ = fmin(1.0, gam_ * am_); \
+            double merit_ = al_ * (1.0 - sg_);                     /* predicted mu reduction */ \
+            if (merit_ > BM) { BM = merit_; BSIG = sg_; BAL = al_; BAM = am_; } \
+        } } while (0)
+        /* experimental (BRISK_HSDHOC = k): the second-order term re-evaluated k times at the combined
+         * direction of the Mehrotra sigma (a fixed-point iteration on the complementarity equation
+         * with the factorization at hand) */
+        int hoc_on = 0, hoc_kept = 0;   /* passes allowed in this iteration; passes kept */
+        double cQ = 0, tk2 = 0, n0 = 0, n1 = 0, dt0 = 0, dt1 = 0, dk0 = 0, dk1 = 0;
+        static int nhoc_env = -2; static double hoc_theta = 0.9, hoc_theta1 = 0.9, hoc_amin = 0;
+        if (nhoc_env < -1) { const char *e1 = getenv("BRISK_HSDHOCT1"); if (e1) hoc_theta1 = atof(e1); }
+        if (nhoc_env < -1) { const char *eh = getenv("BRISK_HSDHOC"); nhoc_env = eh ? atoi(eh) : -1; const char *et = getenv("BRISK_HSDHOCT"); if (et) hoc_theta = atof(et); const char *ek = getenv("BRISK_HSDHOCA"); if (ek) hoc_amin = atof(ek); }
+        static int hoc_fmax = -1; if (hoc_fmax < 0) { const char *ef = getenv("BRISK_HSDHOCF"); hoc_fmax = ef ? atoi(ef) : 3; }
+        /* the passes (and the long step) are given up for the rest of the solve after hoc_fmax iterations in which
+         * they predicted less than the first direction: the fixed point is not the better direction on this problem */
+        const int nhoc_max = hoc_nfail >= hoc_fmax ? 0 : nhoc_env >= 0 ? nhoc_env : par->hsd_hoc;
+        /* the passes and the long step only after a predictor that went at least hoc_amin of the way to the boundary */
+        static double hoc_end = -1; if (hoc_end < 0) { const char *ee = getenv("BRISK_HSDHOCEND"); hoc_end = ee ? atof(ee) : 100.0; }
+        /* not within a factor 100 of the tolerance: a problem that arrives there step by step (not in one
+         * superlinear step) is ill-conditioned, and the standard step settles better at its accuracy floor
+         * (12 fragile problems x 12 perturbations: 82 OPTIMAL with this rule, 75 without, 87 before 5.7) */
+        const int hoc_late = hoc_end > 0 && fmax(R->pinf, fmax(R->relgap, R->dinf)) <= hoc_end * par->tol;
+        const int nhoc = (aa >= hoc_amin && !hoc_late) ? nhoc_max : 0;
+        hoc_on = nhoc > 0;
+        /* Qp, qvp, ...: the state of the last accepted pass; Q0s, ...: of pass 0 (Mehrotra's direction), to
+         * which the iteration returns unless the passes have converged (total contraction <= kappa) */
+        double **Qp = NULL, *qvp = NULL, cQp = 0, tk2p = 0, hoc_d = 0, hoc_d0 = 0;
+        double **Q0s = NULL, *qv0s = NULL, *u0s = NULL, *uf0s = NULL, cQ0s = 0, tk20s = 0;
+        int hoc_redo = 0, hoc_have = 0; double hoc_m0 = 0, hoc_s0 = 0, hoc_al0 = 0, hoc_am0 = 0, hoc_sig = 0, hoc_ms = 0, hoc_ss = 0, hoc_als = 0, hoc_ams = 0;
+        if (nhoc > 0) {
+            Qp = calloc(nb + 1, sizeof(double *)); Q0s = calloc(nb + 1, sizeof(double *));
+            for (int k = 0; k < nb; k++) { Qp[k] = amalloc(sizeof(double) * bsz(&P->blk[k])); Q0s[k] = amalloc(sizeof(double) * bsz(&P->blk[k])); }
+            qvp = amalloc(sizeof(double) * (m + 1)); qv0s = amalloc(sizeof(double) * (m + 1)); u0s = amalloc(sizeof(double) * (m + 1));
+            if (nf) uf0s = amalloc(sizeof(double) * (nf + 1));
+        }
+        for (int hoc = 0; ; hoc++) {
         /* ---- second-order terms (cone and the tau-kappa pair) */
         td = wtime();
         memset(qv, 0, sizeof(double) * m);
         /* second-order term, optionally damped by the affine step (the correction for a step
          * alpha is alpha^2 dX dZ; Mehrotra's alpha = 1 over-corrects after short predictors) */
         const double qsc = par->hsd_qscale == 1 ? aa : par->hsd_qscale == 2 ? aa * aa : 1.0;
-        double cQ = 0, tk2 = qsc * dtau_a * dkap_a;
+        cQ = 0; tk2 = qsc * dtau_a * dkap_a;
         double *pq = hred(nb, 1);
         aop_begin(qv, NULL, NULL, NULL);
         HPAR_FOR
@@ -5761,6 +6133,34 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         }
         aop_end();
         for (int k = 0; k < nb; k++) cQ += pq[k];
+        if (nhoc > 0) {
+            /* the fixed point is followed while it contracts: |Q_{k+1} - Q_k| <= theta |Q_k - Q_{k-1}| */
+            double d = 0;
+            for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]); const double *q = S[k].Q, *qp = Qp[k]; double t = 0;
+                if (hoc == 0) for (size_t i = 0; i < len; i++) t += q[i] * q[i]; else for (size_t i = 0; i < len; i++) t += (q[i] - qp[i]) * (q[i] - qp[i]);
+                d += t; }
+            d = sqrt(d + (hoc == 0 ? tk2 * tk2 : (tk2 - tk2p) * (tk2 - tk2p)));
+            const int fail = hoc > 0 && !(d <= (hoc == 1 ? hoc_theta1 : hoc_theta) * hoc_d);
+            if (ENV_ON("BRISK_HSDDBG") && hoc > 0) printf("     [second-order pass %d: change %.3e (previous %.3e, first %.3e)%s]\n", hoc, d, hoc_d, hoc_d0, fail ? " stop" : "");
+            if (fail) {
+                if (1) {
+                    /* converged enough (or nothing was accepted): the last accepted state stands */
+                    for (int k = 0; k < nb; k++) memcpy(S[k].Q, Qp[k], sizeof(double) * bsz(&P->blk[k]));
+                    memcpy(qv, qvp, sizeof(double) * m); cQ = cQp; tk2 = tk2p;
+                    R->t_dense += wtime() - td;
+                    break;
+                }
+                for (int k = 0; k < nb; k++) memcpy(S[k].Q, Q0s[k], sizeof(double) * bsz(&P->blk[k]));
+                memcpy(qv, qv0s, sizeof(double) * m); cQ = cQ0s; tk2 = tk20s;
+                memcpy(u0, u0s, sizeof(double) * m); if (nf) memcpy(uf0, uf0s, sizeof(double) * nf);
+                hoc_redo = 1;
+            } else {
+                if (hoc == 0) { hoc_d0 = d; for (int k = 0; k < nb; k++) memcpy(Q0s[k], S[k].Q, sizeof(double) * bsz(&P->blk[k])); memcpy(qv0s, qv, sizeof(double) * m); cQ0s = cQ; tk20s = tk2; }
+                hoc_d = d;
+                for (int k = 0; k < nb; k++) memcpy(Qp[k], S[k].Q, sizeof(double) * bsz(&P->blk[k]));
+                memcpy(qvp, qv, sizeof(double) * m); cQp = cQ; tk2p = tk2;
+            }
+        }
         /* rhs(sigma) = c0 + sigma c1, so the whole corrector family is affine in sigma */
         for (int i = 0; i < m; i++) rhs[i] = rp[i] + hd[i] + qv[i];
         aop_begin(rhs, NULL, NULL, NULL);
@@ -5770,9 +6170,10 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         if (nf) free_A(P, &FV, FV.xf, -1.0, rhs);
         R->t_dense += wtime() - td;
         tc = wtime();
-        if (nf) free_solve(P, Sc, &FV, rhs, rf, u0, uf0);
-        else if (!par->hsd_batch) schur_solve(Sc, rhs, u0, soltol);
-        if (!nf && par->hsd_batch) {
+        if (hoc_redo) { /* (u0 of the first pass is back in place) */ }
+        else if (nf) free_solve(P, Sc, &FV, rhs, rf, u0, uf0);
+        else if (!par->hsd_batch || hoc > 0) schur_solve(Sc, rhs, u0, soltol);
+        if (!nf && par->hsd_batch && hoc == 0) {
             for (int i = 0; i < m; i++) dyd[i] = -(rp[i] + hd[i]) - mu * a0[i];
             const double *rr[2] = { rhs, dyd };
             double *xx[2] = { u0, u1 };
@@ -5780,19 +6181,22 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             schur_solve_multi(Sc, 2, rr, xx, tt);
         }
         for (int i = 0; i < m; i++) rhs[i] = -(rp[i] + hd[i]) - mu * a0[i];
+        if (hoc == 0) {                 /* (u1 does not depend on the second-order term) */
         if (nf) {
             for (int f2 = 0; f2 < nf; f2++) qf[f2] = -rf[f2];
             free_solve(P, Sc, &FV, rhs, qf, u1, uf1);
         }
         else if (!par->hsd_batch) schur_solve(Sc, rhs, u1, soltol);
+        }
         R->t_chol += wtime() - tc;
-        double n0 = rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0)
+        if (nhoc > 0 && hoc == 0) { memcpy(u0s, u0, sizeof(double) * m); if (nf) memcpy(uf0s, uf0, sizeof(double) * nf); }
+        n0 = rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0)
                     + (-tau * kap - tk2) / tau + (nf ? ddot_n(nf, FV.c, uf0) : 0.0);
-        double n1 = -rg + mu * cZi + hcRd - ddot_n(m, P->b, u1) + ddot_n(m, hc, u1) + mu / tau
+        n1 = -rg + mu * cZi + hcRd - ddot_n(m, P->b, u1) + ddot_n(m, hc, u1) + mu / tau
                     + (nf ? ddot_n(nf, FV.c, uf1) : 0.0);
-        double dt0 = n0 / denom, dt1 = (n0 + n1) / denom;
-        double dk0 = (-tau * kap - tk2) / tau - (kap / tau) * dt0;
-        double dk1 = (mu - tau * kap - tk2) / tau - (kap / tau) * dt1;
+        dt0 = n0 / denom; dt1 = (n0 + n1) / denom;
+        dk0 = (-tau * kap - tk2) / tau - (kap / tau) * dt0;
+        dk1 = (mu - tau * kap - tk2) / tau - (kap / tau) * dt1;
 
         /* endpoint directions at sigma = 0 and sigma = 1 */
         td = wtime();
@@ -5822,43 +6226,83 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             }
         }
         R->t_dense += wtime() - td;
+        if (hoc_redo || nhoc == 0) break;
+        {
+            /* the predicted reduction of this pass's family (the sigma search): the passes are kept only if it
+             * is at least the one of the first family; the fixed point is taken at the sigma the first search chose */
+            double mer = -1, sgb = sig_m, alb = 0, amb = 0;
+            HSD_SIGSEARCH(mer, sgb, alb, amb);
+            if (ENV_ON("BRISK_HSDDBG")) printf("     [second-order pass %d: predicted reduction %.4f (sigma %.3g, step %.4f)]\n", hoc, mer, sgb, alb);
+            hoc_kept = hoc;
+            if (hoc == 0) { hoc_m0 = mer; hoc_s0 = sgb; hoc_al0 = alb; hoc_am0 = amb; hoc_sig = getenv("BRISK_HSDHOCSIGM") ? sig_m : sgb; }
+            if (hoc == 0 || mer >= hoc_m0) { hoc_ms = mer; hoc_ss = sgb; hoc_als = alb; hoc_ams = amb; hoc_have = 1; }
+            else {
+                /* worse than the first family: back to it */
+                for (int k = 0; k < nb; k++) memcpy(S[k].Q, Q0s[k], sizeof(double) * bsz(&P->blk[k]));
+                memcpy(qv, qv0s, sizeof(double) * m); cQ = cQ0s; tk2 = tk20s;
+                memcpy(u0, u0s, sizeof(double) * m); if (nf) memcpy(uf0, uf0s, sizeof(double) * nf);
+                hoc_redo = 2; hoc_kept = 0; hoc_nfail++;
+                hoc_ms = hoc_m0; hoc_ss = hoc_s0; hoc_als = hoc_al0; hoc_ams = hoc_am0;
+            }
+            if (hoc_redo != 2) {
+                if (hoc >= nhoc) break;
+                const double sg = hoc_sig;
+                HPAR_FOR
+                for (int k = 0; k < nb; k++) {
+                    const size_t len = bsz(&P->blk[k]);
+                    for (size_t i = 0; i < len; i++) {
+                        S[k].dX[i] = dX0[k][i] + sg * (dX1[k][i] - dX0[k][i]);
+                        S[k].dZ[i] = dZ0[k][i] + sg * (dZ1[k][i] - dZ0[k][i]);
+                    }
+                }
+                dtau_a = dt0 + sg * (dt1 - dt0); dkap_a = dk0 + sg * (dk1 - dk0);
+            }
+        }
+        if (hoc_redo == 2) {
+            /* recompute the scalars and the endpoints from the restored u0 */
+            hoc_redo = 1;
+            n0 = rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0) + (-tau * kap - tk2) / tau + (nf ? ddot_n(nf, FV.c, uf0) : 0.0);
+            dt0 = n0 / denom; dt1 = (n0 + n1) / denom;
+            dk0 = (-tau * kap - tk2) / tau - (kap / tau) * dt0;
+            dk1 = (mu - tau * kap - tk2) / tau - (kap / tau) * dt1;
+            for (int e = 0; e < 2; e++) {
+                double sg = e ? 1.0 : 0.0, dt = e ? dt1 : dt0;
+                for (int i = 0; i < m; i++) dy[i] = u0[i] + sg * u1[i] + dt * v[i];
+                HPAR_FOR
+                for (int k = 0; k < nb; k++) {
+                    const Block *B = &P->blk[k];
+                    BS *s = &S[k];
+                    size_t len = bsz(B);
+                    int n = B->n;
+                    double *DZ = e ? dZ1[k] : dZ0[k], *DX = e ? dX1[k] : dX0[k];
+                    blk_ATy(B, s, dy, DZ);
+                    if (pk[k]) { for (size_t i = 0; i < len; i++) DZ[i] = -DZ[i]; add_R0(s, len, (1.0 - sg) * theta, DZ); }
+                    else for (size_t i = 0; i < len; i++) DZ[i] = (1.0 - sg) * s->F[i] - DZ[i];
+                    sp_add(B, &B->C, dt, DZ);
+                    const double *RX = Zv[k] ? s->Zi : s->X, *ZI = Zv[k] ? Zv[k] : s->Zi;
+                    if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = s->Zi[i] * DZ[i] * s->X[i];
+                    else if (pk[k]) { prod_pat(&hp[k], n, s, DZ, RX, s->G); symmetrize(n, s->G); }
+                    else { prod3(n, s->Zi, DZ, RX, s->W, s->G); symmetrize(n, s->G); }
+                    for (size_t i = 0; i < len; i++) DX[i] = -s->G[i] - s->X[i] - s->Q[i] + sg * mu * ZI[i];
+                }
+                if (nf) {
+                    for (int f2 = 0; f2 < nf; f2++) dxfd[f2] = uf0[f2] + sg * uf1[f2] + dt * vf[f2];
+                    free_set_dir(&FV, S, e ? dX1 : dX0, e ? dZ1 : dZ0, dxfd, 0);
+                }
+            }
+            break;
+        }
+        }
+        if (Qp) { for (int k = 0; k < nb; k++) { free(Qp[k]); free(Q0s[k]); } free(Qp); free(Q0s); free(qvp); free(qv0s); free(u0s); free(uf0s); }
 
         { double _t = wtime(); g_ph[3] += _t - g_ph_last; g_ph_last = _t; }
         /* ---- choose sigma: the embedded system gives mu_new = mu (1 - alpha (1 - sigma))
          * exactly, so maximize alpha(sigma) (1 - sigma) over a few candidates.        */
-        double cand[6], best_merit = -1, best_sig = sig_m, best_alpha = 0, best_am = 0;
-        int nc = 0;
-        cand[nc++] = sig_m;
-        if (par->hsd_sig > 0) {
-            cand[nc++] = fmin(0.95, fmax(1e-4, sig_m * 0.2));
-            cand[nc++] = fmin(0.95, fmax(1e-3, sig_m * 3.0));
-            if (par->hsd_sig > 3) { cand[nc++] = 0.05; cand[nc++] = 0.4; }
-        }
+        double best_merit = -1, best_sig = sig_m, best_alpha = 0, best_am = 0;
         const double tsig0 = wtime();
-        for (int c = 0; c < nc; c++) {
-            double sg = cand[c], dt = dt0 + sg * (dt1 - dt0), dk = dk0 + sg * (dk1 - dk0);
-            HPAR_FOR
-            for (int k = 0; k < nb; k++) {
-                size_t len = bsz(&P->blk[k]);
-                for (size_t i = 0; i < len; i++) {
-                    S[k].dX[i] = dX0[k][i] + sg * (dX1[k][i] - dX0[k][i]);
-                    S[k].dZ[i] = dZ0[k][i] + sg * (dZ1[k][i] - dZ0[k][i]);
-                }
-            }
-            tst = wtime();
-            const double amX = maxstep(P, S, 1, par->lanczos_k), amZ = maxstep(P, S, 0, par->lanczos_k);
-            double am = fmin(amX, amZ);
-            R->t_step += wtime() - tst;
-            if (dt < 0) am = fmin(am, -tau / dt);
-            if (dk < 0) am = fmin(am, -kap / dk);
-            if (ENV_ON("BRISK_HSDDBG"))
-                printf("     [sigma %.3g: aX %.3f aZ %.3f atau %.3g akap %.3g -> %.3f]\n", sg, amX, amZ,
-                       dt < 0 ? -tau / dt : 1e30, dk < 0 ? -kap / dk : 1e30, am);
-            double gam = 0.9 + (par->gamma_max - 0.9) * fmin(1.0, am);
-            double al = fmin(1.0, gam * am);
-            double merit = al * (1.0 - sg);                     /* predicted mu reduction */
-            if (merit > best_merit) { best_merit = merit; best_sig = sg; best_alpha = al; best_am = am; }
-        }
+        if (hoc_kept > 0) hoc_nkept++;
+        if (hoc_have) { best_merit = hoc_ms; best_sig = hoc_ss; best_alpha = hoc_als; best_am = hoc_ams; }   /* (the search of the family that stands was made in the passes) */
+        else HSD_SIGSEARCH(best_merit, best_sig, best_alpha, best_am);
         g_ph[8] += wtime() - tsig0;
         sigma = best_sig;
         alpha = best_alpha;
@@ -6042,6 +6486,27 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 dk -= kap * dte / tau;
                 nrefine++;
             }
+            {   /* experimental: a longer step when the new point stays in the neighbourhood */
+                static double nb_beta = -2, nb_g = 0; static int nb_always = 0;
+                static int nb_mode = 1;      /* 1 (default): only in iterations whose passes were kept; 0: whenever the passes are allowed */
+                if (nb_beta < -1) { nb_always = getenv("BRISK_HSDNBALL") != NULL; const char *em = getenv("BRISK_HSDNBMODE"); if (em) nb_mode = atoi(em); }
+                static double nb_env = -2, nb_amin = 0.9;
+                if (nb_env < -1.5) { const char *e3 = getenv("BRISK_HSDNBAMIN"); if (e3) nb_amin = atof(e3); }
+                if (nb_env < -1.5) { const char *e1 = getenv("BRISK_HSDNB"); nb_env = e1 ? atof(e1) : -1; const char *e2 = getenv("BRISK_HSDNBG"); nb_g = e2 ? atof(e2) : 0.9995; }
+                nb_beta = nb_env >= 0 ? nb_env : par->hsd_nb;
+                if (nb_beta > 0 && best_am >= nb_amin && ((nb_mode == 0 && hoc_on) || (nb_mode == 1 && hoc_kept > 0) || nb_always)) {
+                    const double gs[4] = { nb_g, 1.0 - 4.0 * (1.0 - nb_g), 1.0 - 16.0 * (1.0 - nb_g), 0 };
+                    for (int c = 0; c < 3; c++) {
+                        const double al = fmin(1.0, gs[c] * best_am);
+                        if (al <= alpha) break;
+                        if ((tau + al * dt) <= 0 || (kap + al * dk) <= 0) continue;
+                        const double mun = mu * (1.0 - al * (1.0 - sigma));
+                        const int okn = (tau + al * dt) * (kap + al * dk) >= nb_beta * mun && sdp_nb_ok(P, S, al, nb_beta * mun);
+                        if (ENV_ON("BRISK_HSDDBG")) printf("     [neighbourhood: alpha %.5f (default %.5f): %s]\n", al, alpha, okn ? "inside" : "outside");
+                        if (okn) { alpha = al; break; }
+                    }
+                }
+            }
             /* neighbourhood safeguard: keep tau kappa and the LP products near mu */
             for (int t2 = 0; t2 < 10; t2++) {
                 double munew = 0, tk = (tau + alpha * dt) * (kap + alpha * dk), lo = 1e300;
@@ -6192,8 +6657,9 @@ done:
             muf = fmax(xz / fmax(ndim, 1.0), 1e-300);
         }
         for (int f = 0; f < nf; f++) {
-            for (int w = 0; w < 1 + (keep_best != 0); w++) {
-                double *Xk = w ? S[FV.kb[f]].Xb : S[FV.kb[f]].X, *Zk = w ? S[FV.kb[f]].Zb : S[FV.kb[f]].Z;
+            for (int w = 0; w < 3; w++) {
+                if ((w == 1 && !keep_best) || (w == 2 && !(rc && rc->have))) continue;
+                double *Xk = w == 2 ? S[FV.kb[f]].Xr : w ? S[FV.kb[f]].Xb : S[FV.kb[f]].X, *Zk = w == 2 ? S[FV.kb[f]].Zr : w ? S[FV.kb[f]].Zb : S[FV.kb[f]].Z;
                 const double x = Xk[FV.ip[f]], s0 = 1e-8 * (1.0 + fabs(x));
                 Xk[FV.ip[f]] = fmax(x, 0.0) + s0;
                 Xk[FV.im[f]] = fmax(-x, 0.0) + s0;
@@ -6210,6 +6676,7 @@ done:
     Sc->pivtol = pivtol_saved; Sc->use_hint = 0; Sc->reg_hint = 0;
     if (par->verbose && ncorr) printf("   (HSD: %d centrality correctors accepted)\n", ncorr);
     if (par->verbose && nrefine) printf("   (HSD: %d refinement passes)\n", nrefine);
+    if (par->verbose && (hoc_nkept || hoc_nfail)) printf("   (HSD: second-order passes kept in %d iterations, worse than the first direction in %d)\n", hoc_nkept, hoc_nfail);
     if (par->verbose > 1 && (nref_skip || nref_fail)) printf("   (HSD: refinement at the solve floor: %d stopped after the solve, %d skipped)\n", nref_fail, nref_skip);
     free(dyd);
     *it_out = it;
@@ -6275,6 +6742,7 @@ static int free_cores(void) {
  * (brisk_log_threads_reset at the start of a run). */
 static int g_nt_logged = -1;
 void brisk_log_threads_reset(void) { g_nt_logged = -1; }
+int brisk_threads_logged(void) { return g_nt_logged; }   /* 5.8: the count last logged, for the summary (-1: none) */
 void brisk_log_threads(int verbose) {
     const int nt = nthreads();
     if (verbose > 0 && nt != g_nt_logged) { printf("Number of threads: %d\n", nt); g_nt_logged = nt; }
@@ -6356,12 +6824,28 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
             for (int k = 0; k < P->nblk; k++)
                 if (P->blk[k].type == BLK_SDP) { double nk = P->blk[k].n; n3 += nk * nk * nk; }
             const double fac = mm * mm * mm / 3.0;
+            /* 5.10: ... or next to the assembly. Where the assembly of the Schur complement, not
+             * its factorization, is most of an iteration (few constraints with wide rows on
+             * blocks of order 250-800: a user's relaxations of structural optimization), the
+             * embedding's dense work is a small overhead although it is several times m^3/3:
+             * the embedding is first when that work is at most hsd_first_asm (0.5) of
+             * factorization plus assembly (the route cost model of analyze_sdp_block, in
+             * BLAS-3 flops; 0 for low-rank blocks). On the regression sets the ratio is
+             * below 0.2 or above 0.9 (arch: 0.92-0.97, max-cut and graph partitioning: 35). */
+            double asm_fl = 0;
+            for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) asm_fl += P->blk[k].asm_cost;
+            const double dense = par_local.hsd_first_c * n3;
+            if (ENV_ON("BRISK_HSDASMDBG")) printf("   [embedding-first rule: dense %.2e, factor %.2e, assembly %.2e]\n", dense, fac, asm_fl);
             /* ... and on tiny problems (below 1e7 flops per iteration either way), where the
              * robustness of the embedding costs nothing (hinf11) */
-            if (par_local.hsd_first_c * n3 <= fac || fac + par_local.hsd_first_c * n3 < 1e7) {
+            if (dense <= fac || dense <= par_local.hsd_first_asm * (fac + asm_fl) || fac + dense < 1e7) {
                 par_local.hsd = 1;
                 par_local.hsd_first_on = 1;
-                if (par->verbose > 0) printf("   self-dual embedding first (dense work %.1e <= Schur factor %.1e)\n", par_local.hsd_first_c * n3, fac);
+                if (par->verbose > 0) {
+                    if (dense <= fac) printf("   self-dual embedding first (dense work %.1e <= Schur factor %.1e)\n", dense, fac);
+                    else if (!(dense <= par_local.hsd_first_asm * (fac + asm_fl))) printf("   self-dual embedding first (a small problem: %.1e flops an iteration)\n", fac + dense);
+                    else printf("   self-dual embedding first (dense work %.1e <= %.2g x Schur factor and assembly %.1e)\n", dense, par_local.hsd_first_asm, fac + asm_fl);
+                }
             }
         }
     }
@@ -6868,7 +7352,13 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
     R->methods |= par->hsd == 1 ? 2 : 1;
     if (g_free_hsd) R->free_hsd = 1;
     const double t_loop0 = wtime();
-    if (par->hsd == 1) status = hsd_run(P, par, R, S, &Sc, y, ybest, &best_score, &it, &it_best, &best, keep_best);
+    /* the restoration's iterate: stored when the best one is and the memory allows two more copies */
+    RCand rc = { NULL, 1e300, 0, 0 };
+    if (keep_best && par->polish_r && 2.0 * polish_bytes <= par->polish_mem) {
+        rc.y = malloc(sizeof(double) * (m + 1));
+        for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]) * sizeof(double); S[k].Xr = amalloc(len); S[k].Zr = amalloc(len); }
+    }
+    if (par->hsd == 1) status = hsd_run(P, par, R, S, &Sc, y, ybest, &best_score, &it, &it_best, &best, keep_best, &rc);
     else
     for (it = 0; it <= par->maxit; it++) {
         double td = wtime();
@@ -6951,6 +7441,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         double score = res_score(R);
         if (ENV_ON("BRISK_SCOREDBG")) printf("   SCORE it %d score %.3e comp %.3e best %.3e itbest %d t %.4f\n", it, score, R->relcomp, fmin(score, best_score), score < best_score ? it : it_best, wtime() - par->t_start);
         btrack_offer(par, P, S, y, 1.0, sc * mu, R, it);
+        rcand_offer(&rc, P, S, y, 1.0, R, it);
         const int improved_er = score < best_score;
         if (score < best_score) {
             best_score = score; it_best = it; best = *R;
@@ -7586,7 +8077,11 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 if (B->type == BLK_SDP) n3 += 30.0 * nk * nk * nk;
             }
             assem += 0.5 * (double)m * sum_ef;
-            const double dd_it = 45.0 * (assem + (double)m * m * m / 3.0 + n3);   /* measured: a dd iteration costs ~45 double ones (m = 936) */
+            /* 5.9: the endgame factors the Schur complement as a sparse matrix (ddend.c): the work
+             * of the double solver's sparse factorization when there is one, 4 m^2 for the dense
+             * passes over M */
+            const double chol_fl = Sc.SC ? schol_flops(Sc.SC) + 4.0 * (double)m * m : (double)m * m * m / 3.0;
+            const double dd_it = 45.0 * (assem + chol_fl + n3);   /* measured: a dd iteration costs ~45 double ones (m = 936) */
             const double budget = fmax(par->dd_minwork, par->dd_factor * (par->work_done + work_run));
             int dd_maxit = (int)fmin((double)par->dd_iters, floor(budget / dd_it));
             if (par->verbose > 1)
@@ -7605,12 +8100,15 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 }
                 double cur2 = use_best ? best_score : res_score(R);
                 ran_dd = 1;
-                if (dd_endgame(P, Xs, Zs, yc, par, dd_maxit, par->tol, par->verbose)) {
+                const double tdd0 = wtime(); int dd_ok = dd_endgame(P, Xs, Zs, yc, par, dd_maxit, par->tol, par->verbose);
+                if (getenv("BRISK_DDTIME")) printf("   [endgame: %.3f s, estimate %.2e flop units per iteration, %d allowed]\n", wtime() - tdd0, dd_it, dd_maxit);
+                if (dd_ok > 0) {
                     Result Rp = *R;
                     double sp = measure_candidate(P, S, Xs, Zs, yc, &Rp, Sc.t);
                     if (par->verbose > 0)
                         printf("   high-precision endgame: score %.2e -> %.2e %s\n",
                                cur2, sp, sp < cur2 ? "accepted" : "rejected");
+                    { extern void brisk_note(const char *, ...); brisk_note("double-double endgame of the embedding: score %.1e -> %.1e, %s", cur2, sp, sp < cur2 ? "accepted" : "rejected"); }
                     if (sp < cur2) {
                         double tt[6] = { R->t_setup, R->t_schur, R->t_chol, R->t_dense, R->t_step, R->t_total };
                         int itn = R->iters;
@@ -7645,8 +8143,63 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
             if (use_best || !keep_best || res_score(R) <= best_score) {
                 /* the X-metric correction first (it keeps X positive definite); the
                  * Euclidean projection only if that one was not accepted */
-                int px = par->polish_x && polish_xmetric(P, S, Xb, Zb, use_best ? ybest : y, R, res_score(R), &Sc, dy, par->verbose);
-                if (px) {
+                /* the restoration of the primal feasibility in the square-root metric first: from
+                 * the iterate kept for it when that promises more than the best one, else from the
+                 * best one; the older corrections only if neither is accepted */
+                int ph = 0;
+                if (par->polish_r) {
+                    /* first from the iterate kept for it (the smallest dual residual and
+                     * complementarity), then, if the tolerance is still missed, from the best
+                     * iterate; the better candidate stays in s->G, s->Q, with its y in y_cand */
+                    const int it_ret = use_best ? it_best : it;        /* the iteration of the point in hand */
+                    const double *y_ret = use_best ? ybest : y, *y_cand = NULL;
+                    /* the best iterate is restored only if its primal residual, or what that
+                     * residual puts into the gap, is a quarter of its largest error: a restoration
+                     * moves X in proportion to the residual, so it cannot help an error that is
+                     * the complementarity of a feasible point. The
+                     * complementarity before the restoration is no guide to the one after it:
+                     * with a large residual X has a component that Z sees and the restoration
+                     * removes (attr_henon_d10_K: 2.5e-5 before, 1.2e-8 after). */
+                    const double sc0 = res_score(R), pr0 = fmax(nan_inf(R->pinf), fabs(R->relgap - fabs(R->relcomp)));
+                    double **Gs = malloc(sizeof(double *) * 2 * nb);
+                    for (int k = 0; k < 2 * nb; k++) Gs[k] = NULL;
+                    #define CAND_SAVE() for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]) * sizeof(double); \
+                        if (!Gs[k]) { Gs[k] = malloc(len + 8); Gs[nb + k] = malloc(len + 8); } memcpy(Gs[k], S[k].G, len); memcpy(Gs[nb + k], S[k].Q, len); }
+                    #define CAND_BACK() for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]) * sizeof(double); memcpy(S[k].G, Gs[k], len); memcpy(S[k].Q, Gs[nb + k], len); }
+                    if (rc.have && rc.it != it_ret && rc.score < sc0) {
+                        double **Xr = malloc(sizeof(double *) * nb), **Zr = malloc(sizeof(double *) * nb);
+                        for (int k = 0; k < nb; k++) { Xr[k] = S[k].Xr; Zr[k] = S[k].Zr; }
+                        if (par->verbose > 1) printf("   restoring the primal feasibility of iteration %d (dual residual and complementarity %.1e)\n", rc.it, rc.score);
+                        if (polish_xmetric(P, S, Xr, Zr, rc.y, R, res_score(R), &Sc, dy, par->verbose, 1)) { ph = 1; y_cand = rc.y; }
+                        free(Xr); free(Zr);
+                    }
+                    if ((!ph || res_score(R) > par->tol) && pr0 >= 0.25 * sc0) {
+                        if (ph) CAND_SAVE();
+                        if (polish_xmetric(P, S, Xb, Zb, y_ret, R, res_score(R), &Sc, dy, par->verbose, 1)) { ph = 1; y_cand = y_ret; }
+                        else if (ph) CAND_BACK();
+                    }
+                    /* a restoration that was cut short (halved steps) leaves a primal residual: the
+                     * Euclidean projection of its result, kept if better */
+                    if (ph && res_score(R) > par->tol && R->pinf > 0.5 * res_score(R)) {
+                        CAND_SAVE();
+                        if (!polish_solution(P, S, Gs, Gs + nb, y_cand, R, res_score(R), &Sc, dy, par->verbose)) CAND_BACK();
+                    }
+                    /* still above the tolerance: the Euclidean projection of the unpolished point as
+                     * well, the better one kept (it may trade a small indefiniteness of X for the gap) */
+                    if (ph && res_score(R) > par->tol) {
+                        CAND_SAVE();
+                        if (polish_solution(P, S, Xb, Zb, y_ret, R, res_score(R), &Sc, dy, par->verbose)) y_cand = y_ret;
+                        else CAND_BACK();
+                    }
+                    #undef CAND_SAVE
+                    #undef CAND_BACK
+                    for (int k = 0; k < 2 * nb; k++) free(Gs[k]);
+                    free(Gs);
+                    if (ph) { xsrc = 2; if (y_cand != y) memcpy(y, y_cand, sizeof(double) * m); }
+                }
+                int px = !ph && par->polish_x && polish_xmetric(P, S, Xb, Zb, use_best ? ybest : y, R, res_score(R), &Sc, dy, par->verbose, 0);
+                if (ph) { }
+                else if (px) {
                     xsrc = 2;
                     if (use_best) memcpy(y, ybest, sizeof(double) * m);
                     /* 4.22: still above the tolerance: the Euclidean projection of the
@@ -7770,7 +8323,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         double *bufs[] = { s->X, s->Z, s->LX, s->LZ, s->Zi, s->dX, s->dZ, s->F, s->G,
                            s->Q, s->W, s->Xn, s->Zn, s->Fr, s->T1, s->Zc,
                            s->lq, s->v1, s->v2, s->dtmp, s->Gd, s->Mdd, s->Ct, s->Dxc, s->ev, s->R0, s->r0v,
-                           s->lrV, s->lrPQ, s->lrPd, s->lrQd, s->lrQ, s->Xb, s->Zb,
+                           s->lrV, s->lrPQ, s->lrPd, s->lrQd, s->lrQ, s->Xb, s->Zb, s->Xr, s->Zr,
                            s->ntGbuf, s->ntVt, s->ntT, s->lam, s->dX1, s->dS1, s->dX1t, s->dS1t,
                            s->dXt, s->dZt, s->Rt };
         for (size_t q = 0; q < sizeof(bufs) / sizeof(bufs[0]); q++) free(bufs[q]);
@@ -7782,7 +8335,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         free(s->dW);
         if (s->cpat.owned) { free(s->cpat.fr); free(s->cpat.fc); free(s->cpat.rows); }
     }
-    free(ev); free(wv); free(w1); free(y1); free(ybest); free(slowh);
+    free(ev); free(wv); free(w1); free(y1); free(ybest); free(slowh); free(rc.y);
     endrules_free(&ER_std);
     free(S); free(y); free(dy); free(rhs); free(rp); free(a0); free(h); free(qv);
     free(Gs.M); free(Gs.Md); free(Gs.Mf); free(Gs.ya); envelope_free(Gs.E); free(Gs.e1); free(Gs.e2); free(Gs.e3);

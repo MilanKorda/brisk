@@ -315,6 +315,32 @@ end
     @test_throws ArgumentError set_attribute(model, "output", :nowhere)
 end
 
+@testset "the advice at the end of the log, in the caller's syntax" begin
+    # 1.3.2: more accuracy and a guaranteed bound, as keywords of the function that was called
+    # or as attributes of the JuMP model; what was asked for is not advised again
+    logof(f) = mktemp() do path, io
+        redirect_stdout(f, io)
+        flush(io)
+        read(path, String)
+    end
+    data = (3, [3], [1.0, 1.0, 1.0], [0, 0, 0, 1, 2, 3], fill(1, 6), [1, 1, 2, 1, 2, 3], [2, 3, 3, 1, 2, 3], [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
+    out = logof(() -> Brisk.solve_sdpa_data(data...; output = :julia))
+    @test occursin("For higher accuracy, as keywords of Brisk.solve_sdpa_data(...; ...):", out)
+    @test occursin("acc = \"high\"", out) && occursin("prec = \"dd\"", out)
+    @test occursin("For a guaranteed bound on the optimal value", out) && occursin("bound = \"d\"", out) && occursin("certify = true", out)
+    out = logof(() -> Brisk.solve_sdpa_data(data...; output = :julia, acc = "high", bound = "d"))
+    @test !occursin("acc = \"high\"", out) && !occursin("For a guaranteed bound", out) && occursin("For a rigorous check of the bound", out)
+    out = logof(() -> Brisk.solve_sedumi([1.0 1.0 1.0], [1.0], [1.0, 2.0, 3.0], (l = 3,); output = :julia))
+    @test occursin("as keywords of Brisk.solve_sedumi(...; ...):", out) && count("Summary", out) == 1
+    model = Model(Brisk.Optimizer)
+    @variable(model, X[1:3, 1:3], PSD)
+    @constraint(model, X[1, 2] == 1)
+    @objective(model, Min, tr(X))
+    out = logof(() -> optimize!(model))
+    @test occursin("For higher accuracy, as attributes of the JuMP model:", out)
+    @test occursin("set_attribute(model, \"acc\", \"high\")", out) && occursin("set_attribute(model, \"bound\", \"dual\")", out)
+end
+
 @testset "options reach the solver" begin
     @test Brisk.option_args(["certify_y" => "y.txt", "nohsd" => 1]) == ["-certify-y", "y.txt", "-nohsd", "1"]
     # a max-cut-type SDP on a path (tridiagonal, chordal pattern): chordal decomposition auto / off / forced

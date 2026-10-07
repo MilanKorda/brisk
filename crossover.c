@@ -586,7 +586,7 @@ int sdp_crossover(const PSOrig *O, double **Xo, double *yo, int verbose, double 
         /* the Gauss-Newton fallback (when the reduced Newton steps are cut short: truss5)
          * needs the N x N normal matrix */
         const double gnflops = (double)S.nU * S.nU * m + (double)N * N * N / 3.0 + (double)m * m * S.nU;
-        const int gn_ok = N <= max_unknowns && 3.0 * gnflops <= max_seconds * 3e10 && (double)N * N * 16 < 4e9;   /* ~3 steps in budget */
+        const int gn_ok = N <= max_unknowns && 3.0 * gnflops <= max_seconds * 3e10 && (double)N * N * 16 < 4e9 * brisk_mem_scale();   /* ~3 steps in budget */
         const size_t NH = (!reduced || gn_ok) ? (size_t)N * N : 1;
         double *H = malloc(sizeof(double) * NH), *rhs = malloc(sizeof(double) * (size_t)N), *g = malloc(sizeof(double) * (size_t)N);
         double *Bm = malloc(sizeof(double) * ((size_t)S.nU * m + 1)), *ZB = malloc(sizeof(double) * ((size_t)S.nU * m + 1));

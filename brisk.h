@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.2.1"
+#define BRISK_VERSION "1.3.2"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -96,12 +96,14 @@ typedef struct Block {
     SpSym *A;            /* matrices, parallel to con */
     SpSym C;
     unsigned char *route;/* Schur route per constraint: 0 sparse-sparse, 1 row-product, 2 dense BLAS3 */
+    double asm_cost;     /* estimated work of the block's Schur assembly by the chosen routes, in BLAS-3 flops (0 for the low-rank route) */
     int nd, ns;          /* number of dense / sparse constraints */
     int *dlist, *slist;  /* positions (into con/A) of dense and sparse constraints */
     int *dpos;           /* dense index of position t, or -1 */
     double *Ad;          /* dense copies: nd columns of length n*n */
     int *foff;           /* flattened full entries of sparse constraints (ns+1 offsets) */
     int *ffr, *ffc;
+    int *ffp;            /* 5.7 (a user's patch): their flat positions ffr + ffc*n for the gather of the row products (NULL when n*n >= 2^31) */
     double *ffv;
     int *lfoff, *lfr, *lfc;  /* 4.23: flattened stored (upper) entries of sparse constraints, same order */
     double *lfv;
@@ -223,6 +225,9 @@ typedef struct {
     int no_retry;        /* internal: set on the retry to avoid recursion */
     int hsd_first;       /* auto method: the embedding first when its extra dense work is small (4.20) */
     double hsd_first_c;  /* ... i.e. when hsd_first_c * sum n^3 <= m^3/3 */
+    double hsd_first_asm;   /* ... or at most this fraction of Schur factorization plus assembly (0.5; 0: the factorization alone) */
+    int hsd_hoc;         /* 5.7: embedding: passes that re-evaluate the second-order term at the chosen direction (0 = off) */
+    double hsd_nb;       /* 5.7: embedding: neighbourhood parameter of the long step (lambda_min(XZ) >= hsd_nb mu after the step; 0 = off) */
     int hsd_first_on;    /* internal: this run is the embedding-first attempt */
     int crossover;       /* 0 off, 1 on, -1 auto (when cheap) */
     double fr_gain;      /* facial reduction of depth >= 2 kept only if it cuts the cost per iteration this much (4) */
@@ -237,6 +242,7 @@ typedef struct {
     double dd_time;      /* wall-clock limit for the endgame (seconds) */
     int polish;          /* project the returned point onto A(X) = b, recompute Z (if it improves) */
     int polish_x;        /* polishing in the metric of X (keeps X positive definite) */
+    int polish_r;        /* the restoration of the primal feasibility in the square-root metric (first) */
     double polish_mem;   /* bytes allowed for storing the best iterate */
     double pivtol;       /* squared-pivot threshold of the equilibrated Schur factor (1e-14) */
     double reg_ill;      /* regularization applied when that threshold is violated (1e-10) */
@@ -290,7 +296,12 @@ typedef struct {
     int symsigned;       /* 4.37: -sym auto: signed permutations (a search on |data|, signs lifted over GF(2)) (1) */
     int mfipm;           /* 4.34: matrix-free interior-point method (mfipm.c): 1 on, 0 off; 5.4: 2 the hybrid (hand-off to the standard method) */
     int mf_proj; double mf_eta;      /* 5.5: 1 = exact primal projection of dX and CG to the P^-1-norm tolerance (the 4.34 scheme); 0 = residual-controlled CG, no projection; eta: the share of |Rp| CG may leave (0.1) */
-    double mf_hand; int mf_handcg;   /* 5.4: hand-off rule of the hybrid: merit (1e-5), CG steps of an iteration (600) */
+    double mf_try_tl;                /* internal: the run's own time limit during that attempt (its timelimit is the attempt's) */
+    int mf_try_fits;                 /* internal (5.8): the dense Schur complement fits, i.e. the standard method can follow the attempt (else the first-order engine does) */
+    double mf_try_budget;            /* seconds of that first attempt (set by run_pipeline) */
+    long mf_trial_total;             /* ... and the products M v it may use in all */
+    int mf_try, mf_trial;            /* 5.7: the matrix-free method first on the problems it is made for (1; -mftry 0 off); inside that first attempt: the CG steps a solve may take away from the optimum */
+    double mf_hand; int mf_handcg;   /* 5.4: hand-off rule of the hybrid: merit (1e-3; 1e-5 before 5.7), also the level of the iterate kept by the automatic attempt; CG steps of an iteration (600) */
     int lralm;           /* 4.40: low-rank augmented Lagrangian (lralm.c): 1 on, 0 off (default) */
     int chordal_need;    /* 4.40 (internal): a chordal re-solve; skip it when the form does not convert and the unconverted problem does not fit */
     int lr_rank, lr_rmax, lr_outer, lr_inner, lr_escape, lr_prec, lr_newton;   /* 4.40: ... starting rank (1), largest rank (32), outer (500) and inner (2000) iteration caps, rank escape (1) */
@@ -385,6 +396,9 @@ int  facial_reduction(Problem *P, int verbose);
 int  chordal_convert(Problem *P, const Params *par, int verbose);
 void problem_from_trips(Problem *P, int m, int nblk, const int *bsz, const double *b,
                         size_t nt, const int *con, const int *blk, const int *ii, const int *jj, const double *v);
+void brisk_note(const char *fmt, ...);
+int  brisk_threads_logged(void);         /* 5.8: the thread count the log stated last (-1: none) */   /* 5.8: a line for the summary at the end of the run (events of the solve) */
+int  schur_dense_needed(const Problem *P, const Params *par);   /* 5.8: the standard method would need a dense Schur complement (solver.c) */
 int  dsdp_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
 int  dual_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
 int  fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);   /* 4.31 fom.c */
@@ -591,6 +605,7 @@ typedef struct { int m, mr, order, NI, nblk; int *cls; int **G; int *off, *gblk;
 typedef struct { int m, dense; double *M; SChol *S; double *work; double reg; } Gram;
 Gram *fom_gram_build(const Problem *P, int verbose, double *t_gram);
 double brisk_mem_limit(void);
+double brisk_mem_scale(void);   /* max(1, memory / 8 GB): the factor of the caps sized on the 8 GB machine */
 /* 5.0 (hpsolve.c): high-precision solve of an SDPA file; kind 1 dd, 2 qd, 3 variable precision with `digits` */
 void brisk_hp_clear(void);
 int brisk_hp_certify_given(const char *fname, const BriskData *data, BriskResult *res, const char *cx, const char *cy, int kind, int digits, int verbose);   /* 5.2 */
@@ -621,6 +636,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
  * and yint; mfipm_solve stops on the hand-off rule when they are given. Returns 1 at a hand-off,
  * 2 when CG gave up with the merit above 1e-2 (the point is no use as a start), 0 when the
  * matrix-free method ended by itself, < 0 on an error. */
+int mfipm_solve_snap(Problem *P, const Params *par, Result *R, double *yout, double **Xout, double **Xint, double **Zint, double *yint, double merit, int *taken);
 int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, double **Zint, double *yint, double hand_merit, int hand_cg);
 /* 4.40 low-rank augmented Lagrangian (lralm.c): reads, solves, reports; returns the exit code */
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);
@@ -664,6 +680,7 @@ typedef struct {
     double t;               /* seconds */
 } PSResult;
 int  ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res);   /* 4.30: errors of (Xo, yo) on O */
+int  ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol);   /* 5.8: is the point a certificate of the infeasibility verdict (1), not (0), none (-1) */
 /* Map (X_red, y_red) back, recover y of removed constraints, measure everything on O.
  * Xo[k]: n_k x n_k (SDP) or n_k (LP) arrays for the original blocks, allocated here
  * (NULL if unavailable); yo: length O->m.                                          */
@@ -698,6 +715,8 @@ void   BL(dsymv_)(const char *, const int *, const double *, const double *, con
                   const double *, const int *, const double *, double *, const int *);
 void   BL(dtrsv_)(const char *, const char *, const char *, const int *, const double *,
                   const int *, double *, const int *);
+void   BL(strsv_)(const char *, const char *, const char *, const int *, const float *,
+                  const int *, float *, const int *);
 void   BL(dtrmv_)(const char *, const char *, const char *, const int *, const double *,
                   const int *, double *, const int *);
 double BL(ddot_)(const int *, const double *, const int *, const double *, const int *);

@@ -28,6 +28,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include "amd/amd.h"
 
 static double dd_now(void) {
     struct timespec t;
@@ -98,6 +99,8 @@ typedef struct {
     int type, n;
     size_t len;                 /* n*n (SDP) or n (LP) */
     dd *X, *Z, *Zi, *dX, *dZ, *L, *T1, *T2, *T3, *Rd, *Q;
+    char *fr;                   /* 5.9 (LP blocks): 1 = the + slot of a free variable given as a split pair (X holds its value,
+                                 * Z is 0), 2 = its - slot (X and Z are 0); NULL: no pair in this block */
 } DBlk;
 
 static dd *dalloc(size_t n) {
@@ -107,13 +110,48 @@ static dd *dalloc(size_t n) {
 }
 
 /* C = A B (n x n, dd) */
-static void dd_gemm(int n, const dd *A, const dd *B, dd *C) {
-    for (int j = 0; j < n; j++)
-        for (int i = 0; i < n; i++) {
-            dd s = dd_of(0.0);
-            for (int k = 0; k < n; k++) s = dd_add(s, dd_mul(A[i + (size_t)k * n], B[k + (size_t)j * n]));
-            C[i + (size_t)j * n] = s;
+/* 5.9: the dense kernels on two loops the compiler turns into SIMD code (the kernels of the
+ * high-precision solver, hpsolve.c: "sloppy" double-double sums, enough for factorizations and
+ * products): y += a x and x'y on contiguous vectors. The scalar triple loops they replace
+ * cost about 5 ns per element; these about 1. */
+#define DD_NL 8
+static void dd_axpy(size_t n, dd a, const dd *x, dd *y) {
+    const double ah = a.h, al = a.l;
+#pragma omp simd
+    for (size_t i = 0; i < n; i++) {
+        const double xh = x[i].h, xl = x[i].l, yh = y[i].h;
+        const double p = ah * xh, e = fma(ah, xh, -p) + (ah * xl + al * xh);
+        const double s = yh + p, bb = s - yh;
+        const double t = ((yh - (s - bb)) + (p - bb)) + (y[i].l + e);
+        const double h = s + t;
+        y[i].l = t - (h - s); y[i].h = h;
+    }
+}
+static dd dd_dot(size_t n, const dd *x, const dd *y) {
+    double sh[DD_NL] = { 0 }, sl[DD_NL] = { 0 };
+    size_t i = 0;
+    for (; i + DD_NL <= n; i += DD_NL) {
+#pragma omp simd
+        for (int l = 0; l < DD_NL; l++) {
+            const double ah = x[i + l].h, al = x[i + l].l, bh = y[i + l].h, bl = y[i + l].l;
+            const double p = ah * bh, e = fma(ah, bh, -p) + (ah * bl + al * bh);
+            const double s = sh[l] + p, bb = s - sh[l];
+            sl[l] += ((sh[l] - (s - bb)) + (p - bb)) + e;
+            sh[l] = s;
         }
+    }
+    dd r = dd_of(0.0);
+    for (int l = 0; l < DD_NL; l++) { dd v; v = dd_ts(sh[l], sl[l]); r = dd_add(r, v); }
+    for (; i < n; i++) r = dd_add(r, dd_mul(x[i], y[i]));
+    return r;
+}
+/* C = A B (column-major): column j of C is the combination of the columns of A with column j of B */
+static void dd_gemm(int n, const dd *A, const dd *B, dd *C) {
+    memset(C, 0, sizeof(dd) * (size_t)n * n);
+    for (int j = 0; j < n; j++) {
+        dd *Cj = C + (size_t)j * n;
+        for (int k = 0; k < n; k++) { const dd bkj = B[k + (size_t)j * n]; if (bkj.h == 0 && bkj.l == 0) continue; dd_axpy((size_t)n, bkj, A + (size_t)k * n, Cj); }
+    }
 }
 static void dd_sym(int n, dd *A) {
     for (int j = 0; j < n; j++)
@@ -122,50 +160,36 @@ static void dd_sym(int n, dd *A) {
             A[i + (size_t)j * n] = A[j + (size_t)i * n] = v;
         }
 }
-/* lower Cholesky of the lower triangle of A into L; returns 1 on failure */
+/* lower Cholesky of the lower triangle of A into L (left-looking by columns); returns 1 on failure */
 static int dd_chol(int n, const dd *A, dd *L) {
     memset(L, 0, sizeof(dd) * (size_t)n * n);
     for (int j = 0; j < n; j++) {
-        dd s = A[j + (size_t)j * n];
-        for (int k = 0; k < j; k++) { dd v = L[j + (size_t)k * n]; s = dd_sub(s, dd_mul(v, v)); }
-        if (!(s.h > 0)) return 1;
-        dd d = dd_sqrt(s);
-        L[j + (size_t)j * n] = d;
-        for (int i = j + 1; i < n; i++) {
-            dd t = A[i + (size_t)j * n];
-            for (int k = 0; k < j; k++) t = dd_sub(t, dd_mul(L[i + (size_t)k * n], L[j + (size_t)k * n]));
-            L[i + (size_t)j * n] = dd_div(t, d);
-        }
+        dd *Lj = L + (size_t)j * n;
+        memcpy(Lj + j, A + (size_t)j * n + j, sizeof(dd) * (size_t)(n - j));
+        for (int k = 0; k < j; k++) { const dd v = L[j + (size_t)k * n]; if (v.h == 0 && v.l == 0) continue; dd_axpy((size_t)(n - j), dd_neg(v), L + (size_t)k * n + j, Lj + j); }
+        if (!(Lj[j].h > 0)) return 1;
+        const dd d = dd_sqrt(Lj[j]), inv = dd_div(dd_of(1.0), d);
+        Lj[j] = d;
+        for (int i = j + 1; i < n; i++) Lj[i] = dd_mul(Lj[i], inv);
     }
     return 0;
+}
+static void dd_solve_chol(int m, const dd *L, dd *x) {
+    for (int j = 0; j < m; j++) {                          /* forward, by columns */
+        x[j] = dd_div(x[j], L[j + (size_t)j * m]);
+        if (x[j].h != 0 || x[j].l != 0) dd_axpy((size_t)(m - j - 1), dd_neg(x[j]), L + (size_t)j * m + j + 1, x + j + 1);
+    }
+    for (int i = m - 1; i >= 0; i--) {                     /* backward: dots with the columns */
+        const dd s = dd_sub(x[i], dd_dot((size_t)(m - i - 1), L + (size_t)i * m + i + 1, x + i + 1));
+        x[i] = dd_div(s, L[i + (size_t)i * m]);
+    }
 }
 /* inverse of a symmetric positive definite matrix from its Cholesky factor */
 static void dd_inv_from_chol(int n, const dd *L, dd *Inv, dd *col) {
     for (int j = 0; j < n; j++) {
         for (int i = 0; i < n; i++) col[i] = dd_of(i == j ? 1.0 : 0.0);
-        for (int i = 0; i < n; i++) {                       /* forward */
-            dd s = col[i];
-            for (int k = 0; k < i; k++) s = dd_sub(s, dd_mul(L[i + (size_t)k * n], col[k]));
-            col[i] = dd_div(s, L[i + (size_t)i * n]);
-        }
-        for (int i = n - 1; i >= 0; i--) {                  /* backward */
-            dd s = col[i];
-            for (int k = i + 1; k < n; k++) s = dd_sub(s, dd_mul(L[k + (size_t)i * n], col[k]));
-            col[i] = dd_div(s, L[i + (size_t)i * n]);
-        }
+        dd_solve_chol(n, L, col);
         for (int i = 0; i < n; i++) Inv[i + (size_t)j * n] = col[i];
-    }
-}
-static void dd_solve_chol(int m, const dd *L, dd *x) {
-    for (int i = 0; i < m; i++) {
-        dd s = x[i];
-        for (int k = 0; k < i; k++) s = dd_sub(s, dd_mul(L[i + (size_t)k * m], x[k]));
-        x[i] = dd_div(s, L[i + (size_t)i * m]);
-    }
-    for (int i = m - 1; i >= 0; i--) {
-        dd s = x[i];
-        for (int k = i + 1; k < m; k++) s = dd_sub(s, dd_mul(L[k + (size_t)i * m], x[k]));
-        x[i] = dd_div(s, L[i + (size_t)i * m]);
     }
 }
 
@@ -321,8 +345,10 @@ static void dd_steps(const Problem *P, DBlk *b, int nb, dd *apo, dd *ado) {
                 dd mid = dd_muld(dd_add(lo, hi), 0.5);
                 int ok = 1;
                 if (b[k].type == BLK_LP) {
-                    for (int i = 0; i < n && ok; i++)
+                    for (int i = 0; i < n && ok; i++) {
+                        if (b[k].fr && b[k].fr[i]) continue;            /* (a free variable has no bound) */
                         if (!dd_gt(dd_add(V[i], dd_mul(mid, D[i])), dd_of(0.0))) ok = 0;
+                    }
                 } else {
                     for (size_t i = 0; i < b[k].len; i++) b[k].T1[i] = dd_add(V[i], dd_mul(mid, D[i]));
                     ok = !dd_chol(n, b[k].T1, b[k].T2);
@@ -334,6 +360,169 @@ static void dd_steps(const Problem *P, DBlk *b, int nb, dd *apo, dd *ado) {
     }
     (void)P;
     *apo = ap; *ado = ad;
+}
+
+/* 5.9: the Schur complement factored as a sparse matrix. The endgame used a dense Cholesky
+ * factorization in dd (m^3/3 operations at about 45 flops each: 2.3 s for m = 387 on a problem
+ * that double solves in 0.2 s, so the work budget allowed two iterations or none). The pattern
+ * of M is that of the double solver's Schur complement, usually sparse where the endgame is
+ * needed (many small blocks): an AMD order of the pattern found at the first assembly, then an
+ * up-looking Cholesky with explicit row and column lists (dense storage of L, m <= dd_maxm).
+ * The work is that of the sparse factorization: sum over the columns of (entries below)^2. */
+typedef struct {
+    int dense;                  /* the factor is nearly full: the dense kernels (LD, column-major) */
+    dd *LD;
+    int m; int *perm;           /* row i of L is constraint perm[i] */
+    dd *L;                      /* row-major, lower triangle, permuted */
+    int **rs, *rn, *rcap;       /* columns j < i with L[i,j] != 0, increasing */
+    int **cs, *cn, *ccap;       /* rows k > j with L[k,j] != 0, increasing */
+    char *mark; dd *w, *t;
+    int ndep;                   /* rows found dependent in the last factorization */
+    double flops;               /* of the last factorization */
+} DSp;
+static void dsp_free(DSp *S) {
+    if (!S->perm) return;
+    if (S->rs) for (int i = 0; i < S->m; i++) { free(S->rs[i]); free(S->cs[i]); }
+    free(S->perm); free(S->L); free(S->LD); free(S->rs); free(S->rn); free(S->rcap); free(S->cs); free(S->cn); free(S->ccap); free(S->mark); free(S->w); free(S->t);
+    memset(S, 0, sizeof *S);
+}
+/* the order: AMD on the pattern of M (full symmetric storage) */
+static void dsp_init(DSp *S, int m, const dd *M) {
+    memset(S, 0, sizeof *S);
+    S->m = m; S->perm = (int *)malloc(sizeof(int) * ((size_t)m + 1));
+    int *ap = (int *)calloc((size_t)m + 1, sizeof(int)); size_t nz = 0;
+    for (int j = 0; j < m; j++) { for (int i = 0; i < m; i++) if (i != j && (M[i + (size_t)j * m].h != 0 || M[i + (size_t)j * m].l != 0)) nz++; ap[j + 1] = (int)nz; }
+    int *ai = (int *)malloc(sizeof(int) * (nz + 1)); nz = 0;
+    for (int j = 0; j < m; j++) for (int i = 0; i < m; i++) if (i != j && (M[i + (size_t)j * m].h != 0 || M[i + (size_t)j * m].l != 0)) ai[nz++] = i;
+    if (getenv("BRISK_DDDENSE") || amd_order(m, ap, ai, S->perm, NULL, NULL) < 0) for (int i = 0; i < m; i++) S->perm[i] = i;
+    free(ap); free(ai);
+    /* the work of the sparse factorization, counted on the pattern; beyond a twelfth of the
+     * dense count (the dense kernels are vectorized, about 5 times faster per entry, and the
+     * sparse code pays for its lists) the factor is dense */
+    {
+        const double lim = getenv("BRISK_DDSPARSE") ? 1e300 : (double)m * m * m / 6.0 / 12.0;
+        double fl = 0;
+        int **cs = (int **)calloc((size_t)m + 1, sizeof(int *)), *cn = (int *)calloc((size_t)m + 1, sizeof(int)), *cc = (int *)calloc((size_t)m + 1, sizeof(int));
+        char *mk = (char *)calloc((size_t)m + 1, 1);
+        for (int i = 0; i < m && fl <= lim; i++) {
+            const dd *Mi = M + (size_t)S->perm[i] * m;
+            for (int j = 0; j < i; j++) { const dd v = Mi[S->perm[j]]; mk[j] = v.h != 0 || v.l != 0; }
+            for (int j = 0; j < i; j++) {
+                if (!mk[j]) continue;
+                mk[j] = 0;
+                for (int q = 0; q < cn[j]; q++) mk[cs[j][q]] = 1;
+                fl += cn[j] + 1;
+                if (cn[j] == cc[j]) { cc[j] = 2 * cc[j] + 8; cs[j] = (int *)realloc(cs[j], sizeof(int) * (size_t)cc[j]); }
+                cs[j][cn[j]++] = i;
+            }
+        }
+        for (int i = 0; i < m; i++) free(cs[i]);
+        free(cs); free(cn); free(cc); free(mk);
+        S->dense = getenv("BRISK_DDDENSE") ? 1 : fl > lim;
+    }
+    if (S->dense) { S->LD = (dd *)calloc((size_t)m * m + 1, sizeof(dd)); S->t = (dd *)calloc((size_t)m + 1, sizeof(dd)); return; }
+    S->L = (dd *)calloc((size_t)m * m + 1, sizeof(dd));
+    S->rs = (int **)calloc((size_t)m + 1, sizeof(int *)); S->rn = (int *)calloc((size_t)m + 1, sizeof(int)); S->rcap = (int *)calloc((size_t)m + 1, sizeof(int));
+    S->cs = (int **)calloc((size_t)m + 1, sizeof(int *)); S->cn = (int *)calloc((size_t)m + 1, sizeof(int)); S->ccap = (int *)calloc((size_t)m + 1, sizeof(int));
+    S->mark = (char *)calloc((size_t)m + 1, 1); S->w = (dd *)calloc((size_t)m + 1, sizeof(dd)); S->t = (dd *)calloc((size_t)m + 1, sizeof(dd));
+}
+/* Linearly dependent constraints (the Schur complement is singular): a pivot below 1e-30 of its
+ * diagonal entry (the rounding level of double-double: near the end the pivots of independent
+ * rows legitimately range over many orders of magnitude, and 1e-22 took such rows out on the
+ * option-pricing relaxations) marks the row dependent; its pivot is made huge, which sets that component of
+ * every solve to zero (the rule of the high-precision solver). */
+#define DSP_DEP 1e-30
+static int dsp_factor(DSp *S, const dd *M) {
+    S->ndep = 0;
+    if (S->dense) {
+        const int n = S->m; dd *L = S->LD;
+        S->flops = (double)n * n * n / 6.0;
+        memset(L, 0, sizeof(dd) * (size_t)n * n);
+        for (int j = 0; j < n; j++) {
+            dd *Lj = L + (size_t)j * n;
+            memcpy(Lj + j, M + (size_t)j * n + j, sizeof(dd) * (size_t)(n - j));
+            for (int k = 0; k < j; k++) { const dd v = L[j + (size_t)k * n]; if (v.h == 0 && v.l == 0) continue; dd_axpy((size_t)(n - j), dd_neg(v), L + (size_t)k * n + j, Lj + j); }
+            const double ajj = M[j + (size_t)j * n].h;
+            if (!(Lj[j].h > DSP_DEP * ajj)) {
+                if (!(ajj > 0) || Lj[j].h < -1e-12 * ajj) return 1;
+                Lj[j] = dd_of(1e150 * (ajj > 0 ? ajj : 1.0)); for (int i = j + 1; i < n; i++) Lj[i] = dd_of(0.0);
+                S->ndep++; continue;
+            }
+            const dd d = dd_sqrt(Lj[j]), inv = dd_div(dd_of(1.0), d);
+            Lj[j] = d;
+            for (int i = j + 1; i < n; i++) Lj[i] = dd_mul(Lj[i], inv);
+        }
+        return 0;
+    }
+    const int m = S->m; const int *p = S->perm;
+    dd *L = S->L, *w = S->w; char *mark = S->mark;
+    double fl = 0;
+    for (int i = 0; i < m; i++) { S->rn[i] = 0; S->cn[i] = 0; }
+    for (int i = 0; i < m; i++) {
+        const dd *Mi = M + (size_t)p[i] * m;        /* (M is symmetric: column p[i] = row p[i]) */
+        for (int j = 0; j < i; j++) { w[j] = Mi[p[j]]; mark[j] = w[j].h != 0 || w[j].l != 0; }
+        dd d2 = dd_of(0.0);
+        for (int j = 0; j < i; j++) {
+            if (!mark[j]) continue;
+            mark[j] = 0;
+            const dd x = dd_div(w[j], L[(size_t)j * m + j]);
+            L[(size_t)i * m + j] = x; d2 = dd_add(d2, dd_mul(x, x));
+            const int *c = S->cs[j]; const int nc = S->cn[j];
+            for (int q = 0; q < nc; q++) { const int k = c[q]; w[k] = dd_sub(w[k], dd_mul(L[(size_t)k * m + j], x)); mark[k] = 1; }
+            fl += nc + 1;
+            if (S->cn[j] == S->ccap[j]) { S->ccap[j] = 2 * S->ccap[j] + 8; S->cs[j] = (int *)realloc(S->cs[j], sizeof(int) * (size_t)S->ccap[j]); }
+            S->cs[j][S->cn[j]++] = i;
+            if (S->rn[i] == S->rcap[i]) { S->rcap[i] = 2 * S->rcap[i] + 8; S->rs[i] = (int *)realloc(S->rs[i], sizeof(int) * (size_t)S->rcap[i]); }
+            S->rs[i][S->rn[i]++] = j;
+        }
+        const dd d = dd_sub(Mi[p[i]], d2);
+        if (!(d.h > DSP_DEP * Mi[p[i]].h)) {
+            if (!(Mi[p[i]].h > 0) || d.h < -1e-12 * Mi[p[i]].h) { S->flops = fl; return 1; }
+            /* dependent: the row leaves the factor (its entries to zero, a huge pivot) */
+            for (int q = 0; q < S->rn[i]; q++) { const int j = S->rs[i][q]; L[(size_t)i * m + j] = dd_of(0.0); S->cn[j]--; }
+            S->rn[i] = 0;
+            L[(size_t)i * m + i] = dd_of(1e150 * Mi[p[i]].h); S->ndep++; continue;
+        }
+        L[(size_t)i * m + i] = dd_sqrt(d);
+    }
+    S->flops = fl;
+    return 0;
+}
+static void dsp_solve(const DSp *S, dd *x) {
+    if (S->dense) { dd_solve_chol(S->m, S->LD, x); return; }
+    const int m = S->m; const int *p = S->perm; dd *t = S->t; const dd *L = S->L;
+    for (int i = 0; i < m; i++) t[i] = x[p[i]];
+    for (int i = 0; i < m; i++) {
+        dd s = t[i]; const int *r = S->rs[i]; const dd *Li = L + (size_t)i * m;
+        for (int q = 0; q < S->rn[i]; q++) s = dd_sub(s, dd_mul(Li[r[q]], t[r[q]]));
+        t[i] = dd_div(s, Li[i]);
+    }
+    for (int i = m - 1; i >= 0; i--) {
+        const int *r = S->rs[i]; const dd *Li = L + (size_t)i * m;
+        t[i] = dd_div(t[i], Li[i]);
+        for (int q = 0; q < S->rn[i]; q++) t[r[q]] = dd_sub(t[r[q]], dd_mul(Li[r[q]], t[i]));
+    }
+    for (int i = 0; i < m; i++) x[p[i]] = t[i];
+}
+
+/* 5.9: the bordered solve for free variables. On entry dy = M^-1 rhs; on exit dy and f_new solve
+ * M dy + A_f f_new = rhs, A_f' dy = g, with V = M^-1 A_f and the Cholesky factor of A_f' V. */
+static void dd_border(int m, int nf, const dd *Af, const dd *Vf, const dd *LSf, const dd *g, dd *dy, dd *fnew) {
+    for (int f = 0; f < nf; f++) {
+        dd s = dd_of(0.0);
+        for (int i = 0; i < m; i++) s = dd_add(s, dd_mul(Af[i + (size_t)f * m], dy[i]));
+        fnew[f] = dd_sub(s, g[f]);
+    }
+    dd_solve_chol(nf, LSf, fnew);
+    for (int f = 0; f < nf; f++) for (int i = 0; i < m; i++) dy[i] = dd_sub(dy[i], dd_mul(Vf[i + (size_t)f * m], fnew[f]));
+}
+/* the direction of the free variables: the + slot moves to f_new, nothing else of a pair moves */
+static void dd_free_dir(DBlk *b, const FreePair *prs, int nf, const dd *fnew) {
+    for (int f = 0; f < nf; f++) {
+        DBlk *bk = &b[prs[f].blk];
+        bk->dX[prs[f].ip] = dd_sub(fnew[f], bk->X[prs[f].ip]); bk->dX[prs[f].im] = dd_of(0.0);
+        bk->dZ[prs[f].ip] = dd_of(0.0); bk->dZ[prs[f].im] = dd_of(0.0);
+    }
 }
 
 /* ---------------------------------------------------------------- endgame */
@@ -355,7 +544,34 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         for (size_t i = 0; i < len; i++) { b[k].X[i] = dd_of(Xio[k][i]); b[k].Z[i] = dd_of(Zio[k][i]); }
         ndim += B->n;
     }
-    dd *M = dalloc((size_t)m * m), *LM = dalloc((size_t)m * m);
+    /* 5.9: free variables given as split pairs that the presolve kept (two LP columns a, -a with
+     * costs c, -c). As two nonnegative variables they have no interior: the embedding handles them
+     * by a saddle factorization and returns slacks of opposite signs, and the Schur complement
+     * built from x/z was not positive definite here (the POEMA option-pricing relaxations: the
+     * endgame stopped in its first iteration). Now each pair is one free variable f = x+ - x-:
+     * its slots stay out of the cone terms, and the Newton system is bordered,
+     *     M dy + A_f f_new = rhs,   A_f' dy = c_f - A_f' y,
+     * solved through S = A_f' M^-1 A_f (nf x nf, Cholesky in dd). */
+    FreePair *prs = NULL; const int nfree = getenv("BRISK_DDNOFREE") ? 0 : free_pairs_detect(P, &prs);
+    dd *Af = NULL, *Vf = NULL, *Sf = NULL, *LSf = NULL, *fnew = NULL, *gf = NULL;
+    if (nfree > 0) {
+        for (int f = 0; f < nfree; f++) {
+            DBlk *bk = &b[prs[f].blk];
+            if (!bk->fr) bk->fr = (char *)calloc((size_t)bk->n + 1, 1);
+            bk->fr[prs[f].ip] = 1; bk->fr[prs[f].im] = 2;
+            bk->X[prs[f].ip] = dd_sub(bk->X[prs[f].ip], bk->X[prs[f].im]); bk->X[prs[f].im] = dd_of(0.0);
+            bk->Z[prs[f].ip] = dd_of(0.0); bk->Z[prs[f].im] = dd_of(0.0);
+        }
+        ndim -= 2.0 * nfree; if (ndim < 1) ndim = 1;
+        Af = dalloc((size_t)m * nfree); Vf = dalloc((size_t)m * nfree); Sf = dalloc((size_t)nfree * nfree); LSf = dalloc((size_t)nfree * nfree);
+        fnew = dalloc(nfree); gf = dalloc(nfree);
+        for (int f = 0; f < nfree; f++) {            /* the column of the + slot */
+            const Block *B = &P->blk[prs[f].blk];
+            for (int t = 0; t < B->ncon; t++) { const SpSym *S = &B->A[t]; for (int q = 0; q < S->nnz; q++) if (S->row[q] == prs[f].ip) Af[B->con[t] + (size_t)f * m] = dd_add(Af[B->con[t] + (size_t)f * m], dd_of(S->val[q])); }
+        }
+    }
+    dd *M = dalloc((size_t)m * m);
+    DSp SP; memset(&SP, 0, sizeof SP);
     /* best iterate so far (the time limit may stop the loop at a worse point) */
     double **Xb = malloc(sizeof(double *) * nb), **Zb = malloc(sizeof(double *) * nb);
     for (int k = 0; k < nb; k++) { Xb[k] = malloc(sizeof(double) * b[k].len); Zb[k] = malloc(sizeof(double) * b[k].len); }
@@ -373,7 +589,9 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
 
     double score0 = -1;
     int nostall = 0;
-    double best_inf = 1e300;
+    double best_inf = 1e300, prev_score = 1e300;
+    int started = 0, extra = 0;
+    const int maxit0 = maxit;
     for (int it = 0; it <= maxit; it++) {
         if (t_limit > 0 && dd_now() - t_start > t_limit) {
             if (verbose > 0) printf("   dd endgame: time limit (%.1fs) reached\n", t_limit);
@@ -427,9 +645,17 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
             if (score < score0) improved = 1;
             for (int k = 0; k < nb; k++)
                 for (size_t i = 0; i < b[k].len; i++) { Xb[k][i] = dd_d(b[k].X[i]); Zb[k][i] = dd_d(b[k].Z[i]); }
+            for (int f = 0; f < nfree; f++) {        /* the free value as its two parts */
+                const double v = dd_d(b[prs[f].blk].X[prs[f].ip]);
+                Xb[prs[f].blk][prs[f].ip] = v > 0 ? v : 0.0; Xb[prs[f].blk][prs[f].im] = v < 0 ? -v : 0.0;
+            }
             for (int i = 0; i < m; i++) yb[i] = dd_d(yv[i]);
         }
         if (score < tol) { used = 1; break; }
+        /* 5.9: at the end of the budget, up to half as many iterations more while each one halves
+         * the score (the budget ended runs that were three iterations from the tolerance) */
+        if (it == maxit && it > 0 && extra < maxit0 / 2 + 1 && score < 0.5 * prev_score && mu > 0) { maxit++; extra++; }
+        prev_score = score;
         if (!(mu > 0) || it == maxit || nostall >= 6) break;
 
         /* ---- Z^{-1}, Schur complement, Cholesky */
@@ -437,9 +663,9 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         for (int k = 0; k < nb && !fail; k++) {
             const int n = b[k].n;
             if (b[k].type == BLK_LP) {
-                for (int i = 0; i < n; i++) b[k].Zi[i] = dd_div(dd_of(1.0), b[k].Z[i]);
+                for (int i = 0; i < n; i++) b[k].Zi[i] = b[k].fr && b[k].fr[i] ? dd_of(0.0) : dd_div(dd_of(1.0), b[k].Z[i]);
             } else {
-                if (dd_chol(n, b[k].Z, b[k].L)) { fail = 1; break; }
+                if (dd_chol(n, b[k].Z, b[k].L)) { fail = 1; if (verbose > 0) printf("   dd endgame: Z of block %d is not positive definite in double-double: stopping\n", k + 1); break; }
                 dd_inv_from_chol(n, b[k].L, b[k].Zi, col);
                 dd_sym(n, b[k].Zi);
             }
@@ -449,10 +675,23 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         for (int k = 0; k < nb; k++) dd_schur(&P->blk[k], &b[k], m, M);
         for (int j = 0; j < m; j++)
             for (int i = j + 1; i < m; i++) M[j + (size_t)i * m] = M[i + (size_t)j * m];
-        if (dd_chol(m, M, LM)) {                                   /* tiny shift if needed */
+        if (!SP.perm) dsp_init(&SP, m, M);
+        if (dsp_factor(&SP, M)) {                                  /* tiny shift if needed */
             for (int i = 0; i < m; i++) M[i + (size_t)i * m] = dd_add(M[i + (size_t)i * m],
                                                                       dd_muld(M[i + (size_t)i * m], 1e-24));
-            if (dd_chol(m, M, LM)) break;
+            if (dsp_factor(&SP, M)) { if (verbose > 0) printf("   dd endgame: the Schur complement is not positive definite: stopping\n"); break; }
+        }
+        if (nfree > 0) {
+            memcpy(Vf, Af, sizeof(dd) * (size_t)m * nfree);
+            for (int f = 0; f < nfree; f++) dsp_solve(&SP, Vf + (size_t)f * m);
+            for (int f = 0; f < nfree; f++) for (int g = 0; g <= f; g++) {
+                dd s = dd_of(0.0);
+                for (int i = 0; i < m; i++) s = dd_add(s, dd_mul(Af[i + (size_t)f * m], Vf[i + (size_t)g * m]));
+                Sf[f + (size_t)g * nfree] = s; Sf[g + (size_t)f * nfree] = s;
+            }
+            if (dd_chol(nfree, Sf, LSf)) { if (verbose > 0) printf("   dd endgame: the free variables' system is not positive definite: stopping\n"); break; }
+            /* the dual residual of the free variables: c_f - A_f' y (Rd of the + slot, Z = 0 there) */
+            for (int f = 0; f < nfree; f++) gf[f] = b[prs[f].blk].Rd[prs[f].ip];
         }
 
         /* ---- right-hand side pieces: a0 = A(Zi), h = A(Zi Rd X) */
@@ -475,8 +714,10 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         /* ---- predictor: M dy = b + h ; dZ = Rd - A'dy ; dX = -sym(Zi dZ X) - X */
         for (int i = 0; i < m; i++) rhs[i] = dd_add(dd_of(P->b[i]), hv[i]);
         memcpy(dy, rhs, sizeof(dd) * m);
-        dd_solve_chol(m, LM, dy);
+        dsp_solve(&SP, dy);
+        if (nfree > 0) dd_border(m, nfree, Af, Vf, LSf, gf, dy, fnew);
         for (int k = 0; k < nb; k++) dd_dir(&P->blk[k], &b[k], dy, dd_of(0.0), 0);
+        if (nfree > 0) dd_free_dir(b, prs, nfree, fnew);
         dd ap, ad;
         dd_steps(P, b, nb, &ap, &ad);
 
@@ -511,8 +752,10 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         for (int i = 0; i < m; i++)
             rhs[i] = dd_add(dd_sub(dd_of(P->b[i]), dd_mul(a0[i], smu)), dd_add(qv[i], hv[i]));
         memcpy(dy, rhs, sizeof(dd) * m);
-        dd_solve_chol(m, LM, dy);
+        dsp_solve(&SP, dy);
+        if (nfree > 0) dd_border(m, nfree, Af, Vf, LSf, gf, dy, fnew);
         for (int k = 0; k < nb; k++) dd_dir(&P->blk[k], &b[k], dy, smu, 1);
+        if (nfree > 0) dd_free_dir(b, prs, nfree, fnew);
         dd_steps(P, b, nb, &ap, &ad);
 
         double mn = fmin(dd_d(ap), dd_d(ad));
@@ -520,7 +763,7 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         dd sp = dd_muld(ap, gam), sdd = dd_muld(ad, gam);
         if (dd_d(sp) > 1) sp = dd_of(1.0);
         if (dd_d(sdd) > 1) sdd = dd_of(1.0);
-        if (dd_d(sp) < 1e-10 && dd_d(sdd) < 1e-10) break;
+        if (dd_d(sp) < 1e-10 && dd_d(sdd) < 1e-10) { if (verbose > 0) printf("   dd endgame: the step collapsed: stopping\n"); break; }
         for (int k = 0; k < nb; k++) {
             for (size_t i = 0; i < b[k].len; i++) {
                 b[k].X[i] = dd_add(b[k].X[i], dd_mul(sp, b[k].dX[i]));
@@ -529,7 +772,7 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
             if (b[k].type != BLK_LP) { dd_sym(b[k].n, b[k].X); dd_sym(b[k].n, b[k].Z); }
         }
         for (int i = 0; i < m; i++) yv[i] = dd_add(yv[i], dd_mul(sdd, dy[i]));
-        used = 1;
+        used = 1; started = 1;
     }
 
     if (improved) {
@@ -545,7 +788,10 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         free(b[k].X); free(b[k].Z); free(b[k].Zi); free(b[k].dX); free(b[k].dZ); free(b[k].L);
         free(b[k].T1); free(b[k].T2); free(b[k].T3); free(b[k].Rd); free(b[k].Q);
     }
-    free(b); free(M); free(LM); free(rp); free(rhs); free(dy); free(yv);
+    for (int k = 0; k < nb; k++) free(b[k].fr);
+    free(prs); free(Af); free(Vf); free(Sf); free(LSf); free(fnew); free(gf);
+    dsp_free(&SP);
+    free(b); free(M); free(rp); free(rhs); free(dy); free(yv);
     free(a0); free(hv); free(qv); free(col);
-    return used && improved;
+    return used && improved ? 1 : started ? 0 : -1;       /* 1: an improved point is returned; -1: no step could be taken */
 }

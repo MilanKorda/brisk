@@ -50,7 +50,7 @@ if nargin >= 1 && ischar(varargin{1})
     if nargin >= 2, opts = varargin{2}; end
     if nargin > 2, error('brisk:input', 'usage: brisk_sdpa(filename, opts)'); end
     if ~exist(fname, 'file'), error('brisk:input', 'file not found: %s', fname); end
-    [y, Xb, Zb, info] = brisk_mex(fname, brisk_opts2args(opts));
+    [y, Xb, Zb, info] = brisk_mex(fname, brisk_opts2args(opts, 'brisk_sdpa'));
 else
     if nargin < 5 || nargin > 6
         error('brisk:input', 'usage: brisk_sdpa(mDIM, nBLOCK, bLOCKsTRUCT, c, F [, opts])');
@@ -68,7 +68,7 @@ else
     else
         error('brisk:input', 'F must be an nBLOCK x (mDIM+1) cell array or an nnz x 5 array');
     end
-    [y, Xb, Zb, info] = brisk_mex(m, bs, c, T, brisk_opts2args(opts));
+    [y, Xb, Zb, info] = brisk_mex(m, bs, c, T, brisk_opts2args(opts, 'brisk_sdpa'));
 end
 % BRISK convention -> SDPA-M convention
 x = -y;

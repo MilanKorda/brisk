@@ -840,7 +840,7 @@ function MOI.optimize!(o::Optimizer)
     if D === nothing
         C = o.cone
         res = _solve_sedumi(C.m, C.n, C.Ap, C.Ai, C.Ax, C.b, C.c, C.nf, C.nl, C.q, C.r, C.s,
-                            option_args(_run_options(o)), _output(o))
+                            _tagged(option_args(_run_options(o)), "jump"), _output(o))
         term, pst, dst = _statuses(res.status, res.dimacs, res.x !== nothing, false)
         x = zeros(nvar)
         for j in 1:nvar
@@ -861,7 +861,7 @@ function MOI.optimize!(o::Optimizer)
     else
         kernel = D.form == :kernel
         res = _solve_data(D.m, D.blocksizes, D.c, D.mat, D.blk, D.i, D.j, D.v,
-                          option_args(_run_options(o)), _output(o))
+                          _tagged(option_args(_run_options(o)), "jump"), _output(o))
         term, pst, dst = _statuses(res.status, res.dimacs, res.X !== nothing, kernel)
         x, dual = kernel ? _map_kernel(D, res, nvar, nrow, dst == MOI.INFEASIBILITY_CERTIFICATE) :
                            _map_image(D, res, nvar, nrow)

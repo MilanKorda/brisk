@@ -44,8 +44,8 @@ the default `-llapack -lblas` links OpenBLAS.
 interface. A virtual environment keeps things separate:
 
 ```sh
-tar xzf brisk-1.2.1.tar.gz
-cd brisk-1.2.1
+tar xzf brisk-1.3.2.tar.gz
+cd brisk-1.3.2
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -95,8 +95,8 @@ Homebrew packages are required.
 **2. Python.** Python 3.9 or later: from python.org, Homebrew (`brew install python`) or conda.
 
 ```sh
-tar xzf brisk-1.2.1.tar.gz
-cd brisk-1.2.1
+tar xzf brisk-1.3.2.tar.gz
+cd brisk-1.3.2
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -252,7 +252,10 @@ Options are those of the command line ([OPTIONS.md](../OPTIONS.md)), given as a 
 (`{"acc": "high", "tol": 1e-9, "chordal": 0}`; `True` or 1 gives a bare flag, `None`/`False`
 drops the option; an underscore stands for a dash), a list of strings, or one string. Bad
 options raise `RuntimeError`. `verbose=True` sends the solver's output through `sys.stdout`,
-so it shows in Jupyter.
+so it shows in Jupyter. The log ends with how to get more accuracy and a guaranteed bound,
+written as entries of `options` for the function that was called (`"prec": "dd"`,
+`"bound": "d"`, `"certify": True`) or as keywords of `prob.solve` under CVXPY (`prec="dd"`,
+`bound="dual"`).
 
 **Very large chordal problems.** When BRISK decomposes a large sparse block into cliques
 (AC-OPF relaxations), the dense `X` and `Z` of that block are returned only if they fit in

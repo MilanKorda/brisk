@@ -64,7 +64,7 @@ if m == 0, error('brisk:input', 'no constraints (m = 0)'); end
 if ~isempty(nq) || ~isempty(nr) || isempty(ns)
     % second-order cones, or no PSD block: the problem goes to BRISK in SeDuMi form
     if N == 0, error('brisk:input', 'empty cone'); end
-    [x, y, zz, bi] = brisk_mex('sedumi', A, b, full(c), nf, nl, nq, nr, ns, brisk_opts2args(opts));
+    [x, y, zz, bi] = brisk_mex('sedumi', A, b, full(c), nf, nl, nq, nr, ns, brisk_opts2args(opts, 'brisk_sedumi'));
     if ~bi.have_x
         warning('brisk:nox', 'BRISK returned no primal solution; x is zero. Set opts.returnx = 1 to force it.');
     end
@@ -111,6 +111,7 @@ if isempty(bsizes), error('brisk:input', 'empty cone'); end
 
 % ---- triplets [mat blk i j value]: F_0 = -C, F_i = A_i
 [r, cc, v] = find(A);
+r = r(:); cc = cc(:); v = v(:);          % (find returns rows for a one-row A: m = 1 failed here)
 [r0, ~, v0] = find(c);
 c0 = find(c);
 rows = [r; zeros(numel(c0), 1)];
@@ -131,7 +132,7 @@ keep = val ~= 0;
 T = [u(keep, :), val(keep)];
 clear r cc v r0 v0
 
-[yb, Xb, ~, bi] = brisk_mex(m, bsizes, b, T, brisk_opts2args(opts));
+[yb, Xb, ~, bi] = brisk_mex(m, bsizes, b, T, brisk_opts2args(opts, 'brisk_sedumi'));
 
 % ---- back to SeDuMi's x
 x = zeros(N, 1);

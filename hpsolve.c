@@ -96,6 +96,7 @@ static void dot_f64(size_t n, const double *x, const double *y, double *r) {
 }
 #include "hpipm.inc"
 #include "hpfom.inc"
+#include "hpalg.inc"
 #include "hplr.inc"
 #undef HP_OWN_KERNELS
 #undef HPT
@@ -206,6 +207,7 @@ static void rot_dd(size_t n, const dd_t *c, const dd_t *s, dd_t *x, dd_t *y) {
 }
 #include "hpipm.inc"
 #include "hpfom.inc"
+#include "hpalg.inc"
 #include "hplr.inc"
 #undef HP_OWN_KERNELS
 #undef HP_OWN_ROT
@@ -356,6 +358,7 @@ static void rot_qd(size_t n, const qd_t *c, const qd_t *s, qd_t *x, qd_t *y) {
 }
 #include "hpipm.inc"
 #include "hpfom.inc"
+#include "hpalg.inc"
 #include "hplr.inc"
 #undef HP_OWN_KERNELS
 #undef HP_OWN_ROT
@@ -421,6 +424,7 @@ static void gemm_mp(int n, const uint64_t *A, const uint64_t *B, uint64_t *C) {
 #define HP_EXPORT(d, a, J) mpx_conv(d, (J)->Lm, a, mpx_L)
 #include "hpipm.inc"
 #include "hpfom.inc"
+#include "hpalg.inc"
 #include "hplr.inc"
 #undef HP_OWN_KERNELS
 #undef HP_OWN_GEMM
@@ -739,6 +743,8 @@ static void hp_write(const HPJob *J, const char *yfile, const char *xfile, const
 /* kind: 1 dd, 2 qd, 3 mpx with `digits` decimal digits. Returns the exit code. */
 #include "hppre.inc"
 #include "hpcert.inc"
+#include "hpred.inc"
+static int g_hp_nored = 0;   /* 5.9: the solve is repeated without the reductions of hpred.inc */
 
 /* the pattern structures of the low-rank method */
 typedef struct { long long key; int src; } LrKey;
@@ -1016,6 +1022,31 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
                 warm2_.Z = warm->Z ? hp_split_fwd_d(&sp_, J, warm->Z) : NULL;
                 warm = &warm2_;
             } else warm = NULL;
+        }
+    }
+    /* 5.9: the reductions of the double pipeline (hpred.inc): sign symmetry, orbits of the
+     * constraints, the block structure of the data. From here on J is the reduced problem; the
+     * solution is put back and measured on the problem before them (red_.Jfull) at the end.
+     * (Interior-point method; not with -bound, whose certificate works on the layout as read.) */
+    HPRed red_; int reduced = 0;
+    BriskResult warm3_;
+    const BriskResult *warm_in = warm;
+    memset(&warm3_, 0, sizeof(warm3_));
+    memset(&red_, 0, sizeof(red_));
+    if (use_pre && !g_hp_nored && par->bound_side == 0 && par->fom <= 0 && par->lralm <= 0) {
+        { extern double g_sym_est_cap; extern int g_sym_cap_bound; g_sym_est_cap = 0; g_sym_cap_bound = 0; }
+        g_hpred_bits = target_bits;
+        reduced = hp_reduce(J, &red_, par);
+        if (reduced) {
+            /* the double solution in the reduced layout (none after a chordal decomposition:
+             * the reduced problem then starts in its own double level) */
+            double **X3 = NULL, **Z3 = NULL, *y3 = NULL;
+            const int wok = warm && warm->nblk == red_.Jfull.nblk && warm->m == red_.Jfull.m && warm->X && warm->y && !getenv("BRISK_HPREDCOLD")
+                            && hp_red_fwd(&red_, warm->X, warm->Z, warm->y, &X3, &Z3, &y3);
+            if (warm == &warm2_) { for (int k = 0; k < warm2_.nblk; k++) { free(warm2_.X[k]); if (warm2_.Z) free(warm2_.Z[k]); } free(warm2_.X); free(warm2_.Z); }
+            if (wok) { warm3_ = *warm_in; warm3_.nblk = J->nblk; warm3_.m = J->m; warm3_.X = X3; warm3_.Z = Z3; warm3_.y = y3; warm = &warm3_; }
+            else warm = NULL;
+            memset(&warm2_, 0, sizeof(warm2_));
         }
     }
     HPJob Jr_, Jd_;
@@ -1461,6 +1492,48 @@ hp_again:
             if (rc == 1 && !(tol > 0) && J->best_err <= accept) rc = 0;
         }
         hp_free(JD);
+    }
+    if (reduced) {
+        /* 5.9: back through the reductions; the errors on the problem before them */
+        uint64_t **Xf = NULL, *yf = NULL;
+        const int have = J->have_iter;
+        const double red_err = J->best_err;
+        if (have) hp_red_back(&red_, J->X, J->y, &Xf, &yf);
+        HPJob Jf = red_.Jfull;
+        Jf.tstart = J->tstart; Jf.iters = J->iters; Jf.maxit = J->maxit; Jf.verbose = J->verbose; Jf.method = J->method; Jf.tol = J->tol;
+        Jf.best_pinf = J->best_pinf; Jf.best_dinf = J->best_dinf; Jf.best_gap = J->best_gap; Jf.best_compl = J->best_compl; Jf.best_err = J->best_err;
+        Jf.have_iter = have; Jf.lr_delta = J->lr_delta;
+        if (warm3_.X) { for (int k = 0; k < J->nblk; k++) { free(warm3_.X[k]); if (warm3_.Z) free(warm3_.Z[k]); } free(warm3_.X); free(warm3_.Z); free(warm3_.y); memset(&warm3_, 0, sizeof(warm3_)); }
+        free(J->dep); J->dep = NULL; lr_free(J); hp_free(J);
+        J_ = Jf; J = &J_;
+        nb = J->nblk; m = J->m;
+        J->Z = (uint64_t **)calloc((size_t)nb, sizeof(uint64_t *));
+        if (!have) { Xf = (uint64_t **)calloc((size_t)nb, sizeof(uint64_t *)); yf = (uint64_t *)calloc(((size_t)m + 1) * Wm, sizeof(uint64_t)); }
+        for (int k = 0; k < nb; k++) {
+            const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k];
+            J->Z[k] = (uint64_t *)calloc(len * Wm, sizeof(uint64_t));
+            if (!have) Xf[k] = (uint64_t *)calloc(len * Wm, sizeof(uint64_t));
+        }
+        J->X = Xf; J->y = yf;
+        J->pobj = (uint64_t *)calloc(Wm, sizeof(uint64_t)); J->dobj = (uint64_t *)calloc(Wm, sizeof(uint64_t));
+        hp_red_free(&red_);
+        if (have) {
+            hp_measure(J, J->X, J->y, J->Z, J->tol);
+            if (J->verbose > 1 || getenv("BRISK_HPDBG")) printf("     reductions undone: error %.1e on the reduced problem, %.1e on the problem before them\n", red_err, J->best_err);
+            const double accept = tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            if (rc <= 1 && J->best_err > 10.0 * J->tol && J->best_err > 100.0 * red_err) {
+                /* a reduction that does not hold in the working precision (a symmetry of the
+                 * data rounded to doubles only): the solve is repeated without them */
+                if (J->verbose) printf("presolve: the reductions do not hold in the working precision (error %.1e on the problem as read against %.1e): solving again without them\n", J->best_err, red_err);
+                hp_free(J);
+                if (split) hp_split_free(&sp_);
+                g_hp_nored = 1;
+                const int rc2 = brisk_hp_run(fname, data, res, warm_in == &warm2_ ? NULL : warm_in, par, kind, digits, tol, yfile, xfile, zfile);
+                g_hp_nored = 0;
+                return rc2;
+            }
+            if (rc == 0 && J->best_err > 10.0 * accept) rc = 1;
+        }
     }
     /* -bound: the certificate of one side on the problem as read (hpcert.inc); it replaces
      * its side of the returned pair */

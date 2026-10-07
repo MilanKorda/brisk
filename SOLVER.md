@@ -1,4 +1,4 @@
-# BRISK 1.2.1: the solver in detail
+# BRISK 1.3.2: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -63,6 +63,30 @@ reduction.
 - The printed optimal value uses the SDPA/SDPLIB convention (max tr(F0 Y)), so it compares
   directly with SDPLIB's table. BRISK's "primal infeasible" refers to SDPA's dual.
 
+**The summary at the end of the log (1.3):** every run closes with a block that says what
+happened — the problem as read; every preprocessing step applied and what it changed (sign
+and permutation symmetries, the *-algebra block diagonalisation, the dual form, free
+variables eliminated, the trace bound, the moment-form conversion, the chordal
+decomposition, the facial reduction); the engine and the method (interior-point with the
+infeasible start or the self-dual embedding and its direction, matrix-free, first-order,
+low-rank); every re-solve, method switch (e.g. the matrix-free attempt and the standard
+method continuing from its iterate), double-double endgame, crossover and
+bound; the time; the number of threads; the six DIMACS errors on the data as read; and the closing line "Solved to
+DIMACS error e" (or "Primal/Dual infeasible" with whether the returned point is a
+certificate). The `status:` line with the classification (OPTIMAL, SOLVED TO REDUCED
+ACCURACY, ...) and the exit code are unchanged. `BRISK_NOSUMMARY=1` leaves the block out.
+After a solve in standard precision the log ends with the ways to more accuracy:
+`-acc high` (tolerance 1e-10, still in double precision arithmetic) and the high-precision
+solver, `-prec dd` (about 31 digits), `-prec qd` (about 63) or `-prec <digits>`; after
+`-acc high` only the latter, for a linear program `-tol`. It also says how to get a
+guaranteed bound on the optimal value from a certified feasible point (`-bound d` or `p`,
+and `-certify` for the rigorous check); a high-precision log ends with that part. The
+options are written in the syntax of whoever called the solver: on the command line as
+above, from Python as `"acc": "high"` in `brisk.solve_sdpa(..., options={...})`, from CVXPY
+as `acc="high"`, from Julia as the keyword `acc = "high"`, from JuMP as
+`set_attribute(model, "acc", "high")`, from MATLAB as `opts.acc = 'high'`, from C as the
+option strings `"-acc", "high"`; what was already asked for is not advised again.
+
 **Exit codes:**
 
 | code | meaning |
@@ -88,7 +112,9 @@ Every automatic choice below can be overridden from the command line.
 
 - **Method.** A Mehrotra predictor-corrector path-following method in two variants: the
   homogeneous self-dual embedding and the infeasible-start method.
-  - The embedding runs first when 12·Σn³ ≤ m³/3, when the problem is tiny, when there are
+  - The embedding runs first when its extra dense work is small next to the Schur
+    factorization (12·Σn³ ≤ m³/3) or next to factorization and assembly together (at most
+    half of their estimated work, `-hsdfirstasm`), when the problem is tiny, when there are
     many split free pairs, or in the chordal moment form.
   - The infeasible start runs first only on large dense blocks with a cheap Schur complement
     (max-cut and graph-partitioning type problems).
@@ -125,6 +151,29 @@ Every automatic choice below can be overridden from the command line.
   it gets 20% of that time (`-fomrace 0.2`; 0 turns it off), and the interior-point method
   follows if it has not reached the tolerance.
 
+- **The matrix-free method first.** On problems with one to four dense blocks of order 100 or
+  more that the presolve leaves unchanged and whose Schur factorization is estimated at 3.5
+  times a matrix-free solve or more — at least equal when every constraint has an entry in an
+  LP block — (truss topology problems, SOS relaxations with a low-rank Gram matrix), the matrix-free interior-point method (`-mfipm 1` below) runs first. The
+  attempt is stopped when a solve away from the optimum needs more CG steps than a sixth of
+  one factorization costs, or after a quarter of the standard solve's work; unless it ends
+  OPTIMAL the standard method follows (from the attempt's iterate of merit 1e-3 if it got that far). `-mftry 0` turns this off. The attempt is also made when the dense Schur complement does
+  not fit in memory: the first-order engine is then the fallback and a result at reduced
+  accuracy is kept; when neither the Schur complement nor the engine's factor of A A' fits,
+  the matrix-free method runs as well.
+- **A double-double endgame for small problems that end short of the tolerance** (m ≤ 1,200,
+  Σ n² ≤ 2e5): a few iterations with all the linear algebra in double-double arithmetic,
+  within a work budget; the result is kept when it is better. `-nodd` turns it off. The log
+  ends with the ways to more accuracy (`-acc high`, `-prec`) and to a guaranteed bound
+  (`-bound`, `-certify`), in the syntax of the calling interface.
+- **A point that missed the tolerance has its primal feasibility restored before it is
+  returned** (1.3.2): X ← X^½ (I + W) X^½ with W chosen so that A(X) = b. On problems without
+  an interior the primal residual rises to about 1e-6 in the last iterations while the dual
+  residual and the complementarity keep falling; this correction removes the primal residual
+  (to 1e-12), keeps X positive semidefinite and leaves the complementarity where it was. It
+  starts from the iterate with the smallest dual residual and complementarity. `-nopolishr`
+  turns it off.
+
 ## Optional methods
 
 - **`-prec dd | qd | <digits>`:** high precision. The solve runs in double-double (about 32
@@ -132,7 +181,10 @@ Every automatic choice below can be overridden from the command line.
   or 1e-77 at 100 digits (`-hptol` sets a tolerance). The data are read exactly as written in the file, and
   `-x`, `-y`, `-z` write all the digits. With `-fom 1` or `-lralm 1` a first-order method
   runs in high precision instead of the interior-point method. Blocks whose data are block diagonal
-  after a permutation are split, a presolve in the working
+  after a permutation are split; the reductions of the double solver are applied to the data
+  in the working precision (sign and permutation symmetry, with the group verified entry by
+  entry; the block diagonalisation of the data; the chordal decomposition where the banded
+  factorization can use it); a presolve in the working
   precision removes free variables and simple faces, and the solve starts from a double
   solve by the default method. Problems without an interior that the presolve does not
   reduce reach about half the digits of a precision; the solve then continues in the next
@@ -141,10 +193,10 @@ Every automatic choice below can be overridden from the command line.
 - **`-mfipm 1`:** a matrix-free interior-point method. Its Newton systems are solved by
   preconditioned CG, so the Schur complement is never formed. It suits problems with a
   low-rank optimal side, e.g. SOS relaxations with a low-rank Gram matrix, or truss topology
-  problems (m = 41,616 in 7 minutes on one core, where a Schur complement would need 14 GB). **`-mfipm 2`** is
+  problems (m = 41,616 in 2.5 minutes on one core, where a Schur complement would need 14 GB). **`-mfipm 2`** is
   the hybrid: the matrix-free iteration while its CG is cheap, then the standard method from
-  that iterate (a few Schur factorizations instead of thirty; truss topology problems with
-  m = 7,000–14,000: 2.5–3× faster than the default).
+  that iterate (a few Schur factorizations instead of thirty; the hand-off at a merit of 1e-3, `-mfhand`). The default does the same by itself when its
+  matrix-free attempt gets near but does not end OPTIMAL.
 - **`-lralm 1` (experimental):** a low-rank augmented Lagrangian method (X = R Rᵀ) for very large
   sparse SDPs such as AC-OPF relaxations beyond the interior-point method's reach. Its Newton
   steps use a sparse n × n preconditioner, so its memory stays O(nnz + n·rank). It reports

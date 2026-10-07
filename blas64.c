@@ -46,6 +46,7 @@ void   B64(dsyrk_)(const char *, const char *, const bi *, const bi *, const dou
 void   B64(dgemv_)(const char *, const bi *, const bi *, const double *, const double *, const bi *, const double *, const bi *, const double *, double *, const bi *);
 void   B64(dsymv_)(const char *, const bi *, const double *, const double *, const bi *, const double *, const bi *, const double *, double *, const bi *);
 void   B64(dtrsv_)(const char *, const char *, const char *, const bi *, const double *, const bi *, double *, const bi *);
+void   B64(strsv_)(const char *, const char *, const char *, const bi *, const float *, const bi *, float *, const bi *);
 void   B64(dtrmv_)(const char *, const char *, const char *, const bi *, const double *, const bi *, double *, const bi *);
 double B64(ddot_)(const bi *, const double *, const bi *, const double *, const bi *);
 void   B64(daxpy_)(const bi *, const double *, const double *, const bi *, double *, const bi *);
@@ -114,6 +115,10 @@ void BW(dsymv_)(const char *u, const int *n, const double *al, const double *a, 
 void BW(dtrsv_)(const char *u, const char *t, const char *d, const int *n, const double *a, const int *lda, double *x, const int *incx) {
     const bi N = I(n), LA = I(lda), IX = I(incx);
     B64(dtrsv_)(u, t, d, &N, a, &LA, x, &IX);
+}
+void BW(strsv_)(const char *u, const char *t, const char *d, const int *n, const float *a, const int *lda, float *x, const int *incx) {
+    const bi N = I(n), LA = I(lda), IX = I(incx);
+    B64(strsv_)(u, t, d, &N, a, &LA, x, &IX);
 }
 void BW(dtrmv_)(const char *u, const char *t, const char *d, const int *n, const double *a, const int *lda, double *x, const int *incx) {
     const bi N = I(n), LA = I(lda), IX = I(incx);

@@ -26,5 +26,6 @@ int socp_solve(const SocpProb *P, const SocpOpts *opt, SocpRes *R);
 void socp_result_free(SocpRes *R);
 const char *socp_status_str(int s);
 extern int (*socp_printf)(const char *fmt, ...);   /* where the solver prints (default: printf) */
+extern void (*socp_note)(const char *fmt, ...);    /* 5.8: lines for the caller's summary (NULL: none) */
 extern volatile int *socp_stop;                    /* a flag that stops the solve when it becomes nonzero */
 #endif

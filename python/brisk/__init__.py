@@ -11,7 +11,7 @@
 from ._core import (STATUS, ConeResult, Result, certify, hp_solution, interrupt, library_path, load_library, options_to_argv,
                     set_interruptible, solve_file, solve_sdpa, solve_sedumi, version, write_sdpa)
 
-__version__ = "1.2.1"
+__version__ = "1.3.2"
 __all__ = ["STATUS", "ConeResult", "Result", "certify", "hp_solution", "interrupt", "set_interruptible", "library_path", "load_library", "options_to_argv", "solve_file",
            "solve_sdpa", "solve_sedumi", "version", "write_sdpa", "BRISK"]
 

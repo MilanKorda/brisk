@@ -382,7 +382,7 @@ static int ps_lammin_sparse(int n, const double *M, double delta, double *out) {
     for (int i = 0; i < n; i++) nbr[i] = malloc(sizeof(int) * (deg[i] + 1));
     for (int j = 0; j < n; j++)
         for (int i = j + 1; i < n; i++) if (M[i + (size_t)j * n] != 0) { nbr[i][fill[i]++] = j; nbr[j][fill[j]++] = i; }
-    SChol *S = schol_analyze_adj(n, deg, nbr, (size_t)fmin(3e7, 0.3 * (double)n * n) + 1000);
+    SChol *S = schol_analyze_adj(n, deg, nbr, (size_t)fmin(3e7 * brisk_mem_scale(), 0.3 * (double)n * n) + 1000);
     for (int i = 0; i < n; i++) free(nbr[i]);
     free(nbr); free(fill); free(deg);
     if (!S) return 1;
@@ -653,7 +653,7 @@ static int sparse_gtag(int n, const double *A, const double *G, int kw, double *
     for (int i = 0; i < n; i++) nbr[i] = malloc(sizeof(int) * (deg[i] + 1));
     for (int j = 0; j < n; j++)
         for (int i = j + 1; i < n; i++) if (A[i + (size_t)j * n] != 0) { nbr[i][fill[i]++] = j; nbr[j][fill[j]++] = i; }
-    SChol *F = schol_analyze_adj(n, deg, nbr, (size_t)fmin(3e7, 0.3 * (double)n * n) + 1000);
+    SChol *F = schol_analyze_adj(n, deg, nbr, (size_t)fmin(3e7 * brisk_mem_scale(), 0.3 * (double)n * n) + 1000);
     for (int i = 0; i < n; i++) free(nbr[i]);
     free(nbr); free(fill); free(deg);
     if (!F) return 1;
@@ -718,7 +718,7 @@ static int spx_lammin(const PSSpX *s, const double *v, double delta, double *out
     int **nbr = pmalloc(sizeof(int *) * (n + 1)), *fill = pcalloc(n + 1, sizeof(int));
     for (int i = 0; i < n; i++) nbr[i] = pmalloc(sizeof(int) * (deg[i] + 1));
     for (int e = 0; e < s->ne; e++) { const int i = (int)(s->key[e] / (uint64_t)n), j = (int)(s->key[e] % (uint64_t)n); if (i != j && v[e] != 0) { nbr[i][fill[i]++] = j; nbr[j][fill[j]++] = i; } }
-    SChol *S = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8, 0.3 * (double)n * n) + 1000);
+    SChol *S = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8 * brisk_mem_scale(), 0.3 * (double)n * n) + 1000);
     for (int i = 0; i < n; i++) free(nbr[i]);
     free(nbr); free(fill); free(deg);
     if (!S) return 1;
@@ -756,7 +756,7 @@ static int spx_analyze(PSSpX *s) {
     int **nbr = pmalloc(sizeof(int *) * (n + 1)), *fill = pcalloc(n + 1, sizeof(int));
     for (int i = 0; i < n; i++) nbr[i] = pmalloc(sizeof(int) * (deg[i] + 1));
     for (int e = 0; e < s->ne; e++) { const int i = (int)(s->key[e] / (uint64_t)n), j = (int)(s->key[e] % (uint64_t)n); if (i != j) { nbr[i][fill[i]++] = j; nbr[j][fill[j]++] = i; } }
-    s->F = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8, 0.3 * (double)n * n) + 1000);
+    s->F = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8 * brisk_mem_scale(), 0.3 * (double)n * n) + 1000);
     for (int i = 0; i < n; i++) free(nbr[i]);
     free(nbr); free(fill); free(deg);
     if (!s->F) { s->Ffail = 1; return 1; }
@@ -1864,6 +1864,79 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
 
 /* 4.30: the DIMACS errors of a given (Xo, yo) on O (dense blocks; Z = C - A'y formed here).
  * Used after the dual form is mapped back to the problem as read. */
+/* 5.8 (a user's report): is the returned point a certificate of the infeasibility verdict on
+ * the data as read?  Primal infeasible: a Farkas ray y with b'y > 0 and A'y <= 0; dual
+ * infeasible: X >= 0 with A(X) = 0 and <C,X> < 0.  Returns 1 (verified), 0 (not: the verdict
+ * rests on the presolve, e.g. a face found by the facial reduction, or the problem is weakly
+ * infeasible and no ray exists), -1 (no point to check).  The scaled measures are returned for
+ * the log: obj = b'y or <C,X> with the ray scaled to unit norm, viol = the violation of the cone
+ * (and of A(X) = 0) relative to the ray's norm. */
+int ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol) {
+    const int nbo = O->nblk, mo = O->m;
+    *obj = 0; *viol = 0;
+    if (status == 1) {
+        if (!yo) return -1;
+        double ny = 0; for (int i = 0; i < mo; i++) ny += yo[i] * yo[i];
+        ny = sqrt(ny); if (!(ny > 0)) return 0;
+        double **W = pmalloc(sizeof(double *) * (nbo + 1));
+        for (int o = 0; o < nbo; o++) W[o] = pcalloc(bsize(O->bs[o]) + 1, sizeof(double));
+        double nw = 0;
+        for (size_t q = 0; q < O->nnz; q++) {
+            if (O->con[q] < 0) continue;
+            const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+            const double coef = -yo[O->con[q]] / ny * O->v[q];      /* -A'y, scaled */
+            if (coef == 0) continue;
+            if (O->bs[o] < 0) W[o][i] += coef;
+            else { W[o][i + (size_t)j * no] += coef; if (i != j) W[o][j + (size_t)i * no] += coef; }
+        }
+        size_t maxn2 = 1;
+        for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+        double *work = pmalloc(sizeof(double) * maxn2);
+        double lam = 0;
+        for (int o = 0; o < nbo; o++) {
+            const int no = abs(O->bs[o]); const size_t len = bsize(O->bs[o]);
+            for (size_t q = 0; q < len; q++) nw += W[o][q] * W[o][q];
+            if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lam = fmin(lam, W[o][i]); }
+            else lam = fmin(lam, ps_lammin_tol(no, W[o], work, 0.0));
+        }
+        nw = sqrt(nw);
+        double by = 0; for (int i = 0; i < mo; i++) by += O->b[i] * yo[i];
+        *obj = by / ny / (1.0 + O->nb1);
+        *viol = fmax(0.0, -lam) / fmax(nw, 1e-300);
+        free(work);
+        for (int o = 0; o < nbo; o++) free(W[o]);
+        free(W);
+        return (by > 0 && *viol <= 1e-6) ? 1 : 0;
+    }
+    if (status == 2) {
+        if (!Xo) return -1;
+        double nx = 0, lam = 0, cx = 0;
+        size_t maxn2 = 1;
+        for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+        double *work = pmalloc(sizeof(double) * maxn2);
+        for (int o = 0; o < nbo; o++) {
+            const int no = abs(O->bs[o]); const size_t len = bsize(O->bs[o]);
+            for (size_t q = 0; q < len; q++) nx += Xo[o][q] * Xo[o][q];
+            if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lam = fmin(lam, Xo[o][i]); }
+            else lam = fmin(lam, ps_lammin_tol(no, Xo[o], work, 0.0));
+        }
+        free(work);
+        nx = sqrt(nx); if (!(nx > 0)) return 0;
+        double *rp = pcalloc(mo + 1, sizeof(double));
+        for (size_t q = 0; q < O->nnz; q++) {
+            const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+            const double x = O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
+            const double c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
+            if (O->con[q] < 0) cx += c; else rp[O->con[q]] += c;
+        }
+        double r2 = 0; for (int i = 0; i < mo; i++) r2 += rp[i] * rp[i];
+        free(rp);
+        *obj = cx / nx / (1.0 + O->nC1);
+        *viol = fmax(sqrt(r2) / nx / (1.0 + O->nC1), fmax(0.0, -lam) / nx);
+        return (cx < 0 && *viol <= 1e-6) ? 1 : 0;
+    }
+    return -1;
+}
 int ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res) {
     const double t0 = ps_now();
     const int nbo = O->nblk, mo = O->m;

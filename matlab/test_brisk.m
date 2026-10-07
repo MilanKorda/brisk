@@ -115,6 +115,17 @@ nfail = nfail + check('brisk_sedumi accepts opts.bound = ''sos''', is2.numerr <=
 a = brisk_opts2args(struct('chordal', 0, 'nohsd', true, 'nofr', false, 'certify', true, 'dir', 'nt', 'fomstart_x', 'x.txt'));
 nfail = nfail + check('opts -> args: numbers, flags, strings, underscore = dash', ...
     isequal(a, {'-q', '-silent', '-chordal', '0', '-nohsd', '-certify', '-dir', 'nt', '-fomstart-x', 'x.txt'}));
+% 1.3.2: the commands name themselves to the solver, and the advice at the end of the log is
+% written as fields of their options; a SeDuMi problem with one row (find(A) returned rows)
+a = brisk_opts2args(struct('verbose', 1), 'brisk_sdpa');
+nfail = nfail + check('opts -> args: the calling command', isequal(a, {'-caller', 'matlab:brisk_sdpa'}));
+out = evalc('brisk_sdpa(ex1, struct(''verbose'', 1));');
+has = @(t) ~isempty(strfind(out, t));
+nfail = nfail + check('log: the advice in MATLAB syntax (accuracy, precision, bound)', ...
+    has('in the options of brisk_sdpa(..., opts)') && has('opts.acc = ''high''') && has('opts.prec = ''dd''') && ...
+    has('opts.bound = ''d''') && has('opts.certify = true'));
+[x1, y1, i1] = brisk_sedumi(sparse([1 0 0 1]), 1, [2; 0; 0; 2], struct('s', 2));
+nfail = nfail + check('brisk_sedumi: one constraint (min 2 tr X, tr X = 1)', i1.numerr <= 1 && abs([2 0 0 2] * x1 - 2) < 1e-6 && abs(y1 - 2) < 1e-6);
 % a max-cut-type SDP on a path (tridiagonal, chordal pattern): chordal decomposition auto / off / forced
 n = 120; Tm = zeros(0, 5);
 for k = 1:n

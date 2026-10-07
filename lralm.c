@@ -274,7 +274,7 @@ static double ladder(const LS *s, double scale) {
     for (int i = 0; i < n; i++) for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] != i) deg[i]++;
     int **nbr = lx(sizeof(int *) * (n + 1));
     for (int i = 0; i < n; i++) { nbr[i] = lx(sizeof(int) * (deg[i] + 1)); int c = 0; for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] != i) nbr[i][c++] = s->sj[p]; }
-    SChol *F = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8, 0.3 * (double)n * n) + 1000);
+    SChol *F = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8 * brisk_mem_scale(), 0.3 * (double)n * n) + 1000);
     for (int i = 0; i < n; i++) free(nbr[i]);
     free(nbr); free(deg);
     if (!F) return -1;
@@ -298,7 +298,7 @@ static int z_posdef(LS *s) {
         for (int i = 0; i < n; i++) for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] != i) deg[i]++;
         int **nbr = lx(sizeof(int *) * (n + 1));
         for (int i = 0; i < n; i++) { nbr[i] = lx(sizeof(int) * (deg[i] + 1)); int c = 0; for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] != i) nbr[i][c++] = s->sj[p]; }
-        s->Fz = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8, 0.3 * (double)n * n) + 1000);
+        s->Fz = schol_analyze_adj(n, deg, nbr, (size_t)fmin(2e8 * brisk_mem_scale(), 0.3 * (double)n * n) + 1000);
         for (int i = 0; i < n; i++) free(nbr[i]);
         free(nbr); free(deg);
         if (!s->Fz) return 0;

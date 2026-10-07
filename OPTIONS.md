@@ -64,10 +64,12 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `sym` | exact symmetry reduction: `auto` (sign symmetries and permutation automorphisms found and used), `none`, or a file of generators | `auto` |
 | `symmin` | apply the reduction only when it shrinks the problem by this factor: the constraints, Σn³ of the blocks, or (at most 4 SDP blocks, m ≤ 20,000) the estimated work m³/3 + 30 Σn³ | 1.5 |
 | `symtime`, `symnodes` | caps of the automatic search | 20 s, 500 nodes |
-| `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. | −1 |
+| `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. | −1 | The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra (5.8).
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
 | `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
 | `freeelim` | eliminate split free variables (kernel-form SOS): `-1` auto, `0` off, `1` on | `-1` |
+| `nodd` | no double-double endgame in the embedding (by default a small problem, m ≤ 1,200 and Σ n² ≤ 2e5, that ends short of the tolerance is continued in double-double arithmetic within a work budget, and the result is kept when it is better) | endgame on |
+| `nopolishr` | no restoration of the primal feasibility of a point that missed the tolerance. By default such a point is corrected before it is returned, X ← X^½ (I + W) X^½ with W chosen so that A(X) = b (the square-root metric of X: X stays positive semidefinite, the complementarity stays, and the matrix has the square root of the Schur complement's condition number), starting from the iterate with the smallest dual residual and complementarity; the older corrections (X-metric, Euclidean) follow only if it is not accepted. One to three Schur assemblies, on runs that missed the tolerance only. | restoration on |
 | `dualize` | solve the dual form when its Schur complement is at most half the size: `-1` auto, `0` off, `1` force | `-1` |
 | `tracebound` | trace bound with the free elimination | `-1` auto |
 
@@ -76,12 +78,13 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | option | meaning | default |
 |---|---|---|
 | `hsd` / `nohsd` | force / forbid the homogeneous self-dual embedding | automatic, each method the other's fallback |
-| `hsdfirst` | automatic order: `1` the embedding first where it is cheap | 1 |
+| `hsdfirst` | automatic order: `1` the embedding first where it is cheap: its extra dense work 12·Σn³ is at most m³/3 (`hsdfirstc` 12), or at most half of m³/3 plus the estimated work of the Schur assembly (`hsdfirstasm` 0.5: problems whose iteration is mostly assembly), or the problem is tiny | 1 |
 | `dir` | search direction `auto`, `hkm`, `nt` | `auto` |
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off | 0.2 |
-| `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-5, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
+| `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
+| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block); the attempt is limited in work (CG steps a solve worth a sixth of a factorization; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
 | `crossover` | SDP crossover after the solve: `0` off, `1` on, `-1` when cheap | 0 |
 
@@ -100,7 +103,7 @@ ACCURACY, PRIMAL/DUAL INFEASIBLE with a certificate, …).
 
 | option | meaning | default |
 |---|---|---|
-| `prec` | `dd` (double-double, about 32 digits), `qd` (quad-double, about 64 digits) or a number of decimal digits (variable precision). The interior-point method runs in that precision; with `fom = 1` the augmented Lagrangian / semismooth Newton method, with `lralm = 1` the low-rank augmented Lagrangian method. The data of a file are read exactly as written. Blocks whose data are block diagonal after a permutation are split; a presolve in the working precision removes split free variables and simple faces; the solve starts from a double solve by the default method; the result and its errors are those of the problem as read. | off |
+| `prec` | `dd` (double-double, about 32 digits), `qd` (quad-double, about 64 digits) or a number of decimal digits (variable precision). The interior-point method runs in that precision; with `fom = 1` the augmented Lagrangian / semismooth Newton method, with `lralm = 1` the low-rank augmented Lagrangian method. The data of a file are read exactly as written. Blocks whose data are block diagonal after a permutation are split; the reductions of the double solver are applied to the data in the working precision (sign and permutation symmetry with the group verified entry by entry, the block diagonalisation of the data, the chordal decomposition where the banded factorization can use it; governed by `sym`, `symalg`, `chordal` as in double; not with `bound`, `fom`, `lralm`); a presolve in the working precision removes split free variables and simple faces; the solve starts from a double solve by the default method; the result and its errors are those of the problem as read. | off |
 | `hpext` | interior-point method: when the precision is exhausted short of the tolerance, the solve continues in the next precision (dd, qd, then more bits), at most this many times and while that gains a digit; 0: off. The tolerance and the digits returned stay those of `prec` | 2 |
 | `hptol` | tolerance of the high-precision solve | the solve aims at 1e-24 (dd), 1e-48 (qd), 1e-77 (100 digits) and a result within 1e-19, 1e-38, 1e-62 counts as optimal; `fom` / `lralm` aim at the latter |
 
@@ -199,7 +202,11 @@ high precision
   -prec <p>        solve in high precision: dd (double-double, about 32 digits), qd (quad-double,
                    about 64 digits) or a number of decimal digits (variable precision; up to 31
                    digits is dd, up to 63 qd). The data are read exactly as written in the file.
-                   Blocks whose data are block diagonal after a permutation are split. A
+                   Blocks whose data are block diagonal after a permutation are split. The
+                   reductions of the double solver are applied to the data in the working
+                   precision: sign and permutation symmetry (the group verified entry by entry),
+                   the block diagonalisation of the data (-symalg), the chordal decomposition
+                   where the banded factorization can use it (not with -bound, -fom, -lralm). A
                    presolve in the working precision plus guard digits removes split free
                    variables and simple faces (rank-one, diagonal, LP certificates); the result
                    and its errors are those of the problem as read. The solve starts from a
@@ -234,7 +241,8 @@ method
   -hsdfirst <0|1>  automatic method: the embedding first when its extra dense work is small or the
                    problem tiny (1; 0: standard first); many split free pairs and the chordal moment
                    form use the embedding either way
-  -hsdfirstc <c>   ... i.e. when c * sum n^3 <= m^3/3 (12)
+  -hsdfirstc <c>   ... i.e. when c * sum n^3 <= m^3/3 (12),
+  -hsdfirstasm <f> ... or <= f * (m^3/3 + the estimated work of the Schur assembly) (0.5; 0: off)
   -stdslow <k>     standard method: stop for the retry when the best score has not halved in k iterations (10; 0 off)
   -retryacc <a>    retry with the embedding only if the first result is worse than a (1e-7)
   -warm <l>        re-solve from l x (first point) + (1 - l) x (standard start) (0 = off; measured slower)
@@ -262,10 +270,20 @@ presolve
   -mfipm <k>       matrix-free interior-point method: NT Mehrotra steps, Newton systems
                    by preconditioned CG, no Schur complement (1 on, 0 off); for problems with
                    a low-rank optimal side (moment-SOS with few atoms). 2: the hybrid - the
-                   matrix-free iteration until its merit is below -mfhand (1e-5) or an
+                   matrix-free iteration until its merit is below -mfhand (1e-3) or an
                    iteration needs more than -mfhandcg (600) CG steps, then the standard
                    method from that iterate (a few Schur factorizations instead of thirty;
                    truss topology problems with m = 7,000-14,000: 2.5-3x faster). Its options:
+  -mftry <k>       the matrix-free method first, automatically (1; 0 off): on problems with one
+                   to four dense blocks of order >= 100 whose Schur factorization is
+                   estimated at 3.5 times a matrix-free solve or more (at least equal when
+                   every constraint has an entry in an LP block), and that the presolve
+                   leaves unchanged. The attempt ends when a solve away from the
+                   optimum needs more CG steps than a sixth of a Schur factorization costs,
+                   or the attempt more than a quarter of the standard solve; unless it
+                   ends OPTIMAL, the standard method follows (from the attempt's iterate
+                   of merit 1e-3 if it got that far); also when the Schur complement does
+                   not fit in memory (the first-order engine follows then)
   -mfrho <r>, -mfrmax <k>, -mfdrop <d>, -mfkmax <k>   preconditioner: bulk spread (10), outlier
                    eigenvectors per block (4), dropped pairs (0.5), largest capacitance (8000)
   -mfproj <k>, -mfeta <e>   0 (default): no projection of the primal direction, CG until its
@@ -369,6 +387,10 @@ iteration details
   -hsdpat <k>      self-dual embedding: products on the data pattern (1) or dense (0)
   -hsdbeta <b>     self-dual embedding: neighbourhood floor (1e-3)
   -hsdcorr <k>     self-dual embedding: centrality correctors per iteration (3)
+  -hsdhoc <k>      self-dual embedding: passes that re-evaluate the second-order term at the chosen
+                   direction, kept when they predict a larger reduction (4; 0 = off)
+  -hsdnb <b>       self-dual embedding: after kept passes the step may go to 0.9995 of the boundary
+                   while lambda_min(XZ) >= b mu (0.3; 0 = off)
   -hsdcfrac <f>    ... their time budget as a fraction of Schur assembly+factorization (1)
   -hsdcbmin <b>, -hsdcbmax <b>   ... target box for the scaled products (0.1, 10)
   -hsdrefine <k>   self-dual embedding: passes enforcing the primal Newton equation (2)
@@ -401,6 +423,8 @@ dual method
 expert and tuning options (listed for completeness; the defaults are the tested ones)
   -vv              very verbose (per-iteration internals)
   -knownfeas       a solution is known to exist: no infeasibility exits
+  -nopolishr       no restoration of the primal feasibility of a point that missed the tolerance
+                   (the correction in the square-root metric of X; the older polishes stay)
   -nopolishx       no X-metric polish of the returned point (the Euclidean polish stays)
   -mixedfrac <f>   float Schur factor for 1000 <= m < 4000 when the factorization is at least
                    this fraction of an iteration's work (0.4)
@@ -422,7 +446,9 @@ expert and tuning options (listed for completeness; the defaults are the tested 
                    rule (2), largest change factor (2)
   -fomsingle <r>   first-order projections in single precision above this residual (1e-4; 0 never)
   -fomssn <0|1>    first-order phase II (ALM + semismooth Newton-CG) (1); -fomssnafter <k> (300),
-                   -fomssnres <r> (1e-3): when it starts; -fomssnrho (3), -fomssnsig0 (10),
+                   -fomssnres <r> (1e-3): when it starts (phase II begins as soon as the
+                   residual is below -fomssnres, whatever -fomssnafter says; to delay it,
+                   lower both); -fomssnrho (3), -fomssnsig0 (10),
                    -fomssnprec (1 Gram), -fomssneta (0.1), -fomssnwarm (0), -fomssnouter (200),
                    -fomssnnewton (30), -fomssncg (200), -fomssnstall (6)
   -fombm <0|1>     first-order kernel B (Burer-Monteiro ALM after the splitting; experimental, 0);

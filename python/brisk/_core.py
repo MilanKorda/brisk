@@ -205,10 +205,21 @@ def interrupt():
     load_library().brisk_interrupt()
 
 
-def _run(call, options, verbose, collect=None):
+def _caller_args(tag):
+    """The option pair that tells libbrisk which interface and command called it, so that the
+    advice at the end of the log (more accuracy, a guaranteed bound) is written in that
+    command's syntax. Libraries before 1.3.2 do not know it and are not given it."""
+    try:
+        v = tuple(int(x) for x in version().split(".")[:3])
+    except ValueError:
+        return []
+    return ["-caller", tag] if tag and v >= (1, 3, 2) else []
+
+
+def _run(call, options, verbose, collect=None, caller=None):
     global _worker
     L = load_library()
-    av = options_to_argv(options)
+    av = options_to_argv(options) + _caller_args(caller)
     arr = (ctypes.c_char_p * max(len(av), 1))(*[a.encode() for a in av])
 
     def cb(s, is_err):
@@ -373,7 +384,7 @@ def _is_mat(path):
         return f.read(6) == b"MATLAB"
 
 
-def solve_file(path, options=None, verbose=True):
+def solve_file(path, options=None, verbose=True, _caller="python:solve_file"):
     """Solve a problem file as the command line (./brisk path options...): an SDPA file
     (.dat-s; returns a Result) or a MAT-file with a problem in SeDuMi format (A or At, b, c,
     K; returns a ConeResult)."""
@@ -382,10 +393,10 @@ def solve_file(path, options=None, verbose=True):
     p = os.fsencode(path)
     mat = str(path).endswith(".mat") and _is_mat(path)
     return _run(lambda L, n, a, r: L.brisk_solve_file(p, n, a, r), options, verbose,
-                _collect_sedumi if mat else None)
+                _collect_sedumi if mat else None, caller=_caller)
 
 
-def solve_sedumi(A, b, c, K, options=None, verbose=True):
+def solve_sedumi(A, b, c, K, options=None, verbose=True, _caller="python:solve_sedumi"):
     """Solve a problem in SeDuMi format:
 
         min c'x  s.t.  A x = b,  x in K        max b'y  s.t.  c - A'y = z in K*
@@ -428,10 +439,10 @@ def solve_sedumi(A, b, c, K, options=None, verbose=True):
     return _run(lambda L, n, a, r: L.brisk_solve_sedumi(
         int(b.size), int(c.size), P(Ap, pi), P(Ai, pi), P(Ax, pd), P(b, pd), P(c, pd), nf, nl,
         int(q.size), P(q, pi), int(rr.size), P(rr, pi), int(ss.size), P(ss, pi), n, a, r),
-        options, verbose, _collect_sedumi)
+        options, verbose, _collect_sedumi, caller=_caller)
 
 
-def solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True):
+def solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True, _caller="python:solve_sdpa"):
     """Solve the SDPA problem given by its numbers (see the module docstring): blocksizes
     (LP blocks negative), c (m), and the entries mat (0..m), blk (1..nblk), i, j (1-based
     within the block; i > j is swapped), v."""
@@ -447,7 +458,7 @@ def solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True):
     P = lambda a, t: a.ctypes.data_as(t)   # noqa: E731  (arrays stay referenced for the solve)
     return _run(lambda L, n, a, r: L.brisk_solve_data(
         int(c.size), int(bs.size), P(bs, pi), P(c, pd), nnz, P(arrs[0], pi), P(arrs[1], pi),
-        P(arrs[2], pi), P(arrs[3], pi), P(v, pd), n, a, r), options, verbose)
+        P(arrs[2], pi), P(arrs[3], pi), P(v, pd), n, a, r), options, verbose, caller=_caller)
 
 
 def certify(problem, side, X=None, y=None, verbose=False, prec=None):

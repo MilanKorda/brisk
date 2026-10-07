@@ -42,6 +42,12 @@ static int fails = 0;
 
 static size_t g_chars = 0;
 static int count_cb(const char *s, int is_err) { g_chars += strlen(s); return 0; }
+static char g_log[1 << 16]; static size_t g_nlog = 0;
+static int log_cb(const char *s, int is_err) {
+    const size_t l = strlen(s);
+    if (g_nlog + l < sizeof g_log) { memcpy(g_log + g_nlog, s, l); g_nlog += l; g_log[g_nlog] = 0; }
+    return 0;
+}
 
 enum { M = 6, NB = 2, NMAX = 400 };
 static const int bs[NB] = { 4, -3 };
@@ -124,6 +130,25 @@ int main(void) {
     brisk_set_output(1, NULL);
     brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 0, NULL, rm);
     CHECK(brisk_result_status(rm) == 0, "silent run status");
+    {   /* 1.3.2: the advice at the end of the log is in the caller's syntax: a C program's option
+         * strings by default, an interface's command when the options name it (-caller), and the
+         * tag does not stay for the next call; a bound that was asked for is not advised again */
+        const char *tag[] = { "-caller", "python:solve_sdpa" }, *bnd[] = { "-bound", "d" };
+        g_nlog = 0; g_log[0] = 0; brisk_set_output(2, log_cb);
+        brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 0, NULL, rm);
+        CHECK(strstr(g_log, "For higher accuracy, in the option strings of the call:") && strstr(g_log, "\"-acc\", \"high\"")
+              && strstr(g_log, "\"-prec\", \"dd\"") && strstr(g_log, "For a guaranteed bound") && strstr(g_log, "\"-bound\", \"d\"")
+              && strstr(g_log, "\"-certify\""), "advice in C syntax");
+        g_nlog = 0; g_log[0] = 0;
+        int rct = brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 2, tag, rm);
+        CHECK(rct == 0 && strstr(g_log, "in brisk.solve_sdpa(..., options={...})") && strstr(g_log, "\"acc\": \"high\"")
+              && strstr(g_log, "\"bound\": \"d\"") && strstr(g_log, "\"certify\": True"), "advice in the syntax of the named caller (rc %d)", rct);
+        g_nlog = 0; g_log[0] = 0;
+        brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 2, bnd, rm);
+        CHECK(strstr(g_log, "in the option strings of the call") && !strstr(g_log, "For a guaranteed bound")
+              && strstr(g_log, "For a rigorous check of the bound"), "advice after a bound, and the caller's tag gone");
+        brisk_set_output(1, NULL);
+    }
     {   /* high precision: quad-double, and all the digits as text */
         const char *hopts[] = { "-prec", "qd", "-q" };
         const int rch = brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 3, hopts, rm);

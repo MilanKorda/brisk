@@ -1,4 +1,4 @@
-function args = brisk_opts2args(opts)
+function args = brisk_opts2args(opts, caller)
 %BRISK_OPTS2ARGS  BRISK options struct -> command-line arguments (internal).
 %   Every command-line option of BRISK can be given as a field: opts.<name> = value gives
 %   '-<name> value'. An underscore in the field name stands for a dash (opts.certify_y =
@@ -18,6 +18,7 @@ function args = brisk_opts2args(opts)
 %   Options the MEX interface handles itself are refused: x, y, z (output files; the solution
 %   is returned), certify_x / certify_y (checks of a given certificate: use the command line).
 if nargin < 1 || isempty(opts), opts = struct(); end
+if nargin < 2, caller = ''; end
 if ~isstruct(opts), error('brisk:input', 'options must be a struct'); end
 args = {};
 verbose = 0;
@@ -81,4 +82,7 @@ if isfield(opts, 'args')
     if ~iscell(extra), error('brisk:input', 'opts.args must be a string or a cell array of strings'); end
     args = [args, extra(:)'];
 end
+% which command called: the advice at the end of the log (more accuracy, a guaranteed bound) is
+% then written as fields of that command's options
+if ~isempty(caller), args = [args, {'-caller', ['matlab:', caller]}]; end
 end

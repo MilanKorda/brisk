@@ -698,6 +698,8 @@ double analyze_sdp_block(Block *B, const Params *par) {
         fe += S->ef;
     }
     B->foff[B->ns] = (int)fe;
+    B->ffp = (double)n * n < 2147483648.0 ? xmalloc(sizeof(int) * (fe ? fe : 1)) : NULL;
+    if (B->ffp) for (size_t k = 0; k < fe; k++) B->ffp[k] = B->ffr[k] + B->ffc[k] * n;
     /* 4.23: the stored entries flattened the same way (blk_Aop: contiguous loads, and the
      * summation order of the per-constraint loop, so its rounding is unchanged) */
     size_t le = 0;
@@ -784,8 +786,24 @@ double analyze_sdp_block(Block *B, const Params *par) {
                 }
                 full += (double)S->nr * n2; area += (double)S->nr * ar;
             }
-            B->live = area <= 0.67 * full;
-            if (ENV_ON("BRISK_ROUTEDBG")) printf("   [block n %d: live region of the row products: %.0f %% of nr n^2 (%s)]\n", n, 100.0 * area / fmax(full, 1.0), B->live ? "used" : "not used");
+            /* 5.9 (a user's suggestion, refitted on his 24 relaxations with the flat gather of
+             * 5.7): the ratio at which the live region stops paying grows with the block
+             * order (measured, not derived). 0.67 up to n = 420 as before, then
+             * 0.3026 ln n - 1.1578: 0.75 at n = 550, 0.86 at 777, 1 from n = 1250.
+             * Measured (Schur formation, live against full): n = 777 at a ratio of 0.674
+             * 20 % faster, 580 at 0.709 5-7 %, 550 at 0.735 2-5 %; 437 at 0.720 equal, 418
+             * at 0.726 5-8 % slower, 352 at 0.697 20 % slower, 300-370 at 0.74-0.77 5-29 %
+             * slower; his results on six threads: 860 at 0.68 and two blocks of 1296 and 2208
+             * at 1.00 faster. (370 at 0.679 is 20 % faster too, next to 352 at 0.697: the
+             * ratio is not the only determinant.) His fit on 1.2.1 was 0.215 ln n - 0.465
+             * (BRISK_LIVE=2). */
+            double thr = 0.3026 * log((double)n) - 1.1578;
+            if (thr < 0.67) thr = 0.67;
+            if (thr > 1.0) thr = 1.0;
+            B->live = area <= thr * full;
+            { const char *e = getenv("BRISK_LIVE");      /* test: 0/1 forces it; 2: his fit on 1.2.1; 3: the fixed 0.67 of 4.x-5.8 */
+              if (e) { const int v = atoi(e); B->live = v == 2 ? area <= (0.215 * log((double)n) - 0.465) * full : v == 3 ? area <= 0.67 * full : v; } }
+            if (ENV_ON("BRISK_ROUTEDBG")) printf("   [block n %d: live region of the row products: %.1f %% of nr n^2 (%s)]\n", n, 100.0 * area / fmax(full, 1.0), B->live ? "used" : "not used");
             free(death); free(cnt);
             if (!B->live) { free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
                             B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL; }
@@ -805,6 +823,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
     if (c_row <= c_sl && c_row <= c_dn) B->prod_route = 0;
     else if (c_sl <= c_dn) B->prod_route = 1;
     else B->prod_route = 2;
+    B->asm_cost = B->lowrank ? 0.0 : cost_now / cb;
     return cost_now;
 }
 
@@ -893,7 +912,7 @@ void block_free_contents(Block *B) {
     spsym_free(&B->C);
     free(B->route); free(B->urows); free(B->ufr); free(B->ufc);
     free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad);
-    free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv);
+    free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv); free(B->ffp);
     free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
     free(B->lfoff); free(B->lfr); free(B->lfc); free(B->lfv);
     free(B->lr_off); free(B->lr_W); free(B->lr_sig);

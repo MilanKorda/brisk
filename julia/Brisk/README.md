@@ -95,6 +95,10 @@ r = Brisk.solve_sdpa_data(m, blocksizes, c, mat, blk, i, j, v; output = :silent)
 Brisk.write_sdpa("same.dat-s", m, blocksizes, c, mat, blk, i, j, v)
 ```
 
+The log ends with how to get more accuracy and a guaranteed bound, written as keywords of the
+function that was called (`prec = "dd"`, `bound = "d"`, `certify = true`) or, under JuMP, as
+`set_attribute(model, "prec", "dd")`.
+
 `Brisk.Result` uses BRISK's convention: (P) min ⟨C,X⟩ s.t. ⟨A_i,X⟩ = b_i, X ∈ K, and
 (D) max b'y s.t. C − Σ y_i A_i = Z ∈ K, with C = −F0, A_i = F_i and b = c of the SDPA
 file. The SDPA x is −y, and "primal/dual infeasible" refer to (P)/(D).

@@ -243,7 +243,7 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
     for (int f = 0; f < npr; f++) { F->pb[f] = pr[f].blk; F->pp[f] = pr[f].ip; F->pm[f] = pr[f].im; }
     double offset = 0;
     RE *buf = NULL; int bcap = 0;
-    int *tmp = fx(sizeof(int) * (m + 1));
+    int *tmp = fx(sizeof(int) * ((m > npr ? m : npr) + 1));   /* 5.8 (a user's fix): a pivot row can hold up to npr free variables, more than m after a symmetry reduction (POEMA tensor_mult_33: heap overflow) */
     char *seen = fx(m + 1);
     long fill0 = 0, fill1 = 0;
     for (int r = 0; r < m; r++) fill0 += R[r].n;

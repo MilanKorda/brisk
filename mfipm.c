@@ -56,7 +56,7 @@ typedef struct {
     /* preconditioner */
     double *dg, *Q, *wt;           /* diag(W), D^1/2 (eigvecs of Wt), eigenvalues of Wt (ascending) */
     double tau2, kbulk;
-    int rlo, rhi;
+    int rlo, rhi, jac;   /* jac: W scaled to unit diagonal for the preconditioner (chosen per iteration) */
     double *work; int lwork, *iwork, liwork;
 } MB;
 
@@ -124,7 +124,7 @@ static void mb_init(MF *S, const Problem *P) {
         free(fill);
         double wq; int iq, info, lm1 = -1;
         BL(dsyevd_)("V", "L", &n, b->T1, &n, b->ev, &wq, &lm1, &iq, &lm1, &info);
-        b->lwork = (int)wq + 1; b->liwork = iq;
+        b->lwork = (int)wq + 1; b->liwork = iq; b->jac = 1;
         { double wq2; int iq2, mf, il = 1, iu = 1; const double at = 0; int *isz = mx(sizeof(int) * (2 * n + 2));
           BL(dsyevr_)("N", "I", "L", &n, b->T1, &n, &DZERO, &DZERO, &il, &iu, &at, &mf, b->ev, b->T2, &n, isz, &wq2, &lm1, &iq2, &lm1, &info);
           free(isz);
@@ -287,28 +287,55 @@ static void prec_setup(MF *S, const Params *par, double *lamp_out_kmax) {
     for (int k = 0; k < S->nb; k++) {
         MB *b = &S->b[k]; const int n = b->n;
         if (b->type == BLK_LP) { for (int i = 0; i < n; i++) b->dg[i] = b->W[i] * b->W[i]; b->tau2 = 1; b->rlo = b->rhi = 0; continue; }
-        static int nojac = -1; if (nojac < 0) nojac = getenv("BRISK_MFNOJACOBI") != NULL;
-        for (int i = 0; i < n; i++) { double d = nojac ? 1.0 : b->W[i + (size_t)i * n]; b->dg[i] = d > 1e-300 ? d : 1e-300; }
-        for (int j = 0; j < n; j++) for (int i = 0; i < n; i++) b->Q[i + (size_t)j * n] = b->W[i + (size_t)j * n] / sqrt(b->dg[i] * b->dg[j]);
-        int info = 0, lw = b->lwork, liw = b->liwork;
-        if (rmax > 0) BL(dsyevd_)("V", "L", &n, b->Q, &n, b->wt, b->work, &lw, b->iwork, &liw, &info);
-        else { BL(dsyevd_)("N", "L", &n, b->Q, &n, b->wt, b->work, &lw, b->iwork, &liw, &info); }
-        for (int i = 0; i < n; i++) if (!(b->wt[i] > 1e-300)) b->wt[i] = 1e-300;
-        split_spectrum(b->wt, n, rho, rmax, &b->rlo, &b->rhi);
-        if (getenv("BRISK_MFSPEC")) { printf("   [spec blk %d n %d:", k, n); for (int i = 0; i < n; i += (n > 24 ? n / 12 : 1)) printf(" %.1e", b->wt[i]); printf(" | top:"); for (int i = n - 6 > 0 ? n - 6 : 0; i < n; i++) printf(" %.2e", b->wt[i]); printf(" | rlo %d rhi %d]\n", b->rlo, b->rhi); }
-        /* 5.5: a bulk that no rmax outliers make tight (spread above rho^4: truss problems, one
-         * eigenvalue of 1e2 over a continuum from 2 down to 1e-8). Outliers at the small end then
-         * model nothing (their pairs' eigenvalues are ~0, as the base's tau^2), and those at the top
-         * that are not separated from the rest buy little for their cost (each outlier adds n pairs to
-         * the capacitance matrix, applied at every CG step): only the top eigenvalues above a gap of
-         * sqrt(rho) are kept, at least one. */
-        if (wide_on && rmax > 0 && b->wt[n - 1 - b->rhi] > rho * rho * rho * rho * b->wt[b->rlo]) {
-            int r = 0; const double g = sqrt(rho);
-            for (int q = 1; q <= rmax && q < n; q++) if (b->wt[n - q] > g * b->wt[n - q - 1]) r = q;
-            b->rlo = 0; b->rhi = r > 0 ? r : 1;
+        /* 5.7: the diagonal scaling of W (4.35) is a choice per block and iteration: the variant,
+         * scaled or not, whose bulk (after the outliers) is the tighter. On the truss and vibration
+         * problems the unscaled W has a bulk 10 to 100 times tighter (a third of the CG steps); on
+         * SOS problems the scaled one. The variant of the last iteration is computed with vectors,
+         * the other with eigenvalues only, and it takes over when its bulk is tighter by a factor 2. */
+        static int jmode = -2; if (jmode == -2) { jmode = getenv("BRISK_MFNOJACOBI") ? 0 : getenv("BRISK_MFJACOBI") ? 1 : -1; }
+        int jac = jmode >= 0 ? jmode : b->jac;
+        double width[2] = { 1e300, 1e300 };
+        for (int pass = 0; pass < 3; pass++) {
+            /* pass 0: the other variant, eigenvalues only; pass 1: the current one; pass 2: after a switch */
+            const int jv = pass == 0 ? !jac : jac, vec = pass > 0 && rmax > 0;
+            if (pass == 0 && jmode >= 0) continue;
+            for (int i = 0; i < n; i++) { double d = jv ? b->W[i + (size_t)i * n] : 1.0; b->dg[i] = d > 1e-300 ? d : 1e-300; }
+            for (int j = 0; j < n; j++) for (int i = 0; i < n; i++) b->Q[i + (size_t)j * n] = b->W[i + (size_t)j * n] / sqrt(b->dg[i] * b->dg[j]);
+            int info = 0, lw = b->lwork, liw = b->liwork;
+            BL(dsyevd_)(vec ? "V" : "N", "L", &n, b->Q, &n, b->wt, b->work, &lw, b->iwork, &liw, &info);
+            for (int i = 0; i < n; i++) if (!(b->wt[i] > 1e-300)) b->wt[i] = 1e-300;
+            split_spectrum(b->wt, n, rho, rmax, &b->rlo, &b->rhi);
+            if (getenv("BRISK_MFSPEC")) { printf("   [spec blk %d n %d jac %d:", k, n, jv); for (int i = 0; i < n; i += (n > 24 ? n / 12 : 1)) printf(" %.1e", b->wt[i]); printf(" | top:"); for (int i = n - 6 > 0 ? n - 6 : 0; i < n; i++) printf(" %.2e", b->wt[i]); printf(" | rlo %d rhi %d]\n", b->rlo, b->rhi); }
+            /* 5.5: a bulk that no rmax outliers make tight (spread above rho^4: truss problems, one
+             * eigenvalue of 1e2 over a continuum from 2 down to 1e-8). Outliers at the small end then
+             * model nothing (their pairs' eigenvalues are ~0, as the base's tau^2), and those at the top
+             * that are not separated from the rest buy little for their cost (each outlier adds n pairs to
+             * the capacitance matrix, applied at every CG step): only the top eigenvalues above a gap of
+             * sqrt(rho) are kept, at least one. */
+            if (wide_on && rmax > 0 && b->wt[n - 1 - b->rhi] > rho * rho * rho * rho * b->wt[b->rlo]) {
+                int r = 0; const double g = sqrt(rho);
+                for (int q = 1; q <= rmax && q < n; q++) if (b->wt[n - q] > g * b->wt[n - q - 1]) r = q;
+                b->rlo = 0; b->rhi = r > 0 ? r : 1;
+            }
+            width[jv] = log(b->wt[n - 1 - b->rhi] / b->wt[b->rlo]);
+            if (pass == 0) continue;
+            if (pass == 1 && jmode < 0 && width[!jac] < width[jac] - log(2.0)) { jac = !jac; continue; }
+            break;
         }
+        b->jac = jac;
         const double wlo = b->wt[b->rlo], whi = b->wt[n - 1 - b->rhi];
         b->tau2 = wlo * whi; b->kbulk = (whi / wlo) * (whi / wlo);
+        /* 5.7: for the unscaled variant the constant of the bulk sits near its lower end,
+         * tau = wlo^0.9 whi^0.1 (it was the geometric mean): on the truss and vibration problems
+         * this halves the CG steps again (vib9: 2401 -> 1091; the bulk is then under-estimated, which
+         * leaves a few large eigenvalues of P^-1 M instead of many small ones). Not below
+         * min(sqrt(wlo whi), 1e-4 whi): with a spread of 1e9 at the end of the solve a smaller tau^2
+         * is rounding noise against the outlier terms and CG breaks down. The scaled variant keeps
+         * the geometric mean (sos_random_n20_d2: 9892 CG steps, 15448 with the lower constant). */
+        { static double th = -1; if (th < 0) { const char *e = getenv("BRISK_MFTHETA"); th = e ? atof(e) : 0.1; }
+          static double thj = -1; if (thj < 0) { const char *e = getenv("BRISK_MFTHETAJ"); thj = e ? atof(e) : 0.35; }
+          const double th_ = b->jac ? thj : th;
+          if (th_ < 0.5) { double t = pow(wlo, 1 - th_) * pow(whi, th_); const double fl = fmin(sqrt(wlo * whi), 1e-4 * whi); if (t < fl) t = fl; b->tau2 = t * t; } }
         if (rmax > 0) for (int j = 0; j < n; j++) { for (int i = 0; i < n; i++) b->Q[i + (size_t)j * n] *= sqrt(b->dg[i]); }
         nout += b->rlo + b->rhi;
     }
@@ -623,7 +650,17 @@ static double **blk_arrays(MF *S, int which) {
     return a;
 }
 
-static double **hand_X = NULL, **hand_Z = NULL, *hand_y = NULL; static double hand_merit = 0; static int hand_cg = 0, hand_done = 0;
+static double **hand_X = NULL, **hand_Z = NULL, *hand_y = NULL; static double hand_merit = 0; static int hand_cg = 0, hand_done = 0; static int hand_snap = 0;
+/* 5.7: the automatic first attempt keeps the first iterate with a merit below `merit` (a copy,
+ * the iteration goes on); *taken tells whether there is one.  If the attempt does not end
+ * OPTIMAL the standard method starts from it (main.c). */
+int mfipm_solve_snap(Problem *P, const Params *par, Result *R, double *yout, double **Xout, double **Xint, double **Zint, double *yint, double merit, int *taken) {
+    hand_X = Xint; hand_Z = Zint; hand_y = yint; hand_merit = merit; hand_cg = 0; hand_done = 0; hand_snap = 1;
+    const int rc = mfipm_solve(P, par, R, yout, Xout);
+    hand_X = hand_Z = NULL; hand_y = NULL; hand_snap = 0;
+    *taken = hand_done == 1; hand_done = 0;
+    return rc;
+}
 int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, double **Zint, double *yint, double merit, int cg) {
     hand_X = Xint; hand_Z = Zint; hand_y = yint; hand_merit = merit; hand_cg = cg; hand_done = 0;
     const int rc = mfipm_solve(P, par, R, NULL, NULL);
@@ -641,6 +678,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
     double tg = 0;
     const int proj = getenv("BRISK_MFNOPROJ") ? 0 : par->mf_proj;
     S.G = proj ? fom_gram_build(P, verbose > 1, &tg) : NULL;       /* A A* is needed by the projection only */
+    if (proj && !S.G) { fprintf(stderr, "brisk: -mfproj 1: the factor of A A' does not fit in memory (the default, -mfproj 0, needs none)\n"); exit(1); }
     double *y = mz(sizeof(double) * m), *dy = mz(sizeof(double) * m), *dya = mz(sizeof(double) * m);
     double *Rp = mx(sizeof(double) * m), *h = mx(sizeof(double) * m), *tmp = mx(sizeof(double) * m), *tmp2 = mx(sizeof(double) * m);
     double **Xs = blk_arrays(&S, 0), **dXs = blk_arrays(&S, 1), **Ts = blk_arrays(&S, 2), **dXas = blk_arrays(&S, 3);
@@ -676,6 +714,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
     double *best_y = mx(sizeof(double) * m), **best_X = mx(sizeof(double *) * nb);
     for (int k = 0; k < nb; k++) best_X[k] = mx(sizeof(double) * blen(&S.b[k]));
     int nstall = 0, cg_capped = 0, best_it = 0, last_cg[2] = { 0, 0 };
+    int trial_stop = 0;
     const int sdir = !proj && getenv("BRISK_MFNOSDIR") == NULL;
     for (it = 0; it < par->maxit; it++) {
         /* residuals */
@@ -701,7 +740,12 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 for (int k = 0; k < nb; k++) memcpy(best_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k]));
             }
             if (merit < tol) { status = ST_OPTIMAL; break; }
-            if (hand_X && (merit <= hand_merit || hand_done)) {
+            if (hand_X && hand_snap) {
+                if (!hand_done && merit <= hand_merit) {
+                    for (int k = 0; k < nb; k++) { memcpy(hand_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k])); memcpy(hand_Z[k], S.b[k].Z, sizeof(double) * blen(&S.b[k])); }
+                    memcpy(hand_y, y, sizeof(double) * m); hand_done = 1;
+                }
+            } else if (hand_X && (merit <= hand_merit || hand_done)) {
                 /* the hybrid: hand this iterate to the standard method (hand_done: the last
                  * iteration's solves were too long for CG) */
                 for (int k = 0; k < nb; k++) { memcpy(hand_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k])); memcpy(hand_Z[k], S.b[k].Z, sizeof(double) * blen(&S.b[k])); }
@@ -774,9 +818,15 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
              * target - and at least to 1e-2 in the P^-1 norm. */
             double rabs = 0, r2 = 0;
             if (!proj) rabs = fmax(par->mf_eta * sqrt(dotn(m, Rp, Rp)), 0.1 * tol * (1.0 + nbv));
-            cgk[stage] = pcg(&S, h, dyv, proj ? cgtol : 1e-2, par->mf_cgmax, tleft > 0 ? tleft : 0, &cgres[stage], stage == 1 && par->mf_warm, rabs, &r2);
+            /* 5.7: inside the first attempt of the automatic choice (main.c) a solve gets mf_trial CG
+             * steps while the iterate is far from optimal, and the attempt ends when it needs more */
+            const int trial_far = par->mf_trial && fmax(gap, fmax(pinf, dinf)) > 1e-6;
+            cgk[stage] = pcg(&S, h, dyv, proj ? cgtol : 1e-2, trial_far && par->mf_cgmax > par->mf_trial ? par->mf_trial : par->mf_cgmax, tleft > 0 ? tleft : 0, &cgres[stage], stage == 1 && par->mf_warm, rabs, &r2);
             if (proj ? cgres[stage] > cgtol : r2 > rabs) cg_capped = 1;
+            if (trial_far && cgk[stage] >= par->mf_trial && (proj ? cgres[stage] > cgtol : r2 > rabs)) trial_stop = 1;
             tot_cg += cgk[stage];
+            if (par->mf_trial && par->mf_trial_total > 0 && S.nmv > par->mf_trial_total) trial_stop = 2;
+            if (trial_stop) break;
             /* dZ = Rd - A*(dy); dX = Rc - W dZ W; exact projection */
             for (int k = 0; k < nb; k++) {
                 MB *b = &S.b[k]; const size_t len = blen(b);
@@ -837,6 +887,11 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 if (fmin(a1, a2) < 0.3) sigma = fmax(sigma, fmin(a1, a2) < 0.1 ? 0.5 : 0.2);     /* short affine step: recentre */
             }
         }
+        if (trial_stop) {
+            if (verbose > 0) { if (trial_stop == 1) printf("matrix-free IPM: a solve needs more than %d CG steps at iteration %d: the standard method is cheaper\n", par->mf_trial, it);
+                               else printf("matrix-free IPM: %ld products at iteration %d, a quarter of the standard solve: stopping\n", S.nmv, it); }
+            status = ST_MAXIT; break;
+        }
         const double gam = 0.9 + 0.09 * fmin(fmin(1.0, ap), fmin(1.0, ad));
         const double alp = fmin(1.0, gam * ap), ald = fmin(1.0, gam * ad);
         for (int k = 0; k < nb; k++) {
@@ -851,7 +906,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
         if (verbose > 0) fflush(stdout);
         if (alp < 1e-6 && ald < 1e-6) { status = ST_NUMERIC; it++; break; }
         last_cg[0] = cgk[0]; last_cg[1] = cgk[1];
-        if (hand_X && it >= 3 && cgk[0] + cgk[1] > hand_cg) hand_done = 1;      /* (the hand-off itself at the top of the next iteration, with the residuals of the new point) */
+        if (hand_X && !hand_snap && it >= 3 && cgk[0] + cgk[1] > hand_cg) hand_done = 1;      /* (the hand-off itself at the top of the next iteration, with the residuals of the new point) */
     }
 done:
     if (status != ST_OPTIMAL && best_merit < fmax(gap, fmax(pinf, dinf))) {

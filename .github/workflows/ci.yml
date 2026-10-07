@@ -17,6 +17,8 @@ jobs:
           for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat; do
             ./brisk "$f" -q || { echo "$f failed"; exit 1; }
           done
+      - name: High-precision reductions and bound threads
+        run: make hpredtest bindtest restoretest advicetest
       - name: C library
         run: make libbrisk capitest
       - uses: actions/setup-python@v5

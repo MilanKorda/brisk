@@ -24,6 +24,7 @@ typedef struct {
     double pobj, dobj;              /* c'x, b'y */
     double err[6];                  /* DIMACS errors 1..6 */
     double time;
+    int cone;                       /* 1: solved by the cone solver (0: by the semidefinite solver, which reports itself) */
 } SedumiRes;
 int  sedumi_is_mat(const char *fname);
 int  sedumi_read_mat(const char *fname, SedumiProb *P, char *msg, size_t nmsg);

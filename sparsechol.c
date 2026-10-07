@@ -455,6 +455,8 @@ void schol_set_signs(SChol *S, const signed char *sgn_orig) {
     for (int j = 0; j < S->m; j++) S->sgn[j] = sgn_orig[S->perm[j]] < 0 ? -1 : 1;
 }
 
+static double g_amalg = 0.0;
+double schol_set_amalg(double f) { const double o = g_amalg; g_amalg = f; return o; }
 SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap) {
     SAdj *adj = sx(sizeof(SAdj) * m);
     for (int i = 0; i < m; i++) {
@@ -673,8 +675,11 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
     if (g_amd_big < 0) { const char *e = getenv("BRISK_AMDBIG"); g_amd_big = e ? atoi(e) : 20000; }
     if (g_amd == 2 && m >= 64 && !schol_order_amd(m, adj, fillcap, &perm, &plen, &pat, &flops, &nnz)) ord_ok = 1;
     g_nd_used = 0;
-    /* (only where the factorization costs: the dissection itself takes the time of a few of them) */
-    if (ord_ok && g_nd_try && m >= 1000 && flops >= (getenv("BRISK_NDMINFLOPS") ? atof(getenv("BRISK_NDMINFLOPS")) : 2e8) && !g_force_perm) {
+    /* (only where the factorization costs: the dissection itself takes the time of a few of them.
+     * 5.7: from 1e9 flops instead of 2e8: with relaxed supernodes and the left-looking code a
+     * factorization of that size takes half the time it did, and the dissection, 0.4-0.5 s on
+     * dfl001 and pds-10, no longer pays for itself there: 2.59 -> 2.23 s and 1.11 -> 0.96 s) */
+    if (ord_ok && g_nd_try && m >= 1000 && flops >= (getenv("BRISK_NDMINFLOPS") ? atof(getenv("BRISK_NDMINFLOPS")) : 1e9) && !g_force_perm) {
         int *perm2 = NULL, *plen2 = NULL, **pat2 = NULL;
         double flops2 = 0; size_t nnz2 = 0;
         const double tm = (double)clock() / CLOCKS_PER_SEC;
@@ -876,9 +881,14 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
      * and the solves at a fraction of the BLAS rate.                                     */
     int *slast = sx(sizeof(int) * (ns + 1));          /* last merged exact supernode start */
     {
-        static double afrac = -1; static int amaxw = 0;
-        if (afrac < 0) { const char *e = getenv("BRISK_AMALG"); afrac = e ? atof(e) : 0.0;
+        /* 5.7: the fraction is set by the caller (schol_set_amalg: 0.3 for the normal equations of the LP
+         * method, where the exact supernodes are narrow and the factorization ran at an eighth of the
+         * BLAS rate; 0 = exact supernodes for the Schur complements of the SDP path, where it measured
+         * neutral); BRISK_AMALG overrides */
+        static double aenv = -2; static int amaxw = 0;
+        if (aenv < -1) { const char *e = getenv("BRISK_AMALG"); aenv = e ? atof(e) : -1;
                          const char *w = getenv("BRISK_AMALGW"); amaxw = w ? atoi(w) : 64; }
+        const double afrac = aenv >= 0 ? aenv : g_amalg;
         int *ss2 = sx(sizeof(int) * (ns + 1)), n2 = 0;
         int cj0 = S->ss[0], clast = S->ss[0];
         double ctrue = 0;
@@ -1413,6 +1423,7 @@ static int schol_factor_ll(SChol *S, double shift) {
         S->pan = S->pmat;
     } else {
         if (!S->pan || S->pan == S->pmat) S->pan = malloc(sizeof(double) * (S->pansz ? S->pansz : 1));
+        if (!S->pan) { fprintf(stderr, "brisk: out of memory (the copy of a sparse factor, %.1f GB)\n", 8.0 * (double)S->pansz / 1e9); exit(1); }
         memcpy(S->pan, S->pmat, sizeof(double) * S->pansz);
     }
     for (int k = 0; k <= ns; k++) { S->snhead[k] = -1; S->snptr[k] = 0; }
@@ -2147,13 +2158,16 @@ static void fnode_chain(SChol *S, int k, double shift, const char *big) {
 static void fsubtree(SChol *S, int u, double shift) {
     for (int k = S->sfd[u]; k <= u; k++) fnode(S, k, shift, 0);
 }
+static int g_solve_seq;       /* (defined with the solve routines) */
 int schol_factor(SChol *S, double shift) {
     if (g_fpar < 0) {
         g_fpar = getenv("BRISK_FACTLL") == NULL; const char *e = getenv("BRISK_FCUT"); g_fcut = e ? atof(e) : 16.0;
         if ((e = getenv("BRISK_FRB"))) FB_RB = atoi(e);
         if ((e = getenv("BRISK_FNB"))) FB_NB = atoi(e);
     }
-    if (!g_fpar) return schol_factor_ll(S, shift);
+    /* 5.7: also for a caller that works sequentially (the LP method: schol_set_solve_seq): at one thread
+     * the plain left-looking code is 25-30 % faster than the tree-parallel one on its patterns */
+    if (!g_fpar || g_solve_seq) return schol_factor_ll(S, shift);
     if (g_fstat < 0) g_fstat = getenv("BRISK_FSTAT") != NULL;
     const int ns = S->ns;
     S->mval_ok = 0;
@@ -2163,6 +2177,7 @@ int schol_factor(SChol *S, double shift) {
         S->pan = S->pmat;
     } else {
         if (!S->pan || S->pan == S->pmat) S->pan = malloc(sizeof(double) * (S->pansz ? S->pansz : 1));
+        if (!S->pan) { fprintf(stderr, "brisk: out of memory (the copy of a sparse factor, %.1f GB)\n", 8.0 * (double)S->pansz / 1e9); exit(1); }
         memcpy(S->pan, S->pmat, sizeof(double) * S->pansz);
     }
     if (!S->ul_ptr) sc_build_tree(S);
