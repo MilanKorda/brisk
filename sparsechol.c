@@ -2091,16 +2091,8 @@ static int NAME(T *A, int n, int ld, int NB, int RB) {                          
     free(tok);                                                                                       \
     return bad;                                                                                      \
 }
-#ifndef BRISK_OMP_BUNDLED
 FD_DAG(fd_dag_d, double, BL(dpotrf_), BL(dtrsm_), BL(dsyrk_), BL(dgemm_))
 FD_DAG(fd_dag_s, float, BL(spotrf_), BL(strsm_), BL(ssyrk_), BL(sgemm_))
-#else
-/* 1.4: the bundled OpenMP runtime (omp/brisk_omp.c, the default on macOS) has no task dependences,
- * and the graph's depend clauses did not link there: the panel loop instead (tasks and a wait after
- * each panel's update; fixed tiles, the same bits for any thread count) */
-static int fd_dag_d(double *A, int n, int lda, int nb, int rb) { (void)nb; (void)rb; return fpanel_tiled_ld(A, n, n, lda, omp_in_parallel()); }
-static int fd_dag_s(float *A, int n, int lda, int nb, int rb) { (void)nb; (void)rb; return fpanel_tiled_s(A, n, n, lda, omp_in_parallel()); }
-#endif
 static int g_fd_dag = -1, g_fd_fixed = 0;
 /* 5.12: the task graph's tiles grow with the order: 128 x 512 below 4500, 192 x 1152 below
  * 11000, 256 x 1536 above (the inner dimension of the updates is the column block: 128 kept the

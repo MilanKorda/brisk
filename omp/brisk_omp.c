@@ -11,8 +11,8 @@
  * Supported: parallel (with if and num_threads), for with schedule(static[,c]) and
  * schedule(dynamic[,c]) / guided / runtime, reduction (critical-section method), critical,
  * single, master/masked, barrier, flush, atomic (inlined by the compiler), tasks with
- * firstprivate/shared and taskwait (no depend clauses), nested parallel regions (serialized,
- * as libomp does by default). Unsupported constructs fail at link time (missing symbol), never
+ * firstprivate/shared, depend clauses (in, out, inout; mutexinoutset and inoutset as inout) and
+ * taskwait, nested parallel regions (serialized, as libomp does by default). Unsupported constructs fail at link time (missing symbol), never
  * silently.
  *
  * Design: one persistent pool of worker threads and one team for the (single) active top-level
@@ -90,6 +90,14 @@ typedef struct Task {
     int cls;                               /* size class of its memory block, -1 malloc */
     kmp_routine_entry_t routine;
     kmp_task_t *kt;
+    /* depend clauses (1.4.1; libomp's scheme): a task with dependences is queued only when its
+     * predecessors, the earlier sibling tasks it depends on, have completed */
+    atomic_int npred;                      /* predecessors not completed, + 1 while it is created */
+    atomic_flag dlock;                     /* guards dep_done and the successor list */
+    int has_deps, dep_done;
+    int nsucc, csucc; struct Task **succ;  /* the tasks waiting for this one */
+    struct DepTab *deps;                   /* as a parent: per address, the last writer and the readers since */
+    long seq;                              /* creation order of a task with dependences (the ready queue's key) */
 } Task;
 #define HDR_SIZE ((sizeof(Task) + 15) & ~(size_t)15)
 
@@ -121,6 +129,13 @@ typedef struct Team {
     _Alignas(64) atomic_long outstanding;  /* tasks created and not completed */
     _Alignas(64) atomic_int queued;        /* tasks in the deques */
     struct Deque *dq;                      /* one per thread (MAXTHREADS, allocated with the team) */
+    /* tasks with dependences that are ready: one queue for the team, oldest created first (as
+     * libgomp's team queue, which takes them in order): a dense Cholesky's earlier panels, its
+     * critical path, then run before the trailing updates of later ones. In the per-thread
+     * deques, newest first, the released updates delayed the next panel (order 9000, four
+     * threads: 1.86 s against 1.32 s with libgomp) */
+    _Alignas(64) atomic_flag rq_lock;
+    atomic_int rq_n; Task **rq; int rq_cap;  /* binary min-heap on seq */
     double t_fork;                         /* statistics */
 } Team;
 
@@ -168,6 +183,7 @@ static void team_init(Team *t, int nth) {
     t->nth = nth; atomic_store(&t->bar_nth, nth);
     t->dq = calloc(MAXTHREADS, sizeof(Deque));
     for (int i = 0; i < MAXTHREADS; i++) atomic_flag_clear(&t->dq[i].lock);
+    atomic_flag_clear(&t->rq_lock);
     for (int i = 0; i < RING; i++) { atomic_flag_clear(&t->disp[i].lock); t->disp[i].gen = -1; }
 }
 static void rt_init(void) {
@@ -264,11 +280,15 @@ static void blk_free(void *p, int cls);
 static void task_release(Task *t) {
     if (!t->implicit && atomic_fetch_sub(&t->refs, 1) == 1) blk_free(t, t->cls);
 }
+static void dep_complete(Task *t);
+static void dep_tab_free(struct DepTab *d);
 static void run_task(Task *t) {
     Task *prev = tl.task;
     tl.task = t;
     t->routine(tl.tid, t->kt);
     tl.task = prev;
+    if (t->has_deps) dep_complete(t);      /* release the tasks that wait for it */
+    if (t->deps) { dep_tab_free(t->deps); t->deps = NULL; }
     Task *p = t->parent;
     Team *tm = tl.team;
     atomic_fetch_sub(&p->children, 1);
@@ -327,11 +347,67 @@ static Task *dq_steal(Team *tm) {
     }
     return NULL;
 }
+/* the team's ready queue of tasks with dependences (a heap on the creation order) */
+static inline void rq_lock(Team *tm) { while (atomic_flag_test_and_set_explicit(&tm->rq_lock, memory_order_acquire)) cpu_relax(); }
+static inline void rq_unlock(Team *tm) { atomic_flag_clear_explicit(&tm->rq_lock, memory_order_release); }
+static void rq_push(Team *tm, Task *t) {
+    rq_lock(tm);
+    int n = atomic_load_explicit(&tm->rq_n, memory_order_relaxed);
+    if (n == tm->rq_cap) {
+        const int nc = tm->rq_cap ? 2 * tm->rq_cap : 256;
+        Task **na = realloc(tm->rq, sizeof(Task *) * (size_t)nc);
+        if (!na) { fprintf(stderr, "brisk_omp: out of memory (ready queue)\n"); abort(); }
+        tm->rq = na; tm->rq_cap = nc;
+    }
+    int i = n;
+    while (i > 0 && tm->rq[(i - 1) / 2]->seq > t->seq) { tm->rq[i] = tm->rq[(i - 1) / 2]; i = (i - 1) / 2; }
+    tm->rq[i] = t;
+    atomic_store_explicit(&tm->rq_n, n + 1, memory_order_release);
+    rq_unlock(tm);
+    atomic_fetch_add_explicit(&tm->queued, 1, memory_order_release);
+}
+static void rq_remove_at(Team *tm, int i, int n) {   /* n: the size before; lock held */
+    Task *last = tm->rq[n - 1];
+    n--;
+    if (i == n) return;
+    /* put `last` at i, then move it up or down */
+    while (i > 0 && tm->rq[(i - 1) / 2]->seq > last->seq) { tm->rq[i] = tm->rq[(i - 1) / 2]; i = (i - 1) / 2; }
+    for (;;) {
+        int c = 2 * i + 1;
+        if (c >= n) break;
+        if (c + 1 < n && tm->rq[c + 1]->seq < tm->rq[c]->seq) c++;
+        if (tm->rq[c]->seq >= last->seq) break;
+        tm->rq[i] = tm->rq[c]; i = c;
+    }
+    tm->rq[i] = last;
+}
+/* the oldest ready task with dependences, or (taskwait) the oldest that is a child of `parent` */
+static Task *rq_pop(Team *tm, Task *parent) {
+    if (atomic_load_explicit(&tm->rq_n, memory_order_acquire) == 0) return NULL;
+    rq_lock(tm);
+    const int n = atomic_load_explicit(&tm->rq_n, memory_order_relaxed);
+    Task *t = NULL; int at = -1;
+    if (n > 0) {
+        if (!parent || tm->rq[0]->parent == parent) at = 0;
+        else for (int i = 1; i < n; i++)
+            if (tm->rq[i]->parent == parent && (at < 0 || tm->rq[i]->seq < tm->rq[at]->seq)) at = i;
+        if (at >= 0) {
+            t = tm->rq[at];
+            rq_remove_at(tm, at, n);
+            atomic_store_explicit(&tm->rq_n, n - 1, memory_order_release);
+        }
+    }
+    rq_unlock(tm);
+    if (t) atomic_fetch_sub_explicit(&tm->queued, 1, memory_order_acq_rel);
+    return t;
+}
 /* any queued task (barriers), or only a child of `parent` (taskwait: the children a thread
- * made are in its own deque unless stolen, and then they are running) */
+ * made are in its own deque unless stolen, and then they are running; tasks with dependences
+ * are in the team's ready queue) */
 static Task *q_pop(Team *tm, Task *parent) {
     if (atomic_load_explicit(&tm->queued, memory_order_acquire) == 0) return NULL;
     Task *t = dq_pop_own(tm, parent);
+    if (!t) t = rq_pop(tm, parent);
     if (!t && !parent) t = dq_steal(tm);
     return t;
 }
@@ -588,20 +664,141 @@ kmp_task_t *__kmpc_omp_task_alloc(ident_t *loc, kmp_int32 gtid, kmp_int32 flags,
 }
 static Task *task_of(kmp_task_t *k) { return (Task *)((char *)k - HDR_SIZE); }
 static Task *current_task(void) { return tl.task ? tl.task : (tl.impl ? tl.impl : &tl_impl0); }
-kmp_int32 __kmpc_omp_task(ident_t *loc, kmp_int32 gtid, kmp_task_t *k) {
-    Task *t = task_of(k), *par = current_task();
+/* a created task counts as its parent's child (taskwait) and as the team's outstanding work
+ * (barriers) from its creation on, also while it waits for its predecessors */
+static void task_register(Task *t, Task *par) {
     t->parent = par; t->creator = tl.tid;
     atomic_fetch_add(&par->children, 1);
     if (!par->implicit) atomic_fetch_add(&par->refs, 1);
+    if (tl.team) atomic_fetch_add(&tl.team->outstanding, 1);
+}
+static void rq_push(Team *tm, Task *t);
+static void task_enqueue(Task *t) {
     Team *tm = tl.team;
-    if (!tm || tm->nth == 1) {             /* nobody to share with: run it now */
-        if (tm) atomic_fetch_add(&tm->outstanding, 1);
-        run_task(t);
-        return 0;
-    }
-    atomic_fetch_add(&tm->outstanding, 1);
+    if (!tm || tm->nth == 1) { run_task(t); return; }   /* nobody to share with: run it now */
     if (g_stats) atomic_fetch_add(&st_tasks, 1);
-    dq_push(tm, tl.tid, t);
+    if (t->has_deps) rq_push(tm, t);       /* the team's ready queue, oldest first */
+    else dq_push(tm, tl.tid, t);
+}
+kmp_int32 __kmpc_omp_task(ident_t *loc, kmp_int32 gtid, kmp_task_t *k) {
+    Task *t = task_of(k);
+    task_register(t, current_task());
+    task_enqueue(t);
+    return 0;
+}
+
+/* ---- task dependences --------------------------------------------------------------------
+ * Only sibling tasks depend on each other, and only the thread running their parent creates
+ * them, so the parent's table needs no lock. Per address: the last task with an out (inout)
+ * dependence, and the tasks with an in dependence created since. A new task depends on the
+ * last writer if it only reads, and on that writer and the readers since if it writes; each
+ * edge is recorded in the predecessor's successor list (unless it has completed already, under
+ * its lock) and counted in the new task's npred. The task is queued when npred reaches 0: at
+ * its creation, or when its last predecessor completes. Tasks in the table hold a reference. */
+typedef struct { intptr_t base_addr; size_t len; uint8_t flags; } kmp_depend_info_t;   /* clang's layout */
+#define DEP_IN 0x01
+#define DEP_OUT 0x02
+#define DEP_MTX 0x04
+#define DEP_SET 0x08
+#define DEP_ALL 0x80
+typedef struct { intptr_t key; Task *out; Task **ins; int nins, cins; } DepEnt;
+typedef struct DepTab { DepEnt *e; int cap, n; } DepTab;
+static inline void dl_lock(Task *t) { while (atomic_flag_test_and_set_explicit(&t->dlock, memory_order_acquire)) cpu_relax(); }
+static inline void dl_unlock(Task *t) { atomic_flag_clear_explicit(&t->dlock, memory_order_release); }
+static void dep_tab_clear(DepTab *d) {
+    for (int i = 0; i < d->cap; i++) {
+        DepEnt *e = &d->e[i];
+        if (!e->key) continue;
+        if (e->out) task_release(e->out);
+        for (int j = 0; j < e->nins; j++) task_release(e->ins[j]);
+        free(e->ins);
+        memset(e, 0, sizeof(*e));
+    }
+    d->n = 0;
+}
+static void dep_tab_free(DepTab *d) { dep_tab_clear(d); free(d->e); free(d); }
+static DepEnt *dep_entry(DepTab *d, intptr_t key) {
+    if (2 * (d->n + 1) > d->cap) {         /* grow (open addressing, at most half full) */
+        const int nc = d->cap ? 2 * d->cap : 64;
+        DepEnt *ne = calloc((size_t)nc, sizeof(DepEnt));
+        if (!ne) { fprintf(stderr, "brisk_omp: out of memory (task dependences)\n"); abort(); }
+        for (int i = 0; i < d->cap; i++) if (d->e[i].key) {
+            size_t h = ((uint64_t)d->e[i].key * 0x9E3779B97F4A7C15ull) >> 20;
+            while (ne[h & (size_t)(nc - 1)].key) h++;
+            ne[h & (size_t)(nc - 1)] = d->e[i];
+        }
+        free(d->e); d->e = ne; d->cap = nc;
+    }
+    size_t h = ((uint64_t)key * 0x9E3779B97F4A7C15ull) >> 20;
+    for (;; h++) {
+        DepEnt *e = &d->e[h & (size_t)(d->cap - 1)];
+        if (e->key == key) return e;
+        if (!e->key) { e->key = key; d->n++; return e; }
+    }
+}
+static void dep_link(Task *p, Task *t) {   /* t waits for p, unless p has completed */
+    if (!p || p == t) return;
+    dl_lock(p);
+    if (!p->dep_done && !(p->nsucc && p->succ[p->nsucc - 1] == t)) {
+        if (p->nsucc == p->csucc) {
+            const int nc = p->csucc ? 2 * p->csucc : 8;
+            Task **na = realloc(p->succ, sizeof(Task *) * (size_t)nc);
+            if (!na) { fprintf(stderr, "brisk_omp: out of memory (task dependences)\n"); abort(); }
+            p->succ = na; p->csucc = nc;
+        }
+        p->succ[p->nsucc++] = t;
+        atomic_fetch_add_explicit(&t->npred, 1, memory_order_relaxed);
+    }
+    dl_unlock(p);
+}
+static void dep_add(Task *par, Task *t, const kmp_depend_info_t *dep) {
+    if (dep->flags & DEP_ALL) { fprintf(stderr, "brisk_omp: depend(omp_all_memory) is not supported\n"); abort(); }
+    if (!par->deps) {
+        par->deps = calloc(1, sizeof(DepTab));
+        if (!par->deps) { fprintf(stderr, "brisk_omp: out of memory (task dependences)\n"); abort(); }
+    }
+    DepEnt *e = dep_entry(par->deps, dep->base_addr);
+    if (dep->flags & (DEP_OUT | DEP_MTX | DEP_SET)) {        /* out, inout (mutexinoutset, inoutset as inout) */
+        dep_link(e->out, t);
+        for (int j = 0; j < e->nins; j++) { dep_link(e->ins[j], t); task_release(e->ins[j]); }
+        e->nins = 0;
+        if (e->out) task_release(e->out);
+        atomic_fetch_add(&t->refs, 1); e->out = t;
+    } else {                                                   /* in */
+        dep_link(e->out, t);
+        if (e->nins == e->cins) {
+            const int nc = e->cins ? 2 * e->cins : 4;
+            Task **na = realloc(e->ins, sizeof(Task *) * (size_t)nc);
+            if (!na) { fprintf(stderr, "brisk_omp: out of memory (task dependences)\n"); abort(); }
+            e->ins = na; e->cins = nc;
+        }
+        atomic_fetch_add(&t->refs, 1); e->ins[e->nins++] = t;
+    }
+}
+/* t has run: release the tasks that wait for it */
+static void dep_complete(Task *t) {
+    dl_lock(t);
+    t->dep_done = 1;
+    Task **s = t->succ; const int n = t->nsucc;
+    t->succ = NULL; t->nsucc = t->csucc = 0;
+    dl_unlock(t);
+    for (int i = 0; i < n; i++)
+        if (atomic_fetch_sub_explicit(&s[i]->npred, 1, memory_order_acq_rel) == 1) task_enqueue(s[i]);
+    free(s);
+}
+kmp_int32 __kmpc_omp_task_with_deps(ident_t *loc, kmp_int32 gtid, kmp_task_t *k, kmp_int32 ndeps,
+                                    kmp_depend_info_t *dl, kmp_int32 ndeps_noalias, kmp_depend_info_t *nl) {
+    Task *t = task_of(k), *par = current_task();
+    /* no child of par left: the dependences of earlier siblings (an earlier region of an implicit
+     * task, or before a taskwait) cannot matter */
+    if (par->deps && atomic_load(&par->children) == 0) dep_tab_clear(par->deps);
+    task_register(t, par);
+    t->has_deps = 1;
+    { static atomic_long seq = 0; t->seq = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed); }
+    atomic_store(&t->npred, 1);
+    for (int i = 0; i < ndeps; i++) dep_add(par, t, &dl[i]);
+    for (int i = 0; i < ndeps_noalias; i++) dep_add(par, t, &nl[i]);
+    if (atomic_fetch_sub_explicit(&t->npred, 1, memory_order_acq_rel) == 1) task_enqueue(t);
     return 0;
 }
 kmp_int32 __kmpc_omp_taskwait(ident_t *loc, kmp_int32 gtid) {
@@ -612,6 +809,7 @@ kmp_int32 __kmpc_omp_taskwait(ident_t *loc, kmp_int32 gtid) {
         Task *t = tm ? q_pop(tm, cur) : NULL;
         if (t) { run_task(t); b.n = 0; } else backoff(&b);
     }
+    if (cur->deps) dep_tab_clear(cur->deps);
     return 0;
 }
 /* if(0) tasks: the compiler runs the body itself between these calls */

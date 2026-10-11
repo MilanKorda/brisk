@@ -42,6 +42,58 @@ static void tnode(int k) {
     }
 }
 
+/* 1.4.1: depend clauses. Tasks with random in / inout dependences on K tokens; each token has a
+ * version. In creation order a reader must see the version its token has then, and a writer must
+ * see it and then advance it: any reordering or early start shows as a wrong version. The clause
+ * shapes include those of the dense Cholesky's task graph (several in items, one inout). */
+static atomic_int dep_bad;
+static void dep_spin(int n) { volatile int z = 0; for (int i = 0; i < n; i++) z += i; }
+static void dep_check(atomic_int *v, int expect) { if (atomic_load_explicit(v, memory_order_relaxed) != expect) atomic_fetch_add(&dep_bad, 1); }
+static void dep_write(atomic_int *v, int expect) { dep_check(v, expect); atomic_store_explicit(v, expect + 1, memory_order_relaxed); }
+static int dep_test(int T, int K, unsigned seed) {
+    atomic_int *ver = malloc(sizeof(atomic_int) * (size_t)K);
+    int *sim = calloc((size_t)K, sizeof(int)), *tok = calloc((size_t)K, sizeof(int));
+    for (int k = 0; k < K; k++) atomic_init(&ver[k], 0);
+    atomic_store(&dep_bad, 0);
+    #pragma omp parallel
+    #pragma omp single
+    {
+        unsigned r = seed;
+        for (int t = 0; t < T; t++) {
+            r = r * 1103515245u + 12345u; const int kind = (int)(r >> 16) % 4;
+            r = r * 1103515245u + 12345u; const int a = (int)(r >> 8) % K;
+            r = r * 1103515245u + 12345u; int b = (int)(r >> 8) % K; if (b == a) b = (b + 1) % K;
+            r = r * 1103515245u + 12345u; int c = (int)(r >> 8) % K; if (c == a || c == b) c = (b + 1) % K == a ? (b + 2) % K : (b + 1) % K;
+            r = r * 1103515245u + 12345u; const int w = (int)(r >> 16) % 2000;
+            if (kind == 0) {                       /* inout on one token */
+                const int ea = sim[a]++;
+                #pragma omp task depend(inout: tok[a]) firstprivate(a, ea, w)
+                { dep_spin(w); dep_write(&ver[a], ea); }
+            } else if (kind == 1) {                /* in on one, inout on another */
+                const int ea = sim[a], eb = sim[b]++;
+                #pragma omp task depend(in: tok[a]) depend(inout: tok[b]) firstprivate(a, b, ea, eb, w)
+                { dep_spin(w); dep_check(&ver[a], ea); dep_write(&ver[b], eb); }
+            } else if (kind == 2) {                /* in on two, inout on a third (the Cholesky's update) */
+                const int ea = sim[a], eb = sim[b], ec = sim[c]++;
+                #pragma omp task depend(in: tok[a], tok[b]) depend(inout: tok[c]) firstprivate(a, b, c, ea, eb, ec, w)
+                { dep_spin(w); dep_check(&ver[a], ea); dep_check(&ver[b], eb); dep_write(&ver[c], ec); }
+            } else {                               /* readers only */
+                const int ea = sim[a], eb = sim[b];
+                #pragma omp task depend(in: tok[a], tok[b]) firstprivate(a, b, ea, eb, w)
+                { dep_spin(w); dep_check(&ver[a], ea); dep_check(&ver[b], eb); }
+            }
+            if (t % 997 == 996) {                  /* a taskwait in the middle: the table restarts */
+                #pragma omp taskwait
+            }
+        }
+        #pragma omp taskwait
+    }
+    int bad = atomic_load(&dep_bad);
+    for (int k = 0; k < K; k++) bad += atomic_load(&ver[k]) != sim[k];   /* every write happened */
+    free(ver); free(sim); free(tok);
+    return bad;
+}
+
 int main(int argc, char **argv) {
     const int reps = argc > 1 ? atoi(argv[1]) : 50;
     const int N = 100003;
@@ -187,6 +239,9 @@ int main(int argc, char **argv) {
             #pragma omp parallel for reduction(+:z)
             for (int i = 5; i < 5; i++) z += 100;
             CHECK(z == 2, "tiny loops %d", z);
+            /* 13. depend clauses */
+            { const int bad = dep_test(r % 5 == 0 ? 20000 : 3000, 2 + r % 61, 977u * (unsigned)r + (unsigned)nt);
+              CHECK(bad == 0, "task dependences: %d wrong", bad); }
         }
     }
     printf("%s (%d failures)\n", fails ? "FAILED" : "all checks passed", fails);

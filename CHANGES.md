@@ -1,5 +1,17 @@
 # BRISK change log
 
+## Version 1.4.1 (October 2026)
+
+- **macOS: the dense Cholesky factorization runs as a task graph again.** The OpenMP runtime that
+  BRISK bundles for compilers without one (Apple's clang on macOS, and the MATLAB MEX file there)
+  now supports task dependences (`depend` clauses). The macOS build of 1.4 used the
+  factorization's panel loop instead (the updates of each panel in parallel, the panels one after
+  another); with the task graph the panels overlap again. Measured on Linux with the bundled
+  runtime, four threads: factorizations of order 3000 to 11000 take 9–22 % less time than with
+  the panel loop and are within 10 % of GCC's runtime, with the same factor bit for bit; nine
+  problems with large dense blocks take 0.95 of the panel loop's time in the geometric mean. Builds
+  with GCC (Linux) are unchanged.
+
 ## Version 1.4 (October 2026)
 
 Faster on large dense blocks and on moment relaxations of polynomial optimization, the same
