@@ -132,13 +132,19 @@ static void usage(void) {
         "  -retryacc <a>    retry with the embedding only if the first result is worse than a (1e-7)\n"
         "  -warm <l>        re-solve from l x (first point) + (1 - l) x (standard start) (0 = off; measured slower)\n"
         "  -dir auto|hkm|nt search direction (auto)\n"
+        "  -zsparse <n>     HKM direction: blocks of order >= n whose dual matrix Z keeps a sparse\n"
+        "                   pattern (max-cut, structural designs) use a sparse Cholesky factor of Z for\n"
+        "                   Z^{-1}, its products and the dual step length; X stays dense (200; 0 off)\n"
+        "  -zsparsefill <f> ... when the factor has at most f n^2 nonzeros (0.1)\n"
         "  -ntfast <k>      NT: form dX on the pattern of dZ (1) or by dense transforms (0, default)\n"
         "  -nodd            no double-double endgame\n"
         "  -ddfactor <f>    endgame work budget as a multiple of the solve's work (1.0)\n"
         "  -ddminwork <w>   ... but at least this many flop-equivalents (2e9)\n"
         "  -ddmaxm <k>      size limit for the endgame (1200)\n"
         "  -ddit <k>        endgame iteration limit (40)\n"
-        "  -nopolish        do not polish reduced-accuracy solutions\n  -crossover <k>   SDP crossover after the solve (Newton on the rank-revealed KKT system; kept only if\n                   the errors on the original data fall): 0 off (default), 1 on, -1 when cheap\n"
+        "  -nopolish        no polishing: the last iterate is returned as it is (not the best one), without\n"
+        "                   the corrections at the end and the polish probes of the embedding (-nopolishx:\n"
+        "                   also the X-metric probe; -nodd: also the double-double endgame)\n  -crossover <k>   SDP crossover after the solve (Newton on the rank-revealed KKT system; kept only if\n                   the errors on the original data fall): 0 off (default), 1 on, -1 when cheap\n"
         "presolve\n"
         "  -nofr            no facial-reduction presolve\n  -fr              facial reduction whatever its depth (default: skipped when of depth >= 2 and saving < frgain)\n  -frgain <g>      per-iteration saving that justifies a facial reduction of depth >= 2 (4)\n"
         "  -nofrretry       do not re-solve without it when the removed duals are not recovered\n"
@@ -159,8 +165,11 @@ static void usage(void) {
         "                   to four dense blocks of order >= 100 whose Schur factorization is\n"
         "                   estimated at 3.5 times a matrix-free solve or more (at least equal when\n"
         "                   every constraint has an entry in an LP block), and that the presolve\n"
-        "                   leaves unchanged. The attempt ends when a solve away from the\n"
+        "                   leaves unchanged; not on moment relaxations (see -hsddir). The attempt\n"
+        "                   ends when a solve away from the\n"
         "                   optimum needs more CG steps than a sixth of a Schur factorization costs,\n"
+        "                   or the steps of a solve grow geometrically (three times the last\n"
+        "                   iteration's, or the next solve past that bound at the same growth),\n"
         "                   or the attempt more than a quarter of the standard solve; unless it\n"
         "                   ends OPTIMAL, the standard method follows (from the attempt's iterate\n"
         "                   of merit 1e-3 if it got that far); also when the Schur complement does\n"
@@ -244,11 +253,15 @@ static void usage(void) {
         "  -sparse <k>      sparse (envelope/supernodal) Schur complement: -1 auto, 0 off, 1 force\n"
         "  -lowrank <k>     low-rank Schur route: -1 auto, 0 off, 1 force\n"
         "  -dict <k>        dictionary (shared-vector) Schur route: -1 auto, 0 off, 1 force\n"
+        "  -cls <k>         entry-class Schur route (entries in the same constraints with the same\n"
+        "                   values grouped: localizing matrices): -1 auto, 0 off, 1 force\n"
         "  -mixed <k>       single-precision Schur factor + PCG: -1 auto (m>=1000), 0 off, 1 on\n"
         "  -route <r>       force Schur route of sparse constraints: 0 sparse-sparse, 1 row-product, 3 row-product on the union pattern\n"
-        "  -threads <k>     OpenMP threads for this run (default: OMP_NUM_THREADS, else all cores; with\n"
-        "                   the default, tiny problems use one thread and, on Linux, the interior-point\n"
-        "                   solve leaves out the cores other processes are using when it starts)\n"
+        "  -threads <k>     OpenMP threads for this run, at most (default: OMP_NUM_THREADS, else all\n"
+        "                   cores). Tiny problems use one thread; on Linux the interior-point solve\n"
+        "                   uses fewer while other processes occupy its cores (at the start, and when its\n"
+        "                   threads wait for cores) and more again when they are free (BRISK_NOBUSY=1:\n"
+        "                   exactly k)\n"
         "  -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on\n"
         "  -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)\n"
         "  -densemem <MB>   memory for dense constraint copies (768)\n"
@@ -260,7 +273,8 @@ static void usage(void) {
         "  -sigma <k>       centering rule: 0 SDPT3 adaptive, 1 Mehrotra cubic, 2 cubic+safeguard\n"
         "  -sigmamin <s>    floor for sigma (0)\n"
         "  -corr <k>        max centrality correctors per iteration (0)\n"
-        "  -init <k>        start: 0 SDPT3-style, 1 least-squares+shift, 2 +balancing (1)\n"
+        "  -init <k>        start: 0 SDPT3-style, 1 least-squares+shift, 2 +balancing, 3 the centred start\n"
+        "                   0.3 I, I, y = 0 (1; 3 automatically on moment relaxations, see -hsddir)\n"
         "  -balance <b>     raise sigma when infeasibility > b * complementarity (0 = off)\n"
         "  -feasgrow <f>    cap primal steps that grow the residual (0 = off)\n"
         "  -hsdsig <k>      self-dual embedding: sigma candidates (3)\n"
@@ -276,7 +290,10 @@ static void usage(void) {
         "  -hsdrefine <k>   self-dual embedding: passes enforcing the primal Newton equation (2)\n"
         "  -hsdfree <k>     self-dual embedding: free variables given as split LP pairs:\n"
         "                   -1 auto, 0 keep split, 1 augmented Lagrangian, 3 saddle factorization (-1)\n"
-        "  -hsddir <k>      self-dual embedding direction: 0 HKM, 1 NT (auto: NT on the chordal moment form, HKM otherwise)\n"
+        "  -hsddir <k>      self-dual embedding direction: 0 HKM, 1 NT (auto: NT on the chordal moment form\n"
+        "                   and, with the centred start -init 3, on moment relaxations as given (the\n"
+        "                   largest block a moment matrix, a localizing block, no LP part, free\n"
+        "                   variables or symmetry reduction); HKM otherwise)\n"
         "  -hsdpivtol <p>   self-dual embedding: squared-pivot threshold of the Schur factor (1e-20)\n"
         "  -hsdstall <k>    self-dual embedding: iterations without a better iterate before stopping (12)\n"
         "  -split / -nosplit, -ntls <k>, -ntlsgap <g>   experimental NT residual split\n"
@@ -304,8 +321,10 @@ static void usage(void) {
         "  -vv              very verbose (per-iteration internals)\n"
         "  -knownfeas       a solution is known to exist: no infeasibility exits\n"
         "  -nopolishr       no restoration of the primal feasibility of a point that missed the tolerance\n"
+        "                   (the log's \"square-root-metric polishing\"; the other corrections stay)\n"
         "                   (the correction in the square-root metric of X; the older polishes stay)\n"
-        "  -nopolishx       no X-metric polish of the returned point (the Euclidean polish stays)\n"
+        "  -nopolishx       no X-metric polish of the returned point and no X-metric probe during the\n"
+        "                   iterations (the log's \"X-metric polishing\"; the Euclidean polish stays)\n"
         "  -mixedfrac <f>   float Schur factor for 1000 <= m < 4000 when the factorization is at least\n"
         "                   this fraction of an iteration's work (0.4)\n"
         "  -freefill <f>    free elimination: no pivot whose Markowitz count exceeds this (1e4)\n"
@@ -314,7 +333,8 @@ static void usage(void) {
         "                   at 8, 4, 12, 0; 0 off)\n"
         "  -chordalmerge <f> merge a clique into its parent when the separator is at least this fraction (0.6)\n"
         "  -chordaldens <f> blocks denser than this are not tried (0.3)\n"
-        "  -ddbudget <n>, -ddtime <s>   double-double endgame: work per iteration (1e9), time cap (60 s)\n"
+        "  -ddtime <s>      double-double endgame: time cap in seconds (0 = none, the default; the budget\n"
+        "                   is the work of -ddfactor / -ddminwork); -ddbudget <n> is accepted and has no effect\n"
         "  -hsdrefine <k>, -hsdstall <k>, -hsdbatch <0|1>, -hsdreghint <0|1>, -hsdqscale <0|1|2>,\n"
         "  -hsdsoltol <t>, -hsdcacc <f>, -hsdcgain <f>, -hsdctarget <0|1>, -hsdctrace <0|1>,\n"
         "  -hsdcucap <f>, -hsdfomega <f>, -hsdpshrink <f>   embedding internals: refinement passes (2),\n"
@@ -403,6 +423,10 @@ typedef struct {
     PSOrig *Osign;          /* 4.33: the problem as read, when the sign-symmetry reduction was applied (before the permutation one) */
     PSSign *sign;
     PSOrig *Oalg;           /* 4.41: the problem before the *-algebra block diagonalisation (after the exact symmetry reductions) */
+    MomAff *aff;            /* 5.12: a moment relaxation over an ellipsoid, solved in the coordinates of the unit ball */
+    double aff_tol0;        /* ... the tolerance asked for (the solve in those coordinates runs to a tighter one) */
+    Params *aff_par;
+    PSOrig *Oaff;           /* ... and the problem as read then (everything else is of the problem in those coordinates) */
     PSAlg *alg;
     PSOrig *Ofin;           /* the problem (Xo, yo) refer to after run_finish: one of O, Otb, Ofile, Odual (not owned) */
     int nXo;                /* blocks of Xo */
@@ -426,6 +450,9 @@ static void run_free(Run *u) {
     if (u->Otb) ps_orig_free(u->Otb);
     if (u->Odual) ps_orig_free(u->Odual);
     dualize_free(u->dual);
+    if (u->aff_par) { u->aff_par->tol = u->aff_tol0; u->aff_par = NULL; }
+    if (u->Oaff) ps_orig_free(u->Oaff);
+    momaff_free(u->aff); u->aff = NULL; u->Oaff = NULL;
     if (u->Osym) ps_orig_free(u->Osym);
     sym_free(u->sym);
     if (u->Osign) ps_orig_free(u->Osign);
@@ -571,12 +598,21 @@ static PSOrig *map_back(Run *u, const Params *par, double ***pXo, double **pyo, 
         Xo = Xs; yo = ys; *pnXo = u->Osign->nblk;
         O = u->Osign;
     }
+    if (u->aff) {
+        /* 5.12: from the coordinates of the unit ball back to those of the file (the blocks and the rows are the same) */
+        double **Xa = NULL, *ya = calloc(u->Oaff->m + 1, sizeof(double));
+        momaff_unmap(u->aff, Xo, yo, Xo ? &Xa : NULL, ya);
+        if (Xo) { for (int k = 0; k < *pnXo; k++) free(Xo[k]); free(Xo); }
+        free(yo);
+        Xo = Xa; yo = ya; *pnXo = u->Oaff->nblk;
+        O = u->Oaff;
+    }
     *pXo = Xo; *pyo = yo;
     return O;
 }
 
 static void run_finish(Run *u, const Params *par) {
-    if (!u->Otb && !u->fe && !u->dual && !u->alg && !u->sym && !u->sign) return;
+    if (!u->Otb && !u->fe && !u->dual && !u->alg && !u->sym && !u->sign && !u->aff) return;
     const int infeas = u->status == ST_PINFEAS || u->status == ST_DINFEAS;
     PSOrig *O = map_back(u, par, &u->Xo, &u->yo, &u->nXo, 1);
     double **Xo = u->Xo, *yo = u->yo;
@@ -595,7 +631,7 @@ static void run_finish(Run *u, const Params *par) {
         else if (acc <= par->red_acc) status = ST_REDUCED;
         else if (status == ST_OPTIMAL || status == ST_REDUCED) status = ST_NUMERIC;
     }
-    if (par->verbose > 0 && (u->fe || u->dual || u->alg || u->sym || u->sign))
+    if (par->verbose > 0 && (u->fe || u->dual || u->alg || u->sym || u->sign || u->aff))
         printf("   (errors on the file data: %.1e %.1e %.1e %.1e %.1e %.1e; reduced problem %.1e)\n",
                pr.err[1], pr.err[2], pr.err[3], pr.err[4], pr.err[5], pr.err[6], u->acc);
     u->status = status;
@@ -615,7 +651,7 @@ static const char g_brisk_data_name[] = "(problem in memory)";
 static void fom_start_map(Params *par, Run *u, Problem *P) {
     if (!par->fom_start_x && !par->fom_start_y) return;
     const PSOrig *O = u->O;
-    int same = !u->alg && !u->sym && !u->sign && !u->dual && !u->fe && u->tbR == 0 && P->ps && P->ps->nrec == 0 && !P->ps->chordal && O && O->m == P->m && O->nblk == P->nblk;
+    int same = !u->aff && !u->alg && !u->sym && !u->sign && !u->dual && !u->fe && u->tbR == 0 && P->ps && P->ps->nrec == 0 && !P->ps->chordal && O && O->m == P->m && O->nblk == P->nblk;
     for (int k = 0; same && k < P->nblk; k++) same = abs(O->bs[k]) == P->blk[k].n && ((O->bs[k] < 0) == (P->blk[k].type == BLK_LP));
     if (!same) { if (par->verbose >= 0) printf("first-order start: ignored (the presolve changed the problem: use -nosym and a problem without free elimination / facial reduction)\n"); return; }
     const int m = P->m, nb = P->nblk;
@@ -677,6 +713,18 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
     }
     u->tread = wtime() - t0;
     double tpre0 = wtime();
+    {   /* 5.12: a moment relaxation over an ellipsoid in the coordinates of the unit ball (momaff.c; BRISK_NOAFF off) */
+        PSOrig *Of = ps_orig_build(P);
+        u->aff = momaff_apply(P, par->verbose);
+        if (u->aff) {
+            u->Oaff = Of;
+            /* the map back multiplies the last digits by up to |B| |B^-1|: a tighter tolerance there (ellipsoid (4,8) of a
+             * user: 4.9e-8 on the problem as read at 1e-8, 5.1e-10 at 1e-11, one iteration more) */
+            u->aff_tol0 = par->tol; u->aff_par = par;
+            par->tol = fmax(1e-12, par->tol * fmin(1.0, 10.0 / momaff_amplification(u->aff)));
+        } else ps_orig_free(Of);
+        if (getenv("BRISK_SETUPT")) printf("   [setup: ellipsoid test %.2fs]\n", wtime() - tpre0);
+    }
     /* 5.7: the matrix-free interior-point method first, on the problems it is made for: one to
      * four dense blocks of order >= 100 and a Schur complement whose factorization costs far
      * more than a matrix-free solve (the truss and vibration problems: tru11 3 s against 100 s).
@@ -948,6 +996,52 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
                 printf("chordal decomposition: %d block(s) split into cliques, m = %d\n", nc, P->m);
         }
     }
+    {   /* 5.12 (BRISK_MOMRULE=0: off) a moment relaxation as given: its largest block a moment
+         * matrix (every entry in exactly one constraint matrix, the entry (b, c) in the constraint
+         * of the monomial b + c), at least one more block (a localizing matrix), and no LP part,
+         * dual form, free variables, trace bound, chordal conversion or symmetry reduction (the
+         * kernel and image forms of SOS programs go through those): the NT direction in the
+         * embedding and the centred start 0.3 I, I (IMPLEMENTATION Section 13; a user's 72
+         * relaxations 602 -> 514 iterations, 1151 -> 1054 s; no OPTIMAL lost under perturbations) */
+        static int momrule = -1; if (momrule < 0) { const char *e = getenv("BRISK_MOMRULE"); momrule = e ? atoi(e) : 1; }
+        int has_lp = 0; for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_LP) has_lp = 1;
+        if (momrule && par->hsd_dir < 0 && par->init == 1 && !u->dual && !u->fe && u->tbR == 0 && !P->ps->chordal && !has_lp
+            && !u->sym && !u->sign && !u->alg) {
+            int found = 0, nsdp = 0, nmax = 0;
+            for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) { nsdp++; if (P->blk[k].n > nmax) nmax = P->blk[k].n; }
+            /* the moment matrix is the largest block and there is at least one more (a localizing
+             * matrix): the relaxations of polynomial problems over a set with inequality constraints */
+            for (int k = 0; k < P->nblk && !found && nsdp >= 2; k++) {
+                const Block *B = &P->blk[k];
+                if (B->type != BLK_SDP || B->n < 20 || B->n > 4000 || B->n < nmax) continue;
+                const int n = B->n; const size_t nt2 = (size_t)n * (n + 1) / 2;
+                unsigned char *cnt = calloc(nt2, 1); int bad = 0; size_t cov = 0;
+                for (int t = 0; t < B->ncon && !bad; t++) {
+                    const SpSym *A = &B->A[t];
+                    for (int q = 0; q < A->nnz; q++) {
+                        int r = A->row[q], c = A->col[q]; if (r > c) { int w = r; r = c; c = w; }
+                        const size_t id = (size_t)c * (c + 1) / 2 + r;
+                        if (cnt[id]) { bad = 1; break; }
+                        cnt[id] = 1; cov++;
+                    }
+                }
+                free(cnt);
+                if (getenv("BRISK_MOMDBG")) printf("   [moment rule: block %d n %d: %s, %zu of %zu entries]\n", k + 1, n, bad ? "an entry in two constraints" : "one constraint an entry", cov, nt2);
+                /* (the constant monomial's entry may be in C only); several entries a constraint on average
+                 * (a Hankel-type moment matrix: the entries of a monomial b + c), not one (a free symmetric
+                 * matrix written entry by entry, as the Lyapunov variables of the control problems) */
+                int ncb = 0; for (int t = 0; t < B->ncon; t++) if (B->A[t].nnz > 0) ncb++;
+                if (!bad && cov + 1 >= nt2 && ncb > 0 && (double)cov >= 2.0 * ncb) found = 1;
+            }
+            if (found) {
+                par->hsd_dir = 1; par->init = 3;
+                /* and no matrix-free attempt first: on these its CG steps grow from the first
+                 * iterations (a user's 72: it ran on 9 and failed on all, 1-6 s each) */
+                if (!getenv("BRISK_MOMMF")) mf_want = 0;
+                if (par->verbose >= 0) printf("moment relaxation: NT direction and the centred start\n");
+            }
+        }
+    }
     if (getenv("BRISK_MFTRYDRY")) { extern int g_sym_cap_bound; printf("MFTRY want %d chordal %d dual %d sym %d m %d->%d search cut %d\n", mf_want, P->ps->chordal, u->dual != NULL, u->sym || u->sign || u->alg, mf_m0, P->m, g_sym_cap_bound); exit(0); }
     if (mf_want && !P->ps->chordal && !u->dual && !u->sym && !u->sign && !u->alg && P->m == mf_m0 && P->nblk == mf_nb0) {
         if (par->verbose >= 0) printf("matrix-free interior-point method first: m = %d and few dense blocks (-mftry 0 turns this off)\n", P->m);
@@ -1007,8 +1101,8 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
     u->tpre = wtime() - tpre0;
     if (getenv("BRISK_SETUPT")) printf("   [setup: problem_prepare done at %.2fs]\n", u->tpre);
     long nroute[4] = { 0, 0, 0, 0 };
-    int maxn = 0, nsdp = 0, nlp = 0, nlr = 0, ndict = 0, dq = 0, dstr = 0;
-    long lrR = 0;
+    int maxn = 0, nsdp = 0, nlp = 0, nlr = 0, ndict = 0, dq = 0, dstr = 0, ncls = 0;
+    long lrR = 0, ncK = 0, ncC = 0;
     for (int k = 0; k < P->nblk; k++) {
         Block *B = &P->blk[k];
         if (B->type == BLK_LP) { nlp += B->n; continue; }
@@ -1016,6 +1110,7 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
         if (B->n > maxn) maxn = B->n;
         if (B->lowrank) { nlr++; lrR += B->lrR; }
         if (B->dict) { ndict++; dq += B->dnu + B->dnv; dstr += B->dstruct; }
+        if (B->cls) { ncls++; ncK += B->cb->ncon; ncC += B->ncon; }
         for (int t = 0; t < B->ncon; t++) {
             if (force_route >= 0 && B->route[t] != 2) B->route[t] = (unsigned char)force_route;
             nroute[B->route[t]]++;
@@ -1031,6 +1126,8 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
         if (ndict)
             printf("Dictionary route: %d block(s), lifted size %d, %d constraint parts through shared vectors\n",
                    ndict, dq, dstr);
+        if (ncls)
+            printf("Entry-class route: %d block(s), %ld entry classes for %ld constraint matrices\n", ncls, ncK, ncC);
     }
     Result *R = &u->R;
     u->y = calloc(P->m + 1, sizeof(double));
@@ -1204,6 +1301,7 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
     }
     if (st_ < 0) { brisk_solve(P, par, R, u->y, u->X); R->t_total += tdual; }
     par->btrack = NULL;
+    if (u->aff_par) { par->tol = u->aff_tol0; u->aff_par = NULL; }   /* (the tolerance asked for, on the problem as read) */
     /* ---- postsolve: the solution of the problem as read, and its errors */
     u->yo = calloc(u->O->m + 1, sizeof(double));
     PSResult *pr = &u->pr;
@@ -1521,6 +1619,7 @@ static void print_summary(const Run *u, const Params *par, const PSOrig *O, int 
     printf("Summary\n  Problem as read:   %s\n", sz);
     /* the presolve chain: each stage's PSOrig is the problem before that step */
     const PSOrig *chain[8]; const char *what[8]; int nc = 0;
+    if (u->Oaff) { chain[nc] = u->Oaff; what[nc++] = "moment relaxation over an ellipsoid: the coordinates of the unit ball"; }
     if (u->Osign) { chain[nc] = u->Osign; what[nc++] = "sign-symmetry reduction"; }
     if (u->Osym) { chain[nc] = u->Osym; what[nc++] = "symmetry reduction (automorphisms)"; }
     if (u->Oalg) { chain[nc] = u->Oalg; what[nc++] = "block diagonalisation along the data's *-algebra"; }
@@ -1559,7 +1658,8 @@ static void print_summary(const Run *u, const Params *par, const PSOrig *O, int 
     if (par->bound_side && u->cert.have)
         printf("                     %s bound on the optimal value: %s (%s)\n", par->bound_side == 1 ? "primal (upper)" : "dual (lower)", u->cert.valid ? "certificate valid" : "approximate", u->cert.src);
     printf("  Time:              %.2f s (presolve %.2f, solve and re-solves %.2f; reading the file %.2f s more)\n", t_all, tpre, fmax(0.0, t_all - tpre), tread);
-    { const int nt = brisk_threads_logged(); if (nt > 0) printf("  Threads:           %d\n", nt); }
+    { const int nt = brisk_threads_logged(); const char *ts = brisk_threads_summary();
+      if (ts) printf("  Threads:           %s\n", ts); else if (nt > 0) printf("  Threads:           %d\n", nt); }
     if (infeas) {
         printf("  Verdict:           %s\n", status == ST_PINFEAS ? "the problem is primal infeasible (no X >= 0 with A(X) = b)" : "the problem is dual infeasible (no y with C - A'y >= 0)");
         if (cause && cause[0]) printf("                     %s\n", cause);
@@ -1981,7 +2081,7 @@ int brisk_main(int argc, char **argv) {
     quiet_summary = getenv("BRISK_NOSUMMARY") != NULL || g_hp_inner;
     if (!g_hp_inner) advice_scan(argc, argv, 1);
     { extern void (*socp_note)(const char *, ...); socp_note = brisk_note; }
-    g_threads_user = getenv("OMP_NUM_THREADS") != NULL;   /* 4.42: set also by -threads: the busy-machine rule then stays out */
+    g_threads_user = getenv("OMP_NUM_THREADS") != NULL;   /* 4.42: set also by -threads (5.11: the count asked for is an upper limit; the busy-machine rule applies to it too) */
     if (argc < 2) { usage(); return 1; }
     for (int i = 1; i < argc; i++) {       /* a MAT-file: a problem in SeDuMi format */
         const size_t l = argv[i] ? strlen(argv[i]) : 0;
@@ -2023,11 +2123,11 @@ int brisk_main(int argc, char **argv) {
         if (0) {}
         OPT_D("-tol", tol) OPT_I("-maxit", maxit) OPT_D("-timelimit", timelimit)
         OPT_I("-init", init) OPT_I("-sigma", sigma_rule) OPT_I("-corr", max_correctors)
-        OPT_I("-mixed", mixed) OPT_D("-mixedfrac", mixed_frac) OPT_I("-lowrank", lowrank) OPT_I("-dict", dict) OPT_D("-gmax", gamma_max)
+        OPT_I("-mixed", mixed) OPT_D("-mixedfrac", mixed_frac) OPT_I("-lowrank", lowrank) OPT_I("-dict", dict) OPT_I("-cls", cls) OPT_D("-gmax", gamma_max)
         OPT_I("-ntls", nt_ls) OPT_D("-ntlsgap", nt_ls_gap) OPT_I("-stallwin", stall_win)
         OPT_I("-sparse", sparse_schur) OPT_D("-balance", balance) OPT_D("-pivtol", pivtol)
         OPT_D("-feasgrow", feas_grow) OPT_D("-sigmamin", sigma_min) OPT_D("-dualrho", dual_rho)
-        OPT_I("-dualcert", dual_cert) OPT_D("-dualmargin", dual_margin) OPT_I("-dualgiveup", dual_giveup) OPT_D("-dualtau", dual_tau) OPT_D("-dualtaulong", dual_tau_long) OPT_D("-dualgamma", dual_gamma) OPT_I("-dualmurule", dual_murule) OPT_I("-dualls", dual_ls) OPT_I("-dualcorr", dual_corr) OPT_I("-dualmured", dual_mured) OPT_D("-dualtaunb", dual_tau_nb) OPT_D("-dualtauub", dual_tau_ub) OPT_I("-dualsparse", dual_sparse_n) OPT_I("-dualcorrauto", dual_corr_auto) OPT_I("-dualgstart", dual_gstart) OPT_D("-dualmudrop", dual_mudrop) OPT_I("-dualverifyn", dual_verify_n)
+        OPT_I("-dualcert", dual_cert) OPT_D("-dualmargin", dual_margin) OPT_I("-dualgiveup", dual_giveup) OPT_D("-dualtau", dual_tau) OPT_D("-dualtaulong", dual_tau_long) OPT_D("-dualgamma", dual_gamma) OPT_I("-dualmurule", dual_murule) OPT_I("-dualls", dual_ls) OPT_I("-dualcorr", dual_corr) OPT_I("-dualmured", dual_mured) OPT_D("-dualtaunb", dual_tau_nb) OPT_D("-dualtauub", dual_tau_ub) OPT_I("-dualsparse", dual_sparse_n) OPT_I("-zsparse", zsparse_n) OPT_D("-zsparsefill", zsparse_fill) OPT_I("-dualcorrauto", dual_corr_auto) OPT_I("-dualgstart", dual_gstart) OPT_D("-dualmudrop", dual_mudrop) OPT_I("-dualverifyn", dual_verify_n)
         OPT_I("-chordal", chordal) OPT_I("-cliquemax", chordal_maxclique) OPT_I("-chordalsup", chordal_sup) OPT_D("-chordalmerge", chordal_merge) OPT_D("-chordaldens", chordal_density) OPT_I("-chordalform", chordal_form) OPT_I("-freeelim", free_elim) OPT_D("-freefill", free_elim_fill) OPT_I("-chordalmin", chordal_minn)
         OPT_I("-hsdsig", hsd_sig) OPT_D("-hsdbeta", hsd_beta) OPT_I("-hsddir", hsd_dir) OPT_I("-hsdcorr", hsd_corr) OPT_I("-hsdrefine", hsd_refine) OPT_I("-hsdfree", hsd_free) OPT_I("-hsdstall", hsd_stall) OPT_D("-hsdpshrink", hsd_pshrink) OPT_I("-hsdreghint", hsd_reghint) OPT_I("-hsdqscale", hsd_qscale) OPT_I("-hsdbatch", hsd_batch) OPT_I("-hsdctrace", hsd_ctrace) OPT_I("-hsdctarget", hsd_ctarget) OPT_D("-hsdcbmin", hsd_cbmin) OPT_D("-hsdcbmax", hsd_cbmax) OPT_D("-hsdcacc", hsd_cacc) OPT_D("-hsdsoltol", hsd_soltol) OPT_D("-hsdcfrac", hsd_cfrac) OPT_D("-hsdfomega", hsd_fomega) OPT_D("-hsdpivtol", hsd_pivtol) OPT_D("-hsdcucap", hsd_cucap) OPT_D("-hsdcgain", hsd_cgain) OPT_I("-ddit", dd_iters) OPT_I("-ddmaxm", dd_maxm)
         OPT_D("-ddbudget", dd_budget) OPT_D("-ddtime", dd_time) OPT_D("-ddfactor", dd_factor)
@@ -2179,6 +2279,7 @@ int brisk_main(int argc, char **argv) {
     double textra = 0;      /* time of a discarded solve */
     const int hsd_user = par.hsd, hsddir_user = par.hsd_dir;
     {
+        const double t_pipe0 = wtime();
         int rc = run_pipeline(fname, &par, do_fr, force_route, u);
         if (rc == 8) { run_free(u); par.mf_try = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }      /* 5.7: the symmetry search again with its full budget (run_pipeline) */
         if (rc == 3) { run_free(u); do_fr = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }
@@ -2252,6 +2353,20 @@ int brisk_main(int argc, char **argv) {
             }
         }
         if (rc != 0) return 2;
+        /* 5.12: a relaxation over an ellipsoid solved in the coordinates of the unit ball whose solution, mapped
+         * back, misses the tolerance on the problem as read (the map multiplies the last digits of the moment
+         * matrix by about |B|^2): the problem is solved again as given (momaff.c) */
+        if (u->aff && u->measured && u->status != ST_OPTIMAL && !brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit)) {
+            const double ta = wtime() - t_pipe0;
+            if (par.verbose >= 0) printf("ellipsoid coordinates: %.1e on the problem as read; solving the problem as given\n", u->acc);
+            att_log("the relaxation in the coordinates of the unit ball", ta, u); textra += ta;
+            run_free(u);
+            g_momaff_off = 1;
+            rc = run_pipeline(fname, &par, do_fr, force_route, u);
+            if (rc == 3) { run_free(u); do_fr = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }
+            g_momaff_off = 0;
+            if (rc != 0) return 2;
+        }
         /* 4.37 (B1): the first attempt, and the in-solver method retry as a re-solve */
         g_first_t = u->R.t_total - (u->R.nretry ? u->R.t_retry : 0) + u->tpre + u->pr.t + u->tread;
         g_first_acc = u->R.nretry ? u->R.acc_first : u->acc;
@@ -3004,6 +3119,7 @@ int brisk_run(int argc, char **argv, BriskResult *res) {
     g_brisk_jmp_on = 0;
     g_brisk_result = NULL;
     caller_leave(av_caller);
+    if (g_caller_depth == 0) brisk_threads_restore();     /* and its OpenBLAS thread count (not for a nested call) */
 #if defined(__x86_64__) || defined(__i386__)
     _mm_setcsr(csr);
 #endif

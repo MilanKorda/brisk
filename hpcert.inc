@@ -20,13 +20,13 @@
  * integer arithmetic. Quantities that only enter the bounds (sums of absolute values,
  * norms) are evaluated in double and inflated by 1 %.
  *
- * p. r^ = fl(b - A(X~)); |r^_i - r_i| <= (k_i + 8) u (|b_i| + sum |a| |x|) = E_i, so
+ * p. r^ = fl(b - A(X~)); |r^_i - r_i| <= (2 k_i + 8) u (|b_i| + sum |a| |x|) = E_i, so
  *    ||r|| <= || |r^| + E ||. The point X* = X~ + A*(G^{-1} r), G = A A*, is feasible and
  *    ||X* - X~||_F <= ||r|| / sqrt(lambda_min(G)) = delta; lambda_min(G) is bounded below in
  *    double with directed rounding (boundcert.c: the doubles of the data are within one ulp
  *    of the decimals). Certified when lambda_min(X~_k) >= delta for every block (LP: every
  *    entry); then  optimum <= <C,X~> + E_C + ||C||_F delta.
- * d. Z^ = fl(C - A*(y~)), entrywise within (k + 8) u (|C| + sum |y| |A|); its Frobenius norm
+ * d. Z^ = fl(C - A*(y~)), entrywise within (2 k + 8) u (|C| + sum |y| |A|); its Frobenius norm
  *    over block k is rho_k. Split pairs (LP columns that are exact negatives, cost included)
  *    are equalities of (D): their residuals are removed by y* = y~ - Ap'(Gp^{-1} z_p), a
  *    change of at most delta = ||z_p|| / sqrt(lambda_min(Gp)) in norm, which moves Z_k by at

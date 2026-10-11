@@ -40,7 +40,7 @@ static const int IONE = 1;
 static const double DONE_ = 1.0, DZERO_ = 0.0;
 
 static void *dm(size_t n) { void *p = calloc(n ? n : 1, 1); if (!p) { fprintf(stderr, "brisk: out of memory\n"); exit(1); } return p; }
-static int dchol(int n, double *A) { int info = 0; BL(dpotrf_)("L", &n, A, &n, &info); return info != 0; }
+static int dchol(int n, double *A) { return brisk_dpotrf(n, A, n) != 0; }   /* 5.12: tiled on the threads (LAPACK's dpotrf ran on one) */
 
 /* ------------------------------------------------------------------------ */
 typedef struct {
@@ -146,9 +146,11 @@ static int db_factor(DB *d, const double *y, int want_inv) {
         if (schol_factor(d->SC, 0.0)) return 0;
         d->logdet = schol_logdet(d->SC);
         if (want_inv) {
-            memset(d->Zi, 0, sizeof(double) * nn);
-            for (int j = 0; j < n; j++) d->Zi[j + (size_t)j * n] = 1.0;
-            schol_solve_many(d->SC, d->Zi, n, d->W);
+            if (getenv("BRISK_DSOLD")) {
+                memset(d->Zi, 0, sizeof(double) * nn);
+                for (int j = 0; j < n; j++) d->Zi[j + (size_t)j * n] = 1.0;
+                schol_solve_many(d->SC, d->Zi, n, d->W);
+            } else schol_inverse(d->SC, d->Zi, n);   /* 5.12: half-solves on the paths to the root, the dense root by panels */
         }
         return 1;
     }
@@ -159,12 +161,8 @@ static int db_factor(DB *d, const double *y, int want_inv) {
     for (int i = 0; i < n; i++) ld += 2.0 * log(d->L[i + (size_t)i * n]);
     d->logdet = ld;
     if (want_inv) {
-        int info = 0;
         memcpy(d->Zi, d->L, sizeof(double) * nn);
-        BL(dpotri_)("L", &n, d->Zi, &n, &info);
-        if (info) return 0;
-        for (int j = 0; j < n; j++)
-            for (int i = j + 1; i < n; i++) d->Zi[j + (size_t)i * n] = d->Zi[i + (size_t)j * n];
+        if (brisk_dpotri_full(n, d->Zi, n)) return 0;        /* 5.12: in panels on the threads, the full inverse */
     }
     return 1;
 }
@@ -285,9 +283,7 @@ static int ms_factor(MS *S, int use_float) {
     S->is_float = 0;
     if (use_float) {
         for (size_t q = 0; q < sz; q++) S->Mf[q] = (float)S->M[q];
-        int info = 0;
-        BL(spotrf_)("L", &mm, S->Mf, &mm, &info);
-        if (!info) { S->is_float = 1; return 0; }
+        if (!brisk_spotrf(mm, S->Mf, mm)) { S->is_float = 1; return 0; }
     }
     double reg = 0;
     for (;;) {
@@ -300,11 +296,12 @@ static int ms_factor(MS *S, int use_float) {
 }
 static void ms_base(MS *S, double *x) {
     int info = 0;
+    (void)info;
     if (S->is_float) {
         for (int i = 0; i < S->mm; i++) S->fr[i] = (float)x[i];
-        BL(spotrs_)("L", &S->mm, &IONE, S->Mf, &S->mm, S->fr, &S->mm, &info);
+        brisk_spotrs1(S->mm, S->Mf, S->mm, S->fr);           /* 5.12: panel solves on the threads */
         for (int i = 0; i < S->mm; i++) x[i] = S->fr[i];
-    } else BL(dpotrs_)("L", &S->mm, &IONE, S->Md, &S->mm, x, &S->mm, &info);
+    } else brisk_dpotrs1(S->mm, S->Md, S->mm, x);
 }
 /* solve M x = rhs to near machine precision; returns the final relative residual */
 static double ms_solve(MS *S, const double *rhs, double *x) {

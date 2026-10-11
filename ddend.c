@@ -14,7 +14,7 @@
  * iterations starting from the double solver's best iterate, and only when
  *   - that iterate missed the tolerance, and
  *   - the problem is small enough (m <= dd_maxm and sum n^2 <= dd_maxn2),
- * so the cost (about 20x the flop cost of double arithmetic, on problems that take
+ * so the cost (about 45x the flop cost of double arithmetic, on problems that take
  * milliseconds) is irrelevant. The caller accepts the result only if the measured
  * accuracy improves.
  *

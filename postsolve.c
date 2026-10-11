@@ -421,13 +421,15 @@ static double lammin_eig(int n, const double *M, double *work);
 double ps_lammin_tol(int n, const double *M, double *work, double delta) {
     if (n > 1 && delta > 0) { double v; if (ps_lammin_sparse(n, M, delta, &v) == 0) return v; }
     if (n <= 1 || !(delta > 0)) return ps_lammin(n, M, work);
+    /* 5.12: the verdicts by brisk_dpotrf (tiled on the solver's threads): LAPACK's dpotrf ran on
+     * one thread, 0.8 s at order 5000 for the test of X alone */
     memcpy(work, M, sizeof(double) * (size_t)n * n);
     int info;
-    BL(dpotrf_)("L", &n, work, &n, &info);
+    info = brisk_dpotrf(n, work, n);
     if (info == 0) return 0;
     memcpy(work, M, sizeof(double) * (size_t)n * n);
     for (int i = 0; i < n; i++) work[i + (size_t)i * n] += delta;
-    BL(dpotrf_)("L", &n, work, &n, &info);
+    info = brisk_dpotrf(n, work, n);
     if (info == 0) return -delta;
     if (n <= 500) return lammin_eig(n, M, work);   /* 4.42: small blocks: the eigenvalue itself (cheap, exact) */
     if (n > 4000) {
@@ -445,7 +447,7 @@ double ps_lammin_tol(int n, const double *M, double *work, double delta) {
             d *= 10;
             memcpy(work, M, sizeof(double) * (size_t)n * n);
             for (int i = 0; i < n; i++) work[i + (size_t)i * n] += d;
-            BL(dpotrf_)("L", &n, work, &n, &info);
+            info = brisk_dpotrf(n, work, n);
             if (info == 0) {
                 /* three bisections in the exponent: the bound is within a factor 1.33 */
                 double lo = d / 10, hi = d;
@@ -453,7 +455,7 @@ double ps_lammin_tol(int n, const double *M, double *work, double delta) {
                     const double h = sqrt(lo * hi);
                     memcpy(work, M, sizeof(double) * (size_t)n * n);
                     for (int i = 0; i < n; i++) work[i + (size_t)i * n] += h;
-                    BL(dpotrf_)("L", &n, work, &n, &info);
+                    info = brisk_dpotrf(n, work, n);
                     if (info == 0) hi = h; else lo = h;
                 }
                 return -hi;

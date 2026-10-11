@@ -252,7 +252,8 @@ static double gram_lammin_lower_sparse(const PSOrig *O, int exact) {
 
 /* a lower bound on lambda_min(G) for G = A W A' (W = 2 on off-diagonal SDP entries), over the
  * constraints listed in rows (all when rows == NULL), from a double G and an entrywise error
- * bound that covers the data intervals. Returns -inf when too large (m > 8000). */
+ * bound that covers the data intervals. Above 6000 rows: the sparse path when all the
+ * constraints are taken, -inf for a subset. */
 static double gram_lammin_lower(const PSOrig *O, int exact, int nr, const int *rows) {
     const int m = O->m;
     if (nr > 6000 || (getenv("BRISK_GRAMSPARSE") && rows == NULL && nr == m)) return rows == NULL && nr == m ? gram_lammin_lower_sparse(O, exact) : -INFINITY;

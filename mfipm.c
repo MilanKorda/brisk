@@ -17,7 +17,10 @@
  * m x k array): B' Dg^-1 B has blocks Q' (Sq_i' Dg^-1 Sq_j) Q. The capacitance matrix
  * diag(1/lam') + B' Dg^-1 B is symmetric indefinite (dsytrf).
  *
- * Inexact Newton: the CG residual is moved out of the primal equation by the exact
+ * Inexact Newton (the default, -mfproj 0): no projection and no A A*; CG runs to 1e-2 in the
+ * P^-1 norm and to a residual r that the primal infeasibility can absorb,
+ * |r| <= max(mf_eta |Rp|, 0.1 tol (1 + |b|)). The older scheme (-mfproj 1): the CG
+ * residual is moved out of the primal equation by the exact
  * projection dX += A*((A A*)^-1 (Rp - A dX)) (A A* factored once, fom.c's Gram matrix),
  * CG stops on the P^-1-norm residual relative to the right-hand side's, at
  * clamp(1e-2 mu/mu0, 1e-10, 1e-3). Memory O(sum n^2 + k^2 + nnz), no m x m object.
@@ -330,8 +333,9 @@ static void prec_setup(MF *S, const Params *par, double *lamp_out_kmax) {
          * this halves the CG steps again (vib9: 2401 -> 1091; the bulk is then under-estimated, which
          * leaves a few large eigenvalues of P^-1 M instead of many small ones). Not below
          * min(sqrt(wlo whi), 1e-4 whi): with a spread of 1e9 at the end of the solve a smaller tau^2
-         * is rounding noise against the outlier terms and CG breaks down. The scaled variant keeps
-         * the geometric mean (sos_random_n20_d2: 9892 CG steps, 15448 with the lower constant). */
+         * is rounding noise against the outlier terms and CG breaks down. The scaled variant uses
+         * tau = wlo^0.65 whi^0.35 (BRISK_MFTHETAJ; sos_random_n20_d2: 9892 CG steps at the
+         * geometric mean, 15448 with the lower constant 0.1). */
         { static double th = -1; if (th < 0) { const char *e = getenv("BRISK_MFTHETA"); th = e ? atof(e) : 0.1; }
           static double thj = -1; if (thj < 0) { const char *e = getenv("BRISK_MFTHETAJ"); thj = e ? atof(e) : 0.35; }
           const double th_ = b->jac ? thj : th;
@@ -703,6 +707,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                m, nb, s3, 4 * s3, nnz, !S.G ? "not formed" : S.G->dense ? "dense" : "sparse", tg, par->mf_rho, par->mf_rmax, par->mf_kmax);
         printf(" it   pobj            dobj            pinf     dinf     gap      mu       alp   ald   sigma   cg(pred,corr) k     kbulk    time\n");
     }
+    if (par->mf_trial && getenv("BRISK_MFDBG2")) printf("   [mf attempt: cap %d CG steps a solve, %ld products in all]\n", par->mf_trial, (long)par->mf_trial_total);
     double mu0 = -1, pobj = 0, dobj = 0, pinf = 1, dinf = 1, gap = 1;
     int it, status = ST_MAXIT, tot_cg = 0;
     const double tol = 0.5 * par->tol;   /* the file-data measure is typically 1.5x the scaled one */
@@ -905,6 +910,24 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                    it, sc * pobj, sc * dobj, pinf, dinf, gap, mu, alp, ald, sigma, cgk[0], cgk[1], S.k, kbulk, wtime() - t0);
         if (verbose > 0) fflush(stdout);
         if (alp < 1e-6 && ald < 1e-6) { status = ST_NUMERIC; it++; break; }
+        /* 5.12: in the automatic first attempt, far from the optimum, the CG steps of a solve that grow
+         * geometrically mean the attempt will not pay: stop as soon as (1) in the first ten
+         * iterations a solve needs three times the last iteration's steps and a tenth of the cap, or
+         * (2) the next solve, at the same growth, would pass the cap (the most expensive iteration of
+         * a failed attempt is the last). On the instances where the attempt runs (poema, the
+         * matrix-free SOS set, a user's moment relaxations, Mittelmann's theta and moment files) the
+         * failures stopped 1-5 iterations earlier (theta12 33 -> 10 s of the attempt), the successes
+         * (tru*, vib*, sos_planted*, sos_random*) never trigger. BRISK_MFGROW=0: off. */
+        {   static int grow_on = -1; if (grow_on < 0) { const char *e = getenv("BRISK_MFGROW"); grow_on = e ? atoi(e) : 1; }
+            const int now = cgk[0] > cgk[1] ? cgk[0] : cgk[1], prev = last_cg[0] > last_cg[1] ? last_cg[0] : last_cg[1];
+            const double cap = par->mf_trial, g = prev > 0 ? (double)now / prev : 1.0;
+            const int r1 = it >= 2 && it <= 10 && now >= 3 * prev && now >= 0.1 * cap;
+            const int r2 = it >= 2 && now >= 0.25 * cap && now * g > cap;
+            if (grow_on && par->mf_trial && (r1 || r2) && fmax(gap, fmax(pinf, dinf)) > 1e-6) {
+                if (verbose > 0) printf("matrix-free IPM: %d CG steps a solve at iteration %d after %d (cap %d): growing, the standard method is cheaper\n", now, it, prev, par->mf_trial);
+                status = ST_MAXIT; break;
+            }
+        }
         last_cg[0] = cgk[0]; last_cg[1] = cgk[1];
         if (hand_X && !hand_snap && it >= 3 && cgk[0] + cgk[1] > hand_cg) hand_done = 1;      /* (the hand-off itself at the top of the next iteration, with the residuals of the new point) */
     }

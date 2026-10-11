@@ -16,7 +16,7 @@ Contents:
 6. [Troubleshooting](#6-troubleshooting)
 7. [Reporting a problem](#7-reporting-a-problem)
 
-All commands below are run from the top directory of the unpacked package (`brisk-1.3.2/`).
+All commands below are run from the top directory of the unpacked package (`brisk-1.4/`).
 
 ## 1. Requirements
 
@@ -115,12 +115,12 @@ Full documentation: [python/README.md](python/README.md).
 
 Requirements: Julia 1.9 or later.
 
-1. In a terminal, build the library (section 2) in the `brisk-1.3.2` directory: `make libbrisk`.
+1. In a terminal, build the library (section 2) in the `brisk-1.4` directory: `make libbrisk`.
 2. In Julia, add the package by its **full path**:
 
    ```julia
    using Pkg
-   Pkg.develop(path = "/path/to/brisk-1.3.2/julia/Brisk")
+   Pkg.develop(path = "/path/to/brisk-1.4/julia/Brisk")
    Pkg.add("JuMP")                        # for the JuMP interface
    using Brisk
    Brisk.version()
@@ -130,7 +130,7 @@ Requirements: Julia 1.9 or later.
    - A relative path such as `julia/Brisk` is read from the directory Julia was started in,
      and fails elsewhere.
    - Julia records the path and does not copy the package, and the package loads `libbrisk`
-     from the `brisk-1.3.2` directory: keep that directory in place. If you move it, run
+     from the `brisk-1.4` directory: keep that directory in place. If you move it, run
      `Pkg.develop` once more with the new path.
    - The installation belongs to the active Julia environment; in another environment, run
      the two `Pkg` lines again.
@@ -177,7 +177,7 @@ liboctave-dev`) and BLAS/LAPACK (section 1).
 Then, in MATLAB or Octave:
 
 ```matlab
-cd brisk-1.3.2/matlab
+cd brisk-1.4/matlab
 build_brisk_mex            % about a minute
 test_brisk                 % every line should say PASS
 addpath(pwd); savepath     % keeps it on the path
@@ -196,10 +196,14 @@ Options go in a struct, e.g. `opts.timelimit = 60`. Full documentation:
   (section 1), or the library has another name: `make BLASLIB="-lopenblas"`.
 - **Slow solves:** check which BLAS is linked (`ldd ./brisk | grep -i blas`). The reference
   BLAS is several times slower than OpenBLAS.
-- **Threads on a busy machine:** with the default thread count BRISK uses only the cores
-  that are free when the solve starts (Linux). If you fix the count (`-threads`,
-  `OMP_NUM_THREADS`) and other processes occupy cores, spin-waiting OpenMP barriers stall:
-  use fewer threads or set `OMP_WAIT_POLICY=passive`.
+- **Threads on a busy machine:** on Linux BRISK uses only the cores that are free among those
+  it may use (its affinity mask: `taskset`, a container's or a cluster job's cpuset). The count
+  given by `-threads` or `OMP_NUM_THREADS` is an upper limit: the solve starts with the cores
+  that are free and, during the solve, uses fewer threads while its threads wait for cores and
+  more again when cores are free. `-v` prints each change and the summary the range.
+  `BRISK_NOBUSY=1` keeps the count fixed; if other processes then occupy cores, spin-waiting
+  OpenMP barriers stall: use fewer threads or set `OMP_WAIT_POLICY=passive` (also on macOS,
+  where the count is not adapted).
 - **Build options changed but nothing happened:** `make clean` first.
 - **macOS link error naming a `__kmpc_*` symbol:** run `make omptest` and send its output
   (the bundled OpenMP runtime lacks an entry point that this clang uses). The macOS build has

@@ -44,6 +44,7 @@ void   B64(dgemm_)(const char *, const char *, const bi *, const bi *, const bi 
 void   B64(dsymm_)(const char *, const char *, const bi *, const bi *, const double *, const double *, const bi *, const double *, const bi *, const double *, double *, const bi *);
 void   B64(dsyrk_)(const char *, const char *, const bi *, const bi *, const double *, const double *, const bi *, const double *, double *, const bi *);
 void   B64(dgemv_)(const char *, const bi *, const bi *, const double *, const double *, const bi *, const double *, const bi *, const double *, double *, const bi *);
+void   B64(sgemv_)(const char *, const bi *, const bi *, const float *, const float *, const bi *, const float *, const bi *, const float *, float *, const bi *);
 void   B64(dsymv_)(const char *, const bi *, const double *, const double *, const bi *, const double *, const bi *, const double *, double *, const bi *);
 void   B64(dtrsv_)(const char *, const char *, const char *, const bi *, const double *, const bi *, double *, const bi *);
 void   B64(strsv_)(const char *, const char *, const char *, const bi *, const float *, const bi *, float *, const bi *);
@@ -107,6 +108,10 @@ void BW(dsyrk_)(const char *u, const char *t, const int *n, const int *k, const 
 void BW(dgemv_)(const char *t, const int *m, const int *n, const double *al, const double *a, const int *lda, const double *x, const int *incx, const double *be, double *y, const int *incy) {
     const bi M = I(m), N = I(n), LA = I(lda), IX = I(incx), IY = I(incy);
     B64(dgemv_)(t, &M, &N, al, a, &LA, x, &IX, be, y, &IY);
+}
+void BW(sgemv_)(const char *t, const int *m, const int *n, const float *al, const float *a, const int *lda, const float *x, const int *incx, const float *be, float *y, const int *incy) {
+    const bi M = I(m), N = I(n), LA = I(lda), IX = I(incx), IY = I(incy);
+    B64(sgemv_)(t, &M, &N, al, a, &LA, x, &IX, be, y, &IY);
 }
 void BW(dsymv_)(const char *u, const int *n, const double *al, const double *a, const int *lda, const double *x, const int *incx, const double *be, double *y, const int *incy) {
     const bi N = I(n), LA = I(lda), IX = I(incx), IY = I(incy);

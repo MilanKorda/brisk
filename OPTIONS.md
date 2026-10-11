@@ -51,7 +51,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `tol` | the tolerance itself (overrides `acc`) | 1e-8 |
 | `maxit` | iteration limit | 100 |
 | `timelimit` | wall-clock limit in seconds | none |
-| `threads` | OpenMP threads. With the default, tiny problems use one thread and (Linux) the interior-point solve uses only the cores that are free when it starts. The log prints the count in use (`Number of threads: k`). | `OMP_NUM_THREADS`, else all cores |
+| `threads` | OpenMP threads, at most. Tiny problems use one thread; on Linux the interior-point solve uses fewer while other processes occupy the cores it may use (at the start, and during the solve when its threads wait for cores), and more again when they are free; `BRISK_NOBUSY=1` keeps the count exactly. The log prints the count in use (`Number of threads: k`) and each change. | `OMP_NUM_THREADS`, else all cores |
 | `q`, `v` | quiet, verbose (command line) | |
 | `returnx` | library calls (MATLAB, Python, Julia): the dense X of a chordal-decomposed block is returned unless that needs more than 30% of the memory (`-1`), never (`0`; the point is verified on the cliques, fastest), always (`1`). A block that is not returned is empty (`None` in Python). | `-1` |
 
@@ -64,12 +64,10 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `sym` | exact symmetry reduction: `auto` (sign symmetries and permutation automorphisms found and used), `none`, or a file of generators | `auto` |
 | `symmin` | apply the reduction only when it shrinks the problem by this factor: the constraints, Σn³ of the blocks, or (at most 4 SDP blocks, m ≤ 20,000) the estimated work m³/3 + 30 Σn³ | 1.5 |
 | `symtime`, `symnodes` | caps of the automatic search | 20 s, 500 nodes |
-| `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. | −1 | The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra (5.8).
+| `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra. | −1 |
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
 | `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
 | `freeelim` | eliminate split free variables (kernel-form SOS): `-1` auto, `0` off, `1` on | `-1` |
-| `nodd` | no double-double endgame in the embedding (by default a small problem, m ≤ 1,200 and Σ n² ≤ 2e5, that ends short of the tolerance is continued in double-double arithmetic within a work budget, and the result is kept when it is better) | endgame on |
-| `nopolishr` | no restoration of the primal feasibility of a point that missed the tolerance. By default such a point is corrected before it is returned, X ← X^½ (I + W) X^½ with W chosen so that A(X) = b (the square-root metric of X: X stays positive semidefinite, the complementarity stays, and the matrix has the square root of the Schur complement's condition number), starting from the iterate with the smallest dual residual and complementarity; the older corrections (X-metric, Euclidean) follow only if it is not accepted. One to three Schur assemblies, on runs that missed the tolerance only. | restoration on |
 | `dualize` | solve the dual form when its Schur complement is at most half the size: `-1` auto, `0` off, `1` force | `-1` |
 | `tracebound` | trace bound with the free elimination | `-1` auto |
 
@@ -80,13 +78,39 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `hsd` / `nohsd` | force / forbid the homogeneous self-dual embedding | automatic, each method the other's fallback |
 | `hsdfirst` | automatic order: `1` the embedding first where it is cheap: its extra dense work 12·Σn³ is at most m³/3 (`hsdfirstc` 12), or at most half of m³/3 plus the estimated work of the Schur assembly (`hsdfirstasm` 0.5: problems whose iteration is mostly assembly), or the problem is tiny | 1 |
 | `dir` | search direction `auto`, `hkm`, `nt` | `auto` |
+| `hsddir` | direction inside the embedding: `0` HKM, `1` NT; automatic: NT on moment relaxations as given (the largest block a moment matrix, localizing blocks, no LP part, free variables or symmetry reduction; with the centred start `init 3`) and on the chordal moment form, HKM otherwise | automatic |
+| `init` | starting point: `0` SDPT3-style, `1` least squares with a shift, `2` with balancing, `3` the centred start X = 0.3 I, Z = I, y = 0 | `1`; `3` on moment relaxations |
+| `zsparse`, `zsparsefill` | HKM direction: an SDP block of order ≥ `zsparse` whose dual matrix Z keeps a sparse pattern (max-cut, box-QP, structural design) gets Z⁻¹, its products and the dual step length from a sparse Cholesky factor of Z when that factor has at most `zsparsefill` n² nonzeros; X stays dense; `zsparse 0` off | 200; 0.1 |
+| `cls` | entry-class route of the Schur assembly: a block whose entries fall into classes with the same coefficients in the same constraints (localizing matrices of moment relaxations) is assembled from the much smaller Schur complement of its classes: `-1` auto, `0` off, `1` force | `-1` |
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off | 0.2 |
 | `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
-| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block); the attempt is limited in work (CG steps a solve worth a sixth of a factorization; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
+| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
 | `crossover` | SDP crossover after the solve: `0` off, `1` on, `-1` when cheap | 0 |
+
+### The end of the solve: best iterate, endgame, polishing
+
+After the iterations the interior-point method can change the point it returns. Each step is
+kept only if it lowers the largest DIMACS error, and each prints a line (`-v`, the default
+verbosity of the command line). All are flags: `true` or `1` turns the step off (`0` or `false`
+leaves the flag out, so the step stays on).
+
+| step (log line) | what it does | off with |
+|---|---|---|
+| `returning best iterate (iteration k)` | the iterate with the smallest error is kept and returned, not the last one | `nopolish` |
+| `HSD: polish probe …`, `polishing: score … (the probe's candidate)` | during the iterations of the embedding: the primal residual of the iterate corrected in the metric of the last iteration with the Schur factor at hand (NT direction), else its Euclidean polish; the solve stops when the corrected point meets the tolerance | `nopolish` |
+| `restoring the primal feasibility …`, `square-root-metric polishing: …` | a point that missed the tolerance in its primal residual: X ← X^½ (I + W) X^½ with W chosen so that A(X) = b (X stays positive semidefinite, the complementarity stays), from the iterate with the smallest dual residual and complementarity, during the iterations and at the end | `nopolishr` (or `nopolish`) |
+| `dd k pinf …`, `high-precision endgame: …` | a small problem (m ≤ 1,200 and Σ n² ≤ 2e5) that ends short of the tolerance is continued in double-double arithmetic within a work budget | `nodd` |
+| `X-metric polishing: …` | the returned point corrected in the metric of X (X stays positive definite); also tried as a probe during the iterations | `nopolishx` (or `nopolish`) |
+| `polishing: score … (Gram CG residual …)` | the Euclidean projection onto A(X) = b, when the steps above leave the point above the tolerance | `nopolish` |
+
+To get the interior-point iterate as it is: `nopolish`, `nopolishx` and `nodd`. Command line:
+`-nopolish -nopolishx -nodd`; JuMP: `set_attribute(model, "nopolish", true)` and the same for
+the other two; Python: `nopolish=True, nopolishx=True, nodd=True`; MATLAB: `opts.nopolish = 1`.
+A correction that is accepted lowers the errors of the presolved problem; the errors printed at
+the end are those of the problem as read.
 
 ### Linear and second-order cone programs (SeDuMi format)
 
@@ -247,13 +271,19 @@ method
   -retryacc <a>    retry with the embedding only if the first result is worse than a (1e-7)
   -warm <l>        re-solve from l x (first point) + (1 - l) x (standard start) (0 = off; measured slower)
   -dir auto|hkm|nt search direction (auto)
+  -zsparse <n>     HKM direction: blocks of order >= n whose dual matrix Z keeps a sparse
+                   pattern (max-cut, structural designs) use a sparse Cholesky factor of Z for
+                   Z^{-1}, its products and the dual step length; X stays dense (200; 0 off)
+  -zsparsefill <f> ... when the factor has at most f n^2 nonzeros (0.1)
   -ntfast <k>      NT: form dX on the pattern of dZ (1) or by dense transforms (0, default)
   -nodd            no double-double endgame
   -ddfactor <f>    endgame work budget as a multiple of the solve's work (1.0)
   -ddminwork <w>   ... but at least this many flop-equivalents (2e9)
   -ddmaxm <k>      size limit for the endgame (1200)
   -ddit <k>        endgame iteration limit (40)
-  -nopolish        do not polish reduced-accuracy solutions
+  -nopolish        no polishing: the last iterate is returned as it is (not the best one), without
+                   the corrections at the end and the polish probes of the embedding (-nopolishx:
+                   also the X-metric probe; -nodd: also the double-double endgame)
   -crossover <k>   SDP crossover after the solve (Newton on the rank-revealed KKT system; kept only if
                    the errors on the original data fall): 0 off (default), 1 on, -1 when cheap
 presolve
@@ -278,8 +308,11 @@ presolve
                    to four dense blocks of order >= 100 whose Schur factorization is
                    estimated at 3.5 times a matrix-free solve or more (at least equal when
                    every constraint has an entry in an LP block), and that the presolve
-                   leaves unchanged. The attempt ends when a solve away from the
+                   leaves unchanged; not on moment relaxations (see -hsddir). The attempt
+                   ends when a solve away from the
                    optimum needs more CG steps than a sixth of a Schur factorization costs,
+                   or the steps of a solve grow geometrically (three times the last
+                   iteration's, or the next solve past that bound at the same growth),
                    or the attempt more than a quarter of the standard solve; unless it
                    ends OPTIMAL, the standard method follows (from the attempt's iterate
                    of merit 1e-3 if it got that far); also when the Schur complement does
@@ -364,11 +397,15 @@ Schur complement and linear algebra
   -sparse <k>      sparse (envelope/supernodal) Schur complement: -1 auto, 0 off, 1 force
   -lowrank <k>     low-rank Schur route: -1 auto, 0 off, 1 force
   -dict <k>        dictionary (shared-vector) Schur route: -1 auto, 0 off, 1 force
+  -cls <k>         entry-class Schur route (entries in the same constraints with the same
+                   values grouped: localizing matrices): -1 auto, 0 off, 1 force
   -mixed <k>       single-precision Schur factor + PCG: -1 auto (m>=1000), 0 off, 1 on
   -route <r>       force Schur route of sparse constraints: 0 sparse-sparse, 1 row-product, 3 row-product on the union pattern
-  -threads <k>     OpenMP threads for this run (default: OMP_NUM_THREADS, else all cores; with
-                   the default, tiny problems use one thread and, on Linux, the interior-point
-                   solve leaves out the cores other processes are using when it starts)
+  -threads <k>     OpenMP threads for this run, at most (default: OMP_NUM_THREADS, else all
+                   cores). Tiny problems use one thread; on Linux the interior-point solve
+                   uses fewer while other processes occupy its cores (at the start, and when its
+                   threads wait for cores) and more again when they are free (BRISK_NOBUSY=1:
+                   exactly k)
   -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on
   -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)
   -densemem <MB>   memory for dense constraint copies (768)
@@ -380,7 +417,8 @@ iteration details
   -sigma <k>       centering rule: 0 SDPT3 adaptive, 1 Mehrotra cubic, 2 cubic+safeguard
   -sigmamin <s>    floor for sigma (0)
   -corr <k>        max centrality correctors per iteration (0)
-  -init <k>        start: 0 SDPT3-style, 1 least-squares+shift, 2 +balancing (1)
+  -init <k>        start: 0 SDPT3-style, 1 least-squares+shift, 2 +balancing, 3 the centred start
+                   0.3 I, I, y = 0 (1; 3 automatically on moment relaxations, see -hsddir)
   -balance <b>     raise sigma when infeasibility > b * complementarity (0 = off)
   -feasgrow <f>    cap primal steps that grow the residual (0 = off)
   -hsdsig <k>      self-dual embedding: sigma candidates (3)
@@ -396,7 +434,10 @@ iteration details
   -hsdrefine <k>   self-dual embedding: passes enforcing the primal Newton equation (2)
   -hsdfree <k>     self-dual embedding: free variables given as split LP pairs:
                    -1 auto, 0 keep split, 1 augmented Lagrangian, 3 saddle factorization (-1)
-  -hsddir <k>      self-dual embedding direction: 0 HKM, 1 NT (auto: NT on the chordal moment form, HKM otherwise)
+  -hsddir <k>      self-dual embedding direction: 0 HKM, 1 NT (auto: NT on the chordal moment form
+                   and, with the centred start -init 3, on moment relaxations as given (the
+                   largest block a moment matrix, a localizing block, no LP part, free
+                   variables or symmetry reduction); HKM otherwise)
   -hsdpivtol <p>   self-dual embedding: squared-pivot threshold of the Schur factor (1e-20)
   -hsdstall <k>    self-dual embedding: iterations without a better iterate before stopping (12)
   -split / -nosplit, -ntls <k>, -ntlsgap <g>   experimental NT residual split
@@ -424,8 +465,10 @@ expert and tuning options (listed for completeness; the defaults are the tested 
   -vv              very verbose (per-iteration internals)
   -knownfeas       a solution is known to exist: no infeasibility exits
   -nopolishr       no restoration of the primal feasibility of a point that missed the tolerance
+                   (the log's "square-root-metric polishing"; the other corrections stay)
                    (the correction in the square-root metric of X; the older polishes stay)
-  -nopolishx       no X-metric polish of the returned point (the Euclidean polish stays)
+  -nopolishx       no X-metric polish of the returned point and no X-metric probe during the
+                   iterations (the log's "X-metric polishing"; the Euclidean polish stays)
   -mixedfrac <f>   float Schur factor for 1000 <= m < 4000 when the factorization is at least
                    this fraction of an iteration's work (0.4)
   -freefill <f>    free elimination: no pivot whose Markowitz count exceeds this (1e4)
@@ -434,7 +477,8 @@ expert and tuning options (listed for completeness; the defaults are the tested 
                    at 8, 4, 12, 0; 0 off)
   -chordalmerge <f> merge a clique into its parent when the separator is at least this fraction (0.6)
   -chordaldens <f> blocks denser than this are not tried (0.3)
-  -ddbudget <n>, -ddtime <s>   double-double endgame: work per iteration (1e9), time cap (60 s)
+  -ddtime <s>      double-double endgame: time cap in seconds (0 = none, the default; the budget
+                   is the work of -ddfactor / -ddminwork); -ddbudget <n> is accepted and has no effect
   -hsdrefine <k>, -hsdstall <k>, -hsdbatch <0|1>, -hsdreghint <0|1>, -hsdqscale <0|1|2>,
   -hsdsoltol <t>, -hsdcacc <f>, -hsdcgain <f>, -hsdctarget <0|1>, -hsdctrace <0|1>,
   -hsdcucap <f>, -hsdfomega <f>, -hsdpshrink <f>   embedding internals: refinement passes (2),

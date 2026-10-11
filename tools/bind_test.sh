@@ -25,12 +25,17 @@ check() {   # name, expected minimum number of distinct processors, environment.
     done
     kill $p 2>/dev/null; wait $p 2>/dev/null
     local single; single=$(echo "$masks" | grep -c -E '^[0-9]+$')
+    # bound: one CPU, or one core's hardware threads (GitHub's runners have two per core, and a
+    # thread bound to a core then has the mask of both, e.g. "0-1" or "0,2")
+    local bound; bound=$(echo "$masks" | while read -r m; do [ -n "$m" ] || continue
+        if echo "$m" | grep -qE '^[0-9]+$' || echo "$SIBLINGS" | grep -qxF "$m"; then echo y; fi; done | grep -c y)
     if [ "$want" = bound ]; then
-        if [ "$single" -ge 2 ] && [ "$nthr" -eq 2 ]; then echo "  ok    $name: $nthr threads on $(echo $masks | tr '\n' ' ')"; else echo "  FAIL  $name: $nthr threads, masks: $(echo $masks | tr '\n' ' ')"; fail=1; fi
+        if [ "$bound" -ge 2 ] && [ "$nthr" -eq 2 ]; then echo "  ok    $name: $nthr threads on $(echo $masks | tr '\n' ' ')"; else echo "  FAIL  $name: $nthr threads, masks: $(echo $masks | tr '\n' ' ')"; fail=1; fi
     else
         if [ "$single" -eq 0 ] && [ "$nthr" -eq 2 ]; then echo "  ok    $name: $nthr threads, not bound ($(echo $masks | tr '\n' ' '))"; else echo "  FAIL  $name: $nthr threads, masks: $(echo $masks | tr '\n' ' ')"; fail=1; fi
     fi
 }
+SIBLINGS=$(cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list 2>/dev/null | sort -u)
 echo "bind test ($B):"
 check "no binding" free X=1
 check "OMP_PROC_BIND=true" bound OMP_PROC_BIND=true

@@ -18,8 +18,9 @@
  * Design: one persistent pool of worker threads and one team for the (single) active top-level
  * region; workers spin briefly and then sleep on a condition variable between regions.
  * Barriers are counter + epoch (no ABA across regions), executing queued tasks while they
- * wait, and complete only when the team has no outstanding task. Tasks go to one team queue
- * (mutex); a thread in taskwait runs only children of the task it waits in (libgomp's rule, so
+ * wait, and complete only when the team has no outstanding task. Tasks go to one deque per
+ * thread (the owner pushes and pops the newest, the others steal the oldest); a thread in
+ * taskwait runs only children of the task it waits in (libgomp's rule, so
  * a suspended task's per-thread scratch data is never reused by an unrelated task). Worksharing
  * loops with dynamic schedules share a ring of dispatch buffers indexed by the per-thread loop
  * count. Environment: OMP_NUM_THREADS (default: all online processors), BRISK_OMP_SPIN_US

@@ -35,7 +35,7 @@ else
   OMPFLAG := -Wno-unknown-pragmas
 endif
 CFLAGS  ?= -O3 $(ARCHFLAG) -funroll-loops $(OMPFLAG) -std=gnu11 -Wall -Wextra -Wno-unused-parameter
-SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c fom.c mfipm.c lralm.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c
+SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c momaff.c fom.c mfipm.c lralm.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c
 BLAS    ?= system
 
 ifeq ($(BLAS),scipy)

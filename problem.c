@@ -19,6 +19,37 @@ static void *xcalloc(size_t n, size_t s) {
     return p;
 }
 
+/* 5.12: decimal numbers whose digits fit 2^53 with a power of ten of at most 22 converted exactly
+ * by one multiplication or division (Clinger's fast path: both operands exact, one correctly
+ * rounded operation), the rest by strtod; 0 when the token is not of that form. The same doubles
+ * as strtod's, several times faster on the large moment relaxations (83 MB: 1.29 s to read). */
+static int fast_num(const char *p, char **endp, double *out) {
+    static const double p10[23] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+                                    1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+    const char *q = p;
+    int neg = 0;
+    if (*q == '-' || *q == '+') { neg = *q == '-'; q++; }
+    unsigned long long mnt = 0; int nd = 0, e10 = 0, any = 0;
+    while (*q >= '0' && *q <= '9') { if (nd < 19) { mnt = mnt * 10 + (unsigned)(*q - '0'); if (mnt) nd++; } else e10++; q++; any = 1; }
+    if (*q == '.') {
+        q++;
+        while (*q >= '0' && *q <= '9') { if (nd < 19) { mnt = mnt * 10 + (unsigned)(*q - '0'); if (mnt) nd++; e10--; } q++; any = 1; }
+    }
+    if (!any) return 0;
+    if (*q == 'e' || *q == 'E') {
+        const char *r = q + 1; int eneg = 0, ev = 0, dig = 0;
+        if (*r == '-' || *r == '+') { eneg = *r == '-'; r++; }
+        while (*r >= '0' && *r <= '9') { if (ev < 10000) ev = ev * 10 + (*r - '0'); r++; dig = 1; }
+        if (!dig) return 0;
+        e10 += eneg ? -ev : ev; q = r;
+    }
+    if (*q && !isspace((unsigned char)*q)) return 0;
+    if (nd >= 19 || mnt > (1ULL << 53) || e10 < -22 || e10 > 22) return 0;
+    double v = (double)mnt;
+    if (e10 > 0) v *= p10[e10]; else if (e10 < 0) v /= p10[-e10];
+    *out = neg ? -v : v; *endp = (char *)q;
+    return 1;
+}
 /* Parse next number; skips non-numeric tokens (counted). Returns 0 at end of buffer. */
 static long g_skipped_words = 0;
 static int next_num(char **pp, double *out) {
@@ -27,6 +58,8 @@ static int next_num(char **pp, double *out) {
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) { *pp = p; return 0; }
         char *e;
+        { static int fn = -1; if (fn < 0) fn = !getenv("BRISK_NOFASTNUM");
+          if (fn && fast_num(p, &e, out)) { *pp = e; return 1; } }
         double v = strtod(p, &e);
         if (e != p && (*e == '\0' || isspace((unsigned char)*e))) { *out = v; *pp = e; return 1; }
         if (e != p) { *out = v; *pp = e; g_skipped_words++; return 1; }   /* number glued to text */
@@ -569,6 +602,8 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
     free(Ws); free(Ss); free(rk);
 }
 
+static double g_fact_ref = 0;   /* the work of a dense factorization of the Schur complement (problem_prepare) */
+static double g_symg_min = -1;  /* the gather share from which the symmetric gather is used (BRISK_SYMGMIN) */
 typedef struct { double ef; int t; } EfIdx;
 static int cmp_ef_desc(const void *a, const void *b) {
     const EfIdx *x = a, *y = b;
@@ -652,7 +687,22 @@ double analyze_sdp_block(Block *B, const Params *par) {
     if (B->lowrank) dict_free(B);
     else if (B->vb && (par->dict > 0 || cost_dict < cost_now)) { B->dict = 1; cost_now = cost_dict; }
     else dict_free(B);
-    if (B->lowrank) {                          /* all constraints treated as sparse */
+    /* the entry-class route (dictroute.c) where it is cheaper than the block's routes */
+    class_free(B);
+    if (!B->lowrank && !B->dict && par->cls != 0) {
+        const double cost_cls = class_build(B, par);
+        /* auto: cheaper by a fifth by the model (it overestimates the route: box (4,8) 0.55 by the
+         * model, 0.65 measured), on a block whose assembly matters (above about ten milliseconds an
+         * iteration), and a saving of at least 4 % of a dense factorization of the Schur complement:
+         * where it saves less, the gain is lost in the noise while the other rounding moves the
+         * ill-posed problems (moment relaxations of a user's benchmark: 8-240 %, all faster; on the
+         * regression sets 0-1.2 % where it lost or tied, e_moment_quadknap 26 -> 70 iterations) */
+        const int take = B->cb && (par->cls > 0 || (cost_cls < 0.8 * cost_now && cost_now > 1e7 && cost_now - cost_cls >= 0.04 * g_fact_ref));
+        if (B->cb && getenv("BRISK_CLSDBG")) printf("   [block n %d: entry-class route %.3g against %.3g: %s]\n", n, cost_cls, cost_now, take ? "taken" : "not taken");
+        if (take) { B->cls = 1; cost_now = cost_cls; }
+        else class_free(B);
+    }
+    if (B->lowrank || B->cls) {                /* all constraints treated as sparse */
         for (int t = 0; t < nc; t++) B->dpos[t] = -1;
         nd = 0;
     }
@@ -743,10 +793,11 @@ double analyze_sdp_block(Block *B, const Params *par) {
      * with shares of 53-58 %, losses of 8 % at a share of 74 % (n = 135) and of 15 % on blocks of
      * 55-66 (small products run at a lower rate, the gather is not reduced). */
     B->live = 0; B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL;
+    B->lu_cp = B->lu_ca = B->lu_cr = B->lu_ch = NULL; B->lu_cv = NULL; B->symg = 0;
     {
         int n1 = 0;
         for (int a = 0; a < B->ns; a++) n1 += B->route[B->slist[a]] == 1;
-        if (n1 > 0 && n >= 128 && fe > 0 && fe < ((size_t)1 << 28) && !ENV_ON("BRISK_NOLIVE")) {
+        if (n1 > 0 && n >= 128 && fe > 0 && fe < ((size_t)1 << 28) && !B->cls && !ENV_ON("BRISK_NOLIVE")) {
             const int ns = B->ns;
             int *death = xmalloc(sizeof(int) * n), *cnt = xcalloc((size_t)ns + 2, sizeof(int));
             for (int i = 0; i < n; i++) death[i] = -1;
@@ -773,8 +824,10 @@ double analyze_sdp_block(Block *B, const Params *par) {
                 int hmax = 0;
                 for (int t = B->lv_cp[q + 1] - 1; t >= B->lv_cp[q]; t--) { if (B->lv_cr[t] + 1 > hmax) hmax = B->lv_cr[t] + 1; B->lv_ch[t] = hmax; }
             }
-            /* the staircases against the full products */
-            double full = 0, area = 0;
+            /* the staircases against the full products; the gather's entries (for the symmetric gather) */
+            double full = 0, area = 0, gath = 0;
+            {   double sf = 0;
+                for (int a = ns - 1; a >= 0; a--) { sf += B->A[B->slist[a]].ef; if (B->route[B->slist[a]] == 1) gath += sf; } }
             for (int a = 0; a < ns; a++) {
                 if (B->route[B->slist[a]] != 1) continue;
                 const SpSym *S = &B->A[B->slist[a]];
@@ -803,10 +856,45 @@ double analyze_sdp_block(Block *B, const Params *par) {
             B->live = area <= thr * full;
             { const char *e = getenv("BRISK_LIVE");      /* test: 0/1 forces it; 2: his fit on 1.2.1; 3: the fixed 0.67 of 4.x-5.8 */
               if (e) { const int v = atoi(e); B->live = v == 2 ? area <= (0.215 * log((double)n) - 0.465) * full : v == 3 ? area <= 0.67 * full : v; } }
-            if (ENV_ON("BRISK_ROUTEDBG")) printf("   [block n %d: live region of the row products: %.1f %% of nr n^2 (%s)]\n", n, 100.0 * area / fmax(full, 1.0), B->live ? "used" : "not used");
+            /* 5.12: the symmetric gather halves the gather and doubles the inner dimension of the
+             * products (their flops about the same, at a lower rate, and twice the copies): it pays
+             * where the gather is a good share of the work. Measured: moment matrices with 15-27
+             * rows a constraint, gather 0.4-0.8 of the products' cost units, 8-10 % faster; sphere
+             * relaxations with 134 rows a constraint, 0.2, 12 % slower. */
+            const double gshare = gath / fmax(2.0 * cb / cs * area, 1.0);
+            if (ENV_ON("BRISK_ROUTEDBG")) printf("   [block n %d: live region of the row products: %.1f %% of nr n^2 (%s); gather %.3g entries, products %.3g flops, share %.2f]\n", n, 100.0 * area / fmax(full, 1.0), B->live ? "used" : "not used", gath, 2.0 * area, gshare);
             free(death); free(cnt);
             if (!B->live) { free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
                             B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL; }
+            else if (!ENV_ON("BRISK_NOSYMG")) {
+                /* 5.12, the symmetric gather (solver.c): the upper triangle in the permuted order, in
+                 * the same column-and-constraint order. BRISK_NOSYMG=1: the full entries as before.
+                 * Built for every live block: the single-precision row products of the early
+                 * iterations always take it (their products cost half, so halving the gather pays:
+                 * box (4,8) of a user's set, assembly 13.3 -> 10.5 s); in double precision only from
+                 * the gather share g_symg_min (symg) */
+                B->symg = gshare >= g_symg_min || ENV_ON("BRISK_SYMG");
+                size_t fu = 0;
+                for (int q = 0; q < n; q++) for (int t = B->lv_cp[q]; t < B->lv_cp[q + 1]; t++) fu += B->lv_cr[t] <= q;
+                B->lu_cp = xcalloc((size_t)n + 1, sizeof(int));
+                B->lu_ca = xmalloc(sizeof(int) * (fu + 1)); B->lu_cr = xmalloc(sizeof(int) * (fu + 1));
+                B->lu_ch = xmalloc(sizeof(int) * (fu + 1)); B->lu_cv = xmalloc(sizeof(double) * (fu + 1));
+                size_t w = 0;
+                for (int q = 0; q < n; q++) {
+                    B->lu_cp[q] = (int)w;
+                    for (int t = B->lv_cp[q]; t < B->lv_cp[q + 1]; t++) {
+                        if (B->lv_cr[t] > q) continue;
+                        B->lu_ca[w] = B->lv_ca[t]; B->lu_cr[w] = B->lv_cr[t];
+                        B->lu_cv[w] = B->lv_cr[t] == q ? 0.5 * B->lv_cv[t] : B->lv_cv[t];
+                        w++;
+                    }
+                }
+                B->lu_cp[n] = (int)w;
+                for (int q = 0; q < n; q++) {
+                    int hmax = 0;
+                    for (int t = B->lu_cp[q + 1] - 1; t >= B->lu_cp[q]; t--) { if (B->lu_cr[t] + 1 > hmax) hmax = B->lu_cr[t] + 1; B->lu_ch[t] = hmax; }
+                }
+            }
         }
     }
 
@@ -874,6 +962,8 @@ void problem_prepare(Problem *P, const Params *par) {
     for (int k = 0; k < P->nblk; k++) spsym_scale(&P->blk[k].C, 1.0 / P->cs);
     P->scaled = 1;
 
+    g_fact_ref = par->c_blas * (double)m * m * m / 3.0;
+    if (g_symg_min < 0) { const char *e = getenv("BRISK_SYMGMIN"); g_symg_min = e ? atof(e) : 0.3; }
     for (int k = 0; k < P->nblk; k++) {
         Block *B = &P->blk[k];
         int n = B->n;
@@ -914,10 +1004,12 @@ void block_free_contents(Block *B) {
     free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad);
     free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv); free(B->ffp);
     free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
+    free(B->lu_cp); free(B->lu_ca); free(B->lu_cr); free(B->lu_ch); free(B->lu_cv);
     free(B->lfoff); free(B->lfr); free(B->lfc); free(B->lfv);
     free(B->lr_off); free(B->lr_W); free(B->lr_sig);
     free(B->lp_ptr); free(B->lp_con); free(B->lp_val);
     dict_free(B);
+    class_free(B);
     memset(B, 0, sizeof(*B));
 }
 

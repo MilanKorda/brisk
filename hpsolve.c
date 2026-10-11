@@ -3,7 +3,8 @@
  * the target precision (the "master" data); the interior-point method of hpipm.inc then runs
  * up a ladder of precisions (double, double-double, quad-double, mpx), each level starting
  * from the iterate of the one below and running only while it makes healthy progress.
- * No presolve: the problem is solved as read, and the errors are measured in the working
+ * The presolve (hppre.inc), the reductions of the double pipeline (hpred.inc) and the dual
+ * form are applied in the master precision; the errors are measured in the working
  * precision on the data as read.
  */
 #include "brisk.h"

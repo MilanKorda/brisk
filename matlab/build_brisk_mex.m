@@ -40,7 +40,7 @@ o = p.Results;
 here = fileparts(mfilename('fullpath'));
 src = fullfile(here, '..');
 names = {'problem.c', 'presolve.c', 'postsolve.c', 'dictroute.c', 'chordal.c', 'freeelim.c', ...
-         'dualize.c', 'fom.c', 'mfipm.c', 'lralm.c', 'symred.c', 'symalg.c', 'sparsechol.c', 'dualscale.c', 'ddend.c', 'crossover.c', 'solver.c', 'bound.c', 'boundcert.c', 'hpmp.c', 'hpsolve.c', 'socp.c', 'sedumi.c', 'lpio.c', 'lpsolve.c', 'nd.c', 'main.c'};
+         'dualize.c', 'momaff.c', 'fom.c', 'mfipm.c', 'lralm.c', 'symred.c', 'symalg.c', 'sparsechol.c', 'dualscale.c', 'ddend.c', 'crossover.c', 'solver.c', 'bound.c', 'boundcert.c', 'hpmp.c', 'hpsolve.c', 'socp.c', 'sedumi.c', 'lpio.c', 'lpsolve.c', 'nd.c', 'main.c'};
 files = [cellfun(@(f) fullfile(src, f), names, 'UniformOutput', false), {fullfile(here, 'brisk_mex.c')}];
 for k = 1:numel(files)
     if ~exist(files{k}, 'file'), error('brisk:build', 'missing source file %s', files{k}); end

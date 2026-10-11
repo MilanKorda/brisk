@@ -1,5 +1,74 @@
 # BRISK change log
 
+## Version 1.4 (October 2026)
+
+Faster on large dense blocks and on moment relaxations of polynomial optimization, the same
+result for any thread count, and a thread count that follows the free cores of a busy machine.
+On 121 problems taken from every class of the development benchmark (SDPLIB, Mittelmann's
+benchmark, max-cut and theta families, moment and sum-of-squares relaxations, structural
+design, truss and vibration problems, AC optimal power flow, DIMACS, second-order cone and
+linear programs; four threads, one machine) 1.4 takes 0.76 of 1.3.2's time in the geometric
+mean and 0.46 in total (0.40 of MOSEK 11's in the geometric mean), and solves 119 of the 121
+against 117 (MOSEK: 111). No class is slower: the classes near parity, timed four times, are
+within 3 % of 1.3.2 in their medians. Five problems end with a better status, one (qap9, at
+1.1e-8 against the tolerance 1e-8) with a worse one.
+
+- **Large blocks whose dual matrix stays sparse: dense X, sparse Z.** In max-cut, box-QP and
+  structural-design relaxations the dual matrix Z = C − A'(y) keeps the pattern of the data while
+  X is dense. In the HKM direction the inverse of Z, its products and the dual step length now
+  come from a sparse Cholesky factor of Z under a fill-reducing ordering; X keeps its dense
+  factor. Automatic for blocks of order 200 or more whose factor has at most 0.1 n² nonzeros
+  (`-zsparse`, `-zsparsefill`).
+- **One large block uses all cores, and the result does not depend on how many there are.** The
+  dense Cholesky factorization runs as a task graph of tiles that grow with the order; products
+  and triangular solves with many right-hand sides, the passes over the n² entries of a block,
+  the reduction to tridiagonal form and the dense Schur solves with one right-hand side run on
+  the threads. Every sum is taken in a fixed order, so the iterates are the same bits for any
+  thread count, also when the count changes during a solve (checked at one to four threads and
+  with a count changing from iteration to iteration, on every path:
+  dense, sparse and envelope Schur complements, chordal and symmetry reductions, the first-order,
+  matrix-free, cone, LP, low-rank and high-precision solvers; decisions taken by the clock, such
+  as the time budget of the symmetry search, still depend on the machine's speed and load). With
+  the sparse Z above, at four
+  threads: maxG32 (order 2000) 21.4 → 3.4 s, G40mc 25.9 → 5.9 s, checker_1.5 143 → 21 s,
+  theta12 145 → 76 s, vibra5 506 → 149 s.
+- **Moment relaxations of polynomial optimization.** On a user's benchmark of 72 relaxations of
+  random polynomial problems over a ball, a box and an ellipsoid (four threads), 1.3.2 took
+  1828 s and MOSEK 11 1546 s; 1.4 takes 575 s with fewer iterations than MOSEK (477 against
+  532), all solved to 1e-8. What changed:
+  - the Schur complement of a localizing block is assembled from the much smaller one of its
+    classes of entries (entries that appear in the same constraints with the same values;
+    automatic, `-cls`);
+  - a relaxation whose largest block is a moment matrix with localizing blocks is solved in the
+    self-dual embedding with the NT direction from the centred start X = 0.3 I, Z = I, y = 0
+    (`-hsddir`, `-init 3`);
+  - the Schur complement is assembled in single precision while the residuals are above 1e-3
+    (it was already factored in single precision, with conjugate-gradient refinement), and
+    factored in double precision once the residuals and the gap are below 1e-6;
+  - at the end, a longer last step when the predicted measures meet the tolerance, and the
+    primal residual corrected in the metric of the last iteration with the factor at hand,
+    instead of further iterations;
+  - a relaxation over an ellipsoid is rewritten in coordinates in which the ellipsoid is the
+    unit ball, solved, and its solution mapped back and checked on the problem as given (the
+    user's 24 ellipsoid relaxations: 170 → 139 iterations; MOSEK 162).
+- **The solve stops on the measures it is judged by.** Once the best iterate meets the tolerance
+  in the DIMACS measures from which the status is set, with a factor two to spare, and an
+  iteration does not improve on it, the solve returns it. The loop's own measures are scaled
+  differently (by the 2-norms of b and C instead of the 1-norms) and could keep it iterating at
+  their floor: thetaG51 now takes 14 iterations whatever the last bits of b (13–19 before, with
+  b perturbed by a few units in the last place).
+- **The thread count follows the free cores; `-threads k` is an upper limit.** On Linux the
+  interior-point solve uses fewer threads while other processes occupy its cores, and more again
+  when they are free; a cpuset or a container counts only its own cores. On four cores with
+  three taken, 29 test problems went from 147 to 61 s. `BRISK_NOBUSY=1` keeps exactly k threads.
+- **macOS 15 and later: Accelerate on one thread under BRISK's own.** Accelerate threaded its own
+  calls (200–400 % CPU at `-threads 1`, and different iterates from run to run).
+- **The end of the solve, option by option.** OPTIONS.md names, for each line at the end of the
+  log, the flag that turns it off and how it is given in each interface; the texts of
+  `nopolish`, `nopolishr` and `nopolishx` corrected.
+- **Fixed:** on large problems under a memory limit (`ulimit -v`) a segmentation fault where
+  "out of memory" was meant.
+
 ## Version 1.3.2 (October 2026)
 
 - **A point that missed the tolerance has its primal feasibility restored in the square-root

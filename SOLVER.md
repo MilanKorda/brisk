@@ -1,4 +1,4 @@
-# BRISK 1.3.2: the solver in detail
+# BRISK 1.4: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -8,7 +8,7 @@ BRISK solves block-diagonal semidefinite programs with LP blocks:
 
 It reads SDPA sparse files (`.dat-s`), so SDPLIB and Mittelmann's instances run unchanged.
 It can also be called from Python/CVXPY, Julia/JuMP and MATLAB/Octave. All interfaces run the
-same C code (about 28 000 lines on BLAS/LAPACK).
+same C code (about 46,000 lines on BLAS/LAPACK).
 
 **Installation: see [INSTALL.md](INSTALL.md).** In short: `make && ./brisk examples/theta1.dat-s`.
 
@@ -99,10 +99,13 @@ option strings `"-acc", "high"`; what was already asked for is not advised again
 | 15 | time limit |
 | 1 / 2 | usage / input error |
 
-**Threads:** `-threads k` or `OMP_NUM_THREADS` (default: all cores). With the default count,
-tiny problems run on one thread, and on Linux the interior-point solve uses only the cores
-that are free when it starts (`-v` shows the choice). With a fixed count on a machine where
-other processes occupy cores, use fewer threads or `OMP_WAIT_POLICY=passive`.
+**Threads:** `-threads k` or `OMP_NUM_THREADS` (default: all cores), an upper limit. Tiny
+problems run on one thread, and on Linux the interior-point solve uses fewer threads while other
+processes occupy the cores it may use, and more again when they are free (`-v` shows the
+changes; `BRISK_NOBUSY=1` keeps the count exactly as asked). On macOS, with a machine where
+other processes occupy cores, use fewer threads or `OMP_WAIT_POLICY=passive`. The BLAS runs on
+one thread under BRISK's own (OpenBLAS; Accelerate from macOS 15 on, earlier set
+`VECLIB_MAXIMUM_THREADS=1`).
 
 **Ctrl-C** stops the solve and returns the current point. Pressing it twice aborts.
 
@@ -121,11 +124,24 @@ Every automatic choice below can be overridden from the command line.
   - Each method is the other's fallback, and a result that misses 1e-6 on the original data
     is re-solved with the other one.
   - `-hsd` / `-nohsd` force one method.
+  - The solve stops once the best iterate meets the tolerance, with a factor two to spare, in
+    the DIMACS errors the status is set from, and an iteration does not improve on it.
 - **Direction.** HKM or NT: NT where its extra dense work is cheap next to the Schur
-  factorization, HKM otherwise (`-dir`).
+  factorization, HKM otherwise (`-dir`). In the embedding: NT on moment relaxations as given
+  (the largest block a moment matrix, localizing blocks, no LP part or free variables), with the
+  centred start 0.3 I, I (`-hsddir`, `-init 3`), and on the chordal moment form.
+- **Large blocks with a sparse dual matrix.** With HKM, an SDP block of order ≥ 200 whose Z
+  keeps a sparse pattern (max-cut, box-QP, structural design) gets Z⁻¹, its products and the
+  dual step length from a sparse Cholesky factor of Z with at most 0.1 n² nonzeros; X stays
+  dense (`-zsparse`, `-zsparsefill`). One large block uses all cores (a task-graph Cholesky,
+  threaded products and solves) with the same bits for any thread count.
 - **Schur complement.** Assembled by fused sparse kernels, row products, dense BLAS-3, a
-  low-rank route or a dictionary route, chosen by a cost model. It is factored dense (mixed
-  precision), by envelope, or by a supernodal sparse Cholesky.
+  low-rank route, a dictionary route or an entry-class route (localizing matrices of moment
+  relaxations), chosen by a cost model. It is factored dense (mixed
+  precision: factored in single precision far from the solution, with conjugate-gradient
+  refinement, where the self-dual embedding also forms its large products in single precision;
+  in double precision once the residuals and the gap are below 1e-6), by envelope, or by a
+  supernodal sparse Cholesky.
 - **Presolve:**
   - facial reduction;
   - sign and permutation symmetry reduction (`-sym none` turns it off);
@@ -137,6 +153,9 @@ Every automatic choice below can be overridden from the command line.
     `-symalg 0` turns it off, `-symalg 1` checks every block;
   - elimination of split free variables;
   - the dual form, when it has at most half the rows;
+  - a moment relaxation (order ≥ 3) over an ellipsoid is solved in coordinates in which the
+    ellipsoid is the unit ball, and its solution mapped back and measured on the problem as
+    given;
   - chordal decomposition, when it lowers the cost per iteration.
 - **Problems too large for the Schur complement.** The first-order engine (an ADMM/
   Douglas–Rachford splitting with Anderson acceleration, then an augmented Lagrangian with
@@ -154,9 +173,12 @@ Every automatic choice below can be overridden from the command line.
 - **The matrix-free method first.** On problems with one to four dense blocks of order 100 or
   more that the presolve leaves unchanged and whose Schur factorization is estimated at 3.5
   times a matrix-free solve or more — at least equal when every constraint has an entry in an
-  LP block — (truss topology problems, SOS relaxations with a low-rank Gram matrix), the matrix-free interior-point method (`-mfipm 1` below) runs first. The
+  LP block — (truss topology problems, SOS relaxations with a low-rank Gram matrix; not moment
+  relaxations with localizing blocks), the matrix-free interior-point method (`-mfipm 1` below) runs first. The
   attempt is stopped when a solve away from the optimum needs more CG steps than a sixth of
-  one factorization costs, or after a quarter of the standard solve's work; unless it ends
+  one factorization costs, when the steps of a solve grow geometrically (three times the last
+  iteration's, or the next solve past that bound at the same growth), or after a quarter of
+  the standard solve's work; unless it ends
   OPTIMAL the standard method follows (from the attempt's iterate of merit 1e-3 if it got that far). `-mftry 0` turns this off. The attempt is also made when the dense Schur complement does
   not fit in memory: the first-order engine is then the fallback and a result at reduced
   accuracy is kept; when neither the Schur complement nor the engine's factor of A A' fits,
@@ -222,9 +244,12 @@ Every automatic choice below can be overridden from the command line.
 
 ## Reproducibility
 
-For a given build, thread count and BLAS library a run is deterministic: no decision depends on
-timings or on random seeds, and the threaded loops give the same result for any schedule. Two
-things outside BRISK can still make two runs differ:
+For a given build and BLAS library a run gives the same bits for any thread count: the threaded
+loops add their parts in an order fixed by the data and by fixed sizes, never by the number of
+threads or the schedule, and no random seed varies. A few decisions are taken by the clock, so a
+run on a loaded or slower machine can take another path: the budget of the symmetry search, the
+time allowed to the automatic matrix-free attempt, the first-order engine's stall caps, and a
+time limit. Two things outside BRISK can make two runs differ:
 
 - **A BLAS whose threaded rounding varies from run to run** (reported with macOS/Accelerate). The
   differences start at the level of a rounding error, and the single-precision Schur
@@ -232,7 +257,7 @@ things outside BRISK can still make two runs differ:
   iterates; the result is the same to the tolerance, the iteration count can change by a few.
   `-mixed 0` (`mixed = 0`) keeps every factorization in double; one BLAS thread
   (`VECLIB_MAXIMUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`) removes the source.
-- **A different thread count or BLAS**: other rounding, same remarks.
+- **A different BLAS** (or another build of BRISK): other rounding, same remarks.
 
 ## Files
 

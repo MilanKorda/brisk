@@ -422,6 +422,7 @@ double dict_build(Block *B, const Params *par) {
     Params pv = *par;
     pv.lowrank = 0;                                          /* P is singular: no factor-based route */
     pv.dict = 0;
+    pv.cls = 0;
     double cost_vb = analyze_sdp_block(vb, &pv);
     B->vb = vb;
     B->dV = V;
@@ -431,4 +432,141 @@ double dict_build(Block *B, const Params *par) {
     double nd = n;
     double form = par->c_blas * 2.0 * (nd * nd * nv + nd * (double)nv * nv) + par->c_sparse * (double)qd * qd;
     return cost_vb + form;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Entry-class route.
+ *
+ * Two entries of the block are in the same class when they appear in the same constraints
+ * with the same values. With B_k the 0/1 indicator of class k (both triangles) and G_tk the
+ * value of constraint t on class k,
+ *     A_t = sum_k G_tk B_k,    <A_s, X A_t Zi> = (G M_K G')_st,    (M_K)_kl = <B_k, X B_l Zi>,
+ * so the K x K Schur matrix M_K of a virtual block holding the B_k is assembled by the ordinary
+ * routes and then mapped through G (solver.c, schur_cls). Localizing matrices of moment
+ * relaxations are the case in point: the entry (beta, beta') of the localizing matrix of g,
+ * sum_gamma g_gamma y_{beta+beta'+gamma}, is in the class of beta+beta', so K is the number of
+ * moments of degree 2d - deg g against m of degree 2d, and every class is in |supp g|
+ * constraints (ball and ellipsoid constraints in 6 variables at order 5: K = 3003 against
+ * m = 8007, 7 constraints a class).
+ * ---------------------------------------------------------------------------------------- */
+typedef struct { size_t pos; int t; double v; } CTrip;
+static int cmp_ctrip(const void *a, const void *b) {
+    const CTrip *x = a, *y = b;
+    if (x->pos != y->pos) return x->pos < y->pos ? -1 : 1;
+    return (x->t > y->t) - (x->t < y->t);
+}
+static uint64_t sig_hash(const CTrip *E, int len) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int q = 0; q < len; q++) {
+        uint64_t u; double v = E[q].v + 0.0; memcpy(&u, &v, 8);
+        h = (h ^ (uint64_t)E[q].t) * 1099511628211ULL; h = (h ^ u) * 1099511628211ULL;
+    }
+    return h;
+}
+static int sig_eq(const CTrip *A, int la, const CTrip *B, int lb) {
+    if (la != lb) return 0;
+    for (int q = 0; q < la; q++) if (A[q].t != B[q].t || A[q].v != B[q].v) return 0;
+    return 1;
+}
+
+void class_free(Block *B) {
+    if (B->cb) { block_free_contents(B->cb); free(B->cb); B->cb = NULL; }
+    free(B->cg_ptr); free(B->cg_k); free(B->cg_v);
+    B->cg_ptr = B->cg_k = NULL; B->cg_v = NULL;
+    B->cls = 0;
+}
+
+/* Build the class representation. Returns the estimated per-iteration cost of the route
+ * (cost-model units), or 1e300 if the block does not qualify. */
+double class_build(Block *B, const Params *par) {
+    const int n = B->n, nc = B->ncon;
+    if (par->cls == 0 || B->type != BLK_SDP || nc < 2) return 1e300;
+    size_t P = 0;
+    for (int t = 0; t < nc; t++) P += (size_t)B->A[t].nnz;
+    /* an entry in one constraint on average: the classes are at least the constraints */
+    if ((double)P < 1.5 * 0.5 * ((double)B->unf + n) || P >= ((size_t)1 << 31)) return 1e300;
+    CTrip *E = xm(sizeof(CTrip) * P);
+    size_t e = 0;
+    for (int t = 0; t < nc; t++) {
+        const SpSym *S = &B->A[t];
+        for (int q = 0; q < S->nnz; q++) E[e++] = (CTrip){ (size_t)S->row[q] * n + (size_t)S->col[q], t, S->val[q] };
+    }
+    qsort(E, P, sizeof(CTrip), cmp_ctrip);
+    /* entries: runs of equal pos */
+    size_t ne = 0;
+    for (size_t q = 0; q < P; q++) if (q == 0 || E[q].pos != E[q - 1].pos) ne++;
+    size_t *est = xm(sizeof(size_t) * (ne + 1));
+    ne = 0;
+    for (size_t q = 0; q < P; q++) if (q == 0 || E[q].pos != E[q - 1].pos) est[ne++] = q;
+    est[ne] = P;
+    /* classes by hashed signature, exact comparison against the representative */
+    size_t hs = 1; while (hs < 2 * ne + 2) hs <<= 1;
+    int *tab = xm(sizeof(int) * hs);
+    for (size_t i = 0; i < hs; i++) tab[i] = -1;
+    int *ecl = xm(sizeof(int) * (ne + 1)), *rep = xm(sizeof(int) * (ne + 1)), K = 0;
+    for (size_t i = 0; i < ne; i++) {
+        const CTrip *Si = E + est[i]; const int li = (int)(est[i + 1] - est[i]);
+        size_t h = (size_t)(sig_hash(Si, li) & (uint64_t)(hs - 1));
+        int k = -1;
+        while (tab[h] >= 0) {
+            const int r = rep[tab[h]];
+            if (sig_eq(E + est[r], (int)(est[r + 1] - est[r]), Si, li)) { k = tab[h]; break; }
+            h = (h + 1) & (hs - 1);
+        }
+        if (k < 0) { k = K++; rep[k] = (int)i; tab[h] = k; }
+        ecl[i] = k;
+    }
+    free(tab);
+    /* (auto: the K x K core at most a tenth of the memory) */
+    if (par->cls < 0 ? (K > 0.8 * nc || 8.0 * K * K > 0.1 * brisk_mem_limit()) : K >= nc) { free(E); free(est); free(ecl); free(rep); return 1e300; }
+    /* G by constraint */
+    int *gp = xc((size_t)nc + 2, sizeof(int));
+    size_t gnz = 0;
+    for (int k = 0; k < K; k++) {
+        const int r = rep[k];
+        for (size_t q = est[r]; q < est[r + 1]; q++) gp[E[q].t + 2]++;
+        gnz += est[r + 1] - est[r];
+    }
+    for (int t = 0; t < nc; t++) gp[t + 2] += gp[t + 1];
+    int *gk = xm(sizeof(int) * (gnz + 1));
+    double *gv = xm(sizeof(double) * (gnz + 1));
+    for (int k = 0; k < K; k++) {                           /* classes ascending within a row */
+        const int r = rep[k];
+        for (size_t q = est[r]; q < est[r + 1]; q++) { const int w = gp[E[q].t + 1]++; gk[w] = k; gv[w] = E[q].v; }
+    }
+    /* the virtual block: constraint k is the indicator of class k */
+    int *cnt = xc((size_t)K + 1, sizeof(int));
+    for (size_t i = 0; i < ne; i++) cnt[ecl[i]]++;
+    SpSym *SS = xc((size_t)K, sizeof(SpSym));
+    for (int k = 0; k < K; k++) {
+        SS[k].row = xm(sizeof(int) * cnt[k]); SS[k].col = xm(sizeof(int) * cnt[k]); SS[k].val = xm(sizeof(double) * cnt[k]);
+    }
+    for (size_t i = 0; i < ne; i++) {                       /* entries by row, then column (as read) */
+        SpSym *S = &SS[ecl[i]];
+        const size_t pos = E[est[i]].pos;
+        S->row[S->nnz] = (int)(pos / n); S->col[S->nnz] = (int)(pos % n); S->val[S->nnz] = 1.0; S->nnz++;
+    }
+    for (int k = 0; k < K; k++) spsym_finish(&SS[k], n, 0);
+    free(cnt); free(E); free(est); free(ecl); free(rep);
+    Block *cb = xc(1, sizeof(Block));
+    cb->type = BLK_SDP;
+    cb->n = n;
+    cb->ncon = K;
+    cb->con = xm(sizeof(int) * (K + 1));
+    for (int k = 0; k < K; k++) cb->con[k] = k;
+    cb->A = SS;
+    cb->C.nnz = 0;
+    cb->C.row = xm(sizeof(int)); cb->C.col = xm(sizeof(int)); cb->C.val = xm(sizeof(double));
+    spsym_finish(&cb->C, n, 0);
+    Params pv = *par;
+    pv.lowrank = 0; pv.dict = 0; pv.cls = 0;
+    pv.dense_mem = 0;                                        /* no dense copies: the core uses the block's buffers */
+    double cost_cb = analyze_sdp_block(cb, &pv);
+    class_free(B);
+    B->cb = cb; B->cg_ptr = gp; B->cg_k = gk; B->cg_v = gv;
+    /* the map G M_K G': a column of M_K G' (K per class entry of the row, streamed), then
+     * the lower part of the column of G (M_K G') (a gather from it per entry of G) */
+    const double map = par->c_blas * 4.0 * (double)K * gnz + 0.5 * par->c_sparse * (double)nc * gnz;
+    if (getenv("BRISK_CLSDBG")) printf("   [block n %d: %d constraints, %d entry classes, %zu class memberships; core cost %.3g, map %.3g]\n", n, nc, K, gnz, cost_cb, map);
+    return cost_cb + map;
 }

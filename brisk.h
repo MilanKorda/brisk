@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.3.2"
+#define BRISK_VERSION "1.4"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -95,7 +95,7 @@ typedef struct Block {
     int *con;            /* their ids, ascending */
     SpSym *A;            /* matrices, parallel to con */
     SpSym C;
-    unsigned char *route;/* Schur route per constraint: 0 sparse-sparse, 1 row-product, 2 dense BLAS3 */
+    unsigned char *route;/* Schur route per constraint: 0 sparse-sparse, 1 row-product, 2 dense BLAS3, 3 row-product on the union pattern */
     double asm_cost;     /* estimated work of the block's Schur assembly by the chosen routes, in BLAS-3 flops (0 for the low-rank route) */
     int nd, ns;          /* number of dense / sparse constraints */
     int *dlist, *slist;  /* positions (into con/A) of dense and sparse constraints */
@@ -117,6 +117,11 @@ typedef struct Block {
      * sorted by constraint (lv_ca: position in slist, lv_cr: permuted row, lv_ch: one more than
      * the largest row from this entry to the end of the column) */
     int live; int *lv_perm, *lv_rank, *lv_u, *lv_cp, *lv_ca, *lv_cr, *lv_ch; double *lv_cv;
+    /* 5.12: the same for the upper triangle in the permuted order (row <= column), diagonal
+     * values halved: read from X A_a Zi + Zi A_a X (the symmetric gather; NULL when not used) */
+    int *lu_cp, *lu_ca, *lu_cr, *lu_ch; double *lu_cv;
+    int symg;            /* 5.12: the symmetric gather in double precision too (by the gather's share; single-precision
+                          * row products always take it when lu_cp is there) */
     int prod_route;      /* Zi*(A'y)*R: 0 row-subset, 1 sparse-left, 2 dense */
     /* low-rank Schur route (whole block): A_t = W_t diag(sig_t) W_t' */
     int lowrank;
@@ -131,6 +136,12 @@ typedef struct Block {
     double *dV;          /* n x dnv dense columns */
     struct Block *vb;    /* virtual q x q block holding the S_t (q = dnu + dnv) */
     int dstruct;         /* constraints represented through dense columns */
+    /* entry-class route (whole block): A_t = sum_k G_tk B_k with B_k the 0/1 indicator of a class
+     * of entries that appear in the same constraints with the same values (dictroute.c) */
+    int cls;             /* route selected */
+    struct Block *cb;    /* virtual block holding the B_k (its constraint k is class k) */
+    int *cg_ptr, *cg_k;  /* G by constraint (ncon + 1 offsets): classes ... */
+    double *cg_v;        /* ... and values */
     /* LP: coefficient lists by variable (CSC) */
     int *lp_ptr, *lp_con;
     double *lp_val;
@@ -180,6 +191,7 @@ typedef struct {
     double gamma_max;    /* step-length factor: gamma = 0.9 + (gamma_max - 0.9) * min predictor step */
     int stall_win;       /* stop after this many non-improving iterations once below 1e-6 */
     int dict;            /* dictionary (shared-vector) Schur route: -1 auto, 0 off, 1 force */
+    int cls;             /* entry-class Schur route: -1 auto, 0 off, 1 force (where the classes are fewer than the constraints) */
     int sparse_schur;    /* envelope (sparse) Schur complement: -1 auto, 0 off, 1 force */
     int hsd_sig;         /* sigma-search candidates (the corrector family is affine in sigma) */
     double hsd_pshrink;
@@ -215,6 +227,8 @@ typedef struct {
     int dual_gstart;     /* dual method: Gershgorin diagonal start when the diagonal is in range */
     int dual_corr_auto;  /* dual method: fewer correctors when Z^{-1} costs as much as the Schur matrix */
     int dual_sparse_n;   /* dual method: sparse Cholesky of Z for SDP blocks at least this large (0: off) */
+    int zsparse_n;       /* 5.12 HKM iteration: sparse Cholesky of Z (dense X) for SDP blocks at least this large whose Z factors with little fill (0: off) */
+    double zsparse_fill; /* ... when nnz(L) <= this * n^2 */
     int dual_verify_n;   /* dual method: blocks this large verify certificates only now and then */
     double dual_tau_ub;  /* dual method: with a bound, mu may go below gap/(rho n) down to this decrement */
     double dual_tau_nb;  /* dual method: decrement target while no bound is certified */      /* dual method: reduce mu without a certificate (old heuristic) */       /* dual method: corrector steps per Schur factorization */         /* dual method: potential line search over several step lengths */     /* dual method: 1 adaptive long step (decrement), 0 potential reduction */   /* dual method phase 1: weight of r in b'y - Gamma r */   /* dual method: Newton-decrement targets (short / long step) */     /* iterations without a certificate before falling back */
@@ -314,7 +328,7 @@ typedef struct {
     double mf_cgtol_min, mf_cgtol_max;   /* 4.34: ... CG tolerance clamp(1e-2 mu/mu0, min, max) (1e-10, 1e-3) */
     int mf_diag;         /* 4.35: base of the preconditioner: 0 the handoff's tau^2 diag(A(D x D)A*), 1 the exact diagonal of M */
     int mf_warm;         /* 4.35: corrector CG started from the predictor's solution (1) */
-    int fom_ssn_stall;   /* 4.35: phase II gives up after this many outer steps without a 20% improvement (3; 0 never) */
+    int fom_ssn_stall;   /* 4.35: phase II gives up after this many outer steps without a 20% improvement (6; 0 never) */
     int fom_aadr;        /* 4.35: Anderson acceleration on the Douglas-Rachford variable (half the state; step 1) */
     double fom_single;   /* 4.37: projections in single precision while the residual is above this (1e-4; 0: never) */
     double fom_sigma0;   /* 4.35: starting penalty of the splitting phase when adaptive (1) */
@@ -404,6 +418,8 @@ int  dual_solve(Problem *P, const Params *par, Result *R, double *yout, double *
 int  fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);   /* 4.31 fom.c */
 void brisk_log_threads(int verbose);   /* (solver.c) the log line "Number of threads: k", once per run */
 void brisk_log_threads_reset(void);
+void brisk_threads_adapt(int verbose);          /* 5.11 (solver.c): the thread count of the next iteration = the free cores */
+const char *brisk_threads_summary(void);        /* 5.11: the summary's words when the count changed or stayed under its limit, else NULL */
 int  brisk_threads_busy(int verbose);   /* 4.42 (solver.c): the busy-machine thread rule; returns the count to restore or -1 */
 /* sparse Cholesky of the Schur complement (sparsechol.c) */
 typedef struct SChol SChol;
@@ -433,6 +449,11 @@ void   schol_set_inplace(SChol *S, int on);
 void   schol_solve(const SChol *S, double *b, double *work);
 void   schol_solve2(const SChol *S, double *b1, double *b2, double *work);
 void   schol_solve_many(const SChol *S, double *Bm, int nrhs, double *work);
+void   schol_solve_rows(const SChol *S, double *T, int ldt, int nrow);   /* 5.12: rows of B as columns of T, fixed chunks */
+void   schol_inverse(const SChol *S, double *Zi, int ldz);              /* 5.12: M^{-1} (full, symmetric) */
+const int *schol_perm(const SChol *S);                 /* perm[new] = old */
+void   schol_lsolve(const SChol *S, double *x);        /* L x = b, permuted ordering */
+void   schol_ltsolve(const SChol *S, double *x);       /* L' x = b, permuted ordering */
 double schol_cost(const SChol *S, double c_narrow, double c_wide);
 void   schol_set_flopcap(double cap);
 double schol_flops(const SChol *S);
@@ -447,6 +468,8 @@ double analyze_sdp_block(Block *B, const Params *par);
 void   block_free_contents(Block *B);
 void   problem_clone(const Problem *P, Problem *Q);   /* 4.30: exact copy of an unprepared problem */
 double dict_build(Block *B, const Params *par);
+double class_build(Block *B, const Params *par);
+void   class_free(Block *B);
 int  dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Params *par,
                 int maxit, double tol, int verbose);
 void   dict_free(Block *B);
@@ -589,6 +612,12 @@ typedef struct {
 PSDual *dualize_apply(Problem *P, int automatic, int verbose);   /* NULL: not applied */
 void dualize_unmap(const PSDual *D, double **Xp, const double *yp, double ***Xo, double *yo);
 void dualize_free(PSDual *D);
+typedef struct MomAff MomAff;      /* momaff.c: a moment relaxation over an ellipsoid in the coordinates of the unit ball */
+MomAff *momaff_apply(Problem *P, int verbose);   /* NULL: not applied */
+void momaff_unmap(const MomAff *R, double **Xp, const double *yp, double ***Xo, double *yo);
+void momaff_free(MomAff *R);
+double momaff_amplification(const MomAff *R);
+extern int g_momaff_off;
 void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose);   /* 4.30 */
 void free_elim_free(PSFreeElim *F);
 void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile);
@@ -715,6 +744,10 @@ void   BL(dsymv_)(const char *, const int *, const double *, const double *, con
                   const double *, const int *, const double *, double *, const int *);
 void   BL(dtrsv_)(const char *, const char *, const char *, const int *, const double *,
                   const int *, double *, const int *);
+void   BL(sgemm_)(const char *, const char *, const int *, const int *, const int *, const float *, const float *, const int *,
+                 const float *, const int *, const float *, float *, const int *);
+void   BL(sgemv_)(const char *, const int *, const int *, const float *, const float *,
+                  const int *, const float *, const int *, const float *, float *, const int *);
 void   BL(strsv_)(const char *, const char *, const char *, const int *, const float *,
                   const int *, float *, const int *);
 void   BL(dtrmv_)(const char *, const char *, const char *, const int *, const double *,
@@ -779,8 +812,20 @@ void pdgemm(const char *ta, const char *tb, const int *m, const int *n, const in
             const double *A, const int *lda, const double *B, const int *ldb, const double *beta, double *C, const int *ldc);
 void pdsymm(const char *side, const char *uplo, const int *m, const int *n, const double *alpha,
             const double *A, const int *lda, const double *B, const int *ldb, const double *beta, double *C, const int *ldc);
+void pdtrsm(const char *side, const char *uplo, const char *ta, const char *diag, const int *m, const int *n,
+            const double *alpha, const double *A, const int *lda, double *B, const int *ldb);     /* 5.12: fixed panels on the threads */
+void pdtrmm(const char *side, const char *uplo, const char *ta, const char *diag, const int *m, const int *n,
+            const double *alpha, const double *A, const int *lda, double *B, const int *ldb);
 int brisk_spotrf(int n, float *A, int lda);
+void brisk_dpotrs1(int n, const double *L, int lda, double *x);
+void brisk_dtrsv1(int trans, int n, const double *L, int lda, double *x);
+int brisk_dpotri_full(int n, double *A, int lda);
+int brisk_dsytrd_low(int n, double *A, int lda, double *d, double *e, double *tau);   /* 5.12: dsytrd "L" on the threads, fixed panels */
+void brisk_spotrs1(int n, const float *L, int lda, float *x);
+void brisk_dpotrsk(int n, int k, const double *L, int lda, double *X, int ldx);   /* 5.12: k right-hand sides, L read once */
+void brisk_spotrsk(int n, int k, const float *L, int lda, float *X, int ldx);
 void brisk_threads_init(void);
+void brisk_threads_restore(void);
 #define XTRI_BASE 8
 /* B (m x nb, ld ldb) := L^{-1} B, L m x m */
 static void xtri_lln(int m, int nb, const double *L, int ldl, double *B, int ldb) {
@@ -934,7 +979,7 @@ static inline void xtrsm(const char *side, const char *uplo, const char *ta, con
     const int m = *m_, n = *n_, left = side[0] == 'L', tr = ta[0] == 'T';
     const int k = left ? m : n;
     if (!g_xtri || k > 64 || uplo[0] != 'L' || diag[0] != 'N' || k <= 0 || (left ? n : m) <= 0) {
-        BL(dtrsm_)(side, uplo, ta, diag, m_, n_, alpha, L, ldl_, B, ldb_);
+        pdtrsm(side, uplo, ta, diag, m_, n_, alpha, L, ldl_, B, ldb_);     /* 5.12: fixed panels on the threads when large */
         return;
     }
     xscale(m, n, *alpha, B, *ldb_);
@@ -946,7 +991,7 @@ static inline void xtrmm(const char *side, const char *uplo, const char *ta, con
     const int m = *m_, n = *n_, left = side[0] == 'L', tr = ta[0] == 'T';
     const int k = left ? m : n;
     if (!g_xtri || k > 64 || uplo[0] != 'L' || diag[0] != 'N' || k <= 0 || (left ? n : m) <= 0 || (!left && tr)) {
-        BL(dtrmm_)(side, uplo, ta, diag, m_, n_, alpha, L, ldl_, B, ldb_);
+        pdtrmm(side, uplo, ta, diag, m_, n_, alpha, L, ldl_, B, ldb_);     /* 5.12: fixed panels on the threads when large */
         return;
     }
     if (left) { if (tr) xtrm_llt(m, n, L, *ldl_, B, *ldb_); else xtrm_lln(m, n, L, *ldl_, B, *ldb_); }

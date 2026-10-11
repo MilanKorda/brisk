@@ -28,6 +28,10 @@
 static const int IONE = 1;
 static const double DONE = 1.0, DZERO = 0.0;
 #define AA_MAX 32
+#define FOP_NCHK 16        /* 5.11: at most this many fixed chunks of the operator A(D) (fop_A2) */
+#define AA_CH 65536        /* 5.11: rows per chunk of the acceleration's dots (fixed: the same bits for any thread count) */
+static double *g_aapart = NULL; static size_t g_aapart_n = 0;
+static double *aa_part(size_t n) { if (n > g_aapart_n) { free(g_aapart); g_aapart = malloc(sizeof(double) * n); g_aapart_n = n; } return g_aapart; }
 static int g_fom_partial = 2;   /* 0 full eig, 1 + dsyevr ranges, 2 + Lanczos */
 double wtime(void);
 
@@ -112,8 +116,9 @@ typedef struct {
     int nb; size_t np;
     int *pb, *pa, *pt;        /* block, dense offset i + j n, transposed offset j + i n (-1: diagonal / LP) */
     size_t *pp; int *pc; double *pv;
-    int nth; double *acc, *acc2;   /* nth x m accumulators (two: fop_A2) */
+    int nth; double *acc, *acc2;   /* nchk x m accumulators (two: fop_A2) */
     int m;
+    int nchk; size_t *pchk;   /* 5.11: A(D) in nchk fixed chunks of positions (pchk[0..nchk]), 1: serial */
 } FOp;
 static FOp *g_fop = NULL;
 static FOp *fop_build(const Problem *P) {
@@ -150,17 +155,31 @@ static FOp *fop_build(const Problem *P) {
     }
     O->pp[np] = e;
     free(cnt);
-#ifdef _OPENMP
-    O->nth = omp_get_max_threads();
-#else
-    O->nth = 1;
-#endif
-    if (O->nth < 1) O->nth = 1;
-    O->acc = O->nth > 1 ? fo_malloc(sizeof(double) * (size_t)O->nth * (O->m + 1)) : NULL;
-    O->acc2 = O->nth > 1 ? fo_malloc(sizeof(double) * (size_t)O->nth * (O->m + 1)) : NULL;
+    /* 5.11: A(D) scatters into K accumulators, one per fixed chunk of positions (equal entries),
+     * summed in chunk order: the same bits for any thread count (the positions were cut by the
+     * thread count). K = entries / (20 m), at most FOP_NCHK, so that the accumulators cost at most
+     * a tenth of the scatter; below two chunks (fewer than 40 entries per row: there A(D) is a
+     * small part of an iteration next to the projections) one serial scatter, as on one thread
+     * before. The choice depends on the problem alone. */
+    O->nth = 1; O->nchk = 1; O->pchk = NULL;
+    { const double kc = (double)e / (20.0 * (O->m > 0 ? O->m : 1));
+      const int K = kc >= FOP_NCHK ? FOP_NCHK : (int)kc;
+      if (np > 20000 && K >= 2 && !getenv("BRISK_FOPSER")) {
+        O->nchk = K; O->nth = K;
+        O->pchk = fo_malloc(sizeof(size_t) * (K + 1));
+        size_t p = 0;
+        for (int c = 0; c <= K; c++) {
+            const size_t target = (size_t)((double)e * c / K);
+            while (p < np && O->pp[p] < target) p++;
+            O->pchk[c] = c == K ? np : p;
+        }
+      } }
+    if (getenv("BRISK_FOPDBG")) printf("   [fop: m %d, positions %zu, entries %zu (%.1f per row), chunks %d]\n", O->m, np, e, (double)e / (O->m > 0 ? O->m : 1), O->nchk);
+    O->acc = O->nchk > 1 ? fo_malloc(sizeof(double) * (size_t)O->nchk * (O->m + 1)) : NULL;
+    O->acc2 = O->nchk > 1 ? fo_malloc(sizeof(double) * (size_t)O->nchk * (O->m + 1)) : NULL;
     return O;
 }
-static void fop_free(FOp *O) { if (!O) return; free(O->pb); free(O->pa); free(O->pt); free(O->pp); free(O->pc); free(O->pv); free(O->acc); free(O->acc2); free(O); }
+static void fop_free(FOp *O) { if (!O) return; free(O->pchk); free(O->pb); free(O->pa); free(O->pt); free(O->pp); free(O->pc); free(O->pv); free(O->acc); free(O->acc2); free(O); }
 /* F_k = sum_i y_i A_i for every block (F[k] full n x n, or n for LP) */
 static void fop_At(const FOp *O, const Problem *P, const double *y, double **F) {
     for (int k = 0; k < O->nb; k++) memset(F[k], 0, sizeof(double) * (P->blk[k].type == BLK_LP ? (size_t)P->blk[k].n : (size_t)P->blk[k].n * P->blk[k].n));
@@ -174,7 +193,7 @@ static void fop_At(const FOp *O, const Problem *P, const double *y, double **F) 
 /* out[c] += scale <A_c, D> (D symmetric, full); with D2: out2[c] += scale2 <A_c, D2> in the same pass */
 static void fop_A2(const FOp *O, double **D, double *out, double scale, double **D2, double *out2, double scale2) {
     const long np = (long)O->np; const int m = O->m;
-    if (O->nth <= 1 || np <= 20000) {
+    if (O->nchk <= 1) {
         for (long p = 0; p < np; p++) {
             const double w = O->pt[p] >= 0 ? 2.0 : 1.0;
             const double v = scale * w * D[O->pb[p]][O->pa[p]], v2 = D2 ? scale2 * w * D2[O->pb[p]][O->pa[p]] : 0.0;
@@ -182,34 +201,32 @@ static void fop_A2(const FOp *O, double **D, double *out, double scale, double *
         }
         return;
     }
-    /* 4.39: both matrices in one pass over the operator (two accumulators per thread) */
+    /* 4.39: both matrices in one pass over the operator (two accumulators per chunk) */
+    const int K = O->nchk;
     #pragma omp parallel
     {
-#ifdef _OPENMP
-        const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
-#else
-        const int tid = 0, nt = 1;
-#endif
-        double *a = O->acc + (size_t)tid * (m + 1), *a2 = D2 ? O->acc2 + (size_t)tid * (m + 1) : NULL;
-        memset(a, 0, sizeof(double) * m); if (a2) memset(a2, 0, sizeof(double) * m);
-        if (!D2) {
-            #pragma omp for schedule(static)
-            for (long p = 0; p < np; p++) {
-                const double v = (O->pt[p] >= 0 ? 2.0 : 1.0) * D[O->pb[p]][O->pa[p]];
-                if (v == 0) continue;
-                for (size_t q = O->pp[p]; q < O->pp[p + 1]; q++) a[O->pc[q]] += O->pv[q] * v;
-            }
-        } else {
-            #pragma omp for schedule(static)
-            for (long p = 0; p < np; p++) {
-                const double w = O->pt[p] >= 0 ? 2.0 : 1.0, v = w * D[O->pb[p]][O->pa[p]], v2 = w * D2[O->pb[p]][O->pa[p]];
-                for (size_t q = O->pp[p]; q < O->pp[p + 1]; q++) { const int c = O->pc[q]; a[c] += O->pv[q] * v; a2[c] += O->pv[q] * v2; }
+        #pragma omp for schedule(dynamic, 1)
+        for (int ch = 0; ch < K; ch++) {
+            double *a = O->acc + (size_t)ch * (m + 1), *a2 = D2 ? O->acc2 + (size_t)ch * (m + 1) : NULL;
+            memset(a, 0, sizeof(double) * m); if (a2) memset(a2, 0, sizeof(double) * m);
+            const long p0 = (long)O->pchk[ch], p1 = (long)O->pchk[ch + 1];
+            if (!D2) {
+                for (long p = p0; p < p1; p++) {
+                    const double v = (O->pt[p] >= 0 ? 2.0 : 1.0) * D[O->pb[p]][O->pa[p]];
+                    if (v == 0) continue;
+                    for (size_t q = O->pp[p]; q < O->pp[p + 1]; q++) a[O->pc[q]] += O->pv[q] * v;
+                }
+            } else {
+                for (long p = p0; p < p1; p++) {
+                    const double w = O->pt[p] >= 0 ? 2.0 : 1.0, v = w * D[O->pb[p]][O->pa[p]], v2 = w * D2[O->pb[p]][O->pa[p]];
+                    for (size_t q = O->pp[p]; q < O->pp[p + 1]; q++) { const int c = O->pc[q]; a[c] += O->pv[q] * v; a2[c] += O->pv[q] * v2; }
+                }
             }
         }
         #pragma omp for schedule(static)
         for (int c = 0; c < m; c++) {
-            double s = 0; for (int t = 0; t < nt; t++) s += O->acc[(size_t)t * (m + 1) + c]; out[c] += scale * s;
-            if (D2) { double s2 = 0; for (int t = 0; t < nt; t++) s2 += O->acc2[(size_t)t * (m + 1) + c]; out2[c] += scale2 * s2; }
+            double s = 0; for (int t = 0; t < K; t++) s += O->acc[(size_t)t * (m + 1) + c]; out[c] += scale * s;
+            if (D2) { double s2 = 0; for (int t = 0; t < K; t++) s2 += O->acc2[(size_t)t * (m + 1) + c]; out2[c] += scale2 * s2; }
         }
     }
 }
@@ -947,6 +964,11 @@ static void ssn_jacdiag(FB *f, const Block *B, SB *sb, double *D, double *Q, dou
     BL(dgemm_)("N", "T", &n, &n, &n, &DONE, T, &n, Q, &n, &DZERO, D, &n);      /* D = T Q' */
 }
 
+/* 5.11: per-block partial sums, added in block order after the parallel loop: the same bits for
+ * any thread count and schedule (an OpenMP reduction adds the threads' partials in an order
+ * that depends on both) and the bits of the serial loop */
+static double *g_bpart = NULL; static int g_bpart_n = 0;
+static double *bpart(int n) { if (n > g_bpart_n) { free(g_bpart); g_bpart = fo_malloc(sizeof(double) * n); g_bpart_n = n; } return g_bpart; }
 /* psi, grad and the projections at y: W_k = X_k + sigma (A*y - C)_k; returns psi */
 static double ssn_eval(Problem *P, FB *F, SB *S, int nb, int m, const double *y, double sigma, double *grad, double x2sum) {
     double psi = 0, pos2 = 0;
@@ -954,15 +976,17 @@ static double ssn_eval(Problem *P, FB *F, SB *S, int nb, int m, const double *y,
     double **Wp = fo_malloc(sizeof(double *) * (nb + 1)), **Pp = fo_malloc(sizeof(double *) * (nb + 1));
     for (int k = 0; k < nb; k++) { Wp[k] = F[k].W; Pp[k] = S[k].Pos; }
     fop_At(g_fop, P, y, Wp);
-    #pragma omp parallel for schedule(dynamic) reduction(+:pos2) if (nb > 1)
+    double *bp = bpart(nb);
+    #pragma omp parallel for schedule(dynamic) if (nb > 1)
     for (int k = 0; k < nb; k++) {
         const Block *B = &P->blk[k]; FB *f = &F[k]; const size_t len = fbsz(B);
         fb_addC(B, -1.0, f->W);
         for (size_t i = 0; i < len; i++) f->W[i] = f->X[i] + sigma * f->W[i];
         ssn_eig(f, B, f->W, &S[k]);
         double p2 = 0; for (size_t i = 0; i < len; i++) p2 += S[k].Pos[i] * S[k].Pos[i];
-        pos2 += p2;
+        bp[k] = p2;
     }
+    for (int k = 0; k < nb; k++) pos2 += bp[k];
     fop_A(g_fop, Pp, grad, 1.0);
     free(Wp); free(Pp);
     double by = 0; for (int i = 0; i < m; i++) by += P->b[i] * y[i];
@@ -1514,15 +1538,16 @@ static int aa_apply(AAcc *A, double *gw, int it) {
     double d1[AA_MAX + 1], d2[AA_MAX + 1]; for (int c = 0; c <= AA_MAX; c++) d1[c] = d2[c] = 0;   /* type I: dG_c . dR_h, dR_c . dG_h (+ dG_h . r in d1[na]) */
     /* the history as an N x mem column-major matrix: the dots are one dgemv per thread on its rows
      * (BLAS streams the columns at the memory bandwidth; the loops reached a third of it) */
-    #pragma omp parallel if (N > 200000)
-    {
-#ifdef _OPENMP
-        const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
-#else
-        const int tid = 0, nt = 1;
-#endif
-        const size_t r0 = N * tid / nt, r1 = N * (tid + 1) / nt; const int rows = (int)(r1 - r0);
-        double lr = 0, ld[AA_MAX + 1], l1[AA_MAX + 1], l2[AA_MAX + 1];
+    /* 5.11: fixed row chunks (AA_CH rows; one chunk up to 200,000), their partials summed in chunk
+     * order: the same bits for any thread count (the rows were cut by the thread count and the
+     * threads' partials added in a critical section, in the order they arrived) */
+    const int nchk = N > 200000 ? (int)((N + AA_CH - 1) / AA_CH) : 1;
+    const int nps = 3 * (AA_MAX + 1) + 1;
+    double *cp = aa_part((size_t)nchk * nps);
+    #pragma omp parallel for schedule(dynamic, 1) if (nchk > 1)
+    for (int ch = 0; ch < nchk; ch++) {
+        const size_t r0 = nchk > 1 ? (size_t)ch * AA_CH : 0, r1 = nchk > 1 && r0 + AA_CH < N ? r0 + AA_CH : N; const int rows = (int)(r1 - r0);
+        double lr = 0, *ld = cp + (size_t)ch * nps + 1, *l1 = ld + (AA_MAX + 1), *l2 = l1 + (AA_MAX + 1);
         for (size_t i = r0; i < r1; i++) { const double r = gw[i] - A->w[i]; A->r[i] = r; lr += r * r; }
         if (push && rows > 0) {
             for (size_t i = r0; i < r1; i++) { dGh[i] = gw[i] - A->g[i]; dRh[i] = A->r[i] - A->rlast[i]; }
@@ -1536,8 +1561,11 @@ static int aa_apply(AAcc *A, double *gw, int it) {
             }
         } else for (int c = 0; c <= na; c++) ld[c] = 0;
         if (!(push && rows > 0 && t1)) for (int c = 0; c <= na; c++) l1[c] = l2[c] = 0;
-        #pragma omp critical (aa_dots)
-        { rn2 += lr; for (int c = 0; c <= na; c++) { dots[c] += ld[c]; d1[c] += l1[c]; d2[c] += l2[c]; } }
+        cp[(size_t)ch * nps] = lr;
+    }
+    for (int ch = 0; ch < nchk; ch++) {
+        const double *q = cp + (size_t)ch * nps, *ld = q + 1, *l1 = ld + (AA_MAX + 1), *l2 = l1 + (AA_MAX + 1);
+        rn2 += q[0]; for (int c = 0; c <= na; c++) { dots[c] += ld[c]; d1[c] += l1[c]; d2[c] += l2[c]; }
     }
     const double rn = sqrt(rn2);
     if (A->used && A->rsafe >= 0 && rn > A->rsafe) {
@@ -1588,14 +1616,9 @@ static int aa_apply(AAcc *A, double *gw, int it) {
         }
     }
     /* pass 2: g = g_k, w_{k+1} = g_k - dG gamma (one dgemv per thread on its rows) */
-    #pragma omp parallel if (N > 200000)
-    {
-#ifdef _OPENMP
-        const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
-#else
-        const int tid = 0, nt = 1;
-#endif
-        const size_t r0 = N * tid / nt, r1 = N * (tid + 1) / nt; const int rows = (int)(r1 - r0);
+    #pragma omp parallel for schedule(dynamic, 1) if (nchk > 1)
+    for (int ch = 0; ch < nchk; ch++) {
+        const size_t r0 = nchk > 1 ? (size_t)ch * AA_CH : 0, r1 = nchk > 1 && r0 + AA_CH < N ? r0 + AA_CH : N; const int rows = (int)(r1 - r0);
         if (rows > 0) {
             memcpy(A->g + r0, gw + r0, sizeof(double) * rows);
             if (solved) { const int ldn = (int)N; const double mone = -1.0; BL(dgemv_)("N", &rows, &n, &mone, A->dG + r0, &ldn, gam, &IONE, &DONE, gw + r0, &IONE); }
@@ -1637,20 +1660,24 @@ static void pk_unpack(const Problem *P, double *const *W, const size_t *po, cons
  * A*y - C of every block (the projection loop's AyC); V[k]: n x n scratch per SDP block */
 static double fom_dinf_best(Problem *P, FB *F, const int *bord) {
     const int nb = P->nblk; double s2 = 0;
-    #pragma omp parallel for schedule(dynamic) reduction(+:s2) if (nb > 1)
+    double *bp = bpart(nb);
+    #pragma omp parallel for schedule(dynamic) if (nb > 1)
     for (int kk = 0; kk < nb; kk++) {
+        double sb = 0;
         const int k = bord[kk]; const Block *B = &P->blk[k]; FB *f = &F[k]; const int n = B->n;
         if (B->type == BLK_LP) {
-            for (int i = 0; i < n; i++) { const double v = -f->T[i]; if (f->freev && f->freev[i]) s2 += v * v; else if (v < 0) s2 += v * v; }
-            continue;
+            for (int i = 0; i < n; i++) { const double v = -f->T[i]; if (f->freev && f->freev[i]) sb += v * v; else if (v < 0) sb += v * v; }
+        } else {
+            const size_t len = (size_t)n * n;
+            for (size_t i = 0; i < len; i++) f->V[i] = -f->T[i];
+            int info = 0;
+            BL(dsyevd_)("N", "L", &n, f->V, &n, f->ev, f->work, &f->lwork, f->iwork, &f->liwork, &info);
+            if (info != 0) sb = 1e300;
+            else for (int i = 0; i < n && f->ev[i] < 0; i++) sb += f->ev[i] * f->ev[i];
         }
-        const size_t len = (size_t)n * n;
-        for (size_t i = 0; i < len; i++) f->V[i] = -f->T[i];
-        int info = 0;
-        BL(dsyevd_)("N", "L", &n, f->V, &n, f->ev, f->work, &f->lwork, f->iwork, &f->liwork, &info);
-        if (info != 0) { s2 += 1e300; continue; }
-        for (int i = 0; i < n && f->ev[i] < 0; i++) s2 += f->ev[i] * f->ev[i];
+        bp[kk] = sb;
     }
+    for (int kk = 0; kk < nb; kk++) s2 += bp[kk];
     return sqrt(s2);
 }
 
@@ -1995,7 +2022,8 @@ resume_splitting:
             } else if (x_every <= 1 || it % x_every == 0 || it <= 1) aa_apply(&AD, Wv, it);
             if (aapack) pk_unpack(P, Wa, pko, Wp);
             prof[3] += wtime() - tp0; tp0 = wtime();
-            #pragma omp parallel for schedule(dynamic) reduction(+:rd2,pobj) if (nb > 1)
+            double *bp = bpart(2 * nb);
+            #pragma omp parallel for schedule(dynamic) if (nb > 1)
             for (int kk = 0; kk < nb; kk++) {
                 const int k = bord[kk];
                 const Block *B = &P->blk[k]; FB *f = &F[k]; const size_t len = fbsz(B);
@@ -2004,12 +2032,13 @@ resume_splitting:
                 double r2 = 0;
                 for (size_t i = 0; i < len; i++) { const double v = AyC[i] + f->Z[i]; r2 += v * v; }
                 for (size_t i = 0; i < len; i++) f->X[i] = sigma * f->P[i];
-                rd2 += r2;
-                pobj += fb_Cdot(B, f->X);
+                bp[2 * kk] = r2; bp[2 * kk + 1] = fb_Cdot(B, f->X);
             }
+            for (int kk = 0; kk < nb; kk++) { rd2 += bp[2 * kk]; pobj += bp[2 * kk + 1]; }
         } else {
         fop_At(g_fop, P, y, Ta);
-        #pragma omp parallel for schedule(dynamic) reduction(+:rd2,pobj) if (nb > 1)
+        double *bp = bpart(2 * nb);
+        #pragma omp parallel for schedule(dynamic) if (nb > 1)
         for (int kk = 0; kk < nb; kk++) {
             const int k = bord[kk];
             const Block *B = &P->blk[k]; FB *f = &F[k]; const size_t len = fbsz(B);
@@ -2021,9 +2050,9 @@ resume_splitting:
             double r2 = 0;
             for (size_t i = 0; i < len; i++) { const double v = AyC[i] + f->Z[i]; r2 += v * v; }
             for (size_t i = 0; i < len; i++) f->X[i] = (1.0 - tau) * f->X[i] + tau * sigma * f->P[i];
-            rd2 += r2;
-            pobj += fb_Cdot(B, f->X);
+            bp[2 * kk] = r2; bp[2 * kk + 1] = fb_Cdot(B, f->X);
         }
+        for (int kk = 0; kk < nb; kk++) { rd2 += bp[2 * kk]; pobj += bp[2 * kk + 1]; }
         }
         if (ENV_ON("BRISK_FOMDBG") && it <= 6) {
             /* per-block check of the projection: |Pos Neg|_F / (|Pos| |Neg|) (should be ~1e-15), norms of X, Z, y */

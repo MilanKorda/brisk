@@ -1,6 +1,7 @@
 /* lpsolve.c - a primal-dual interior-point method for linear programs in bounded standard form
  *
- *     min c'x,   A x = b,   0 <= x_j <= u_j   (u_j = +inf: no upper bound; no free variables)
+ *     min c'x,   A x = b,   0 <= x_j <= u_j   (u_j = +inf: no upper bound; the first nfree
+ *                                              columns are free: a proximal term)
  *
  * Mehrotra's predictor-corrector from an infeasible start, with
  *   - upper bounds kept as bounds (x + s = u, multipliers w): the normal equations are

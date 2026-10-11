@@ -72,6 +72,9 @@ struct SChol {
     int *mrp;                        /* per column: first run */
     int run_state;                   /* 0 not analysed, 1 use runs, -1 entry loop */
     double *t2; size_t t2cap;        /* schol_solve2 workspace */
+    long fgen;                       /* 5.12: factorizations so far */
+    double *tinv; long tinv_gen; int tinv_kt, tinv_kt2;   /* (L_TT L_TT')^{-1} of the top (schol_inverse), for factor tinv_gen */
+    double *tl; long tl_gen; int tl_kt, tl_kt2;           /* L_TT, dense lower triangle (the top's solves), for factor tl_gen */
     /* quasi-definite mode: M = L S L' with S = diag(+-1) prescribed per (permuted) column;
      * NULL = ordinary Cholesky */
     signed char *sgn;
@@ -537,8 +540,8 @@ static int schol_order_amd(int m, SAdj *adj, size_t fillcap, int **perm_out, int
  * takes P); same outputs as schol_order */
 __attribute__((unused)) static int schol_symb_perm(int m, SAdj *adj, size_t fillcap, int *P, int **perm_out, int **cpat_len,
                            int ***cpat, double *flops_out, size_t *nnz_out) {
-    int *ip = malloc(sizeof(int) * m), *mark = malloc(sizeof(int) * m), *head = malloc(sizeof(int) * (m + 1)), *nxt = malloc(sizeof(int) * (m + 1));
-    int *plen = malloc(sizeof(int) * m), **pat = calloc(m, sizeof(int *)), *buf = malloc(sizeof(int) * (m + 1));
+    int *ip = sx(sizeof(int) * m), *mark = sx(sizeof(int) * m), *head = sx(sizeof(int) * (m + 1)), *nxt = sx(sizeof(int) * (m + 1));
+    int *plen = sx(sizeof(int) * m), **pat = sx(sizeof(int *) * m), *buf = sx(sizeof(int) * (m + 1));
     for (int j = 0; j < m; j++) { ip[P[j]] = j; mark[j] = -1; head[j] = -1; }
     size_t total = 0;
     double flops = 0;
@@ -553,7 +556,7 @@ __attribute__((unused)) static int schol_symb_perm(int m, SAdj *adj, size_t fill
         total += (size_t)len;
         flops += (double)len * len;
         if (total > fillcap || (g_flopcap > 0 && flops > g_flopcap)) { rc = 1; break; }
-        pat[j] = malloc(sizeof(int) * len);
+        pat[j] = sx(sizeof(int) * len);   /* 5.12: checked (a NULL here crashed tru19 under a memory cap) */
         memcpy(pat[j], buf, sizeof(int) * len);
         plen[j] = len;
         int par = m;
@@ -970,7 +973,7 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
 void schol_free(SChol *S) {
     if (!S) return;
     free(S->perm); free(S->iperm); free(S->cp); free(S->ci); free(S->mcp); free(S->mri); free(S->moff); free(S->mval); free(S->mrun); free(S->mrp); free(S->t2); free(S->sgn); free(S->sw);
-    free(S->acc); free(S->acc2); free(S->head); free(S->next); free(S->mark); free(S->stack);
+    free(S->acc); free(S->acc2); free(S->head); free(S->next); free(S->mark); free(S->stack); free(S->tinv); free(S->tl);
     free(S->ss); free(S->snof); free(S->pbase); free(S->prow); free(S->prp); free(S->pnr);
     if (S->pan != S->pmat) free(S->pan);
     free(S->pmat); free(S->relind); free(S->relidx); free(S->upd); free(S->wrk);
@@ -1934,8 +1937,15 @@ extern void BL(strsm_)(const char *, const char *, const char *, const char *, c
 extern void BL(ssyrk_)(const char *, const char *, const int *, const int *, const float *, const float *, const int *, const float *, float *, const int *);
 extern void BL(sgemm_)(const char *, const char *, const int *, const int *, const int *, const float *, const float *, const int *, const float *, const int *, const float *, float *, const int *);
 /* 4.25: row tiles of the dense (Schur, X, Z) Cholesky: 2048 rows instead of the sparse
- * factor's 512 (fewer OpenBLAS packings; still fixed, so the same bits at any thread count) */
-static int FD_RB = 2048;
+ * factor's 512 (fewer OpenBLAS packings; still fixed, so the same bits at any thread count).
+ * 5.12: 512 again. With 2048 the triangular solve of each panel was one task up to order 2176
+ * and the updates few and long: at four threads order 2000 took 48-63 ms (double) and 26-28 ms
+ * (single) against 27 and 15 ms with 512, slower than at two threads; order 3500 115-130 against
+ * 94 ms, 6910 651 / 338 against 628 / 304 ms; one thread at 6910 about 10 % slower
+ * (bench/dense_5.12/potrf_bench.c, BRISK_FDRB). Below order 1536 the same tiles run on one
+ * thread: the tasks cost more than they share (order 1000: 10.6 ms at four threads, 9.1 at one). */
+static int FD_RB = 512;
+#define FD_PAR_MIN 1536
 static void pd_env(void);
 static int fpanel_tiled_ld(double *P, int nr, int w, int ld, int par) {
     int bad = 0;
@@ -2026,6 +2036,75 @@ static int fpanel_tiled_s(float *P, int nr, int w, int ld, int par) {
     return bad;
 }
 /* returns LAPACK-style info (0 ok, > 0 not positive definite) */
+/* 5.12: the tiled Cholesky as a task graph: column blocks of FB_NB, row groups of FD_RB fixed by
+ * the order (aligned at multiples of FD_RB), one dependence token per (row group, column
+ * block). A column block's factorization starts as soon as its own updates are done, while
+ * the rest of the trailing matrix is still being updated (lookahead without a schedule of its
+ * own); each tile receives its updates in panel order through the chain of its token, so the
+ * result does not depend on the thread count. Called inside a single region. */
+#define FD_DAG(NAME, T, POTRF, TRSM, SYRK, GEMM)                                                     \
+static int NAME(T *A, int n, int ld, int NB, int RB) {                                              \
+    const int nJ = (n + NB - 1) / NB, nG = (n + RB - 1) / RB;                                        \
+    char *tok = calloc((size_t)nG * nJ + 1, 1);                                                      \
+    int bad = 0;                                                                                     \
+    const T one = 1, mone = -1;                                                                      \
+    for (int J = 0; J < nJ; J++) {                                                                   \
+        const int c0 = J * NB, cb = c0 + NB < n ? NB : n - c0, gd = c0 / RB;                         \
+        T *D = A + c0 + (size_t)c0 * ld;                                                             \
+        char *tdj = tok + (size_t)gd * nJ + J; (void)tdj;                                            \
+        _Pragma("omp task depend(inout: tdj[0]) shared(bad)")                                       \
+        { int info = 0; if (!bad) { POTRF("L", &cb, D, &ld, &info); if (info) { _Pragma("omp atomic write") bad = 1; } } } \
+        for (int G = gd; G < nG; G++) {                         /* the column block below its diagonal */ \
+            const int r0 = G == gd ? c0 + cb : G * RB, r1 = (G + 1) * RB < n ? (G + 1) * RB : n;      \
+            if (r0 >= r1) continue;                                                                  \
+            const int rr = r1 - r0;                                                                  \
+            T *B = A + r0 + (size_t)c0 * ld;                                                         \
+            char *tg = tok + (size_t)G * nJ + J; (void)tg;                                           \
+            if (G == gd) {                                      /* (the diagonal block's own group) */ \
+                _Pragma("omp task depend(inout: tdj[0]) shared(bad)")                               \
+                { if (!bad) TRSM("R", "L", "T", "N", &rr, &cb, &one, D, &ld, B, &ld); }              \
+            } else {                                                                                 \
+                _Pragma("omp task depend(in: tdj[0]) depend(inout: tg[0]) shared(bad)")             \
+                { if (!bad) TRSM("R", "L", "T", "N", &rr, &cb, &one, D, &ld, B, &ld); }              \
+            }                                                                                        \
+        }                                                                                            \
+        for (int K = J + 1; K < nJ; K++) {                      /* the updates of column block K */  \
+            const int k0 = K * NB, kb = k0 + NB < n ? NB : n - k0, gk = k0 / RB;                     \
+            const T *AK = A + k0 + (size_t)c0 * ld;                     /* rows of K in panel J */  \
+            char *tkj = tok + (size_t)gk * nJ + J, *tkk = tok + (size_t)gk * nJ + K; (void)tkj; (void)tkk; \
+            T *DK = A + k0 + (size_t)k0 * ld;                                                        \
+            _Pragma("omp task depend(in: tkj[0]) depend(inout: tkk[0]) shared(bad)")                \
+            { if (!bad) SYRK("L", "N", &kb, &cb, &mone, AK, &ld, &one, DK, &ld); }                   \
+            for (int G = gk; G < nG; G++) {                                                          \
+                const int r0 = G == gk ? k0 + kb : G * RB, r1 = (G + 1) * RB < n ? (G + 1) * RB : n;  \
+                if (r0 >= r1) continue;                                                              \
+                const int rr = r1 - r0;                                                              \
+                const T *AR = A + r0 + (size_t)c0 * ld;                                              \
+                T *CR = A + r0 + (size_t)k0 * ld;                                                    \
+                char *tgj = tok + (size_t)G * nJ + J, *tgk = tok + (size_t)G * nJ + K; (void)tgj; (void)tgk; \
+                _Pragma("omp task depend(in: tgj[0], tkj[0]) depend(inout: tgk[0]) shared(bad)")    \
+                { if (!bad) GEMM("N", "T", &rr, &kb, &cb, &mone, AR, &ld, AK, &ld, &one, CR, &ld); } \
+            }                                                                                        \
+        }                                                                                            \
+    }                                                                                                \
+    _Pragma("omp taskwait")                                                                          \
+    free(tok);                                                                                       \
+    return bad;                                                                                      \
+}
+FD_DAG(fd_dag_d, double, BL(dpotrf_), BL(dtrsm_), BL(dsyrk_), BL(dgemm_))
+FD_DAG(fd_dag_s, float, BL(spotrf_), BL(strsm_), BL(ssyrk_), BL(sgemm_))
+static int g_fd_dag = -1, g_fd_fixed = 0;
+/* 5.12: the task graph's tiles grow with the order: 128 x 512 below 4500, 192 x 1152 below
+ * 11000, 256 x 1536 above (the inner dimension of the updates is the column block: 128 kept the
+ * double updates at 150 GF/s where dgemm gives 215). They depend on n only: the same bits for any
+ * thread count. Measured on a 4-core Cascade Lake, four threads (bench/dense_5.12/potrf_tiles_cl_T4.txt):
+ * double 150 -> 196 GF/s at n = 14949, 160 -> 185 at 8000; single 305 -> 386 at 14949; below
+ * 4500 the small tiles stay best. BRISK_FNB / BRISK_FDRB (test): fixed tiles for every order. */
+static void fd_tiles(int n, int *nb, int *rb) {
+    if (g_fd_fixed || n < 4500) { *nb = FB_NB; *rb = FD_RB; }
+    else if (n < 11000) { *nb = 192; *rb = 1152; }
+    else { *nb = 256; *rb = 1536; }
+}
 int brisk_dpotrf(int n, double *A, int lda) {
     if (n <= 0) return 0;                      /* 4.25: m = 0 (LAPACK rejects lda = 0) */
     pd_env();
@@ -2035,11 +2114,14 @@ int brisk_dpotrf(int n, double *A, int lda) {
 #ifdef _OPENMP
     nt = omp_in_parallel() ? 1 : omp_get_max_threads();
 #endif
-    if (nt <= 1) return fpanel_tiled_ld(A, n, n, lda, 0);
+    if (n < FD_PAR_MIN) return fpanel_tiled_ld(A, n, n, lda, 0);
+    if (g_fd_dag < 0) g_fd_dag = !ENV_ON("BRISK_FDNODAG");
+    int fnb, frb; fd_tiles(n, &fnb, &frb);
+    if (nt <= 1) return g_fd_dag ? fd_dag_d(A, n, lda, fnb, frb) : fpanel_tiled_ld(A, n, n, lda, 0);   /* (the same tasks, in order: the same bits) */
     int bad = 0;
     #pragma omp parallel
     #pragma omp single
-    bad = fpanel_tiled_ld(A, n, n, lda, 1);
+    bad = g_fd_dag ? fd_dag_d(A, n, lda, fnb, frb) : fpanel_tiled_ld(A, n, n, lda, 1);
     return bad;
 }
 int brisk_spotrf(int n, float *A, int lda) {
@@ -2051,19 +2133,365 @@ int brisk_spotrf(int n, float *A, int lda) {
 #ifdef _OPENMP
     nt = omp_in_parallel() ? 1 : omp_get_max_threads();
 #endif
-    if (nt <= 1) return fpanel_tiled_s(A, n, n, lda, 0);
+    if (n < FD_PAR_MIN) return fpanel_tiled_s(A, n, n, lda, 0);
+    if (g_fd_dag < 0) g_fd_dag = !ENV_ON("BRISK_FDNODAG");
+    int fnb, frb; fd_tiles(n, &fnb, &frb);
+    if (nt <= 1) return g_fd_dag ? fd_dag_s(A, n, lda, fnb, frb) : fpanel_tiled_s(A, n, n, lda, 0);   /* (the same tasks, in order: the same bits) */
     int bad = 0;
     #pragma omp parallel
     #pragma omp single
-    bad = fpanel_tiled_s(A, n, n, lda, 1);
+    bad = g_fd_dag ? fd_dag_s(A, n, lda, fnb, frb) : fpanel_tiled_s(A, n, n, lda, 1);
     return bad;
 }
+/* 5.11 (a user's patch): L L' x = b, one right-hand side, L lower: the dense Schur solves.
+ * OpenBLAS's level-2 solves run on one core (m = 6264: about 19 ms per pair). Here each sweep
+ * goes over panels of FB_NB columns; the rows below a panel go in fixed chunks of PS_RB, summed
+ * in chunk order: the same bits for any thread count (6 threads: 5.6 ms). Below 2 FB_DENSE_MIN
+ * the two level-2 solves (BRISK_TRSV=1: always). Measured on a 4-core host
+ * (bench/threads_5.11/potrs_bench.c): 0.4-0.56 times the two trsv at four threads from n = 3,000,
+ * 1.0-1.2 times on one thread; in the solver 2 % less time per iteration at four threads,
+ * nothing measurable on one (REPORT_5.11 section 3). */
+#define PS_RB 256
+#define BRISK_POTRS1(NAME, T, TRSV, GEMV)                                                     \
+void NAME(int n, const T *L, int lda, T *x) {                                               \
+    if (n < 2 * FB_DENSE_MIN || ENV_ON("BRISK_TRSV")) {                                     \
+        TRSV("L", "N", "N", &n, L, &lda, x, &IONE); TRSV("L", "T", "N", &n, L, &lda, x, &IONE); return; } \
+    const T one = 1, mone = -1, zero = 0;                                                   \
+    T *wk = malloc(sizeof(T) * (size_t)((n + PS_RB - 1) / PS_RB) * FB_NB);                  \
+    _Pragma("omp parallel if (!omp_in_parallel())")                                         \
+    {                                                                                       \
+        for (int j = 0; j < n; j += FB_NB) {                                                \
+            const int w = j + FB_NB < n ? FB_NB : n - j, r0 = j + w, nch = (n - r0 + PS_RB - 1) / PS_RB; \
+            _Pragma("omp single")                                                           \
+            TRSV("L", "N", "N", &w, L + j + (size_t)j * lda, &lda, x + j, &IONE);           \
+            _Pragma("omp for schedule(static)")                                             \
+            for (int c = 0; c < nch; c++) {                                                 \
+                const int a = r0 + c * PS_RB, len = a + PS_RB <= n ? PS_RB : n - a;         \
+                GEMV("N", &len, &w, &mone, L + a + (size_t)j * lda, &lda, x + j, &IONE, &one, x + a, &IONE); \
+            }                                                                               \
+        }                                                                                   \
+        for (int j = (n - 1) / FB_NB * FB_NB; j >= 0; j -= FB_NB) {                         \
+            const int w = j + FB_NB < n ? FB_NB : n - j, r0 = j + w, nch = (n - r0 + PS_RB - 1) / PS_RB; \
+            _Pragma("omp for schedule(static)")                                             \
+            for (int c = 0; c < nch; c++) {                                                 \
+                const int a = r0 + c * PS_RB, len = a + PS_RB <= n ? PS_RB : n - a;         \
+                GEMV("T", &len, &w, &one, L + a + (size_t)j * lda, &lda, x + a, &IONE, &zero, wk + (size_t)c * FB_NB, &IONE); \
+            }                                                                               \
+            _Pragma("omp single")                                                           \
+            {                                                                               \
+                for (int c = 0; c < nch; c++) for (int i = 0; i < w; i++) x[j + i] -= wk[(size_t)c * FB_NB + i]; \
+                TRSV("L", "T", "N", &w, L + j + (size_t)j * lda, &lda, x + j, &IONE);       \
+            }                                                                               \
+        }                                                                                   \
+    }                                                                                       \
+    free(wk);                                                                               \
+}
+BRISK_POTRS1(brisk_dpotrs1, double, BL(dtrsv_), BL(dgemv_))
+/* 5.12: one sweep of the above (trans 0: L x = b, 1: L' x = b), for the Lanczos step lengths on
+ * dense blocks (L^{-1} D L^{-T} v): the same panels and fixed chunks, so the same bits for any
+ * thread count. Below 2 FB_DENSE_MIN, and inside a parallel region, the level-2 solve. */
+void brisk_dtrsv1(int trans, int n, const double *L, int lda, double *x) {
+    if (n < 2 * FB_DENSE_MIN || ENV_ON("BRISK_TRSV")) { BL(dtrsv_)("L", trans ? "T" : "N", "N", &n, L, &lda, x, &IONE); return; }
+    const double one = 1, mone = -1, zero = 0;
+    double *wk = trans ? malloc(sizeof(double) * (size_t)((n + PS_RB - 1) / PS_RB) * FB_NB) : NULL;
+    /* 5.12: the same panels inside a parallel region, on one thread there (it fell back to
+     * dtrsv: other bits than at the top level) */
+    #pragma omp parallel if (!omp_in_parallel())
+    {
+        if (!trans) for (int j = 0; j < n; j += FB_NB) {
+            const int w = j + FB_NB < n ? FB_NB : n - j, r0 = j + w, nch = (n - r0 + PS_RB - 1) / PS_RB;
+            #pragma omp single
+            BL(dtrsv_)("L", "N", "N", &w, L + j + (size_t)j * lda, &lda, x + j, &IONE);
+            #pragma omp for schedule(static)
+            for (int c = 0; c < nch; c++) {
+                const int a = r0 + c * PS_RB, len = a + PS_RB <= n ? PS_RB : n - a;
+                BL(dgemv_)("N", &len, &w, &mone, L + a + (size_t)j * lda, &lda, x + j, &IONE, &one, x + a, &IONE);
+            }
+        }
+        else for (int j = (n - 1) / FB_NB * FB_NB; j >= 0; j -= FB_NB) {
+            const int w = j + FB_NB < n ? FB_NB : n - j, r0 = j + w, nch = (n - r0 + PS_RB - 1) / PS_RB;
+            #pragma omp for schedule(static)
+            for (int c = 0; c < nch; c++) {
+                const int a = r0 + c * PS_RB, len = a + PS_RB <= n ? PS_RB : n - a;
+                BL(dgemv_)("T", &len, &w, &one, L + a + (size_t)j * lda, &lda, x + a, &IONE, &zero, wk + (size_t)c * FB_NB, &IONE);
+            }
+            #pragma omp single
+            {
+                for (int c = 0; c < nch; c++) for (int i = 0; i < w; i++) x[j + i] -= wk[(size_t)c * FB_NB + i];
+                BL(dtrsv_)("L", "T", "N", &w, L + j + (size_t)j * lda, &lda, x + j, &IONE);
+            }
+        }
+    }
+    free(wk);
+}
+BRISK_POTRS1(brisk_spotrs1, float, BL(strsv_), BL(sgemv_))
+/* 5.12: L L' X = B for k right-hand sides (X n x k, leading dimension ldx): the panels and fixed
+ * chunks of brisk_*potrs1 with a product of k columns per chunk, so that L is read once for all the
+ * columns instead of once per column by a level-2 solve on one thread (the Schur solves of the
+ * embedding with two or three right-hand sides). The same bits for any thread count. */
+#define BRISK_POTRSK(NAME, T, TRSM, GEMM, POTRS1)                                             \
+void NAME(int n, int k, const T *L, int lda, T *X, int ldx) {                               \
+    if (k <= 0) return;                                                                     \
+    if (k == 1) { POTRS1(n, L, lda, X); return; }                                           \
+    const T one = 1, mone = -1, zero = 0;                                                   \
+    if (n < 2 * FB_DENSE_MIN || ENV_ON("BRISK_TRSV")) {                                     \
+        TRSM("L", "L", "N", "N", &n, &k, &one, L, &lda, X, &ldx);                           \
+        TRSM("L", "L", "T", "N", &n, &k, &one, L, &lda, X, &ldx); return; }                 \
+    T *wk = malloc(sizeof(T) * (size_t)((n + PS_RB - 1) / PS_RB) * FB_NB * k);              \
+    _Pragma("omp parallel if (!omp_in_parallel())")                                         \
+    {                                                                                       \
+        for (int j = 0; j < n; j += FB_NB) {                                                \
+            const int w = j + FB_NB < n ? FB_NB : n - j, r0 = j + w, nch = (n - r0 + PS_RB - 1) / PS_RB; \
+            _Pragma("omp single")                                                           \
+            TRSM("L", "L", "N", "N", &w, &k, &one, L + j + (size_t)j * lda, &lda, X + j, &ldx); \
+            _Pragma("omp for schedule(static)")                                             \
+            for (int c = 0; c < nch; c++) {                                                 \
+                const int a = r0 + c * PS_RB, len = a + PS_RB <= n ? PS_RB : n - a;         \
+                GEMM("N", "N", &len, &k, &w, &mone, L + a + (size_t)j * lda, &lda, X + j, &ldx, &one, X + a, &ldx); \
+            }                                                                               \
+        }                                                                                   \
+        for (int j = (n - 1) / FB_NB * FB_NB; j >= 0; j -= FB_NB) {                         \
+            const int w = j + FB_NB < n ? FB_NB : n - j, r0 = j + w, nch = (n - r0 + PS_RB - 1) / PS_RB; \
+            _Pragma("omp for schedule(static)")                                             \
+            for (int c = 0; c < nch; c++) {                                                 \
+                const int a = r0 + c * PS_RB, len = a + PS_RB <= n ? PS_RB : n - a;         \
+                GEMM("T", "N", &w, &k, &len, &one, L + a + (size_t)j * lda, &lda, X + a, &ldx, &zero, wk + (size_t)c * FB_NB * k, &w); \
+            }                                                                               \
+            _Pragma("omp single")                                                           \
+            {                                                                               \
+                for (int c = 0; c < nch; c++)                                               \
+                    for (int q = 0; q < k; q++) {                                           \
+                        const T *wc = wk + (size_t)c * FB_NB * k + (size_t)q * w; T *xq = X + j + (size_t)q * ldx; \
+                        for (int i = 0; i < w; i++) xq[i] -= wc[i];                         \
+                    }                                                                       \
+                TRSM("L", "L", "T", "N", &w, &k, &one, L + j + (size_t)j * lda, &lda, X + j, &ldx); \
+            }                                                                               \
+        }                                                                                   \
+    }                                                                                       \
+    free(wk);                                                                               \
+}
+BRISK_POTRSK(brisk_dpotrsk, double, BL(dtrsm_), BL(dgemm_), brisk_dpotrs1)
+BRISK_POTRSK(brisk_spotrsk, float, BL(strsm_), BL(sgemm_), brisk_spotrs1)
+/* 5.12: the full inverse of an SPD matrix from its Cholesky factor (the HKM method's Z^{-1}),
+ * from n = 768 outside parallel regions: column panels of 128, W = L^{-1} by triangular solves of
+ * the identity's panels, then Z^{-1} = W' W by a triangular product per panel, both panel loops
+ * on the threads (each panel by single-threaded BLAS on one thread: the same bits for any thread
+ * count), and the upper triangle copied. LAPACK's dpotri ran on one core: at n = 2000 115 ms
+ * against 44 ms at four threads (141 ms on one; bench/dense_5.12/potri_bench.c); the results
+ * agree to 3e-15 relative. A: the factor in the lower triangle on entry, the full inverse on
+ * exit. Returns LAPACK's info (from dpotri below the threshold). */
+int brisk_dpotri_full(int n, double *A, int lda) {
+    if (n < 768 || omp_in_parallel() || lda != n || ENV_ON("BRISK_POTRI")) {
+        int info;
+        BL(dpotri_)("L", &n, A, &lda, &info);
+        if (info == 0) for (int j = 0; j < n; j++) for (int i = j + 1; i < n; i++) A[j + (size_t)i * lda] = A[i + (size_t)j * lda];
+        return info;
+    }
+    for (int j = 0; j < n; j++) if (!(A[j + (size_t)j * lda] != 0)) return j + 1;
+    static double *W = NULL; static size_t wn = 0;
+    if ((size_t)n * n > wn) { free(W); wn = (size_t)n * n; W = malloc(sizeof(double) * wn); if (!W) { wn = 0; int info; BL(dpotri_)("L", &n, A, &lda, &info); return info; } }
+    const double one = 1.0;
+    const int nb = 128, np = (n + nb - 1) / nb;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < np; p++) {             /* W(j0:, J) = L(j0:, j0:)^{-1} I(j0:, J) */
+        const int j0 = p * nb, nj = j0 + nb < n ? nb : n - j0, r = n - j0;
+        for (int j = j0; j < j0 + nj; j++) { double *w = W + (size_t)j * n; memset(w + j0, 0, sizeof(double) * r); w[j] = 1.0; }
+        BL(dtrsm_)("L", "L", "N", "N", &r, &nj, &one, A + j0 + (size_t)j0 * n, &n, W + j0 + (size_t)j0 * n, &n);
+    }
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < np; p++) {             /* A(j0:, J) = W(j0:, j0:)' W(j0:, J) */
+        const int j0 = p * nb, nj = j0 + nb < n ? nb : n - j0, r = n - j0;
+        for (int j = j0; j < j0 + nj; j++) memcpy(A + j0 + (size_t)j * n, W + j0 + (size_t)j * n, sizeof(double) * r);
+        BL(dtrmm_)("L", "L", "T", "N", &r, &nj, &one, W + j0 + (size_t)j0 * n, &n, A + j0 + (size_t)j0 * n, &n);
+    }
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < n; j++) for (int i = j + 1; i < n; i++) A[j + (size_t)i * n] = A[i + (size_t)j * n];
+    return 0;
+}
+/* 5.12: Householder tridiagonalization of a symmetric matrix (lower triangle), LAPACK's dsytrd
+ * with uplo "L" (the same reflectors, d, e, tau, so that dormtr applies them), with its two costly
+ * parts on the threads: the product of the trailing matrix with each Householder vector (half
+ * of the 4/3 n^3 flops, memory-bound: one thread was 93 ms at n = 1001) in fixed column panels of
+ * equal area whose partial vectors are added in panel order, and the rank-2k update after each
+ * panel of 32 columns in fixed column blocks of 128. The panels and blocks depend on the sizes
+ * only, so the bits do not depend on the thread count. Below order 256 LAPACK's dsytrd. */
+extern void BL(dlarfg_)(const int *, double *, double *, const int *, double *);
+extern void BL(dsytd2_)(const char *, const int *, double *, const int *, double *, double *, double *, int *);
+extern void BL(dsyr2k_)(const char *, const char *, const int *, const int *, const double *, const double *, const int *,
+                        const double *, const int *, const double *, double *, const int *);
+extern void BL(dscal_)(const int *, const double *, double *, const int *);
+#define TRD_NB 32
+#define TRD_NX 128
+#define TRD_PMAX 32
+/* All the functions below run inside one parallel region per tridiagonalization (orphaned
+ * work-sharing): a region per column cost more than the column's work when the caller is itself
+ * in a parallel region (an inactive one, a loop over blocks with one block): libgomp creates the
+ * threads of a nested team anew for each region (swissroll, n = 799: 120 ms a reduction against
+ * 31 ms outside such a loop). */
+/* y = A x for A s x s symmetric (lower, ld lda); buf: TRD_PMAX * s doubles */
+static void trd_symv(int s, const double *A, int lda, const double *x, double *y, double *buf) {
+    const double one = 1.0, zero = 0.0;
+    if (s < 512) {
+        #pragma omp single
+        BL(dsymv_)("L", &s, &one, A, &lda, x, &IONE, &zero, y, &IONE);
+        return;
+    }
+    int P = s / 128; if (P < 4) P = 4; if (P > TRD_PMAX) P = TRD_PMAX;
+    int cut[TRD_PMAX + 1];
+    for (int b = 0; b <= P; b++) cut[b] = (int)(s - s * sqrt(1.0 - (double)b / P) + 0.5);
+    cut[0] = 0; cut[P] = s;
+    #pragma omp for schedule(dynamic, 1)
+    for (int b = 0; b < P; b++) {
+        const int c0 = cut[b], c1 = cut[b + 1], nc = c1 - c0, nr = s - c1;
+        double *w = buf + (size_t)b * s;
+        if (nc <= 0) continue;
+        BL(dsymv_)("L", &nc, &one, A + c0 + (size_t)c0 * lda, &lda, x + c0, &IONE, &zero, w + c0, &IONE);
+        if (nr > 0) {
+            BL(dgemv_)("N", &nr, &nc, &one, A + c1 + (size_t)c0 * lda, &lda, x + c0, &IONE, &zero, w + c1, &IONE);
+            BL(dgemv_)("T", &nr, &nc, &one, A + c1 + (size_t)c0 * lda, &lda, x + c1, &IONE, &one, w + c0, &IONE);
+        }
+    }
+    #pragma omp for schedule(static)
+    for (int i = 0; i < s; i++) {
+        double t = 0;
+        for (int b = 0; b < P && cut[b] <= i; b++) if (cut[b + 1] > cut[b]) t += buf[(size_t)b * s + i];
+        y[i] = t;
+    }
+}
+/* C -= V W' + W V' (lower, s x s), V and W s x k: fixed column blocks of 128 */
+static void trd_syr2k(int s, int k, const double *V, int ldv, const double *W, int ldw, double *C, int ldc) {
+    const double one = 1.0, mone = -1.0;
+    const int nbk = 128, np = (s + nbk - 1) / nbk;
+    #pragma omp for schedule(dynamic, 1)
+    for (int p = 0; p < np; p++) {
+        const int j0 = p * nbk, nj = s - j0 < nbk ? s - j0 : nbk, nr = s - j0 - nj;
+        BL(dsyr2k_)("L", "N", &nj, &k, &mone, V + j0, &ldv, W + j0, &ldw, &one, C + j0 + (size_t)j0 * ldc, &ldc);
+        if (nr > 0) {
+            BL(dgemm_)("N", "T", &nr, &nj, &k, &mone, V + j0 + nj, &ldv, W + j0, &ldw, &one, C + j0 + nj + (size_t)j0 * ldc, &ldc);
+            BL(dgemm_)("N", "T", &nr, &nj, &k, &mone, W + j0 + nj, &ldw, V + j0, &ldv, &one, C + j0 + nj + (size_t)j0 * ldc, &ldc);
+        }
+    }
+}
+/* LAPACK's dlatrd, uplo "L": the first nb columns of the k x k matrix A, W k x nb */
+static void trd_latrd(int k, int nb, double *A, int lda, double *e, double *tau, double *W, int ldw, double *buf) {
+    const double one = 1.0, zero = 0.0, mone = -1.0;
+    for (int i = 0; i < nb; i++) {
+        const int r = k - i;
+        int q = k - i - 1;
+        double *ai = A + (i + 1) + (size_t)i * lda, *wi = W + (i + 1) + (size_t)i * ldw, *wt = W + (size_t)i * ldw;
+        #pragma omp single
+        {
+            if (i > 0) {
+                BL(dgemv_)("N", &r, &i, &mone, A + i, &lda, W + i, &ldw, &one, A + i + (size_t)i * lda, &IONE);
+                BL(dgemv_)("N", &r, &i, &mone, W + i, &ldw, A + i, &lda, &one, A + i + (size_t)i * lda, &IONE);
+            }
+            if (i < k - 1) {
+                BL(dlarfg_)(&q, ai, A + (i + 2 < k ? i + 2 : k - 1) + (size_t)i * lda, &IONE, tau + i);
+                e[i] = ai[0]; ai[0] = 1.0;
+            }
+        }
+        if (i < k - 1) {
+            trd_symv(q, A + (i + 1) + (size_t)(i + 1) * lda, lda, ai, wi, buf);
+            #pragma omp single
+            {
+                if (i > 0) {
+                    BL(dgemv_)("T", &q, &i, &one, W + (i + 1), &ldw, ai, &IONE, &zero, wt, &IONE);
+                    BL(dgemv_)("N", &q, &i, &mone, A + (i + 1), &lda, wt, &IONE, &one, wi, &IONE);
+                    BL(dgemv_)("T", &q, &i, &one, A + (i + 1), &lda, ai, &IONE, &zero, wt, &IONE);
+                    BL(dgemv_)("N", &q, &i, &mone, W + (i + 1), &ldw, wt, &IONE, &one, wi, &IONE);
+                }
+                BL(dscal_)(&q, tau + i, wi, &IONE);
+                const double alpha = -0.5 * tau[i] * BL(ddot_)(&q, wi, &IONE, ai, &IONE);
+                BL(daxpy_)(&q, &alpha, ai, &IONE, wi, &IONE);
+            }
+        }
+    }
+}
+int brisk_dsytrd_low(int n, double *A, int lda, double *d, double *e, double *tau) {
+    int info = 0;
+    if (n < 256) {
+        int lwork = -1; double wq;
+        BL(dsytrd_)("L", &n, A, &lda, d, e, tau, &wq, &lwork, &info);
+        lwork = (int)wq + 1;
+        double *work = malloc(sizeof(double) * (size_t)lwork);
+        BL(dsytrd_)("L", &n, A, &lda, d, e, tau, work, &lwork, &info);
+        free(work);
+        return info;
+    }
+    double *W = malloc(sizeof(double) * (size_t)n * TRD_NB), *buf = malloc(sizeof(double) * (size_t)n * TRD_PMAX);
+    if (!W || !buf) { free(W); free(buf); return -1; }
+    int iend = 0;
+    #pragma omp parallel if (!omp_in_parallel())
+    {
+        int i = 0;
+        for (; i + 1 <= n - TRD_NX; i += TRD_NB) {
+            const int k = n - i;
+            trd_latrd(k, TRD_NB, A + i + (size_t)i * lda, lda, e + i, tau + i, W, k, buf);
+            trd_syr2k(k - TRD_NB, TRD_NB, A + (i + TRD_NB) + (size_t)i * lda, lda, W + TRD_NB, k, A + (i + TRD_NB) + (size_t)(i + TRD_NB) * lda, lda);
+            #pragma omp single
+            for (int j = i; j < i + TRD_NB; j++) { A[(j + 1) + (size_t)j * lda] = e[j]; d[j] = A[j + (size_t)j * lda]; }
+        }
+        #pragma omp single
+        iend = i;
+    }
+    const int nl = n - iend;
+    BL(dsytd2_)("L", &nl, A + iend + (size_t)iend * lda, &lda, d + iend, e + iend, tau + iend, &info);
+    free(W); free(buf);
+    return info;
+}
+
 /* 4.24: BRISK owns the threads: OpenBLAS runs single-threaded (its pthread workers spin
  * next to the OpenMP ones: case14 0.02 -> 0.14 s at 2 threads; its threaded kernels also
  * change the results with the thread count). BRISK_BLASMT=1 keeps OpenBLAS threading. */
+static int blas_T_host = 0;      /* the OpenBLAS thread count found at the first call of a run */
+#ifdef __APPLE__
+/* 5.11 (a user's report, 8 October 2026): on macOS the BLAS is Accelerate, which runs threads of
+ * its own: trto5 at -threads 1 used 200 % of the CPU on an M1 and 400 % on an Intel i9, and on
+ * the M1 the iteration count changed from run to run (its threaded kernels add in an order of
+ * their own). BLASSetThreading (macOS 15; the setting is per thread) asks for one thread:
+ * value 1 (BLAS_THREADING_SINGLE_THREADED of vecLib's thread_api.h; 0 lets Accelerate decide).
+ * Looked up at run time, so that older systems and other BLAS libraries are left as they are;
+ * set on the calling thread and on every OpenMP thread, and the caller's setting is given back
+ * at the end of a library call (BLASGetThreading). Before macOS 15: VECLIB_MAXIMUM_THREADS=1. */
+#include <dlfcn.h>
+static int (*accel_set)(unsigned) = NULL;
+static unsigned (*accel_get)(void) = NULL;
+static int accel_looked = 0;
+static long accel_host = -1;          /* the caller's setting, to give back (-1: none saved) */
+static void accel_single(void) {
+    if (!accel_looked) {
+        accel_looked = 1;
+        accel_set = (int (*)(unsigned))dlsym(RTLD_DEFAULT, "BLASSetThreading");
+        accel_get = (unsigned (*)(void))dlsym(RTLD_DEFAULT, "BLASGetThreading");
+    }
+    if (!accel_set) return;
+    if (accel_get && accel_host < 0) accel_host = (long)accel_get();
+    (void)accel_set(1u);
+    #pragma omp parallel
+    (void)accel_set(1u);
+}
+#endif
 void brisk_threads_init(void) {
     if (getenv("BRISK_BLASMT")) return;
-    if (BL(openblas_set_num_threads)) BL(openblas_set_num_threads)(1);
+#ifdef __APPLE__
+    accel_single();
+#endif
+    if (BL(openblas_set_num_threads)) {
+        if (BL(openblas_get_num_threads) && blas_T_host == 0) { const int t = BL(openblas_get_num_threads)(); if (t > 1) blas_T_host = t; }
+        BL(openblas_set_num_threads)(1);
+    }
+}
+/* Library interfaces: the host gets its OpenBLAS thread count back when the call returns.
+ * A host that shares this OpenBLAS (Python with SciPy and BLAS=scipy, Octave) was left with
+ * one BLAS thread for the rest of the process: scipy dgemm, n = 1500, 0.06 -> 0.13 s on two
+ * cores after the first solve. */
+void brisk_threads_restore(void) {
+#ifdef __APPLE__
+    if (accel_set && accel_host >= 0) (void)accel_set((unsigned)accel_host);
+    accel_host = -1;
+#endif
+    if (blas_T_host > 1 && BL(openblas_set_num_threads)) BL(openblas_set_num_threads)(blas_T_host);
+    blas_T_host = 0;
 }
 
 /* 4.24: tiled dgemm / dsymm for large products, parallel outside parallel regions. The
@@ -2073,53 +2501,250 @@ void brisk_threads_init(void) {
 /* 4.25: 2048 x 512 tiles (1024 x 256 in 4.24 cost 29% against one dgemm at n = 5000 - A was
  * packed once per column tile - and made maxG55/60 10-15% slower than 4.13; now 11%) */
 static int PD_RB = 2048, PD_CB = 512;   /* fixed tiles (BRISK_PDRB, BRISK_PDCB): they define the arithmetic */
+static int pd_cb_fixed = 0;
 static void pd_env(void) {
     static int done = 0;
     if (done) return;
     const char *e;
     if ((e = getenv("BRISK_PDRB"))) PD_RB = atoi(e);
-    if ((e = getenv("BRISK_PDCB"))) PD_CB = atoi(e);
-    if ((e = getenv("BRISK_FNB"))) FB_NB = atoi(e);
-    if ((e = getenv("BRISK_FDRB"))) FD_RB = atoi(e);
+    if ((e = getenv("BRISK_PDCB"))) { PD_CB = atoi(e); pd_cb_fixed = 1; }
+    if ((e = getenv("BRISK_FNB"))) { FB_NB = atoi(e); g_fd_fixed = 1; }
+    if ((e = getenv("BRISK_FDRB"))) { FD_RB = atoi(e); g_fd_fixed = 1; }
     done = 1;
+}
+/* 5.12: the reference tiles and verified fast cuts. The fixed tiles below (pd_ref_*) define the
+ * arithmetic: they depend on the sizes only, so the bits do not depend on the thread count. Two
+ * faster ways give the same bits whenever the BLAS computes every entry the same way wherever
+ * it sits in the cut (OpenBLAS does from order ~1000, not always below): one call on one thread
+ * (the reference tiles pack the large operand once per tile: 17-19 % more at n = 1761 ... 3000)
+ * and one tile per thread otherwise (better balanced than the fixed tiles). Neither is assumed:
+ * for each kind and size at a thread count both ways are computed once on random data of that
+ * size, leading dimensions and alignment (pd_verify), and the fast way is used only if the bits
+ * are the same (OpenBLAS: yes at n = 1000-3000 for every cut on multiples of 16; at n = 500 not
+ * for three tiles). Two extra products per size and thread count; above 256 MB of result no
+ * check (the reference). Side "R" products are cut in row tiles of PD_CB (512) since 5.12: with tiles of
+ * PD_RB (2048) a product of order below 2048 was one tile, on one thread (maxG32: half of the
+ * solve). BRISK_PDFIXED=1: always the reference; BRISK_PDDBG=1: the verdicts. */
+/* 5.12: below 1024 columns the column tiles are 128 wide (were 512: a product of order 462 was one
+ * tile, on one thread; bench/dense_5.12/trsm_blocked.txt). By the size only: the same bits for
+ * any thread count. */
+static inline int pd_cb(int len) { return (len < 1024 && !pd_cb_fixed) ? 128 : PD_CB; }
+static void pd_ref_gemm(const char *ta, const char *tb, int m, int n, const int *k_, const double *alpha, const double *A, int lda,
+                        const double *B, int ldb, const double *beta, double *C, int ldc) {
+    const int tA = ta[0] == 'T' || ta[0] == 't', tB = tb[0] == 'T' || tb[0] == 't';
+    const int CB = pd_cb(n);
+    const int nr = (m + PD_RB - 1) / PD_RB, nc = (n + CB - 1) / CB, nt = nr * nc;
+    #pragma omp parallel for schedule(dynamic, 1) if (!omp_in_parallel() && nt > 1)
+    for (int t = 0; t < nt; t++) {
+        const int i0 = (t % nr) * PD_RB, j0 = (t / nr) * CB;
+        const int mi = m - i0 < PD_RB ? m - i0 : PD_RB, nj = n - j0 < CB ? n - j0 : CB;
+        const double *Ai = tA ? A + (size_t)i0 * lda : A + i0;
+        const double *Bj = tB ? B + j0 : B + (size_t)j0 * ldb;
+        BL(dgemm_)(ta, tb, &mi, &nj, k_, alpha, Ai, &lda, Bj, &ldb, beta, C + i0 + (size_t)j0 * ldc, &ldc);
+    }
+}
+static void pd_ref_symm(const char *side, const char *uplo, int m, int n, const double *alpha, const double *A, const int *lda_,
+                        const double *B, int ldb, const double *beta, double *C, int ldc) {
+    const int left = side[0] == 'L' || side[0] == 'l';
+    const int CB = pd_cb(left ? n : m);
+    const int nt = left ? (n + CB - 1) / CB : (m + CB - 1) / CB;
+    #pragma omp parallel for schedule(dynamic, 1) if (!omp_in_parallel() && nt > 1)
+    for (int t = 0; t < nt; t++) {
+        const int a0 = t * CB, len = (left ? n : m) - a0 < CB ? (left ? n : m) - a0 : CB;
+        if (left) BL(dsymm_)(side, uplo, &m, &len, alpha, A, lda_, B + (size_t)a0 * ldb, &ldb, beta, C + (size_t)a0 * ldc, &ldc);    /* C(:, J) = A B(:, J) */
+        else BL(dsymm_)(side, uplo, &len, &n, alpha, A, lda_, B + a0, &ldb, beta, C + a0, &ldc);                                    /* C(I, :) = B(I, :) A */
+    }
+}
+/* the fast way: one call for T = 1, else T tiles of the longer side (gemm) or of the side the
+ * symm keeps whole (columns for "L", rows for "R"), cut on multiples of 16 */
+static void pd_fast(int symm, const char *a, const char *b, int m, int n, const int *k_, const double *alpha, const double *A, const int *lda_,
+                    const double *B, int ldb, const double *beta, double *C, int ldc, int T) {
+    const int lda = *lda_;
+    const int rows = symm ? !(a[0] == 'L' || a[0] == 'l') : m >= n;
+    if (T <= 1) {
+        if (symm) BL(dsymm_)(a, b, &m, &n, alpha, A, lda_, B, &ldb, beta, C, &ldc);
+        else BL(dgemm_)(a, b, &m, &n, k_, alpha, A, lda_, B, &ldb, beta, C, &ldc);
+        return;
+    }
+    const int tA = !symm && (a[0] == 'T' || a[0] == 't'), tB = !symm && (b[0] == 'T' || b[0] == 't');
+    const int len = rows ? m : n, u = (len + 15) / 16;
+    #pragma omp parallel for schedule(static, 1)
+    for (int t = 0; t < T; t++) {
+        int a0 = (int)((long)u * t / T) * 16, a1 = (int)((long)u * (t + 1) / T) * 16;
+        if (a1 > len) a1 = len;
+        if (a0 >= a1) continue;
+        const int l = a1 - a0;
+        if (symm) {
+            if (rows) BL(dsymm_)(a, b, &l, &n, alpha, A, lda_, B + a0, &ldb, beta, C + a0, &ldc);
+            else BL(dsymm_)(a, b, &m, &l, alpha, A, lda_, B + (size_t)a0 * ldb, &ldb, beta, C + (size_t)a0 * ldc, &ldc);
+        } else {
+            if (rows) BL(dgemm_)(a, b, &l, &n, k_, alpha, tA ? A + (size_t)a0 * lda : A + a0, lda_, B, &ldb, beta, C + a0, &ldc);
+            else BL(dgemm_)(a, b, &m, &l, k_, alpha, A, lda_, tB ? B + a0 : B + (size_t)a0 * ldb, &ldb, beta, C + (size_t)a0 * ldc, &ldc);
+        }
+    }
+}
+#define PD_NV 64
+static struct { int kind, m, n, k, T; signed char ok; } pd_ver[PD_NV];
+static int pd_nver = 0;
+/* -1 unknown, 0 the reference, 1 the fast way (for this kind, size and thread count) */
+static int pd_lookup(int kind, int m, int n, int k, int T) {
+    for (int i = 0; i < pd_nver; i++)
+        if (pd_ver[i].kind == kind && pd_ver[i].m == m && pd_ver[i].n == n && pd_ver[i].k == k && pd_ver[i].T == T) return pd_ver[i].ok;
+    return -1;
+}
+/* does the fast way give the reference's bits for products of this kind and size? Checked on
+ * random data with the same sizes, leading dimensions and alignments (mod 64 bytes) as the call:
+ * the solver's own first product can have a special structure (Z^{-1} nearly diagonal at the
+ * start: entries that are single exact terms), and mcp500-1 passed the check on it and then
+ * differed at three threads. */
+static int pd_verify(int symm, const char *a, const char *b, int m, int n, const int *k_, int lda, int ldb, int ldc,
+                     const void *pA, const void *pB, const void *pC, int T) {
+    const int left = symm && (a[0] == 'L' || a[0] == 'l');
+    const int tA = !symm && (a[0] == 'T' || a[0] == 't'), tB = !symm && (b[0] == 'T' || b[0] == 't');
+    const int k = symm ? (left ? m : n) : *k_;
+    const size_t la = (size_t)lda * (symm ? k : (tA ? m : k)), lb = (size_t)ldb * (symm ? n : (tB ? k : n)), lc = (size_t)ldc * n;
+    const size_t oa = (uintptr_t)pA % 64, ob = (uintptr_t)pB % 64, oc = (uintptr_t)pC % 64;
+    char *bA = malloc(sizeof(double) * la + 128), *bB = malloc(sizeof(double) * lb + 128);
+    char *bC = malloc(sizeof(double) * lc + 128), *bD = malloc(sizeof(double) * lc + 128);
+    if (!bA || !bB || !bC || !bD) { free(bA); free(bB); free(bC); free(bD); return 0; }
+    double *A = (double *)(bA + (64 - (uintptr_t)bA % 64) % 64 + oa), *B = (double *)(bB + (64 - (uintptr_t)bB % 64) % 64 + ob);
+    double *C1 = (double *)(bC + (64 - (uintptr_t)bC % 64) % 64 + oc), *C2 = (double *)(bD + (64 - (uintptr_t)bD % 64) % 64 + oc);
+    uint64_t r = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)m << 32) ^ (uint64_t)n;
+    for (size_t i = 0; i < la; i++) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; A[i] = (double)(r >> 11) * 0x1.0p-53 - 0.5; }
+    for (size_t i = 0; i < lb; i++) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; B[i] = (double)(r >> 11) * 0x1.0p-53 - 0.5; }
+    const double one = 1.0, zero = 0.0;
+    if (symm) pd_ref_symm(a, b, m, n, &one, A, &lda, B, ldb, &zero, C1, ldc);
+    else pd_ref_gemm(a, b, m, n, k_, &one, A, lda, B, ldb, &zero, C1, ldc);
+    pd_fast(symm, a, b, m, n, k_, &one, A, &lda, B, ldb, &zero, C2, ldc, T);
+    int same = 1;
+    for (int j = 0; j < n && same; j++) same = memcmp(C1 + (size_t)j * ldc, C2 + (size_t)j * ldc, sizeof(double) * m) == 0;
+    free(bA); free(bB); free(bC); free(bD);
+    return same;
+}
+/* the product: the fast way where it was verified to give the reference's bits for this kind,
+ * size and thread count, else the reference tiles */
+static void pd_run(int symm, const char *a, const char *b, int m, int n, const int *k_, const double *alpha, const double *A, const int *lda_,
+                   const double *B, int ldb, const double *beta, double *C, int ldc) {
+    static int fixed = -1, dbg = -1;
+    if (fixed < 0) { fixed = getenv("BRISK_PDFIXED") != NULL; dbg = getenv("BRISK_PDDBG") != NULL; }
+    int T = 1;
+#ifdef _OPENMP
+    T = omp_in_parallel() ? 0 : omp_get_max_threads();       /* inside a region: the reference, serially */
+#endif
+    const int kind = (symm ? 8 : 0) + 2 * (a[0] == 'T' || a[0] == 't' || a[0] == 'R' || a[0] == 'r') + (b[0] == 'T' || b[0] == 't' || b[0] == 'U' || b[0] == 'u');
+    const int k = symm ? 0 : *k_;
+    int v = (fixed || T == 0) ? 0 : pd_lookup(kind, m, n, k, T);
+    if (v < 0) {
+        if (pd_nver >= PD_NV || (double)ldc * n * 8.0 > 256e6) v = 0;
+        else {
+            v = pd_verify(symm, a, b, m, n, k_, *lda_, ldb, ldc, A, B, C, T);
+            pd_ver[pd_nver].kind = kind; pd_ver[pd_nver].m = m; pd_ver[pd_nver].n = n; pd_ver[pd_nver].k = k; pd_ver[pd_nver].T = T; pd_ver[pd_nver].ok = (signed char)v;
+            pd_nver++;
+            if (dbg) printf("   [pd: %s %c%c %d x %d x %d at %d threads: %s]\n", symm ? "dsymm" : "dgemm", a[0], b[0], m, n, symm ? (a[0] == 'L' || a[0] == 'l' ? m : n) : k, T,
+                            v ? "the fast way gives the same bits" : "the reference tiles");
+        }
+    }
+    if (v == 1) { pd_fast(symm, a, b, m, n, k_, alpha, A, lda_, B, ldb, beta, C, ldc, T); return; }
+    if (symm) pd_ref_symm(a, b, m, n, alpha, A, lda_, B, ldb, beta, C, ldc);
+    else pd_ref_gemm(a, b, m, n, k_, alpha, A, *lda_, B, ldb, beta, C, ldc);
 }
 void pdgemm(const char *ta, const char *tb, const int *m_, const int *n_, const int *k_, const double *alpha,
             const double *A, const int *lda_, const double *B, const int *ldb_, const double *beta, double *C, const int *ldc_) {
-    const int m = *m_, n = *n_, k = *k_, lda = *lda_, ldb = *ldb_, ldc = *ldc_;
+    const int m = *m_, n = *n_, k = *k_;
     pd_env();
     if ((double)m * n * k < PD_MIN || getenv_cached_pd()) { BL(dgemm_)(ta, tb, m_, n_, k_, alpha, A, lda_, B, ldb_, beta, C, ldc_); return; }
-    const int tA = ta[0] == 'T' || ta[0] == 't', tB = tb[0] == 'T' || tb[0] == 't';
-    const int nr = (m + PD_RB - 1) / PD_RB, nc = (n + PD_CB - 1) / PD_CB, nt = nr * nc;
-    #pragma omp parallel for schedule(dynamic, 1) if (!omp_in_parallel() && nt > 1)
-    for (int t = 0; t < nt; t++) {
-        const int i0 = (t % nr) * PD_RB, j0 = (t / nr) * PD_CB;
-        const int mi = m - i0 < PD_RB ? m - i0 : PD_RB, nj = n - j0 < PD_CB ? n - j0 : PD_CB;
-        const double *Ai = tA ? A + (size_t)i0 * lda : A + i0;
-        const double *Bj = tB ? B + j0 : B + (size_t)j0 * ldb;
-        BL(dgemm_)(ta, tb, &mi, &nj, k_, alpha, Ai, lda_, Bj, ldb_, beta, C + i0 + (size_t)j0 * ldc, ldc_);
-    }
+    pd_run(0, ta, tb, m, n, k_, alpha, A, lda_, B, *ldb_, beta, C, *ldc_);
 }
 void pdsymm(const char *side, const char *uplo, const int *m_, const int *n_, const double *alpha,
             const double *A, const int *lda_, const double *B, const int *ldb_, const double *beta, double *C, const int *ldc_) {
-    const int m = *m_, n = *n_, ldb = *ldb_, ldc = *ldc_;
+    const int m = *m_, n = *n_;
     const int left = side[0] == 'L' || side[0] == 'l', k = left ? m : n;
     pd_env();
     if ((double)m * n * k < PD_MIN || getenv_cached_pd()) { BL(dsymm_)(side, uplo, m_, n_, alpha, A, lda_, B, ldb_, beta, C, ldc_); return; }
-    if (left) {        /* C(:, J) = A B(:, J) */
-        const int nc = (n + PD_CB - 1) / PD_CB;
-        #pragma omp parallel for schedule(dynamic, 1) if (!omp_in_parallel() && nc > 1)
-        for (int t = 0; t < nc; t++) {
-            const int j0 = t * PD_CB, nj = n - j0 < PD_CB ? n - j0 : PD_CB;
-            BL(dsymm_)(side, uplo, m_, &nj, alpha, A, lda_, B + (size_t)j0 * ldb, ldb_, beta, C + (size_t)j0 * ldc, ldc_);
-        }
-    } else {           /* C(I, :) = B(I, :) A */
-        const int nr = (m + PD_RB - 1) / PD_RB;
-        #pragma omp parallel for schedule(dynamic, 1) if (!omp_in_parallel() && nr > 1)
-        for (int t = 0; t < nr; t++) {
-            const int i0 = t * PD_RB, mi = m - i0 < PD_RB ? m - i0 : PD_RB;
-            BL(dsymm_)(side, uplo, &mi, n_, alpha, A, lda_, B + i0, ldb_, beta, C + i0, ldc_);
+    pd_run(1, side, uplo, m, n, NULL, alpha, A, lda_, B, *ldb_, beta, C, *ldc_);
+}
+/* 5.12: triangular solves and products with many right-hand sides on the threads. The
+ * right-hand side splits into independent fixed panels (128 columns of B for side "L", 128
+ * rows for side "R"), each one single-threaded BLAS call; the panels are the same inside a
+ * parallel region (computed one after the other there), so the bits do not depend on the
+ * thread count. Below PD_MIN flops (m n k) one call as before. The corrector of the embedding
+ * spent 3.8 of thetaG51's 28 s in these calls on one thread. */
+#define PT_W 128
+/* 5.12: one panel by blocks of PT_NB: the triangle's diagonal blocks by dtrsm / dtrmm, the rest by
+ * dgemm updates (L lower, non-unit). OpenBLAS's dtrsm on these shapes (order 462-792, 128 columns)
+ * ran at 12-20 GF/s on one core, the blocked form at 25-34 (bench/dense_5.12/trsm_blocked.txt);
+ * the blocks are fixed, so the bits do not depend on the thread count. BRISK_PTBLK0=1: dtrsm. */
+#define PT_NB 64
+static int g_ptblk = -1;
+static void pt_blocked(int solve, int left, int tr, int m, int n, double alpha, const double *L, int ldl, double *B, int ldb) {
+    const double one = 1.0, mone = -1.0;
+    const int k = left ? m : n, nbk = (k + PT_NB - 1) / PT_NB;
+    if (alpha != 1.0) for (int j = 0; j < n; j++) for (int i = 0; i < m; i++) B[i + (size_t)j * ldb] *= alpha;
+    /* forward (block 0 first) or backward, by the variant: see the comments of each case */
+    for (int s = 0; s < nbk; s++) {
+        int q;
+        if (solve) q = (left ? !tr : tr) ? s : nbk - 1 - s;      /* L^{-1}B, B L^{-T}: forward; L^{-T}B, B L^{-1}: backward */
+        else q = (left ? tr : !tr) ? s : nbk - 1 - s;             /* L'B, B L: forward (they read the rows/columns not yet changed) */
+        const int j = q * PT_NB, b = k - j < PT_NB ? k - j : PT_NB, r = k - j - b;
+        const double *Ljj = L + j + (size_t)j * ldl;
+        if (left) {
+            double *Bj = B + j;
+            if (solve) {
+                BL(dtrsm_)("L", "L", tr ? "T" : "N", "N", &b, &n, &one, Ljj, &ldl, Bj, &ldb);
+                if (!tr && r > 0) BL(dgemm_)("N", "N", &r, &n, &b, &mone, Ljj + b, &ldl, Bj, &ldb, &one, Bj + b, &ldb);   /* B_below -= L_below,j X_j */
+                if (tr && j > 0) BL(dgemm_)("T", "N", &j, &n, &b, &mone, L + j, &ldl, Bj, &ldb, &one, B, &ldb);         /* B_above -= L_j,above' X_j */
+            } else {
+                BL(dtrmm_)("L", "L", tr ? "T" : "N", "N", &b, &n, &one, Ljj, &ldl, Bj, &ldb);
+                if (tr && r > 0) BL(dgemm_)("T", "N", &b, &n, &r, &one, Ljj + b, &ldl, Bj + b, &ldb, &one, Bj, &ldb);    /* + L_below,j' B_below */
+                if (!tr && j > 0) BL(dgemm_)("N", "N", &b, &n, &j, &one, L + j, &ldl, B, &ldb, &one, Bj, &ldb);           /* + L_j,above B_above */
+            }
+        } else {
+            double *Bj = B + (size_t)j * ldb;
+            if (solve) {
+                BL(dtrsm_)("R", "L", tr ? "T" : "N", "N", &m, &b, &one, Ljj, &ldl, Bj, &ldb);
+                if (!tr && j > 0) BL(dgemm_)("N", "N", &m, &j, &b, &mone, Bj, &ldb, L + j, &ldl, &one, B, &ldb);           /* B_left -= X_j L_j,left */
+                if (tr && r > 0) BL(dgemm_)("N", "T", &m, &r, &b, &mone, Bj, &ldb, Ljj + b, &ldl, &one, Bj + (size_t)b * ldb, &ldb);  /* B_right -= X_j L_right,j' */
+            } else {
+                BL(dtrmm_)("R", "L", tr ? "T" : "N", "N", &m, &b, &one, Ljj, &ldl, Bj, &ldb);
+                if (!tr && r > 0) BL(dgemm_)("N", "N", &m, &b, &r, &one, Bj + (size_t)b * ldb, &ldb, Ljj + b, &ldl, &one, Bj, &ldb);  /* + B_right L_right,j */
+                if (tr && j > 0) BL(dgemm_)("N", "T", &m, &b, &j, &one, B, &ldb, L + j, &ldl, &one, Bj, &ldb);           /* + B_left L_j,left' */
+            }
         }
     }
+}
+static void pdtri(int solve, const char *side, const char *uplo, const char *ta, const char *diag, const int *m_, const int *n_,
+                  const double *alpha, const double *A, const int *lda_, double *B, const int *ldb_) {
+    const int m = *m_, n = *n_, left = side[0] == 'L' || side[0] == 'l', k = left ? m : n;
+    pd_env();
+    if ((double)m * n * k < PD_MIN || getenv_cached_pd() || (left ? n : m) <= PT_W) {
+        if (solve) BL(dtrsm_)(side, uplo, ta, diag, m_, n_, alpha, A, lda_, B, ldb_);
+        else BL(dtrmm_)(side, uplo, ta, diag, m_, n_, alpha, A, lda_, B, ldb_);
+        return;
+    }
+    const int ldb = *ldb_, np = ((left ? n : m) + PT_W - 1) / PT_W;
+    int nt = 1;
+#ifdef _OPENMP
+    nt = omp_in_parallel() ? 1 : omp_get_max_threads();
+#endif
+    if (g_ptblk < 0) g_ptblk = !ENV_ON("BRISK_PTBLK0");
+    const int blk = g_ptblk && (uplo[0] == 'L' || uplo[0] == 'l') && (diag[0] == 'N' || diag[0] == 'n') && k > 2 * PT_NB;
+    #pragma omp parallel for schedule(dynamic, 1) if (nt > 1)
+    for (int p = 0; p < np; p++) {
+        const int r0 = p * PT_W, w = ((left ? n : m) - r0) < PT_W ? ((left ? n : m) - r0) : PT_W;
+        double *Bp = left ? B + (size_t)r0 * ldb : B + r0;
+        const int mm = left ? m : w, nn = left ? w : n;
+        if (blk) pt_blocked(solve, left, ta[0] == 'T' || ta[0] == 't', mm, nn, *alpha, A, *lda_, Bp, ldb);
+        else if (solve) BL(dtrsm_)(side, uplo, ta, diag, &mm, &nn, alpha, A, lda_, Bp, ldb_);
+        else BL(dtrmm_)(side, uplo, ta, diag, &mm, &nn, alpha, A, lda_, Bp, ldb_);
+    }
+}
+void pdtrsm(const char *side, const char *uplo, const char *ta, const char *diag, const int *m_, const int *n_,
+            const double *alpha, const double *A, const int *lda_, double *B, const int *ldb_) {
+    pdtri(1, side, uplo, ta, diag, m_, n_, alpha, A, lda_, B, ldb_);
+}
+void pdtrmm(const char *side, const char *uplo, const char *ta, const char *diag, const int *m_, const int *n_,
+            const double *alpha, const double *A, const int *lda_, double *B, const int *ldb_) {
+    pdtri(0, side, uplo, ta, diag, m_, n_, alpha, A, lda_, B, ldb_);
 }
 /* one node: shift, updates (row blocks, as tasks when par), panel factorization */
 static void fnode(SChol *S, int k, double shift, int par) {
@@ -2160,6 +2785,7 @@ static void fsubtree(SChol *S, int u, double shift) {
 }
 static int g_solve_seq;       /* (defined with the solve routines) */
 int schol_factor(SChol *S, double shift) {
+    S->fgen++;
     if (g_fpar < 0) {
         g_fpar = getenv("BRISK_FACTLL") == NULL; const char *e = getenv("BRISK_FCUT"); g_fcut = e ? atof(e) : 16.0;
         if ((e = getenv("BRISK_FRB"))) FB_RB = atoi(e);
@@ -2694,6 +3320,566 @@ void schol_solve2(const SChol *S, double *b1, double *b2, double *work) {
         }
     }
     for (int i = 0; i < m; i++) { b1[S->perm[i]] = x[i]; b2[S->perm[i]] = y[i]; }
+}
+
+/* 5.12: M Y = B for many right-hand sides held as rows: T is nrow x m (column-major, leading
+ * dimension ldt) and its column i is row i of B (original indexing); on return column i of T
+ * is row i of Y. The rows of T go in fixed chunks of SR_CB through a permuted copy that stays
+ * in the core's cache, and every operation is an axpy over the SR_CB entries of a chunk, so
+ * the result does not depend on the thread count or the chunking. The factor is read entry by
+ * entry (the panels of a graph pattern are narrow: a BLAS call per supernode costs more than
+ * its work). For Z^{-1} times a dense matrix on a sparse Z: 4 nnz(L) nrow flops against the
+ * 2 m^2 nrow of a product with a dense Z^{-1}. */
+#define SR_CB 64
+/* one chunk of CB lanes (CB a constant after inlining: the lane loops stay in registers) */
+#define SR_MAXT 256
+static double *g_sr_buf[SR_MAXT];
+static size_t g_sr_cap[SR_MAXT];
+static int g_sr_wb = 0;      /* supernodes at least this wide go through BLAS (dtrsm, dgemm on the chunk) */
+/* a > 0 (the inverse): entries below a are zero on entry and not wanted on exit, so the work
+ * starts at a's supernode, inside it at column a; mk != NULL: the forward visits only the
+ * supernodes marked stamp (the ancestors of the chunk's indices: L^{-1} e_j lives on the
+ * path from j to the root) */
+/* kt < kt2: the supernodes kt..kt2-1 (the top, solved in panels: sr_top) are skipped; dir: 1
+ * the forward solve only, 2 the backward only, 3 both */
+static inline __attribute__((always_inline)) void sr_chunk(const SChol *S, double *restrict Wc, double *restrict A, const int CB,
+                                                           const int a, const int *mk, const int stamp, const int kt, const int kt2, const int dir) {
+    const int k0 = a ? S->snof[a] : 0, ns = S->ns;
+    const double one = 1.0, zero = 0.0, mone = -1.0;
+    if (dir & 1)
+    for (int k = k0; k < ns; k++) {                             /* forward: L x = b */
+        if (k == kt) { k = kt2 - 1; continue; }
+        if (mk && mk[k] != stamp) continue;
+        const int c0 = k == k0 ? a - S->ss[k] : 0;
+        const int j0 = S->ss[k] + c0, w = S->ss[k + 1] - j0, nr = S->pnr[k] - c0;
+        const int *rw = S->prow + S->prp[k] + c0;
+        const double *Pk = S->pan + S->pbase[k] + c0 + (size_t)c0 * S->pnr[k];
+        const int ld = S->pnr[k];
+        double *restrict X0 = Wc + (size_t)j0 * CB;
+        if (w >= g_sr_wb) {
+            /* the chunk's columns of the supernode as a CB x w matrix X (ld CB): X <- X L11^{-T}, U = X L21' */
+            const int rest = nr - w;
+            BL(dtrsm_)("R", "L", "T", "N", &CB, &w, &one, Pk, &ld, X0, &CB);
+            if (rest > 0) {
+                BL(dgemm_)("N", "T", &CB, &rest, &w, &one, X0, &CB, Pk + w, &ld, &zero, A, &CB);
+                for (int q = 0; q < rest; q++) {
+                    double *restrict xt = Wc + (size_t)rw[w + q] * CB;
+                    const double *restrict u = A + (size_t)q * CB;
+                    for (int r = 0; r < CB; r++) xt[r] -= u[r];
+                }
+            }
+            continue;
+        }
+        for (int cc = 0; cc < w; cc++) {                        /* the diagonal block */
+            const double *col = Pk + (size_t)cc * ld;
+            double *restrict xc = X0 + (size_t)cc * CB;
+            const double d = col[cc];
+            for (int r = 0; r < CB; r++) xc[r] /= d;
+            for (int q = cc + 1; q < w; q++) {
+                double *restrict xt = X0 + (size_t)q * CB;
+                const double l = col[q];
+                for (int r = 0; r < CB; r++) xt[r] -= l * xc[r];
+            }
+        }
+        if (w == 1)                                             /* (most of a sparse forest) */
+            for (int q = 1; q < nr; q++) {
+                double *restrict xt = Wc + (size_t)rw[q] * CB;
+                const double l = Pk[q];
+                for (int r = 0; r < CB; r++) xt[r] -= l * X0[r];
+            }
+        else
+        for (int q = w; q < nr; q++) {                          /* each row below: all w columns at once */
+            double *restrict xt = Wc + (size_t)rw[q] * CB;
+            double s[CB];
+            for (int r = 0; r < CB; r++) s[r] = xt[r];
+            for (int cc = 0; cc < w; cc++) {
+                const double l = Pk[q + (size_t)cc * ld];
+                const double *restrict xc = X0 + (size_t)cc * CB;
+                for (int r = 0; r < CB; r++) s[r] -= l * xc[r];
+            }
+            for (int r = 0; r < CB; r++) xt[r] = s[r];
+        }
+    }
+    if (dir & 2)
+    for (int k = ns - 1; k >= k0; k--) {                        /* backward: L' y = x */
+        if (k == kt2 - 1 && kt < kt2) { k = kt; continue; }
+        const int c0 = k == k0 ? a - S->ss[k] : 0;              /* columns >= c0 need only columns >= c0 */
+        const int j0 = S->ss[k] + c0, w = S->ss[k + 1] - j0, nr = S->pnr[k] - c0;
+        const int *rw = S->prow + S->prp[k] + c0;
+        const double *Pk = S->pan + S->pbase[k] + c0 + (size_t)c0 * S->pnr[k];
+        const int ld = S->pnr[k];
+        double *restrict X0 = Wc + (size_t)j0 * CB;
+        if (w >= g_sr_wb) {                                     /* X <- (X - G L21) L11^{-1}, G = rows below */
+            const int rest = nr - w;
+            if (rest > 0) {
+                for (int q = 0; q < rest; q++) memcpy(A + (size_t)q * CB, Wc + (size_t)rw[w + q] * CB, sizeof(double) * CB);
+                BL(dgemm_)("N", "N", &CB, &w, &rest, &mone, A, &CB, Pk + w, &ld, &one, X0, &CB);
+            }
+            BL(dtrsm_)("R", "L", "N", "N", &CB, &w, &one, Pk, &ld, X0, &CB);
+            continue;
+        }
+        if (w == 1) {                                           /* (most of a sparse forest; the same operations) */
+            for (int q = 1; q < nr; q++) {
+                const double *restrict xt = Wc + (size_t)rw[q] * CB;
+                const double l = Pk[q];
+                for (int r = 0; r < CB; r++) X0[r] -= l * xt[r];
+            }
+            const double d = Pk[0];
+            for (int r = 0; r < CB; r++) X0[r] /= d;
+            continue;
+        }
+        for (size_t i = 0; i < (size_t)w * CB; i++) A[i] = X0[i];
+        for (int q = w; q < nr; q++) {                          /* each row below read once for all w columns */
+            const double *restrict xt = Wc + (size_t)rw[q] * CB;
+            for (int cc = 0; cc < w; cc++) {
+                const double l = Pk[q + (size_t)cc * ld];
+                double *restrict ac = A + (size_t)cc * CB;
+                for (int r = 0; r < CB; r++) ac[r] -= l * xt[r];
+            }
+        }
+        for (int cc = w - 1; cc >= 0; cc--) {
+            const double *col = Pk + (size_t)cc * ld;
+            double *restrict ac = A + (size_t)cc * CB;
+            for (int q = cc + 1; q < w; q++) {
+                const double l = col[q];
+                const double *restrict xq = X0 + (size_t)q * CB;
+                for (int r = 0; r < CB; r++) ac[r] -= l * xq[r];
+            }
+            const double d = col[cc];
+            double *restrict xc = X0 + (size_t)cc * CB;
+            for (int r = 0; r < CB; r++) xc[r] = ac[r] / d;
+        }
+    }
+}
+static void sr_chunk64(const SChol *S, double *Wc, double *A, int kt, int kt2, int dir) { sr_chunk(S, Wc, A, 64, 0, NULL, 0, kt, kt2, dir); }
+static void sr_chunk32(const SChol *S, double *Wc, double *A, int kt, int kt2, int dir) { sr_chunk(S, Wc, A, 32, 0, NULL, 0, kt, kt2, dir); }
+static void sr_chunk16(const SChol *S, double *Wc, double *A, int kt, int kt2, int dir) { sr_chunk(S, Wc, A, 16, 0, NULL, 0, kt, kt2, dir); }
+#define SR_CHUNK(S_, Wc_, A_, kt_, kt2_, dir_) do { if (CB == 64) sr_chunk64(S_, Wc_, A_, kt_, kt2_, dir_); else if (CB == 32) sr_chunk32(S_, Wc_, A_, kt_, kt2_, dir_); \
+                                                    else sr_chunk16(S_, Wc_, A_, kt_, kt2_, dir_); } while (0)
+static void sr_ichunk64(const SChol *S, double *Wc, double *A, int a, const int *mk, int st, int kt, int kt2, int dir) { sr_chunk(S, Wc, A, 64, a, mk, st, kt, kt2, dir); }
+static void sr_ichunk32(const SChol *S, double *Wc, double *A, int a, const int *mk, int st, int kt, int kt2, int dir) { sr_chunk(S, Wc, A, 32, a, mk, st, kt, kt2, dir); }
+/* 5.12: the top of the factor: supernodes kt..kt2-1, columns m0..m1-1, the root of the tree
+ * of the widest supernode and the run of wide supernodes before it in the postorder whose
+ * parents are in the run (the dense separators at the root of a nested dissection; an
+ * upward-closed set). Between the forward and the backward solve of the rest, the top's own
+ * forward and backward solve runs for panels of PR right-hand sides at once (sr_top_solve:
+ * blocks of 128 columns, dtrsm on the diagonal block and dgemm with the rows below; L_TT
+ * gathered once per factorization). OpenBLAS's dtrsm on these shapes runs at 25-38 GF/s a
+ * core (1427 x 1427 triangle, 32-256 right-hand sides) against 47-68 for dgemm. */
+static int g_sr_top = -1, g_sr_pr = 256;
+static int sr_parent(const SChol *S, int k) {
+    const int w = S->ss[k + 1] - S->ss[k];
+    return S->pnr[k] > w ? S->snof[S->prow[S->prp[k] + w]] : -1;
+}
+static int sr_top_range(const SChol *S, int *kt2) {
+    if (g_sr_top < 0) { const char *e = getenv("BRISK_SRTOP"); g_sr_top = e ? atoi(e) : 256; if ((e = getenv("BRISK_SRPR"))) g_sr_pr = atoi(e); }
+    const int ns = S->ns;
+    *kt2 = ns;
+    if (g_sr_top <= 0 || ns < 2) return ns;
+    int kw = 0;
+    for (int k = 1; k < ns; k++) if (S->ss[k + 1] - S->ss[k] > S->ss[kw + 1] - S->ss[kw]) kw = k;
+    int r = kw;
+    for (int p; (p = sr_parent(S, r)) >= 0; ) r = p;
+    int kt = r;
+    while (kt > 0 && S->ss[kt] - S->ss[kt - 1] >= 64) {
+        const int p = sr_parent(S, kt - 1);
+        if (p < kt || p > r) break;
+        kt--;
+    }
+    for (int k = kt; k <= r; k++) if (S->ss[k + 1] - S->ss[k] < 64) return ns;   /* (a narrow one between) */
+    if (S->ss[r + 1] - S->ss[kt] < g_sr_top) return ns;
+    *kt2 = r + 1;
+    return kt;
+}
+/* S->tl = L_TT (dense lower triangle, ld mt) for the top kt..kt2-1 of the current factor */
+static int sr_top_factor(SChol *S, int kt, int kt2) {
+    if (S->tl && S->tl_gen == S->fgen && S->tl_kt == kt && S->tl_kt2 == kt2) return 1;
+    const int m0 = S->ss[kt], mt = S->ss[kt2] - m0;
+    if (!S->tl || S->tl_kt != kt || S->tl_kt2 != kt2) {
+        free(S->tl); S->tl = NULL;
+        if (posix_memalign((void **)&S->tl, 64, sizeof(double) * (size_t)mt * mt)) { S->tl = NULL; return 0; }
+        S->tl_kt = kt; S->tl_kt2 = kt2;
+    }
+    double *Lt = S->tl;
+    memset(Lt, 0, sizeof(double) * (size_t)mt * mt);
+    for (int k = kt; k < kt2; k++) {
+        const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k];
+        const int *rw = S->prow + S->prp[k];
+        const double *Pk = S->pan + S->pbase[k];
+        for (int c = 0; c < w; c++) {
+            double *col = Lt + (size_t)(j0 - m0 + c) * mt;
+            for (int q = c; q < nr; q++) col[rw[q] - m0] = Pk[q + (size_t)c * nr];
+        }
+    }
+    S->tl_gen = S->fgen;
+    return 1;
+}
+/* S->tinv = (L_TT L_TT')^{-1}: the top's own columns of the inverse (schol_inverse) */
+static int sr_top_inverse(SChol *S, int kt, int kt2) {
+    if (S->tinv && S->tinv_gen == S->fgen && S->tinv_kt == kt && S->tinv_kt2 == kt2) return 1;
+    if (!sr_top_factor(S, kt, kt2)) return 0;
+    const int mt = S->ss[kt2] - S->ss[kt];
+    if (!S->tinv || S->tinv_kt != kt || S->tinv_kt2 != kt2) {
+        free(S->tinv); S->tinv = NULL;
+        if (posix_memalign((void **)&S->tinv, 64, sizeof(double) * (size_t)mt * mt)) { S->tinv = NULL; return 0; }
+        S->tinv_kt = kt; S->tinv_kt2 = kt2;
+    }
+    memcpy(S->tinv, S->tl, sizeof(double) * (size_t)mt * mt);
+    if (brisk_dpotri_full(mt, S->tinv, mt) != 0) { S->tinv_gen = -1; return 0; }
+    S->tinv_gen = S->fgen;
+    return 1;
+}
+/* the top's forward and backward solve for a panel X (pw x mt, ld pw; the right-hand sides
+ * as rows): X <- X L^{-T} L^{-1}, blocked by 128 columns: a triangular solve on the diagonal
+ * block and a product with the rows below it (most of the flops in dgemm; backward stable,
+ * unlike a product with the explicit inverse, which cost thetaG51 two iterations at the end) */
+static int g_sr_nb = 0;
+static void sr_top_solve(const double *Lt, int mt, double *X, int pw) {
+    if (!g_sr_nb) { const char *e = getenv("BRISK_SRNB"); g_sr_nb = e && atoi(e) > 0 ? atoi(e) : 128; }
+    const int NB = g_sr_nb;
+    const double one = 1.0, mone = -1.0;
+    for (int j0 = 0; j0 < mt; j0 += NB) {                  /* X <- X L^{-T} */
+        const int nb = j0 + NB < mt ? NB : mt - j0, rest = mt - j0 - nb;
+        BL(dtrsm_)("R", "L", "T", "N", &pw, &nb, &one, Lt + j0 + (size_t)j0 * mt, &mt, X + (size_t)j0 * pw, &pw);
+        if (rest > 0) BL(dgemm_)("N", "T", &pw, &rest, &nb, &mone, X + (size_t)j0 * pw, &pw, Lt + (j0 + nb) + (size_t)j0 * mt, &mt, &one, X + (size_t)(j0 + nb) * pw, &pw);
+    }
+    for (int j0 = (mt - 1) / NB * NB; j0 >= 0; j0 -= NB) { /* X <- X L^{-1} */
+        const int nb = j0 + NB < mt ? NB : mt - j0, rest = mt - j0 - nb;
+        if (rest > 0) BL(dgemm_)("N", "N", &pw, &nb, &rest, &mone, X + (size_t)(j0 + nb) * pw, &pw, Lt + (j0 + nb) + (size_t)j0 * mt, &mt, &one, X + (size_t)j0 * pw, &pw);
+        BL(dtrsm_)("R", "L", "N", "N", &pw, &nb, &one, Lt + j0 + (size_t)j0 * mt, &mt, X + (size_t)j0 * pw, &pw);
+    }
+}
+static double *g_sr_xt = NULL; static size_t g_sr_xtcap = 0;
+static double g_srti[4];
+void schol_solve_rows(const SChol *S, double *T, int ldt, int nrow) {
+    const int m = S->m, ns = S->ns;
+    if (!S->pan) { static int w = 0; if (!w++) fprintf(stderr, "brisk: internal: sparse solve without a factor\n"); return; }
+    /* lanes per chunk: the chunk (m x CB doubles) within about 1 MB of cache */
+    static int cbx = -1; if (cbx < 0) { const char *e = getenv("BRISK_SRCB"); cbx = e ? atoi(e) : 0; }
+    const int CB = cbx == 16 || cbx == 32 || cbx == 64 ? cbx : (size_t)m * 64 * 8 <= (1u << 20) ? 64 : 32;
+    const int nch = (nrow + CB - 1) / CB;
+    if (!g_sr_wb) { const char *e = getenv("BRISK_SRWB"); g_sr_wb = e ? atoi(e) : 16; if (g_sr_wb < 1) g_sr_wb = 1; }
+    int wmax = 1;                       /* scratch: w x CB (narrow backward), rest x CB (BLAS updates) */
+    for (int k = 0; k < ns; k++) { if (S->ss[k + 1] - S->ss[k] > wmax) wmax = S->ss[k + 1] - S->ss[k]; if (S->pnr[k] > wmax) wmax = S->pnr[k]; }
+    static int dbg = -1; if (dbg < 0) dbg = getenv("BRISK_SRDBG") != NULL;
+    if (dbg == 1) {
+        dbg = 2;
+        double h[5] = { 0 }, hd = 0, tot = 0;     /* off-diagonal entries by supernode width 1, 2-3, 4-7, 8-31, 32+ */
+        for (int k = 0; k < ns; k++) {
+            const int w = S->ss[k + 1] - S->ss[k], nr = S->pnr[k];
+            const double off = (double)w * (nr - w), dia = 0.5 * w * (w + 1);
+            h[w == 1 ? 0 : w < 4 ? 1 : w < 8 ? 2 : w < 32 ? 3 : 4] += off; hd += dia; tot += off + dia;
+        }
+        printf("   [solve_rows: m %d, %d supernodes, wmax %d, CB %d; entries: diagonal blocks %.0f%%, below by width 1: %.0f%% 2-3: %.0f%% 4-7: %.0f%% 8-31: %.0f%% 32+: %.0f%%]\n",
+               m, ns, wmax, CB, 100 * hd / tot, 100 * h[0] / tot, 100 * h[1] / tot, 100 * h[2] / tot, 100 * h[3] / tot, 100 * h[4] / tot);
+        /* the top set (supernodes of width >= W and their ancestors): columns, supernodes, entries */
+        char *top = malloc(ns);
+        for (int W = 32; W <= 1024; W *= 2) {
+            memset(top, 0, ns);
+            for (int k = 0; k < ns; k++) {
+                const int w = S->ss[k + 1] - S->ss[k];
+                if (w >= W) top[k] = 1;
+                if (top[k] && S->pnr[k] > w) top[S->snof[S->prow[S->prp[k] + w]]] = 1;
+            }
+            double te = 0; int tc = 0, tk = 0;
+            for (int k = 0; k < ns; k++) if (top[k]) {
+                const int w = S->ss[k + 1] - S->ss[k], nr = S->pnr[k];
+                te += (double)w * (nr - w) + 0.5 * w * (w + 1); tc += w; tk++;
+            }
+            printf("   [top set from width %4d: %d supernodes, %d columns, %.0f%% of the entries]\n", W, tk, tc, 100 * te / tot);
+        }
+        free(top);
+        {   /* the rest below the top of sr_top_range: supernodes, entries, rows below that are in the top */
+            int kt2, kt = sr_top_range(S, &kt2), nsf = 0, nbl = 0; double ef = 0, eb = 0, et = 0;
+            for (int k = 0; k < ns; k++) {
+                if (k >= kt && k < kt2) continue;
+                const int w = S->ss[k + 1] - S->ss[k], nr = S->pnr[k];
+                nsf++; if (w >= g_sr_wb) nbl++;
+                ef += 0.5 * w * (w + 1) + (double)w * (nr - w); eb += (double)w * (nr - w);
+                for (int q = w; q < nr; q++) { const int r = S->prow[S->prp[k] + q]; if (kt < ns && r >= S->ss[kt] && r < S->ss[kt2]) et += w; }
+            }
+            printf("   [below the top (supernodes %d..%d): %d supernodes (%d through BLAS), %.0f entries, %.0f below the diagonal blocks, %.0f of them in the top's rows]\n",
+                   kt, kt2 - 1, nsf, nbl, ef, eb, et);
+        }
+    }
+    /* called from a parallel loop over blocks: one thread per call, the caller's thread
+     * number names its buffer (inside the inactive inner region the number would be 0) */
+    const int outer = omp_in_parallel();
+#ifdef _OPENMP
+    const int otid = outer ? omp_get_thread_num() : 0;
+#else
+    const int otid = 0;
+#endif
+    /* 5.12: the top (dense separators at the root) in panels of PR right-hand sides on the
+     * threads, between the forward and the backward solve of the chunks below it; the panels
+     * are fixed by nrow, so the bits do not depend on the thread count */
+    int kt2 = ns, kt = outer || nch < 2 ? ns : sr_top_range(S, &kt2);
+    if (kt < kt2 && !sr_top_factor((SChol *)S, kt, kt2)) kt = kt2 = ns;
+    const int PR = g_sr_pr > CB ? g_sr_pr / CB * CB : CB;
+    const int m0 = S->ss[kt], mt = S->ss[kt2] - m0, nrp = nch * CB, npan = (nrp + PR - 1) / PR;
+    double *XT = NULL, *XF = NULL;       /* the top rows by panels; the other rows by chunks (contiguous) */
+    if (kt < ns) {
+        const size_t need = (size_t)m * nrp;
+        if (need > g_sr_xtcap) { free(g_sr_xt); g_sr_xt = NULL; g_sr_xtcap = 0; if (!posix_memalign((void **)&g_sr_xt, 64, sizeof(double) * need)) g_sr_xtcap = need; }
+        if (g_sr_xt) { XT = g_sr_xt; XF = XT + (size_t)mt * nrp; } else kt = kt2 = ns;
+    }
+    const int *iperm = S->iperm;
+    static int srt = -1; if (srt < 0) srt = getenv("BRISK_SRTIME") != NULL;
+    double tq[4] = { omp_get_wtime(), 0, 0, 0 };
+    #pragma omp parallel if (nch > 1 && !outer)
+    {
+        /* per-thread buffers kept between calls: a fresh 0.5 MB block per call and thread was
+         * an mmap, page faults and an munmap with its TLB shootdown, every product */
+#ifdef _OPENMP
+        const int tid = outer ? otid : omp_get_thread_num();
+#else
+        const int tid = otid;
+#endif
+        double *Wc = NULL, *A = NULL;
+        if (tid < SR_MAXT) {
+            const size_t need = (size_t)m * CB + (size_t)wmax * CB;
+            if (need > g_sr_cap[tid]) {
+                free(g_sr_buf[tid]); g_sr_buf[tid] = NULL; g_sr_cap[tid] = 0;
+                if (!posix_memalign((void **)&g_sr_buf[tid], 64, sizeof(double) * need)) g_sr_cap[tid] = need;
+                else g_sr_buf[tid] = NULL;
+            }
+            if (g_sr_buf[tid]) { Wc = g_sr_buf[tid]; A = Wc + (size_t)m * CB; }
+        }
+        double *own = NULL;
+        if (!Wc) { own = sx(sizeof(double) * ((size_t)m * CB + (size_t)wmax * CB)); Wc = own; A = own + (size_t)m * CB; }
+        #pragma omp for schedule(dynamic, 1)
+        for (int c = 0; c < nch; c++) {
+            const int r0 = c * CB, cb = nrow - r0 < CB ? nrow - r0 : CB;
+            double ti0 = srt ? omp_get_wtime() : 0;
+            for (int j = 0; j < m; j++) {                       /* (T's columns in order: its pages in order) */
+                double *xi = Wc + (size_t)iperm[j] * CB;
+                const double *src = T + r0 + (size_t)j * ldt;
+                int r = 0;
+                for (; r < cb; r++) xi[r] = src[r];
+                for (; r < CB; r++) xi[r] = 0;
+            }
+            if (srt && omp_get_thread_num() == 0) { double t_ = omp_get_wtime(); g_srti[0] += t_ - ti0; ti0 = t_; }
+            if (kt == ns) {
+                SR_CHUNK(S, Wc, A, -1, -1, 3);
+                for (int j = 0; j < m; j++) {
+                    const double *xi = Wc + (size_t)iperm[j] * CB;
+                    double *dst = T + r0 + (size_t)j * ldt;
+                    for (int r = 0; r < cb; r++) dst[r] = xi[r];
+                }
+                continue;
+            }
+            /* the forward solve below the top; the top rows to their panel (lanes r0 % PR on) */
+            SR_CHUNK(S, Wc, A, kt, kt2, 1);
+            if (srt && omp_get_thread_num() == 0) { double t_ = omp_get_wtime(); g_srti[1] += t_ - ti0; ti0 = t_; }
+            double *xf = XF + (size_t)c * (m - mt) * CB;
+            memcpy(xf, Wc, sizeof(double) * (size_t)m0 * CB);
+            memcpy(xf + (size_t)m0 * CB, Wc + (size_t)(m0 + mt) * CB, sizeof(double) * (size_t)(m - m0 - mt) * CB);
+            const int pp = r0 / PR, pw = (pp + 1) * PR <= nrp ? PR : nrp - pp * PR, off = r0 - pp * PR;
+            double *Xp = XT + (size_t)pp * PR * mt;
+            for (int i = m0; i < m0 + mt; i++) memcpy(Xp + (size_t)(i - m0) * pw + off, Wc + (size_t)i * CB, sizeof(double) * CB);
+            if (srt && omp_get_thread_num() == 0) { double t_ = omp_get_wtime(); g_srti[2] += t_ - ti0; g_srti[3] += 1; }
+        }
+        if (kt < ns) {
+            #pragma omp master
+            tq[1] = omp_get_wtime();
+            #pragma omp for schedule(dynamic, 1)
+            for (int pp = 0; pp < npan; pp++) {
+                const int pw = (pp + 1) * PR <= nrp ? PR : nrp - pp * PR;
+                sr_top_solve(S->tl, mt, XT + (size_t)pp * PR * mt, pw);
+            }
+            #pragma omp master
+            tq[2] = omp_get_wtime();
+            #pragma omp for schedule(dynamic, 1)
+            for (int c = 0; c < nch; c++) {                     /* the backward solve below the top */
+                const int r0 = c * CB, cb = nrow - r0 < CB ? nrow - r0 : CB;
+                const double *xf = XF + (size_t)c * (m - mt) * CB;
+                memcpy(Wc, xf, sizeof(double) * (size_t)m0 * CB);
+                memcpy(Wc + (size_t)(m0 + mt) * CB, xf + (size_t)m0 * CB, sizeof(double) * (size_t)(m - m0 - mt) * CB);
+                const int pp = r0 / PR, pw = (pp + 1) * PR <= nrp ? PR : nrp - pp * PR, off = r0 - pp * PR;
+                const double *Xp = XT + (size_t)pp * PR * mt;
+                for (int i = m0; i < m0 + mt; i++) memcpy(Wc + (size_t)i * CB, Xp + (size_t)(i - m0) * pw + off, sizeof(double) * CB);
+                SR_CHUNK(S, Wc, A, kt, kt2, 2);
+                for (int j = 0; j < m; j++) {
+                    const double *xi = Wc + (size_t)iperm[j] * CB;
+                    double *dst = T + r0 + (size_t)j * ldt;
+                    for (int r = 0; r < cb; r++) dst[r] = xi[r];
+                }
+            }
+        }
+        free(own);
+    }
+    if (srt && kt < ns) { fprintf(stderr, "   [solve_rows top %d of %d: forward %.1f ms, top %.1f ms, backward %.1f ms; thread 0 forward: gather %.1f, solve %.1f, store %.1f ms, %.0f chunks]\n", mt, m, 1e3 * (tq[1] - tq[0]), 1e3 * (tq[2] - tq[1]), 1e3 * (omp_get_wtime() - tq[2]), 1e3 * g_srti[0], 1e3 * g_srti[1], 1e3 * g_srti[2], g_srti[3]); memset(g_srti, 0, sizeof g_srti); }
+}
+
+/* M^{-1} (full, symmetric, original indexing) into Zi (ld ldz). The columns of the identity go
+ * in chunks of consecutive permuted indices [a, a + CB): the forward solve of e_j touches only
+ * the ancestors of j (L^{-1} e_j lives on the path from j to the root), and of the result only
+ * the entries at permuted indices >= j are kept (the others are the mirror of an entry found
+ * from a smaller index), so the backward stops at a's supernode. For one dense supernode this
+ * is (1/3 + 1/3) n^3 flops against 2 n^3 for the solve with the identity. The upper half is
+ * then filled by a tiled transpose. The chunks are fixed, so the bits do not depend on the
+ * thread count. */
+static int parent_sn(const SChol *S, int k) {
+    const int w = S->ss[k + 1] - S->ss[k];
+    return S->pnr[k] > w ? S->snof[S->prow[S->prp[k] + w]] : -1;
+}
+void schol_inverse(const SChol *S, double *Zi, int ldz) {
+    const int m = S->m, ns = S->ns;
+    if (!S->pan) { static int w = 0; if (!w++) fprintf(stderr, "brisk: internal: sparse inverse without a factor\n"); return; }
+    const int CB = (size_t)m * 64 * 8 <= (1u << 20) ? 64 : 32;
+    if (!g_sr_wb) { const char *e = getenv("BRISK_SRWB"); g_sr_wb = e ? atoi(e) : 16; if (g_sr_wb < 1) g_sr_wb = 1; }
+    int wmax = 1;
+    for (int k = 0; k < ns; k++) { if (S->ss[k + 1] - S->ss[k] > wmax) wmax = S->ss[k + 1] - S->ss[k]; if (S->pnr[k] > wmax) wmax = S->pnr[k]; }
+    int *par = sx(sizeof(int) * (size_t)ns);
+    for (int k = 0; k < ns; k++) par[k] = parent_sn(S, k);
+    const int *perm = S->perm, *iperm = S->iperm;
+    const int outer = omp_in_parallel();
+#ifdef _OPENMP
+    const int otid = outer ? omp_get_thread_num() : 0;
+#else
+    const int otid = 0;
+#endif
+    /* the top (sr_top_range): its own columns are the inverse of its Schur complement (S->tinv);
+     * the columns below it take the top's part of the solve as a product with S->tinv in
+     * panels of PR (as schol_solve_rows); the chunks: [0, m0) and [m1, m) in steps of CB */
+    int kt2 = ns, kt = outer ? ns : sr_top_range(S, &kt2);
+    if (kt < kt2 && !sr_top_inverse((SChol *)S, kt, kt2)) kt = kt2 = ns;
+    if (kt < ns) {
+        const size_t need = (size_t)m * (((size_t)S->ss[kt] + CB - 1) / CB * CB);
+        if (need > g_sr_xtcap) { free(g_sr_xt); g_sr_xt = NULL; g_sr_xtcap = 0; if (!posix_memalign((void **)&g_sr_xt, 64, sizeof(double) * need)) g_sr_xtcap = need; }
+        if (!g_sr_xt) kt = kt2 = ns;
+    }
+    const int top = kt < ns, m0 = S->ss[kt], m1 = S->ss[kt2], mt = m1 - m0;
+    const int nf = (m0 + CB - 1) / CB, nch = nf + (m - m1 + CB - 1) / CB;
+    const int PR = g_sr_pr > CB ? g_sr_pr / CB * CB : CB, nrp = nf * CB, npan = (nrp + PR - 1) / PR;
+    double *XT = top ? g_sr_xt : NULL, *XF = top ? g_sr_xt + (size_t)mt * nrp : NULL;
+    #pragma omp parallel if (nch > 1 && !outer)
+    {
+#ifdef _OPENMP
+        const int tid = outer ? otid : omp_get_thread_num();
+#else
+        const int tid = otid;
+#endif
+        double *Wc = NULL, *A = NULL;
+        if (tid < SR_MAXT) {
+            const size_t need = (size_t)m * CB + (size_t)wmax * CB;
+            if (need > g_sr_cap[tid]) {
+                free(g_sr_buf[tid]); g_sr_buf[tid] = NULL; g_sr_cap[tid] = 0;
+                if (!posix_memalign((void **)&g_sr_buf[tid], 64, sizeof(double) * need)) g_sr_cap[tid] = need;
+                else g_sr_buf[tid] = NULL;
+            }
+            if (g_sr_buf[tid]) { Wc = g_sr_buf[tid]; A = Wc + (size_t)m * CB; }
+        }
+        double *own = NULL;
+        if (!Wc) { own = sx(sizeof(double) * ((size_t)m * CB + (size_t)wmax * CB)); Wc = own; A = own + (size_t)m * CB; }
+        int *mk = sx(sizeof(int) * (size_t)ns);
+        for (int k = 0; k < ns; k++) mk[k] = -1;
+        #pragma omp for schedule(dynamic, 1)
+        for (int c = 0; c < nch; c++) {
+            const int a = c < nf ? c * CB : m1 + (c - nf) * CB, e = c < nf ? (a + CB < m0 ? a + CB : m0) : (a + CB < m ? a + CB : m);
+            const int cb = e - a, i0 = S->ss[S->snof[a]];
+            for (int i = a; i < e; i++)                         /* the ancestors of the chunk's indices */
+                for (int k = S->snof[i]; k >= 0 && mk[k] != c; k = par[k]) mk[k] = c;
+            memset(Wc + (size_t)i0 * CB, 0, sizeof(double) * (size_t)(m - i0) * CB);
+            for (int r = 0; r < cb; r++) Wc[(size_t)(a + r) * CB + r] = 1.0;
+            if (top && c < nf) {                                /* forward below the top; the top's rows to their panel */
+                if (CB == 64) sr_ichunk64(S, Wc, A, a, mk, c, kt, kt2, 1); else sr_ichunk32(S, Wc, A, a, mk, c, kt, kt2, 1);
+                double *xf = XF + (size_t)c * (m - mt) * CB;
+                memcpy(xf, Wc, sizeof(double) * (size_t)m0 * CB);
+                memcpy(xf + (size_t)m0 * CB, Wc + (size_t)m1 * CB, sizeof(double) * (size_t)(m - m1) * CB);
+                const int r0 = c * CB, pp = r0 / PR, pw = (pp + 1) * PR <= nrp ? PR : nrp - pp * PR, off = r0 - pp * PR;
+                double *Xp = XT + (size_t)pp * PR * mt;
+                for (int i = m0; i < m1; i++) memcpy(Xp + (size_t)(i - m0) * pw + off, Wc + (size_t)i * CB, sizeof(double) * CB);
+                continue;
+            }
+            if (CB == 64) sr_ichunk64(S, Wc, A, a, mk, c, -1, -1, 3); else sr_ichunk32(S, Wc, A, a, mk, c, -1, -1, 3);
+            for (int r = 0; r < cb; r++) {                      /* column perm[j], rows perm[i] for i >= j */
+                const int j = a + r;
+                double *restrict col = Zi + (size_t)perm[j] * ldz;
+                for (int i = j; i < m; i++) col[perm[i]] = Wc[(size_t)i * CB + r];
+            }
+        }
+        if (top) {
+            #pragma omp for schedule(dynamic, 1)
+            for (int pp = 0; pp < npan; pp++) {
+                const int pw = (pp + 1) * PR <= nrp ? PR : nrp - pp * PR;
+                sr_top_solve(S->tl, mt, XT + (size_t)pp * PR * mt, pw);
+            }
+            #pragma omp for schedule(dynamic, 1)
+            for (int c = 0; c < nf; c++) {                      /* backward below the top */
+                const int a = c * CB, e = a + CB < m0 ? a + CB : m0, cb = e - a;
+                const double *xf = XF + (size_t)c * (m - mt) * CB;
+                memcpy(Wc, xf, sizeof(double) * (size_t)m0 * CB);
+                memcpy(Wc + (size_t)m1 * CB, xf + (size_t)m0 * CB, sizeof(double) * (size_t)(m - m1) * CB);
+                const int r0 = c * CB, pp = r0 / PR, pw = (pp + 1) * PR <= nrp ? PR : nrp - pp * PR, off = r0 - pp * PR;
+                const double *Xp = XT + (size_t)pp * PR * mt;
+                for (int i = m0; i < m1; i++) memcpy(Wc + (size_t)i * CB, Xp + (size_t)(i - m0) * pw + off, sizeof(double) * CB);
+                if (CB == 64) sr_ichunk64(S, Wc, A, a, NULL, 0, kt, kt2, 2); else sr_ichunk32(S, Wc, A, a, NULL, 0, kt, kt2, 2);
+                for (int r = 0; r < cb; r++) {
+                    const int j = a + r;
+                    double *restrict col = Zi + (size_t)perm[j] * ldz;
+                    for (int i = j; i < m; i++) col[perm[i]] = Wc[(size_t)i * CB + r];
+                }
+            }
+            #pragma omp for schedule(static)
+            for (int j = m0; j < m1; j++) {                     /* the top's own columns */
+                double *restrict col = Zi + (size_t)perm[j] * ldz;
+                const double *tj = S->tinv + (size_t)(j - m0) * mt;
+                for (int i = j; i < m1; i++) col[perm[i]] = tj[i - m0];
+                for (int i = m1; i < m; i++) col[perm[i]] = 0.0;
+            }
+        }
+        free(mk);
+        free(own);
+    }
+    free(par);
+    /* the other half: entry (r, c) is set iff iperm[r] >= iperm[c]; tiles of 64 x 64 */
+    const int TB = 64, nt = (m + TB - 1) / TB;
+    #pragma omp parallel for schedule(dynamic, 1) if (nt > 4 && !outer)
+    for (int tj = 0; tj < nt; tj++) {
+        const int c0 = tj * TB, c1 = c0 + TB < m ? c0 + TB : m;
+        for (int ti = 0; ti <= tj; ti++) {
+            const int r0 = ti * TB, r1 = r0 + TB < m ? r0 + TB : m;
+            for (int c = c0; c < c1; c++) {
+                const int pc = iperm[c], re = ti == tj ? c : r1;
+                double *restrict zc = Zi + (size_t)c * ldz;
+                for (int r = r0; r < re; r++) {
+                    double *zr = Zi + (size_t)r * ldz + c;     /* (c, r) */
+                    if (iperm[r] >= pc) *zr = zc[r]; else zc[r] = *zr;
+                }
+            }
+        }
+    }
+}
+
+/* 5.12: the halves of a solve, in the permuted ordering (x[i] belongs to original index
+ * perm[i]): L x = b and L' x = b in place. With M = P' L L' P the eigenvalues of
+ * L^{-1} P D P' L^{-T} are those of M^{-1} D (the dual step lengths on a sparse Z). */
+void schol_lsolve(const SChol *S, double *x) {
+    for (int k = 0; k < S->ns; k++) {
+        const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k];
+        const int *rw = S->prow + S->prp[k];
+        const double *Pk = S->pan + S->pbase[k];
+        for (int cc = 0; cc < w; cc++) {
+            const double *col = Pk + (size_t)cc * nr;
+            const double xc = x[j0 + cc] / col[cc];
+            x[j0 + cc] = xc;
+            for (int q = cc + 1; q < nr; q++) x[rw[q]] -= col[q] * xc;
+        }
+    }
+}
+void schol_ltsolve(const SChol *S, double *x) {
+    for (int k = S->ns - 1; k >= 0; k--) {
+        const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k];
+        const int *rw = S->prow + S->prp[k];
+        const double *Pk = S->pan + S->pbase[k];
+        for (int cc = w - 1; cc >= 0; cc--) {
+            const double *col = Pk + (size_t)cc * nr;
+            double v = x[j0 + cc];
+            for (int q = cc + 1; q < nr; q++) v -= col[q] * x[rw[q]];
+            x[j0 + cc] = v / col[cc];
+        }
+    }
 }
 
 /* Solve M X = B for many right-hand sides at once (B is m x nrhs, column-major, original
