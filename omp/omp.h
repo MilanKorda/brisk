@@ -5,6 +5,8 @@
  * interface (__kmpc_*); brisk_omp.c implements the part of it these sources need. */
 #ifndef BRISK_OMP_H
 #define BRISK_OMP_H
+/* this runtime has no task dependences (depend clauses): sources use other paths where they would */
+#define BRISK_OMP_BUNDLED 1
 #ifdef __cplusplus
 extern "C" {
 #endif
