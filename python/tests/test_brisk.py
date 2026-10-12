@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.4.1"
+    assert brisk.version() == "1.4.2"
     assert os.path.exists(brisk.library_path())
 
 
@@ -147,6 +147,24 @@ def test_option_symalg(capsys):
     assert r0.status == 0 and "algebra symmetry" not in out
     assert np.isclose(r.pobj, r0.pobj, rtol=1e-7)
     assert r.X[0].shape == (23, 23) and np.linalg.eigvalsh(r.X[0]).min() > -1e-8
+
+
+@pytest.mark.parametrize("how", ["forced", "automatic"])
+def test_burer_monteiro(monkeypatch, how):
+    """the Burer-Monteiro solver on a max-cut relaxation: the interior-point value, X and y returned"""
+    p = maxcut_sdpa(200, seed=1)
+    r0 = brisk.solve_sdpa(**p, options={"bm": 0}, verbose=False)
+    if how == "automatic":
+        monkeypatch.setenv("BRISK_BMAUTON", "100")   # the route from order 100 instead of 2000
+        r = brisk.solve_sdpa(**p, verbose=False)
+    else:
+        r = brisk.solve_sdpa(**p, options={"bm": 1}, verbose=False)
+    assert r0.status == 0 and r.status == 0
+    assert abs(r.dobj - r0.dobj) <= 1e-7 * (1 + abs(r0.dobj))
+    X = r.X[0]
+    assert X.shape == (200, 200) and np.allclose(np.diag(X), 1.0, atol=1e-9)
+    assert np.min(np.linalg.eigvalsh(X)) > -1e-9
+    assert np.allclose(r.y, r0.y, atol=1e-4 * (1 + np.max(np.abs(r0.y))))
 
 
 def test_missing_file_and_returnx():

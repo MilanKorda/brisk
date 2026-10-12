@@ -188,6 +188,16 @@ static void usage(void) {
         "                   Newton-CG; no Schur complement): -1 auto (when the dense Schur complement\n"
         "                   does not fit in memory; a very sparse large block waits for the\n"
         "                   chordal conversion first), 0 off, 1 force (-1)\n"
+        "  -bm <k>          the Burer-Monteiro solver (X = R R', nothing of size n^2 formed) for large sparse\n"
+        "                   SDPs with low-rank solutions, one semidefinite block (and LP blocks):\n"
+        "                   1 always, 0 never, -1 (default) automatically when the problem has one block of\n"
+        "                   order n >= 500 and every constraint fixes a diagonal entry (max-cut and its\n"
+        "                   relatives; then coordinate steps on the spheres and a Riemannian trust region,\n"
+        "                   stopped on a certified bound; the interior-point method follows if it misses),\n"
+        "                   or when every constraint fixes one entry (matrix completion) and the dense\n"
+        "                   Schur complement does not fit in memory (the first-order engine if it misses).\n"
+        "                   Other constraints: an augmented Lagrangian with L-BFGS and an exact line search.\n"
+        "                   Its tolerance: -tol\n"
         "  -lralm <k>       experimental: low-rank augmented Lagrangian (Burer-Monteiro, X = R R')\n"
         "                   for large sparse SDPs such as AC-OPF relaxations: Newton-CG on R with a sparse\n"
         "                   n x n preconditioner, inequality slacks in closed form, rank 1 first and\n"
@@ -242,7 +252,10 @@ static void usage(void) {
         "                   it proves irreducible), 0 off, 1 every block (any gain); -nosym turns it off too\n"
         "  -symalgmax <n>   ... -symalg -1: largest block tried (1000; the check costs about one\n"
         "                   eigendecomposition and two n x n products per block: 0.2 s at n = 1000,\n"
-        "                   1.3 s at n = 1860)\n"        "  -chordal <k>     chordal decomposition: -1 auto, 0 off, 1 force\n"
+        "                   1.3 s at n = 1860)\n"
+        "  -blkscale <k>    diagonal congruence scaling of the semidefinite blocks, X = D X' D with D from the\n"
+        "                   data (Ruiz iterations, powers of two): 1 on, -1 when a block's factors spread by 4\n"
+        "                   or more, 0 off (the default)\n"        "  -chordal <k>     chordal decomposition: -1 auto, 0 off, 1 force\n"
         "  -chordalmin <n>  only blocks at least this large (100)\n"
         "  -returnx <k>     library calls (MATLAB, Python, Julia): X of a chordal-decomposed block is\n"
         "                   -1 returned as a dense matrix unless that needs more than 30%% of the memory\n"
@@ -423,10 +436,11 @@ typedef struct {
     PSOrig *Osign;          /* 4.33: the problem as read, when the sign-symmetry reduction was applied (before the permutation one) */
     PSSign *sign;
     PSOrig *Oalg;           /* 4.41: the problem before the *-algebra block diagonalisation (after the exact symmetry reductions) */
-    MomAff *aff;            /* 5.12: a moment relaxation over an ellipsoid, solved in the coordinates of the unit ball */
+    BlkScale *aff;          /* 5.14: the semidefinite blocks in scaled coordinates (blkscale.c; an option) */
+    MomAff *maff;           /* 5.12: a moment relaxation over an ellipsoid, solved in the coordinates of the unit ball */
     double aff_tol0;        /* ... the tolerance asked for (the solve in those coordinates runs to a tighter one) */
     Params *aff_par;
-    PSOrig *Oaff;           /* ... and the problem as read then (everything else is of the problem in those coordinates) */
+    PSOrig *Oaff;           /* ... and the problem as read then (everything else is of the scaled problem) */
     PSAlg *alg;
     PSOrig *Ofin;           /* the problem (Xo, yo) refer to after run_finish: one of O, Otb, Ofile, Odual (not owned) */
     int nXo;                /* blocks of Xo */
@@ -450,9 +464,10 @@ static void run_free(Run *u) {
     if (u->Otb) ps_orig_free(u->Otb);
     if (u->Odual) ps_orig_free(u->Odual);
     dualize_free(u->dual);
-    if (u->aff_par) { u->aff_par->tol = u->aff_tol0; u->aff_par = NULL; }
     if (u->Oaff) ps_orig_free(u->Oaff);
-    momaff_free(u->aff); u->aff = NULL; u->Oaff = NULL;
+    if (u->aff_par) { u->aff_par->tol = u->aff_tol0; u->aff_par = NULL; }
+    momaff_free(u->maff); u->maff = NULL;
+    blkscale_free(u->aff); u->aff = NULL; u->Oaff = NULL;
     if (u->Osym) ps_orig_free(u->Osym);
     sym_free(u->sym);
     if (u->Osign) ps_orig_free(u->Osign);
@@ -598,10 +613,11 @@ static PSOrig *map_back(Run *u, const Params *par, double ***pXo, double **pyo, 
         Xo = Xs; yo = ys; *pnXo = u->Osign->nblk;
         O = u->Osign;
     }
-    if (u->aff) {
-        /* 5.12: from the coordinates of the unit ball back to those of the file (the blocks and the rows are the same) */
+    if (u->aff || u->maff) {
+        /* 5.14: from the scaled coordinates (5.12: of the unit ball) back to those of the file (the blocks and the rows are the same) */
         double **Xa = NULL, *ya = calloc(u->Oaff->m + 1, sizeof(double));
-        momaff_unmap(u->aff, Xo, yo, Xo ? &Xa : NULL, ya);
+        if (u->maff) momaff_unmap(u->maff, Xo, yo, Xo ? &Xa : NULL, ya);
+        else blkscale_unmap(u->aff, Xo, yo, Xo ? &Xa : NULL, ya);
         if (Xo) { for (int k = 0; k < *pnXo; k++) free(Xo[k]); free(Xo); }
         free(yo);
         Xo = Xa; yo = ya; *pnXo = u->Oaff->nblk;
@@ -612,7 +628,7 @@ static PSOrig *map_back(Run *u, const Params *par, double ***pXo, double **pyo, 
 }
 
 static void run_finish(Run *u, const Params *par) {
-    if (!u->Otb && !u->fe && !u->dual && !u->alg && !u->sym && !u->sign && !u->aff) return;
+    if (!u->Otb && !u->fe && !u->dual && !u->alg && !u->sym && !u->sign && !u->aff && !u->maff) return;
     const int infeas = u->status == ST_PINFEAS || u->status == ST_DINFEAS;
     PSOrig *O = map_back(u, par, &u->Xo, &u->yo, &u->nXo, 1);
     double **Xo = u->Xo, *yo = u->yo;
@@ -631,7 +647,7 @@ static void run_finish(Run *u, const Params *par) {
         else if (acc <= par->red_acc) status = ST_REDUCED;
         else if (status == ST_OPTIMAL || status == ST_REDUCED) status = ST_NUMERIC;
     }
-    if (par->verbose > 0 && (u->fe || u->dual || u->alg || u->sym || u->sign || u->aff))
+    if (par->verbose > 0 && (u->fe || u->dual || u->alg || u->sym || u->sign || u->aff || u->maff))
         printf("   (errors on the file data: %.1e %.1e %.1e %.1e %.1e %.1e; reduced problem %.1e)\n",
                pr.err[1], pr.err[2], pr.err[3], pr.err[4], pr.err[5], pr.err[6], u->acc);
     u->status = status;
@@ -651,7 +667,7 @@ static const char g_brisk_data_name[] = "(problem in memory)";
 static void fom_start_map(Params *par, Run *u, Problem *P) {
     if (!par->fom_start_x && !par->fom_start_y) return;
     const PSOrig *O = u->O;
-    int same = !u->aff && !u->alg && !u->sym && !u->sign && !u->dual && !u->fe && u->tbR == 0 && P->ps && P->ps->nrec == 0 && !P->ps->chordal && O && O->m == P->m && O->nblk == P->nblk;
+    int same = !u->aff && !u->maff && !u->alg && !u->sym && !u->sign && !u->dual && !u->fe && u->tbR == 0 && P->ps && P->ps->nrec == 0 && !P->ps->chordal && O && O->m == P->m && O->nblk == P->nblk;
     for (int k = 0; same && k < P->nblk; k++) same = abs(O->bs[k]) == P->blk[k].n && ((O->bs[k] < 0) == (P->blk[k].type == BLK_LP));
     if (!same) { if (par->verbose >= 0) printf("first-order start: ignored (the presolve changed the problem: use -nosym and a problem without free elimination / facial reduction)\n"); return; }
     const int m = P->m, nb = P->nblk;
@@ -713,17 +729,25 @@ static int run_pipeline(const char *fname, Params *par, int do_fr, int force_rou
     }
     u->tread = wtime() - t0;
     double tpre0 = wtime();
-    {   /* 5.12: a moment relaxation over an ellipsoid in the coordinates of the unit ball (momaff.c; BRISK_NOAFF off) */
-        PSOrig *Of = ps_orig_build(P);
-        u->aff = momaff_apply(P, par->verbose);
-        if (u->aff) {
-            u->Oaff = Of;
-            /* the map back multiplies the last digits by up to |B| |B^-1|: a tighter tolerance there (ellipsoid (4,8) of a
-             * user: 4.9e-8 on the problem as read at 1e-8, 5.1e-10 at 1e-11, one iteration more) */
-            u->aff_tol0 = par->tol; u->aff_par = par;
-            par->tol = fmax(1e-12, par->tol * fmin(1.0, 10.0 / momaff_amplification(u->aff)));
-        } else ps_orig_free(Of);
-        if (getenv("BRISK_SETUPT")) printf("   [setup: ellipsoid test %.2fs]\n", wtime() - tpre0);
+    {   /* 5.14: diagonal congruence scaling of the semidefinite blocks (blkscale.c; -blkscale) */
+        const char *e = getenv("BRISK_BLKSCALE");
+        const int mode = e ? atoi(e) : par->blkscale;
+        if (getenv("BRISK_BLKSCALEMIN")) g_blkscale_min = atof(getenv("BRISK_BLKSCALEMIN"));
+        PSOrig *Of = mode ? ps_orig_build(P) : NULL;
+        u->aff = mode ? blkscale_apply(P, mode, par->verbose) : NULL;
+        if (u->aff) u->Oaff = Of; else if (Of) ps_orig_free(Of);
+        if (!u->aff) {   /* 5.12: a moment relaxation over an ellipsoid in the coordinates of the unit ball (momaff.c; BRISK_NOAFF off) */
+            PSOrig *Om = ps_orig_build(P);
+            u->maff = momaff_apply(P, par->verbose);
+            if (u->maff) {
+                u->Oaff = Om;
+                /* the map back multiplies the last digits by up to |B| |B^-1|: a tighter tolerance there (ellipsoid (4,8) of a
+                 * user: 4.9e-8 on the problem as read at 1e-8, 5.1e-10 at 1e-11, one iteration more) */
+                u->aff_tol0 = par->tol; u->aff_par = par;
+                par->tol = fmax(1e-12, par->tol * fmin(1.0, 10.0 / momaff_amplification(u->maff)));
+            } else ps_orig_free(Om);
+        }
+        if (getenv("BRISK_SETUPT")) printf("   [setup: block scaling %.2fs]\n", wtime() - tpre0);
     }
     /* 5.7: the matrix-free interior-point method first, on the problems it is made for: one to
      * four dense blocks of order >= 100 and a Schur complement whose factorization costs far
@@ -1619,7 +1643,7 @@ static void print_summary(const Run *u, const Params *par, const PSOrig *O, int 
     printf("Summary\n  Problem as read:   %s\n", sz);
     /* the presolve chain: each stage's PSOrig is the problem before that step */
     const PSOrig *chain[8]; const char *what[8]; int nc = 0;
-    if (u->Oaff) { chain[nc] = u->Oaff; what[nc++] = "moment relaxation over an ellipsoid: the coordinates of the unit ball"; }
+    if (u->Oaff) { chain[nc] = u->Oaff; what[nc++] = u->maff ? "moment relaxation over an ellipsoid: the coordinates of the unit ball" : "diagonal scaling of the semidefinite blocks"; }
     if (u->Osign) { chain[nc] = u->Osign; what[nc++] = "sign-symmetry reduction"; }
     if (u->Osym) { chain[nc] = u->Osym; what[nc++] = "symmetry reduction (automorphisms)"; }
     if (u->Oalg) { chain[nc] = u->Oalg; what[nc++] = "block diagonalisation along the data's *-algebra"; }
@@ -2196,7 +2220,7 @@ int brisk_main(int argc, char **argv) {
             else { fprintf(stderr, "brisk: -bound must be p or d\n"); return 1; }
         }
         OPT_D("-boundtol", bound_tol) OPT_D("-boundmargin", bound_margin) OPT_D("-boundtrack", bound_track_tol)
-        OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle) OPT_D("-mfhand", mf_hand) OPT_I("-mfhandcg", mf_handcg) OPT_I("-mfproj", mf_proj) OPT_D("-mfeta", mf_eta) OPT_I("-mftry", mf_try)
+        OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-blkscale", blkscale) OPT_I("-bm", bm) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle) OPT_D("-mfhand", mf_hand) OPT_I("-mfhandcg", mf_handcg) OPT_I("-mfproj", mf_proj) OPT_D("-mfeta", mf_eta) OPT_I("-mftry", mf_try)
         else if (!strcmp(a, "-threads")) { i = need(i, argc, a); const int nt = (int)num(argv[i], a); if (nt >= 1) { omp_set_num_threads(nt); g_threads_user = 1; } }   /* 4.32: BRISK's OpenMP threads (default OMP_NUM_THREADS / all cores) */
         else if (!strcmp(a, "-route")) { i = need(i, argc, a); force_route = (int)num(argv[i], a); }
         else if (!strcmp(a, "-densemem")) { i = need(i, argc, a); par.dense_mem = num(argv[i], a) * 1048576.0; }
@@ -2233,7 +2257,7 @@ int brisk_main(int argc, char **argv) {
         if (par.chordal < 0) par.chordal = 0;
     }
     par.t_start = wtime();
-    if (par.lralm > 0) (void)brisk_threads_busy(par.verbose);   /* (the process ends, or brisk_run restores the count) */
+    if (par.lralm > 0 || par.bm > 0) (void)brisk_threads_busy(par.verbose);   /* (the process ends, or brisk_run restores the count) */
     if (!g_hp_inner) brisk_hp_clear();                                             /* the text of an earlier high-precision solution */
     if (par.hp_kind > 0 && g_hp_inner) { par.hp_kind = 0; par.verbose = -1; }      /* the double solve inside a high-precision one */
     else if (par.hp_kind > 0) {                                                    /* 5.0: high precision */
@@ -2273,6 +2297,20 @@ int brisk_main(int argc, char **argv) {
         /* 5.10: the high-precision log ends with the way to a guaranteed bound (in the caller's syntax) */
         if (par.verbose > 0 && !g_hp_inner && !getenv("BRISK_NOSUMMARY") && (rc == 0 || rc == 10)) bound_hint(1);
         return rc;
+    }
+    if (par.bm > 0) return bm_run_x(fname, &par, yfile, xfile, zfile, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result, 0);   /* 5.14 */
+    {   /* 5.14: one block of order >= 500 whose constraints fix its diagonal (max-cut and its relatives): the
+         * Burer-Monteiro method first, to the tolerance with a certified bound; the interior-point method if it misses */
+        const BriskData *bd = g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL;
+        const int bmc = bm_auto_candidate(fname, bd, &par, g_brisk_result != NULL || xfile || zfile);
+        if (bmc) {
+            const double tb = wtime();
+            const int rc = bm_run_x(fname, &par, yfile, xfile, zfile, bd, g_brisk_result, bmc);
+            if (rc == 0) return 0;
+            if (rc != -1 && par.verbose >= 0) printf("Burer-Monteiro: the tolerance was not reached in %.1fs; the standard method follows\n", wtime() - tb);
+            if (rc != -1 && par.timelimit > 0) par.timelimit = fmax(1.0, par.timelimit - (wtime() - tb));   /* the attempt's time counts */
+            if (rc != -1 && g_brisk_result) { brisk_result_free(g_brisk_result); memset(g_brisk_result, 0, sizeof(*g_brisk_result)); }
+        }
     }
     if (par.lralm > 0) return lralm_run(fname, &par, yfile, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result);   /* 4.40: its own reading, measures and report */
     Run run, *u = &run;
@@ -2353,18 +2391,17 @@ int brisk_main(int argc, char **argv) {
             }
         }
         if (rc != 0) return 2;
-        /* 5.12: a relaxation over an ellipsoid solved in the coordinates of the unit ball whose solution, mapped
-         * back, misses the tolerance on the problem as read (the map multiplies the last digits of the moment
-         * matrix by about |B|^2): the problem is solved again as given (momaff.c) */
-        if (u->aff && u->measured && u->status != ST_OPTIMAL && !brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit)) {
+        /* 5.14: a solve in scaled coordinates whose solution, mapped back, misses the tolerance on the problem as
+         * read: the problem is solved again as given (blkscale.c) */
+        if ((u->aff || u->maff) && u->measured && u->status != ST_OPTIMAL && !brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit)) {
             const double ta = wtime() - t_pipe0;
-            if (par.verbose >= 0) printf("ellipsoid coordinates: %.1e on the problem as read; solving the problem as given\n", u->acc);
-            att_log("the relaxation in the coordinates of the unit ball", ta, u); textra += ta;
+            if (par.verbose >= 0) printf("%s: %.1e on the problem as read; solving the problem as given\n", u->maff ? "ellipsoid coordinates" : "scaled blocks", u->acc);
+            att_log(u->maff ? "the relaxation in the coordinates of the unit ball" : "the solve with scaled blocks", ta, u); textra += ta;
             run_free(u);
-            g_momaff_off = 1;
+            g_blkscale_off = 1; g_momaff_off = 1;
             rc = run_pipeline(fname, &par, do_fr, force_route, u);
             if (rc == 3) { run_free(u); do_fr = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }
-            g_momaff_off = 0;
+            g_blkscale_off = 0; g_momaff_off = 0;
             if (rc != 0) return 2;
         }
         /* 4.37 (B1): the first attempt, and the in-solver method retry as a re-solve */

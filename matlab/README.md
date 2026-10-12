@@ -10,7 +10,7 @@ verification of the returned point on the data as given).
 2. In MATLAB, once: `mex -setup C` (it should find Xcode's clang).
 3. In MATLAB:
    ```matlab
-   cd brisk-1.4.1/matlab
+   cd brisk-1.4.2/matlab
    build_brisk_mex            % about a minute; produces brisk_mex.mexmaca64
    test_brisk                 % every line should say PASS
    addpath(pwd); savepath     % keep it on the path
@@ -101,6 +101,9 @@ opts.symalg    = 0;          % block structure shared by all data matrices of a 
 opts.chordal   = 0;          % chordal decomposition: -1 automatic (default), 0 off, 1 force
 opts.nohsd     = true;       % a flag: true (or 1) sets it, false (or 0) leaves it out
 opts.fom       = 1;          % first-order engine; opts.lralm = 1: low-rank ALM (experimental)
+opts.bm        = 0;          % Burer-Monteiro solver: -1 automatic (default: one block of order >= 500 with a fixed
+                             % diagonal, or one whose constraints fix single entries when the Schur complement
+                             % does not fit), 0 off, 1 always
 opts.returnx   = 0;          % X of a chordal-decomposed block: -1 returned unless its dense form
                              % exceeds 30% of the memory (default), 0 never (fastest), 1 always.
                              % Blocks that are not returned are empty; info.have_x says which case

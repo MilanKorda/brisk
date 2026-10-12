@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.4.1"
+#define BRISK_VERSION "1.4.2"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -306,6 +306,8 @@ typedef struct {
     double fom_race, fom_race_budget;   /* 4.42: the first-order engine first at tol >= 1e-6 on few large dense blocks: share of the expected IPM time (0.2; 0 off); the budget in seconds (set by run_pipeline) */
     int returnx;         /* 4.42 (library): X of a chordal-decomposed block: -1 returned unless its dense form exceeds 30% of the memory, 0 never (measured on the cliques, fastest), 1 always */
     int symalg;          /* 4.41: *-algebra block diagonalisation (symalg.c): -1 auto (blocks up to symalgmax), 0 off, 1 every block */
+    int bm;              /* 5.14: the Burer-Monteiro solver (bm.c): 0 off, 1 on */
+    int blkscale;        /* 5.14: diagonal congruence scaling of the semidefinite blocks (blkscale.c): 0 off, 1 on, -1 auto */
     int symalgmax;       /* 4.41: ... -symalg -1: largest block size tried (1000) */
     int symsigned;       /* 4.37: -sym auto: signed permutations (a search on |data|, signs lifted over GF(2)) (1) */
     int mfipm;           /* 4.34: matrix-free interior-point method (mfipm.c): 1 on, 0 off; 5.4: 2 the hybrid (hand-off to the standard method) */
@@ -618,6 +620,13 @@ void momaff_unmap(const MomAff *R, double **Xp, const double *yp, double ***Xo, 
 void momaff_free(MomAff *R);
 double momaff_amplification(const MomAff *R);
 extern int g_momaff_off;
+typedef struct BlkScale BlkScale;  /* blkscale.c: diagonal congruence scaling of the semidefinite blocks (X = D X' D) */
+BlkScale *blkscale_apply(Problem *P, int mode, int verbose);   /* mode 0 off, 1 on, -1 automatic; NULL: not applied */
+void blkscale_unmap(const BlkScale *S, double **Xp, const double *yp, double ***Xo, double *yo);
+void blkscale_free(BlkScale *S);
+double blkscale_spread(const BlkScale *S);
+extern int g_blkscale_off;
+extern double g_blkscale_min;
 void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose);   /* 4.30 */
 void free_elim_free(PSFreeElim *F);
 void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile);
@@ -669,6 +678,9 @@ int mfipm_solve_snap(Problem *P, const Params *par, Result *R, double *yout, dou
 int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, double **Zint, double *yint, double hand_merit, int hand_cg);
 /* 4.40 low-rank augmented Lagrangian (lralm.c): reads, solves, reports; returns the exit code */
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);
+int bm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);   /* 5.14: bm.c */
+int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfile, const char *zfile, const BriskData *data, BriskResult *res, int autom);   /* -1: not applicable (automatic route) */
+int bm_auto_candidate(const char *fname, const BriskData *data, const Params *par, int need_dense);
 extern int g_read_maxn;   /* 4.40: largest SDP block the reader accepts (46340; lralm lifts it) */
 PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, long symnodes, int symbd, double symmin, int chordal_minn, double chordal_density, int symsigned);
 /* 4.33 sign symmetries (symred.c): diagonal ±1 automorphisms; blocks split by sign pattern, odd constraints dropped */

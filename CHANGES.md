@@ -1,5 +1,32 @@
 # BRISK change log
 
+## Version 1.4.2 (October 2026)
+
+- **A Burer-Monteiro solver for large sparse problems with low-rank solutions** (`-bm`). X = R Rᵀ
+  with R of n × r; every operation is a product of a sparse matrix on the data's pattern with the
+  factor, and nothing of size n² is formed. It runs by default, before the interior-point method,
+  on two kinds of problems with one semidefinite block:
+  - every constraint fixes a diagonal entry and the order is 500 or more (max-cut and the other
+    relaxations over {−1,1}ⁿ): coordinate steps on the product of spheres, then a Riemannian trust
+    region, until the gap to a lower bound is within the tolerance. The bound comes from the dual
+    matrix Z made positive semidefinite by a shift δ that a sparse Cholesky factorization of Z + δI
+    confirms (where that factorization would fill, the bound is reported as an estimate);
+  - every constraint fixes one entry (matrix completion) and the interior-point method's Schur
+    complement does not fit in memory: an augmented Lagrangian method with L-BFGS and an exact line
+    search.
+
+  If it misses the tolerance within half the time limit, the standard method follows; `-bm 0` turns
+  it off, `-bm 1` uses it for any problem with one semidefinite block. Four threads, the default
+  tolerance 1e-8, the same optimal values: maxG55 (order 5000) 46 → 1.5 s, maxG60 (7000) 79 → 3.3 s,
+  G55mc 39 → 1.8 s, checker_1.5 23.5 → 0.9 s, ice_2.0 119 → 4.4 s, p_auss2_3.0 127 → 8.9 s; a
+  matrix-completion problem with 59,937 constraints 53 → 0.4 s. Against LoRADS (its CPU release, on
+  the classes of its paper; BRISK at `-tol 1e-6` with a certified bound): matrix completion 4-9 times
+  faster (1.5 million constraints in 9.6 s, where LoRADS did not finish in 900 s), max-cut on Gset
+  graphs 2.3 times faster in the geometric mean, Mittelmann's checker_1.5, ice_2.0 and p_auss2_3.0
+  6-41 times faster, and planar graphs of 65,536 to 262,144 nodes solved in 5 to 14 minutes.
+- **`-blkscale 1`**: a diagonal congruence scaling of the semidefinite blocks (X = D X' D, D from
+  Ruiz iterations on the data, powers of two), off by default.
+
 ## Version 1.4.1 (October 2026)
 
 - **macOS: the dense Cholesky factorization runs as a task graph again.** The OpenMP runtime that

@@ -1,4 +1,4 @@
-# BRISK 1.4.1: the solver in detail
+# BRISK 1.4.2: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -219,6 +219,14 @@ Every automatic choice below can be overridden from the command line.
   the hybrid: the matrix-free iteration while its CG is cheap, then the standard method from
   that iterate (a few Schur factorizations instead of thirty; the hand-off at a merit of 1e-3, `-mfhand`). The default does the same by itself when its
   matrix-free attempt gets near but does not end OPTIMAL.
+- **The Burer-Monteiro solver** (`-bm`): X = R Rᵀ, nothing of size n² formed. By default a problem
+  with one semidefinite block of order 500 or more whose constraints all fix diagonal entries
+  (max-cut and its relatives) is solved this way: coordinate steps on the spheres and a Riemannian
+  trust region, stopped on a certified bound, the interior-point method if it misses (`-bm 0`
+  turns this off). `-bm 1` uses it for any problem with one semidefinite block (an augmented
+  Lagrangian with an exact line search; X is not returned above order 20,000); by default also
+  when every constraint fixes one entry (matrix completion) and the interior-point method's Schur
+  complement does not fit in memory.
 - **`-lralm 1` (experimental):** a low-rank augmented Lagrangian method (X = R Rᵀ) for very large
   sparse SDPs such as AC-OPF relaxations beyond the interior-point method's reach. Its Newton
   steps use a sparse n × n preconditioner, so its memory stays O(nnz + n·rank). It reports

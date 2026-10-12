@@ -88,6 +88,8 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
 | `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
+| `bm` | the Burer-Monteiro solver (X = R Rᵀ, nothing of size n² formed): `1` always, `0` never, `-1` automatically for one block of order n ≥ 500 whose constraints fix its diagonal (max-cut and its relatives; stopped on a certified bound, the interior-point method if it misses), or for one block whose constraints each fix one entry (matrix completion) when the dense Schur complement does not fit in memory (the first-order engine if it misses) | -1 |
+| `blkscale` | diagonal congruence scaling of the semidefinite blocks (X = D X' D, D from the data): `1` on, `-1` when a block's factors spread by 4 or more, `0` off | 0 |
 | `crossover` | SDP crossover after the solve: `0` off, `1` on, `-1` when cheap | 0 |
 
 ### The end of the solve: best iterate, endgame, polishing
@@ -331,6 +333,16 @@ presolve
                    Newton-CG; no Schur complement): -1 auto (when the dense Schur complement
                    does not fit in memory; a very sparse large block waits for the
                    chordal conversion first), 0 off, 1 force (-1)
+  -bm <k>          the Burer-Monteiro solver (X = R R', nothing of size n^2 formed) for large sparse
+                   SDPs with low-rank solutions, one semidefinite block (and LP blocks):
+                   1 always, 0 never, -1 (default) automatically when the problem has one block of
+                   order n >= 500 and every constraint fixes a diagonal entry (max-cut and its
+                   relatives; then coordinate steps on the spheres and a Riemannian trust region,
+                   stopped on a certified bound; the interior-point method follows if it misses),
+                   or when every constraint fixes one entry (matrix completion) and the dense
+                   Schur complement does not fit in memory (the first-order engine if it misses).
+                   Other constraints: an augmented Lagrangian with L-BFGS and an exact line search.
+                   Its tolerance: -tol
   -lralm <k>       experimental: low-rank augmented Lagrangian (Burer-Monteiro, X = R R')
                    for large sparse SDPs such as AC-OPF relaxations: Newton-CG on R with a sparse
                    n x n preconditioner, inequality slacks in closed form, rank 1 first and
@@ -386,6 +398,9 @@ presolve
   -symalgmax <n>   ... -symalg -1: largest block tried (1000; the check costs about one
                    eigendecomposition and two n x n products per block: 0.2 s at n = 1000,
                    1.3 s at n = 1860)
+  -blkscale <k>    diagonal congruence scaling of the semidefinite blocks, X = D X' D with D from the
+                   data (Ruiz iterations, powers of two): 1 on, -1 when a block's factors spread by 4
+                   or more, 0 off (the default)
   -chordal <k>     chordal decomposition: -1 auto, 0 off, 1 force
   -chordalmin <n>  only blocks at least this large (100)
   -returnx <k>     library calls (MATLAB, Python, Julia): X of a chordal-decomposed block is

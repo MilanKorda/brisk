@@ -187,7 +187,7 @@ void params_default(Params *p) {
     p->acc_level = 1; p->red_acc = 1e-6; p->retry_hsd1 = 1e-6; p->slow_gate = 1e-5;
     p->tracebound = -1;
     p->dualize = -1;
-    p->symfile = "auto"; p->symtime = 20.0; p->symnodes = 500; p->symbd = 1; p->symmin = 1.5; p->symsign = 1; p->symsigned = 1; p->returnx = -1; p->fom_race = 0.2; p->fom_race_budget = 0; p->hp_kind = 0; p->hp_digits = 0; p->hp_tol = 0; p->hp_ext = 2; p->symalg = -1; p->symalgmax = 1000;
+    p->symfile = "auto"; p->symtime = 20.0; p->symnodes = 500; p->symbd = 1; p->symmin = 1.5; p->symsign = 1; p->symsigned = 1; p->returnx = -1; p->fom_race = 0.2; p->fom_race_budget = 0; p->hp_kind = 0; p->hp_digits = 0; p->hp_tol = 0; p->hp_ext = 2; p->symalg = -1; p->symalgmax = 1000; p->blkscale = 0; p->bm = -1;
     p->chordal_need = 0;
     p->lralm = 0; p->lr_rank = 1; p->lr_rmax = 32; p->lr_outer = 500; p->lr_inner = 2000; p->lr_escape = 1; p->lr_prec = 1; p->lr_newton = 1; p->lr_sigma = 10.0; p->lr_tol = 1e-6; p->lr_trace = 0;
     p->mfipm = 0; p->mf_rho = 10; p->mf_rmax = 4; p->mf_drop = 0.5; p->mf_kmax = 8000; p->mf_cgmax = 3000; p->mf_cgtol_min = 1e-10; p->mf_cgtol_max = 1e-3; p->mf_diag = 0; p->mf_warm = 1; p->mf_stall = 5; p->mf_cgtime = 0; p->mf_hand = 1e-3; p->mf_handcg = 600; p->mf_try = 1; p->mf_trial = 0; p->mf_trial_total = 0; p->mf_try_tl = 0; p->mf_try_fits = 1; p->mf_proj = 0; p->mf_eta = 0.1; p->fom_sigma0 = 1.0; p->fom_aadr = 1; p->fom_single = 1e-4; p->fom_ssn_stall = 6; p->mf_recycle = 0;
