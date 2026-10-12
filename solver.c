@@ -2778,8 +2778,10 @@ static void rect_mv2(int nr, int nc, const double *R, int ld, const double *rest
  * were rows and P the thread count). Panel b = columns [c0, c1) owns its diagonal block (dsymv)
  * and the rectangle that joins it to the other indices - below it for the lower triangle, above
  * it for the upper one - whose two products it adds in one pass (rect_mv2) into a vector of its
- * own; the vectors are summed in panel order. One thread runs the panels in turn through one
- * vector: the same additions in the same order. Measured against one dsymv (m = 1,024 ... 12,000,
+ * own; the vectors are summed in panel order. One thread runs the panels in turn through the
+ * same vectors: the same additions in the same order, at the same addresses (5.15: through one
+ * vector until then; Accelerate rounds a dsymv differently by where its vectors lie, modulo up
+ * to 256 bytes, so on macOS one thread and several gave other bits). Measured against one dsymv (m = 1,024 ... 12,000,
  * bench/threads_5.11/symv_bench.c): 0.91-1.03 times its time on one thread; 2.0-2.3 times faster
  * than the 5.7 version at four threads. Below m = 1,024 one dsymv. BRISK_SYMVSER=1: one dsymv
  * always (the result of 5.6 and earlier). */
@@ -2793,7 +2795,7 @@ static void par_symv(char uplo, int m, double alpha, const double *M, const doub
     for (int b = 0; b <= P; b++) cut[b] = (int)(low ? m - m * sqrt(1.0 - (double)b / P) + 0.5 : m * sqrt((double)b / P) + 0.5);
     cut[0] = 0; cut[P] = m;
     const int inp = in_par(), T0 = inp ? 1 : nthreads(), T = T0 < P ? T0 : P;
-    const size_t need = sizeof(double) * (size_t)m * (T > 1 ? P + 1 : 2);
+    const size_t need = sizeof(double) * (size_t)m * (P + 1);
     double *buf;                                    /* (inside a parallel region: a buffer of its own) */
     if (inp) buf = amalloc(need);
     else { if (need > g_symv_wn) { free(g_symv_w); g_symv_w = amalloc(need); g_symv_wn = need; } buf = g_symv_w; }
@@ -2812,11 +2814,11 @@ static void par_symv(char uplo, int m, double alpha, const double *M, const doub
         } } while (0)
     if (!inp) blas_serial_begin();
     if (T <= 1) {
-        memset(acc, 0, sizeof(double) * (size_t)m);
-        for (int b = 0; b < P; b++) {
-            SYMV_PART(b, W);
-            const int lo = SYMV_LO(b), hi = SYMV_HI(b);
-            for (int i = lo; i < hi; i++) acc[i] += W[i];
+        for (int b = 0; b < P; b++) { double *w = W + (size_t)b * m; SYMV_PART(b, w); }
+        for (int i = 0; i < m; i++) {
+            double t = 0;
+            for (int b = 0; b < P; b++) if (i >= SYMV_LO(b) && i < SYMV_HI(b)) t += W[i + (size_t)b * m];
+            acc[i] = t;
         }
     } else {
         #pragma omp parallel num_threads(T)

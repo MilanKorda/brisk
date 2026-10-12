@@ -560,6 +560,7 @@ static int sym_chordal_conflict(const Problem *P, int nred, const int *nr, const
 #define SYM_BDMAXD 24
 #define SYM_BDMAXGEN 32    /* generators used for the basis (a subgroup is exact; the search can return hundreds) */
 static uint64_t bd_rng = 0x9E3779B97F4A7C15ull;
+void symred_rng_reset(void) { bd_rng = 0x9E3779B97F4A7C15ull; }   /* 5.15: at the start of each solve (see lowrank_rng_reset) */
 static double bd_rand(void) { bd_rng ^= bd_rng << 13; bd_rng ^= bd_rng >> 7; bd_rng ^= bd_rng << 17; return (double)(bd_rng >> 11) * (2.0 / 9007199254740992.0) - 1.0; }
 
 /* nullity of F (d x d) -> [R_s F - F Q_s]_s and, when it is one, the isometric kernel vector */

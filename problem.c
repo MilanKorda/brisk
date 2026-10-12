@@ -426,7 +426,13 @@ static void spsym_scale(SpSym *S, double s) {
  * Small support: eigendecomposition of the principal submatrix.
  * Otherwise: randomized range finder with k = 8, 16, 32 and a randomized
  * residual check. Returns the rank, or -1 if not (cheaply) low-rank.       */
-static unsigned long lr_rng = 88172645463325252UL;
+#define LR_SEED 88172645463325252UL
+static unsigned long lr_rng = LR_SEED;
+/* 5.15: back to the seed at the start of each solve (brisk_main): the state ran on from solve to
+ * solve, so in a library host (Julia, Python, MATLAB) the second solve of the same problem got
+ * other random vectors, other low-rank factors and other bits (gpp124-1: 11 of 16 solves in one
+ * process differed from the first, once in the status) */
+void lowrank_rng_reset(void) { lr_rng = LR_SEED; }
 static double lr_rand(void) {
     lr_rng ^= lr_rng << 13; lr_rng ^= lr_rng >> 7; lr_rng ^= lr_rng << 17;
     return (double)(lr_rng >> 11) / 9007199254740992.0 - 0.5;

@@ -2452,7 +2452,13 @@ static int blas_T_host = 0;      /* the OpenBLAS thread count found at the first
  * value 1 (BLAS_THREADING_SINGLE_THREADED of vecLib's thread_api.h; 0 lets Accelerate decide).
  * Looked up at run time, so that older systems and other BLAS libraries are left as they are;
  * set on the calling thread and on every OpenMP thread, and the caller's setting is given back
- * at the end of a library call (BLASGetThreading). Before macOS 15: VECLIB_MAXIMUM_THREADS=1. */
+ * at the end of a library call (BLASGetThreading).
+ * 5.15: before macOS 15 (no BLASSetThreading) VECLIB_MAXIMUM_THREADS=1 is set in the process,
+ * unless it is set already. Accelerate reads it at its first threaded call, so setting it here,
+ * before BRISK's first BLAS call, is enough (the variable outside the process is not needed).
+ * Without it, on an M3 under macOS 14 at -threads 1, 3-5 % of the runs of theta4 took another
+ * path (Accelerate's LAPACK ran on 7 dispatch threads); with it, 200 of 200 runs were the same.
+ * In a library host the setting stays for the rest of the process (as when the user sets it). */
 #include <dlfcn.h>
 static int (*accel_set)(unsigned) = NULL;
 static unsigned (*accel_get)(void) = NULL;
@@ -2464,7 +2470,7 @@ static void accel_single(void) {
         accel_set = (int (*)(unsigned))dlsym(RTLD_DEFAULT, "BLASSetThreading");
         accel_get = (unsigned (*)(void))dlsym(RTLD_DEFAULT, "BLASGetThreading");
     }
-    if (!accel_set) return;
+    if (!accel_set) { if (!getenv("VECLIB_MAXIMUM_THREADS")) setenv("VECLIB_MAXIMUM_THREADS", "1", 1); return; }
     if (accel_get && accel_host < 0) accel_host = (long)accel_get();
     (void)accel_set(1u);
     #pragma omp parallel

@@ -141,20 +141,37 @@ fprintf('BRISK MEX build: %s (AMD bundled)\n', ternary(isoct, 'Octave', 'MATLAB'
 olddir = pwd;
 c = onCleanup(@() cd(olddir));
 cd(here);
-if isoct
-    setenv('CFLAGS', cflags);
-    if ~isempty(ldextra), setenv('LDFLAGS', ldextra); end
-    args = [{'--mex', '-o', 'brisk_mex'}, defs, incs, files, libs];
-    if o.verbose, args = [{'-v'}, args]; end
-    [out, status] = mkoctfile(args{:});
-    if status ~= 0, error('brisk:build', 'mkoctfile failed:\n%s', out); end
-else
-    args = [{'-output', 'brisk_mex', ['CFLAGS=$CFLAGS ' cflags], 'COPTIMFLAGS=-O3 -DNDEBUG'}, defs, incs, files, libs];
-    if ~isempty(ldextra), args{end + 1} = ['LDFLAGS=$LDFLAGS ' ldextra]; end
-    if o.verbose, args = [{'-v'}, args]; end
-    mex(args{:});
+mexfile = fullfile(here, ['brisk_mex.' mexext]);
+% 5.15: on macOS the linked file goes through the post-link check (../tools/link_check.sh): the
+% linker of Xcode 15.0 changed an instruction of the solver into an undefined word (SIGILL); a
+% damaged file is built again with the classic linker, or removed if there is none
+for attempt = 1:2
+    if isoct
+        setenv('CFLAGS', cflags);
+        if ~isempty(ldextra), setenv('LDFLAGS', ldextra); end
+        args = [{'--mex', '-o', 'brisk_mex'}, defs, incs, files, libs];
+        if o.verbose, args = [{'-v'}, args]; end
+        [out, status] = mkoctfile(args{:});
+        if status ~= 0, error('brisk:build', 'mkoctfile failed:\n%s', out); end
+    else
+        args = [{'-output', 'brisk_mex', ['CFLAGS=$CFLAGS ' cflags], 'COPTIMFLAGS=-O3 -DNDEBUG'}, defs, incs, files, libs];
+        if ~isempty(ldextra), args{end + 1} = ['LDFLAGS=$LDFLAGS ' ldextra]; end
+        if o.verbose, args = [{'-v'}, args]; end
+        mex(args{:});
+    end
+    if ~ismac, break; end
+    [st, out] = system(sprintf('sh "%s" --check "%s"', fullfile(src, 'tools', 'link_check.sh'), mexfile));
+    if st == 0, break; end
+    fprintf('%s', out);
+    if attempt == 2 || ~isempty(strfind(ldextra, '-ld_classic')) || system('ld -ld_classic -v >/dev/null 2>&1') ~= 0 %#ok<STREMP>
+        delete(mexfile);
+        error('brisk:build', ['%s was linked damaged and is removed: update the command-line tools ' ...
+              '(System Settings > Software Update)'], mexfile);
+    end
+    fprintf('building again with the classic linker (-Wl,-ld_classic)\n');
+    ldextra = strtrim([ldextra ' -Wl,-ld_classic']);
 end
-fprintf('built %s\n', fullfile(here, ['brisk_mex.' mexext]));
+fprintf('built %s\n', mexfile);
 end
 
 function r = ternary(c, a, b)

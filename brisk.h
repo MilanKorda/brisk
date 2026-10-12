@@ -10,12 +10,56 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.4.2"
+#define BRISK_VERSION "1.4.3"
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* 5.15: on macOS every allocation of 128 bytes or more is aligned to 256 bytes. Apple's
+ * Accelerate rounds level-1/2 operations (ddot from 16 doubles, dsymv, dnrm2) differently by
+ * where the vectors lie, modulo up to 256 bytes, and malloc places a block at an address that
+ * changes from run to run (with the thread or core that allocates): the same data gave other
+ * bits from run to run at several threads (gpp124-1 at -threads 7: 3-8 % of the runs, from the
+ * residual of the first Schur solve on). With the bases fixed modulo 256 every vector passed to
+ * Accelerate lies at the same place in every run. Below 128 bytes nothing reaches a kernel whose
+ * result depends on the place (measured), and the memory of small blocks is not padded. */
+#if defined(__APPLE__) && !defined(BRISK_PLAIN_MALLOC)
+#include <string.h>
+#include <malloc/malloc.h>
+static inline void *brisk_malloc(size_t n) {
+    if (n < 128) return (malloc)(n);
+    void *p = NULL;
+    return (posix_memalign)(&p, 256, n) ? NULL : p;
+}
+static inline void *brisk_calloc(size_t k, size_t n) {
+    if (n && k > (size_t)-1 / n) return NULL;
+    const size_t t = k * n;
+    if (t < 128) return (calloc)(k, n);
+    void *p = brisk_malloc(t);
+    if (p) memset(p, 0, t);
+    return p;
+}
+static inline void *brisk_realloc(void *p, size_t n) {
+    if (!p) return brisk_malloc(n);
+    if (n < 128) return (realloc)(p, n);
+    const size_t old = malloc_size(p);
+    if (old >= n && (uintptr_t)p % 256 == 0) return p;
+    void *q = brisk_malloc(n);
+    if (!q) return NULL;
+    memcpy(q, p, old < n ? old : n);
+    free(p);
+    return q;
+}
+static inline int brisk_posix_memalign(void **p, size_t a, size_t n) {
+    return (posix_memalign)(p, (n >= 128 && a < 256) ? 256 : a, n);
+}
+#define malloc(n) brisk_malloc(n)
+#define calloc(k, n) brisk_calloc(k, n)
+#define realloc(p, n) brisk_realloc(p, n)
+#define posix_memalign(p, a, n) brisk_posix_memalign(p, a, n)
+#endif
 
 /* ---- 4.30 library interface (MATLAB/Octave MEX, see matlab/): brisk_main is the command
  * line; with a BriskResult attached (brisk_run) the solution of the problem as read is
@@ -407,6 +451,10 @@ typedef struct {
 int  read_sdpa(const char *fname, Problem *P);
 int  problem_from_sdpa_data(const BriskData *d, Problem *P);   /* 4.37: read_sdpa from memory */
 void problem_prepare(Problem *P, const Params *par);
+/* 5.15: the generators of the randomized steps (low-rank detection, symmetry's block
+ * diagonalization) back to their seeds; called at the start of each solve */
+void lowrank_rng_reset(void);
+void symred_rng_reset(void);
 void problem_free(Problem *P);
 int  facial_reduction(Problem *P, int verbose);
 int  chordal_convert(Problem *P, const Params *par, int verbose);

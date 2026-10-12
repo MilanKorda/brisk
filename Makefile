@@ -18,6 +18,14 @@ ifeq ($(UNAME_S),Darwin)
   ifneq ($(filter arm64,$(UNAME_M)),)
     ARCHFLAG := -mcpu=native
   endif
+  # 5.15: the first release of Apple's new linker (Xcode 15.0, `ld -v`: dyld-1015) changed an
+  # instruction that carries no relocation (sedumi_solve: `fmov d3, x15` linked as an undefined
+  # word; SIGILL in the Python tests on an M3); the classic linker links the same objects right.
+  # Every link also goes through tools/link_check.sh, which looks for such words in the result
+  # with any linker and links again with the classic linker if it finds one.
+  ifneq ($(findstring dyld-1015,$(shell ld -v 2>&1)),)
+    LINKFIX := -Wl,-ld_classic
+  endif
 else
   OMP ?= 1
 endif
@@ -76,7 +84,7 @@ ifeq ($(METIS),1)
   METISLIB = -lmetis
 endif
 brisk: $(OBJ) $(AMDOBJ)
-	$(CC) $(CFLAGS) $(DEFS) -o $@ $(OBJ) $(AMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lm
+	sh tools/link_check.sh $@ -- $(CC) $(CFLAGS) $(DEFS) $(LINKFIX) -o $@ $(OBJ) $(AMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lm
 
 amd/%.o: amd/%.c
 	$(CC) $(CFLAGS) -DNDEBUG -Wno-all -Wno-extra -c -o $@ $<
@@ -113,7 +121,7 @@ LIBAMDOBJ = $(patsubst %.c,libobj/%.o,$(AMDSRC))
 libbrisk: $(LIBBRISK)
 
 $(LIBBRISK): $(LIBOBJ) $(LIBAMDOBJ) libbrisk.map libbrisk.exp
-	$(CC) $(CFLAGS) -fPIC $(DEFS) -DBRISK_LIBRARY $(LIBLDFLAGS) -o $@ $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lm
+	sh tools/link_check.sh $@ -- $(CC) $(CFLAGS) -fPIC $(DEFS) -DBRISK_LIBRARY $(LIBLDFLAGS) $(LINKFIX) -o $@ $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lm
 
 libobj/amd/%.o: amd/%.c
 	@mkdir -p $(dir $@)

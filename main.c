@@ -2102,6 +2102,7 @@ int brisk_main(int argc, char **argv) {
     brisk_threads_init();
     brisk_log_threads_reset();
     if (!g_hp_inner) notes_clear();                                                /* 5.8: the summary's notes */
+    if (!g_hp_inner) { lowrank_rng_reset(); symred_rng_reset(); }                  /* 5.15: each solve as in a fresh process */
     quiet_summary = getenv("BRISK_NOSUMMARY") != NULL || g_hp_inner;
     if (!g_hp_inner) advice_scan(argc, argv, 1);
     { extern void (*socp_note)(const char *, ...); socp_note = brisk_note; }

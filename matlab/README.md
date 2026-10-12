@@ -10,7 +10,7 @@ verification of the returned point on the data as given).
 2. In MATLAB, once: `mex -setup C` (it should find Xcode's clang).
 3. In MATLAB:
    ```matlab
-   cd brisk-1.4.2/matlab
+   cd brisk-1.4.3/matlab
    build_brisk_mex            % about a minute; produces brisk_mex.mexmaca64
    test_brisk                 % every line should say PASS
    addpath(pwd); savepath     % keep it on the path
@@ -20,7 +20,9 @@ Nothing else needs to be installed. BLAS and LAPACK come from Apple's Accelerate
 the AMD ordering is bundled (`../amd`, BSD 3-clause), and so is the OpenMP runtime (`../omp`): Apple's clang compiles the OpenMP pragmas but ships no OpenMP library, so BRISK
 brings its own — a small runtime (`omp/brisk_omp.c`, POSIX threads) compiled into the MEX
 file. BRISK's threads then run the Schur assembly, the sparse Cholesky, the block algebra
-and the correctors in parallel, alongside Accelerate's BLAS threads; there is no dylib to
+and the correctors in parallel, with Accelerate on one thread under them (asked for one
+thread on macOS 15 and later; earlier, `VECLIB_MAXIMUM_THREADS=1` is set in the MATLAB process
+unless it is set; `BRISK_BLASMT=1` keeps Accelerate's threads); there is no dylib to
 find at run time and no clash with an OpenMP runtime MATLAB may load itself (the runtime's
 symbols are internal to the MEX file). The thread count follows `OMP_NUM_THREADS` (set before
 starting MATLAB) or `opts.threads = 8`; the default is every core.

@@ -1,5 +1,36 @@
 # BRISK change log
 
+## Version 1.4.3 (October 2026)
+
+- **macOS: the same result from run to run and for any thread count.** Two properties of Apple's
+  Accelerate made runs of the same problem differ in the last digits, which the interior-point
+  method can amplify into other iteration counts:
+  - before macOS 15, Accelerate ran threads of its own even under `-threads 1`; BRISK now sets
+    `VECLIB_MAXIMUM_THREADS=1` in its process unless the variable is set (on macOS 15 and later it
+    asks Accelerate for one thread, as before; `BRISK_BLASMT=1` keeps Accelerate's threads);
+  - Accelerate rounds some vector operations differently depending on where the vectors lie in
+    memory; BRISK now aligns its arrays to 256 bytes on macOS and keeps its work vectors in the
+    same place whatever the thread count.
+
+  Measured on an Apple M3 under macOS 14: before, 3–5 % of the runs of SDPLIB theta4 at one thread
+  and 1–8 % of those of gpp124-1 at seven threads ended differently (other iteration counts, once
+  with a reduced-accuracy status), and one thread gave other digits than several on theta3 and
+  theta6; now every run gives the same result, at 1 to 8 threads. SDPLIB at one thread about 7 %
+  faster, at four threads unchanged.
+- **The same result when a problem is solved again in the same process** (Python, Julia, MATLAB,
+  the C library), on every platform. Two randomized steps of the presolve, the detection of
+  low-rank constraint matrices and the block diagonalization of the symmetry reduction, now start
+  from their seeds at each solve; before, a second solve of the same problem could take other
+  low-rank factors and end with other digits or, rarely, another status. Results from the command
+  line are unchanged.
+- **macOS build: the linked binaries are checked.** The linker of the command-line tools of Xcode
+  15.0 corrupted one instruction of the solver (a crash with "illegal instruction" in the cone
+  solver). With that linker the build now uses Apple's classic linker, and on macOS every link
+  (the command-line program, the library, the MATLAB MEX file) is followed by a check that
+  disassembles the result (`tools/link_check.sh`); a damaged binary is linked again with the
+  classic linker, or removed with a message. `BRISK_LINKCHECK=0` turns the check off. Updating
+  the command-line tools is recommended.
+
 ## Version 1.4.2 (October 2026)
 
 - **A Burer-Monteiro solver for large sparse problems with low-rank solutions** (`-bm`). X = R Rᵀ

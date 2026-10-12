@@ -39,6 +39,9 @@ typedef struct { int *v, n, cap, alive, parent, rep; } Clique;
 static void *ck_malloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (chordal conversion, %zu bytes)\n", n); exit(1); } return p; }
 static void *ck_calloc(size_t a, size_t b) { void *p = calloc(a ? a : 1, b ? b : 1); if (!p) { fprintf(stderr, "brisk: out of memory (chordal conversion, %zu bytes)\n", a * b); exit(1); } return p; }
 static void *ck_realloc(void *q, size_t n) { void *p = realloc(q, n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (chordal conversion, %zu bytes)\n", n); exit(1); } return p; }
+#undef malloc               /* (brisk.h's aligned versions on macOS, called by the ck_ ones above) */
+#undef calloc
+#undef realloc
 #define malloc(n) ck_malloc(n)
 #define calloc(a, b) ck_calloc(a, b)
 #define realloc(q, n) ck_realloc(q, n)

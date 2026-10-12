@@ -1,4 +1,4 @@
-# BRISK 1.4.2: the solver in detail
+# BRISK 1.4.3: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -104,8 +104,9 @@ problems run on one thread, and on Linux the interior-point solve uses fewer thr
 processes occupy the cores it may use, and more again when they are free (`-v` shows the
 changes; `BRISK_NOBUSY=1` keeps the count exactly as asked). On macOS, with a machine where
 other processes occupy cores, use fewer threads or `OMP_WAIT_POLICY=passive`. The BLAS runs on
-one thread under BRISK's own (OpenBLAS; Accelerate from macOS 15 on, earlier set
-`VECLIB_MAXIMUM_THREADS=1`).
+one thread under BRISK's own (OpenBLAS; Accelerate too: BRISK asks it for one thread on macOS 15
+and later, and sets `VECLIB_MAXIMUM_THREADS=1` in its process on earlier versions unless the
+variable is set; `BRISK_BLASMT=1` keeps the BLAS threads).
 
 **Ctrl-C** stops the solve and returns the current point. Pressing it twice aborts.
 
@@ -264,7 +265,7 @@ time limit. Two things outside BRISK can make two runs differ:
   factorizations used far from the optimum (m ≥ 1000) amplify them to 1e-7 … 1e-5 in the early
   iterates; the result is the same to the tolerance, the iteration count can change by a few.
   `-mixed 0` (`mixed = 0`) keeps every factorization in double; one BLAS thread
-  (`VECLIB_MAXIMUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`) removes the source.
+  (`VECLIB_MAXIMUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`; BRISK sets both itself) removes the source.
 - **A different BLAS** (or another build of BRISK): other rounding, same remarks.
 
 ## Files
