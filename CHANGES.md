@@ -1,5 +1,64 @@
 # BRISK change log
 
+## Version 1.4.4 (October 2026)
+
+- **Second-order cones next to semidefinite blocks are solved as cones** (`-soc`, `-socmin`). In a
+  problem with semidefinite blocks a cone of dimension q used to be solved as a q x q arrow block
+  (O(q³) work an iteration and q² unknowns). The self-dual embedding now treats every such cone, and
+  every semidefinite block whose data are arrow matrices (a norm constraint written as a matrix
+  inequality), as a second-order cone: Nesterov-Todd scaling W = β(2vvᵀ − J), the cone's term of the
+  Schur complement β²(A Aᵀ + rank two) formed on the threads, the step length from a quadratic, X
+  returned as the rank-two completion of the cone point. A run that ends worse than reduced accuracy
+  is repeated with the cones as semidefinite blocks; `-soc 0` keeps the old treatment, `-socmin` sets
+  the smallest order. Four threads, before → now (MOSEK 11 for comparison): a synthetic family with
+  two cones of dimension 1024, 28.1 → 0.24 s (0.05 s); nearest correlation matrices of order 100,
+  30.7 → 5.4 s (21.5 s); noisy matrix completion of order 60, 3.0 → 0.45 s (1.1 s); PhaseLift with
+  n = 40, 0.68 → 0.31 s (0.37 s); a robust portfolio with 100 assets, 6.1 → 5.8 s (8.6 s). About
+  half the iterations; DIMACS filter48_socp 2.0 → 1.1 s. The errors of large cones on the problem as
+  read are computed in closed form (λ_min of an arrow matrix, of the rank-two completion) instead of
+  by a dense factorization: two cones of 8192, 15.1 → 4.3 s at one thread.
+- **More accurate on ill-posed problems.** The self-dual embedding eliminates the homogenizing
+  variable τ through a scalar equation whose terms grow with X; on problems whose solutions are large
+  (no strictly feasible point, or nearly so) that equation lost its digits late in the solve. Its
+  column is now formed from X, Z and the dual residual alone (the substitution dy = dy' + (dτ/τ) y),
+  each iteration in whichever of the two forms has the smaller estimated error (and no longer in the
+  first once a step in it leaves the primal residual above twice its prediction). One thread, against
+  1.4.3: SDPLIB OPTIMAL 68 → 70 of 92 (hinf1, hinf6); 56 occupation-measure relaxations OPTIMAL 32 → 35,
+  numerical difficulties 8 → 7; 69 option-pricing relaxations, numerical difficulties 1 → 0; a user's 23
+  structural-optimization relaxations (two threads) OPTIMAL 14 → 19, numerical difficulties 3 → 1, total
+  time 2376 → 2016 s. `BRISK_HSDSHIFT=0` turns it off.
+- **Facial reduction: the reduced solve is returned when the duals of the removed constraints
+  cannot be rebuilt** (the dual optimum of the problem as read is not attained, or a long chain of
+  reductions loses them). If the reduced solve is good in itself, its X (feasible for the problem as
+  read) is returned with the optimal value in [b'y, ⟨C,X⟩] and a note that y is not dual feasible for
+  the removed constraints; before, the problem was solved twice more (the reduced problem by the
+  embedding, then the problem without the reduction) and the better of the answers kept. On a user's
+  structural-optimization relaxation: numerical difficulties in 205 s → OPTIMAL in 4.2 s, the value
+  within 1.2e-8 of the double-double one. `BRISK_FRKEEP=0`: the re-solves as before.
+- **The embedding's stall rules follow its path.** In exact arithmetic its residuals fall as θR₀
+  (θ the product of the 1 − α(1 − σ)); once a residual exceeds twice that, the progress of the
+  current iterate no longer keeps a run going. A frame relaxation without an interior: 33 → 19
+  iterations, the same answer; no status changes on SDPLIB, the occupation measures, option pricing
+  and the sphere relaxations.
+- **The same result at any thread count and under any load, also with several blocks of which one
+  is large.** The inverse of Z of a large block was computed by one routine at one thread and by
+  another inside the parallel loop over blocks, and the single-precision frame changes of the NT
+  scaling were chosen by whether a parallel region was active: now the same arithmetic in both cases.
+  The symmetry search's budget is counted in units of work instead of seconds, so a busy machine no
+  longer stops it at another point.
+- **Fixes.** The chordal conversion's density test (and three other tests of the pattern density of
+  large blocks) counted an entry once for every constraint that touches it; they count the union of
+  the patterns now (an AC-OPF relaxation with the line limits as cones: 4.8 → 0.74 s). A data race in
+  the threaded Schur assembly (its tile settings read lazily by several threads; found with
+  ThreadSanitizer). The library's copy of X did not check its allocations: under a memory cap it
+  crashed after the solve; now it reports that X cannot be returned and returns y and the objectives.
+- **macOS on Intel: the post-link check no longer removes good binaries.** Clang places switch jump
+  tables inside the code on x86-64, and the check took those bytes, which no disassembler decodes,
+  for a damaged link and deleted `brisk` and `libbrisk.dylib`. It now compares the linked file with
+  the objects that went into it: a word counts as damage only if the compiler did not write it.
+  The MATLAB build, which keeps no objects, is checked only on Apple silicon. Thanks to the user who
+  found the cause.
+
 ## Version 1.4.3 (October 2026)
 
 - **macOS: the same result from run to run and for any thread count.** Two properties of Apple's

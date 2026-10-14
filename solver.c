@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <float.h>
 #include <time.h>
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -145,6 +146,7 @@ void params_default(Params *p) {
     p->hsd_hoc = 4;          /* 5.7: second-order passes at the chosen direction (kept only when the predicted reduction is not smaller) */
     p->hsd_nb = 0.3;         /* 5.7: after kept passes the step may go to 0.9995 of the boundary while lambda_min(XZ) >= 0.3 mu */
     p->hsd_first = 1; p->hsd_first_c = 12.0; p->hsd_first_asm = 0.5; p->hsd_first_on = 0; p->std_slow = 10; p->crossover = 0; p->fr_gain = 4.0;
+    p->soc = 1; p->soc_minn = 3;
     p->hsd_sig = 3;          /* candidates in the sigma search (0 = Mehrotra only) */
     p->hsd_beta = 1e-3;
     p->hsd_batch = 1;        /* embedding: paired Schur solves as one multi-rhs PCG */
@@ -310,9 +312,116 @@ typedef struct BS {
     int chunk;
     double part[8];      /* per-block partial sums (summed in block order) */
     char *fm;            /* LP: free-pair mask inside the embedding (1 '+', 2 '-'), or NULL */
+    double *sv, sbeta;   /* 5.16 second-order cone: the NT scaling W = sbeta (2 sv sv' - J) (lam: W z = W^{-1} x) */
+    double *stmp;        /* ... and 3n of work space */
 } BS;
 
 static inline size_t bsz(const Block *B) { return B->type == BLK_SDP ? (size_t)B->n * B->n : (size_t)B->n; }
+
+/* ---- 5.16: second-order cone blocks (BLK_SOC), REPORT_5.16 §9. The cone Q = {x : x_0 >= ||xb||}
+ * (xb = (x_1, ..., x_{n-1})) with the Jordan algebra x o z = (x'z, x_0 zb + z_0 xb), the identity
+ * e = (1, 0, ..., 0), J = diag(1, -1, ..., -1), det x = x'Jx, x^{-1} = Jx / det x; a cone counts
+ * once in mu (x o z = mu e on the central path, x'z = mu). The Nesterov-Todd scaling W is
+ * symmetric, W z = W^{-1} x = lam, and W = beta (2 v v' - J) with v'Jv = 1 (all O(n)):
+ *   xn = x / sqrt(det x), zn = z / sqrt(det z), g = sqrt((1 + xn'zn) / 2),
+ *   wn = (xn + J zn) / (2 g), v = (wn + e) / sqrt(2 (wn_0 + 1)), beta = (det x / det z)^(1/4).
+ * The data are those of an LP block (a vector variable; A_i restricted to the block is a_i). */
+static inline double soc_nb(int n, const double *x) { double t = 0; for (int i = 1; i < n; i++) t += x[i] * x[i]; return sqrt(t); }
+/* det x = (x_0 - ||xb||)(x_0 + ||xb||): no cancellation near the boundary */
+static inline double soc_det(int n, const double *x) { const double r = soc_nb(n, x); return (x[0] - r) * (x[0] + r); }
+static inline int soc_interior(int n, const double *x) { const double r = soc_nb(n, x); return x[0] > 0 && x[0] - r > 1e-15 * x[0]; }
+/* out = J d */
+static inline void soc_J(int n, const double *d, double *out) { out[0] = d[0]; for (int i = 1; i < n; i++) out[i] = -d[i]; }
+/* out = W d (out may not alias d) */
+static void soc_W(const BS *s, int n, const double *d, double *out) {
+    const double *v = s->sv;
+    double vd = 0; for (int i = 0; i < n; i++) vd += v[i] * d[i];
+    const double b = s->sbeta;
+    out[0] = b * (2.0 * v[0] * vd - d[0]);
+    for (int i = 1; i < n; i++) out[i] = b * (2.0 * v[i] * vd + d[i]);
+}
+/* out = W^{-1} d = (2 J v v' J - J) d / beta */
+static void soc_Winv(const BS *s, int n, const double *d, double *out) {
+    const double *v = s->sv;
+    double vJd = v[0] * d[0]; for (int i = 1; i < n; i++) vJd -= v[i] * d[i];
+    const double ib = 1.0 / s->sbeta;
+    out[0] = ib * (2.0 * v[0] * vJd - d[0]);
+    for (int i = 1; i < n; i++) out[i] = ib * (-2.0 * v[i] * vJd + d[i]);
+}
+/* out = W^2 d (the block's operator of the Newton system: dX = -W^2 dZ + ...) */
+static void soc_H(const BS *s, int n, const double *d, double *out, double *tmp) { soc_W(s, n, d, tmp); soc_W(s, n, tmp, out); }
+/* out = u o w */
+static void soc_jprod(int n, const double *u, const double *w, double *out) {
+    double t = 0; for (int i = 0; i < n; i++) t += u[i] * w[i];
+    for (int i = 1; i < n; i++) out[i] = u[0] * w[i] + w[0] * u[i];
+    out[0] = t;
+}
+/* out = l \ r: the solution of l o out = r (l in the interior; out may alias r) */
+static void soc_jdiv(int n, const double *l, const double *r, double *out) {
+    double lr = 0; for (int i = 1; i < n; i++) lr += l[i] * r[i];
+    const double o0 = (l[0] * r[0] - lr) / soc_det(n, l), il0 = 1.0 / l[0];
+    for (int i = 1; i < n; i++) out[i] = (r[i] - o0 * l[i]) * il0;
+    out[0] = o0;
+}
+/* out = z^{-1} = J z / det z */
+static void soc_inv(int n, const double *z, double *out) { const double id = 1.0 / soc_det(n, z); out[0] = z[0] * id; for (int i = 1; i < n; i++) out[i] = -z[i] * id; }
+/* the NT scaling of (x, z) into s->sv, s->sbeta and s->lam; 1 when x or z is not interior */
+static int soc_nt(BS *s, int n, const double *x, const double *z) {
+    if (!soc_interior(n, x) || !soc_interior(n, z)) return 1;
+    const double a = sqrt(soc_det(n, x)), b = sqrt(soc_det(n, z));
+    double xz = 0; for (int i = 0; i < n; i++) xz += x[i] * z[i];
+    const double g = sqrt(0.5 * (1.0 + xz / (a * b)));
+    double *v = s->sv;
+    const double ia = 1.0 / (2.0 * g * a), ib = 1.0 / (2.0 * g * b);
+    v[0] = x[0] * ia + z[0] * ib;                         /* wn = (xn + J zn) / (2 g) */
+    for (int i = 1; i < n; i++) v[i] = x[i] * ia - z[i] * ib;
+    const double f = 1.0 / sqrt(2.0 * (v[0] + 1.0));
+    v[0] = (v[0] + 1.0) * f;
+    for (int i = 1; i < n; i++) v[i] *= f;
+    s->sbeta = sqrt(a / b);
+    soc_W(s, n, z, s->lam);
+    return 0;
+}
+/* the identity scaling (W = I): beta = 1, v = e */
+static void soc_nt_identity(BS *s, int n) { s->sbeta = 1.0; s->sv[0] = 1.0; for (int i = 1; i < n; i++) s->sv[i] = 0.0; }
+/* the largest a with u + a du in the cone (1e30: no bound); the quadratic det(u + a du) = 0 in
+ * the units of u (det = 1 after scaling by 1/sqrt(det u)) */
+static double soc_maxstep(int n, const double *u, const double *du) {
+    for (int i = 0; i < n; i++) if (!isfinite(du[i])) return 0.0;
+    const double r = soc_nb(n, u), d = (u[0] - r) * (u[0] + r);
+    if (!(d > 0) || !(u[0] > 0)) return 0.0;
+    const double sc = 1.0 / sqrt(d);
+    double nd = 0, ud = 0;
+    for (int i = 1; i < n; i++) { nd += du[i] * du[i]; ud += u[i] * du[i]; }
+    const double d0 = du[0] * sc, ndn = nd * sc * sc;
+    const double qa = d0 * d0 - ndn, qb = 2.0 * (u[0] * sc * d0 - ud * sc * sc), qc = 1.0;
+    double a = 1e30;
+    if (qa == 0) { if (qb < 0) a = -qc / qb; }
+    else {
+        const double disc = qb * qb - 4.0 * qa * qc;
+        if (disc >= 0) {
+            const double q = -0.5 * (qb + (qb >= 0 ? sqrt(disc) : -sqrt(disc)));
+            const double r1 = q / qa, r2 = q != 0 ? qc / q : 1e30;
+            if (r1 > 0 && r1 < a) a = r1;
+            if (r2 > 0 && r2 < a) a = r2;
+        }
+    }
+    return a;
+}
+/* the smallest spectral value of the NT-scaled product: (lam_0 - ||lamb||)^2 of the pair
+ * (x + a dx, z + a dz) (the block's lambda_min(XZ)); -1 when not interior. tmp: 2n doubles */
+static double soc_lmin_at(int n, const double *x, const double *dx, const double *z, const double *dz, double a, double *tmp) {
+    double *xt = tmp, *zt = tmp + n;
+    for (int i = 0; i < n; i++) { xt[i] = x[i] + a * (dx ? dx[i] : 0.0); zt[i] = z[i] + a * (dz ? dz[i] : 0.0); }
+    if (!soc_interior(n, xt) || !soc_interior(n, zt)) return -1.0;
+    /* lam_0 +- ||lamb|| from det lam = sqrt(det x det z) and lam'lam = x'z */
+    const double dl = sqrt(soc_det(n, xt) * soc_det(n, zt));
+    double xz = 0; for (int i = 0; i < n; i++) xz += xt[i] * zt[i];
+    /* lam_0^2 + ||lamb||^2 = x'z, lam_0^2 - ||lamb||^2 = dl: lam_0 - ||lamb|| = dl / (lam_0 + ||lamb||) */
+    const double l0 = sqrt(0.5 * (xz + dl)), lb = sqrt(fmax(0.0, 0.5 * (xz - dl)));
+    const double lm = dl / (l0 + lb);
+    return lm * lm;
+}
 
 /* 4.37 bound mode: offer the current iterate to the tracker (X/tau of (P) or y/tau of (D),
  * unscaled as the solver's output). Admissible when the tracked side's residual is within
@@ -324,7 +433,7 @@ static void btrack_copy(const Problem *P, struct BS *S, const double *y, double 
     const double f = P->bs / tau;
     for (int k = 0; k < P->nblk; k++) {
         const double *Xk = S[k].X;
-        if (P->blk[k].type == BLK_LP) { for (int i = 0; i < P->blk[k].n; i++) X[k][i] = f * Xk[i]; }
+        if (P->blk[k].type != BLK_SDP) { for (int i = 0; i < P->blk[k].n; i++) X[k][i] = f * Xk[i]; }
         else {
             const int n = P->blk[k].n;
             for (int j = 0; j < n; j++)
@@ -648,7 +757,7 @@ static void blk_Aop(const Block *B, BS *s, const double *D, double *out, double 
 #define AOUT(t, val) do { if (cpos) out[cpos[t]] += (val); else out[t] = (val); } while (0)
 static void blk_Aop_serial(const Block *B, BS *s, const double *D, double *out, double scale, const int *cpos) {
     int n = B->n;
-    if (B->type == BLK_LP) {
+    if (B->type != BLK_SDP) {             /* LP and second-order cone blocks: vectors */
         for (int t = 0; t < B->ncon; t++) {
             const SpSym *S = &B->A[t];
             double v = 0;
@@ -693,7 +802,7 @@ static void blk_Aop_serial(const Block *B, BS *s, const double *D, double *out, 
 /* F = sum_i y_i A_i (dense full / vector) */
 static void blk_ATy(const Block *B, BS *s, const double *y, double *F) {
     int n = B->n;
-    if (B->type == BLK_LP) {
+    if (B->type != BLK_SDP) {
         memset(F, 0, sizeof(double) * n);
         for (int t = 0; t < B->ncon; t++) {
             const SpSym *S = &B->A[t];
@@ -727,7 +836,7 @@ static void blk_ATy(const Block *B, BS *s, const double *y, double *F) {
 
 static void sp_add(const Block *B, const SpSym *S, double a, double *D) {
     int n = B->n;
-    if (B->type == BLK_LP)
+    if (B->type != BLK_SDP)
         for (int q = 0; q < S->nnz; q++) D[S->row[q]] += a * S->val[q];
     else
         for (int q = 0; q < S->ef; q++) D[S->fr[q] + (size_t)S->fc[q] * n] += a * S->fv[q];
@@ -736,7 +845,7 @@ static void sp_add(const Block *B, const SpSym *S, double a, double *D) {
 static double sp_inner(const Block *B, const SpSym *S, const double *D) {
     int n = B->n;
     double s = 0;
-    if (B->type == BLK_LP)
+    if (B->type != BLK_SDP)
         for (int q = 0; q < S->nnz; q++) s += S->val[q] * D[S->row[q]];
     else
         for (int q = 0; q < S->ef; q++) s += S->fv[q] * D[S->fr[q] + (size_t)S->fc[q] * n];
@@ -785,6 +894,14 @@ static void add_R0(const BS *s, size_t len, double theta, double *D) {
     for (int e = 0; e < s->r0n; e++) D[s->r0r[e] + (size_t)s->r0c[e] * s->n] += theta * s->r0v[e];
 }
 
+/* sum_i R0_i D_i (R0 dense or the sparse list of add_R0) */
+static double dot_R0(const BS *s, size_t len, const double *D) {
+    double t = 0;
+    if (s->R0) { for (size_t i = 0; i < len; i++) t += s->R0[i] * D[i]; return t; }
+    for (int e = 0; e < s->r0n; e++) t += s->r0v[e] * D[s->r0r[e] + (size_t)s->r0c[e] * s->n];
+    return t;
+}
+
 /* sum_i (D_i + theta R0_i)^2 */
 static double norm2_plus_R0(const BS *s, size_t len, const double *D, double theta) {
     if (s->type == BLK_SDP && len >= 2 * (size_t)PN_CH) {
@@ -828,7 +945,7 @@ static double norm2_plus_R0(const BS *s, size_t len, const double *D, double the
     double v = 0;
     const int n = s->n;
     int e = 0;
-    if (s->type == BLK_LP) {
+    if (s->type != BLK_SDP) {
         for (int i = 0; i < n; i++) {
             double t = D[i];
             if (e < s->r0n && s->r0r[e] == i) t += theta * s->r0v[e++];
@@ -2260,6 +2377,95 @@ static void schur_lp(const Block *B, const BS *s, int m, double *M) {
 }
 
 
+/* 5.16: a second-order cone block: M += A_c W^2 A_c' with W^2 = beta^2 (I + 4 |v|^2 v v' - 2 (v (Jv)' +
+ * (Jv) v')): the identity part variable by variable (an LP block of weight beta^2), the rank-two part
+ * over the block's constraints with p = A_c v, q = A_c J v */
+/* 5.16: the cone's term of the Schur complement, beta^2 (A_c A_c' + 4|v|^2 p p' - 2 (p q' + q p')) on
+ * its nc constraints (A_c: the cone's data, nc x n; p = A_c v, q = A_c J v). Column u of this nc x nc
+ * matrix is formed in a buffer of its own (A_c A_c' from the coordinates of constraint u and their
+ * constraint lists, or read from one product A_c A_c' when the data are dense; then the rank-two
+ * term) and added to M once. The columns run on the solver's threads; every entry of M is written by
+ * one thread, in an order fixed by the data, so the bits do not depend on the thread count. Until
+ * then the term ran on one thread, row by row across M's columns (ncm_100: 1.2 s of 4.4 s at four
+ * threads; filter48_socp, a cone of 49 with dense data: 1.0 s of 2.0 s). */
+static void schur_soc(const Block *B, const BS *s, int m, double *M) {
+    const int n = B->n, nc = B->ncon;
+    if (nc == 0) return;
+    const int *con = B->con;
+    const double b2 = s->sbeta * s->sbeta, *v = s->sv;
+    double vv = 0;
+    for (int i = 0; i < n; i++) vv += v[i] * v[i];
+    const double c4 = 4.0 * vv * b2, c2 = -2.0 * b2;
+    /* where the values go: 0 M itself (dense), 1 the sparse factor's storage at offsets known for
+     * the cone's constraint pairs, 2 the envelope, 3 through MADDL on this thread (the sparse factor
+     * by search, or the local buffer of a caller that set one up) */
+    const size_t *pos = NULL;
+    if (g_bpos && g_schol) { const long k = B - g_blk0; if (k >= 0 && k < g_nbk) pos = g_bpos[k]; }
+    const int mode = (g_direct_g | g_direct_t) ? 0 : g_pos ? 3 : !g_schol && !g_env ? 0 : g_schol ? (pos ? 1 : 3) : 2;
+    double *pm = mode == 1 ? g_pm : NULL;
+    const Envelope *env = g_env;
+    const int par = mode != 3 && !in_par() && nthreads() > 1 && (double)nc * nc >= 65536.0;
+    double *pq = malloc(sizeof(double) * 2 * ((size_t)nc + 1));
+    #pragma omp parallel for schedule(static) if (par)
+    for (int t = 0; t < nc; t++) {
+        const SpSym *A = &B->A[t];
+        double pt = 0, qt = 0;
+        for (int q = 0; q < A->nnz; q++) { const int i = A->row[q]; pt += A->val[q] * v[i]; qt += A->val[q] * (i ? -v[i] : v[i]); }
+        pq[2 * (size_t)t] = pt; pq[2 * (size_t)t + 1] = qt;
+    }
+    /* A_c A_c' as one product when the data are dense: the pair loops cost sum_p nnz_p^2 scattered
+     * updates (about 1 ns each), the product 2 nc^2 n flops in fixed panels (about 0.05 ns each) */
+    double s2 = 0;
+    for (int p = 0; p < n; p++) { const double d = B->lp_ptr[p + 1] - B->lp_ptr[p]; s2 += d * d; }
+    double *L = NULL;
+    static int dense_env = -2; if (dense_env == -2) { const char *e = getenv("BRISK_SOCDENSE"); dense_env = e ? atoi(e) : -1; }
+    if (dense_env != 0 && (dense_env == 1 || s2 > 0.1 * (double)nc * nc * n)
+        && 8.0 * ((double)nc * nc + (double)nc * n) < brisk_mem_limit() / 16) {
+        double *Ad = calloc((size_t)n * nc + 1, sizeof(double));
+        L = malloc(sizeof(double) * ((size_t)nc * nc + 1));
+        if (Ad && L) {
+            for (int t = 0; t < nc; t++) { const SpSym *A = &B->A[t]; for (int q = 0; q < A->nnz; q++) Ad[(size_t)A->row[q] + (size_t)t * n] += A->val[q]; }
+            pdgemm("T", "N", &nc, &nc, &n, &DONE, Ad, &n, Ad, &n, &DZERO, L, &nc);
+        } else { free(L); L = NULL; }
+        free(Ad);
+    }
+    int *loc = NULL;
+    if (!L) { loc = malloc(sizeof(int) * ((size_t)m + 1)); for (int t = 0; t < nc; t++) loc[con[t]] = t; }
+    #pragma omp parallel if (par)
+    {
+        double *col = L ? NULL : calloc((size_t)nc + 1, sizeof(double));
+        #pragma omp for schedule(dynamic, 16)
+        for (int u = 0; u < nc; u++) {
+            const double *cu = L ? L + (size_t)u * nc : col;
+            if (!L) {                                     /* (A_c A_c')_tu, t >= u, over the coordinates of constraint u */
+                const SpSym *A = &B->A[u];
+                for (int q = 0; q < A->nnz; q++) {
+                    const int p = A->row[q], e1 = B->lp_ptr[p + 1];
+                    const double a = A->val[q];
+                    int e = B->lp_ptr[p], hi = e1;            /* the constraint list of p is sorted: start at con[u] */
+                    while (e < hi) { const int mid = (e + hi) >> 1; if (B->lp_con[mid] < con[u]) e = mid + 1; else hi = mid; }
+                    for (; e < e1; e++) col[loc[B->lp_con[e]]] += a * B->lp_val[e];
+                }
+            }
+            const double pu = pq[2 * (size_t)u], qu = pq[2 * (size_t)u + 1];
+            const size_t cuc = (size_t)con[u];
+            for (int t = u; t < nc; t++) {
+                const double pt = pq[2 * (size_t)t], qt = pq[2 * (size_t)t + 1];
+                const double val = b2 * cu[t] + c4 * pt * pu + c2 * (pt * qu + qt * pu);
+                const size_t ct = (size_t)con[t];
+                if (mode == 0) M[ct + cuc * (size_t)m] += val;
+                else if (mode == 1) pm[pos[(size_t)t * nc + u]] += val;
+                else if (mode == 2) env_add(env, ct, cuc, val);
+                else MADDL(ct, cuc, val);
+                if (!L) col[t] = 0;
+            }
+        }
+        free(col);
+    }
+    free(loc); free(L); free(pq);
+}
+
+
 static int *deg_ctx;
 static int cmp_by_deg(const void *a, const void *b) {
     int x = *(const int *)a, y = *(const int *)b;
@@ -2277,7 +2483,7 @@ static int schur_pattern(const Problem *P, long **aptr_out, int **adj_out) {
     long tot = 0;
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
-        if (B->type == BLK_SDP) { ncl++; tot += B->ncon; }
+        if (B->type != BLK_LP) { ncl++; tot += B->ncon; }      /* (a second-order cone too: W^2 couples all its constraints) */
         else for (int p = 0; p < B->n; p++) { ncl++; tot += B->lp_ptr[p + 1] - B->lp_ptr[p]; }
     }
     int *cptr = malloc(sizeof(int) * (ncl + 1));
@@ -2285,7 +2491,7 @@ static int schur_pattern(const Problem *P, long **aptr_out, int **adj_out) {
     int c = 0; long pos = 0;
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
-        if (B->type == BLK_SDP) {
+        if (B->type != BLK_LP) {
             cptr[c++] = (int)pos;
             for (int t = 0; t < B->ncon; t++) cidx[pos++] = B->con[t];
         } else for (int p = 0; p < B->n; p++) {
@@ -2382,7 +2588,7 @@ static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
         double cl = 0;   /* SDP blocks only: an LP block couples two constraints only through a shared
                           * variable (pglib case1888_rte: its LP block touches nearly every constraint,
                           * and counting it as a clique sent a 1.5e6-entry factor to the dense path) */
-        for (int k = 0; k < P->nblk; k++) { if (P->blk[k].type != BLK_SDP) continue; const double c = P->blk[k].ncon; if (0.5 * c * (c + 1) > cl) cl = 0.5 * c * (c + 1); }
+        for (int k = 0; k < P->nblk; k++) { if (P->blk[k].type == BLK_LP) continue; const double c = P->blk[k].ncon; if (0.5 * c * (c + 1) > cl) cl = 0.5 * c * (c + 1); }
         if (cl > (double)cap && !getenv("BRISK_DUMP_SCHUR")) {
             if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: a block's constraints alone give %.3g entries in the lower triangle, above the cap of %.3g for a sparse factorization: not analysed\n", cl, (double)cap);
             return NULL;
@@ -2452,7 +2658,7 @@ static Envelope *envelope_build(const Problem *P, const Params *par, int verbose
     long tot = 0, maxcl = 0;
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
-        if (B->type == BLK_SDP) { ncl++; tot += B->ncon; if (B->ncon > maxcl) maxcl = B->ncon; }
+        if (B->type != BLK_LP) { ncl++; tot += B->ncon; if (B->ncon > maxcl) maxcl = B->ncon; }
         else for (int p = 0; p < B->n; p++) {
             int c = B->lp_ptr[p + 1] - B->lp_ptr[p];
             ncl++; tot += c; if (c > maxcl) maxcl = c;
@@ -2465,7 +2671,7 @@ static Envelope *envelope_build(const Problem *P, const Params *par, int verbose
         int c = 0; long pos = 0;
         for (int k = 0; k < P->nblk; k++) {
             const Block *B = &P->blk[k];
-            if (B->type == BLK_SDP) {
+            if (B->type != BLK_LP) {
                 cptr[c++] = (int)pos;
                 for (int t = 0; t < B->ncon; t++) cidx[pos++] = B->con[t];
             } else for (int p = 0; p < B->n; p++) {
@@ -2979,6 +3185,7 @@ static void schur_assemble_all(const Problem *P, BS *S, Schur *Sc, double **Zv, 
             BS vtmp;
             const double tk0 = blkt ? wtime() : 0;
             if (P->blk[k].type == BLK_LP) schur_lp(&P->blk[k], &S[k], m, Ma);
+            else if (P->blk[k].type == BLK_SOC) schur_soc(&P->blk[k], &S[k], m, Ma);
             else schur_sdp(&P->blk[k], nt_view(&S[k], &vtmp, Zv[k] != NULL), m, Ma);
             if (blkt && k < 8) {
                 if (!tb) { tb = calloc(8, sizeof(double)); ntb = nb < 8 ? nb : 8; }
@@ -3009,6 +3216,7 @@ static void schur_assemble_all(const Problem *P, BS *S, Schur *Sc, double **Zv, 
             BS vtmp;
             const double tq2 = wtime();
             if (B->type == BLK_LP) schur_lp(B, &S[k], m, Ma);
+            else if (B->type == BLK_SOC) schur_soc(B, &S[k], m, Ma);
             else schur_sdp(B, nt_view(&S[k], &vtmp, Zv[k] != NULL), m, Ma);
             g_asmp[2] += wtime() - tq2;
             k++; continue;
@@ -3071,20 +3279,21 @@ static int __attribute__((unused)) cmp_offidx(const void *x, const void *y) {
     const size_t a = *(const size_t *)x, b = *(const size_t *)y;
     return a < b ? -1 : a > b ? 1 : 0;
 }
-/* scatter offsets of every SDP block's constraint pairs (memory capped) */
+/* scatter offsets of every SDP block's constraint pairs (memory capped); 5.16: a second-order cone's
+ * too (schur_soc writes them on the threads), without the flush lists */
 static void schur_pos_setup(Schur *S, const Problem *P) {
     S->bpos = NULL; S->loc = NULL; S->blk0 = P->blk; S->nbk = P->nblk;
     S->bsoff = NULL; S->bsidx = NULL; S->bsn = NULL; S->lbuf = NULL;
     if (!S->SC || S->Masm) return;
     double tot = 0;
-    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) tot += (double)P->blk[k].ncon * P->blk[k].ncon;
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type != BLK_LP) tot += (double)P->blk[k].ncon * P->blk[k].ncon;
     if (tot * sizeof(size_t) > 1.5e9 * brisk_mem_scale()) return;
     S->bpos = calloc(P->nblk + 1, sizeof(size_t *));
     S->loc = malloc(sizeof(int) * (S->m + 1));
     for (int i = 0; i < S->m; i++) S->loc[i] = -1;
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
-        if (B->type != BLK_SDP || B->ncon == 0) continue;
+        if (B->type == BLK_LP || B->ncon == 0) continue;
         const int nl = B->ncon;
         size_t *pos = malloc(sizeof(size_t) * (size_t)nl * nl);
         if (schol_clique_offsets(S->SC, nl, B->con, pos, NULL, NULL) == 0) S->bpos[k] = pos; else free(pos);
@@ -3093,7 +3302,7 @@ static void schur_pos_setup(Schur *S, const Problem *P) {
     S->bsoff = calloc(P->nblk + 1, sizeof(size_t *)); S->bsidx = calloc(P->nblk + 1, sizeof(int *)); S->bsn = calloc(P->nblk + 1, sizeof(int));
     int nlmax = 0;
     for (int k = 0; k < P->nblk; k++) {
-        if (!S->bpos[k]) continue;
+        if (!S->bpos[k] || P->blk[k].type != BLK_SDP) continue;
         const int nl = P->blk[k].ncon;
         if (nl > 1500) continue;                 /* buffer nl^2: keep it small */
         if (nl > nlmax) nlmax = nl;
@@ -4149,6 +4358,11 @@ static int small_pd_shift(int n, const double *E, double c, double sgn) {
 }
 #define MS_CH 64
 static int g_detpar = 1;   /* 4.24: thread-count independent arithmetic in the parallel loops (BRISK_DETPAR=0: 4.23 serial forms at T = 1) */
+/* 5.16: the step to the boundary of a vector block (LP: ratio test; second-order cone: the quadratic) */
+static double vec_maxstep(const Block *B, const BS *s, int primal) {
+    const double *x = primal ? s->X : s->Z, *dx = primal ? s->dX : s->dZ;
+    return B->type == BLK_SOC ? soc_maxstep(B->n, x, dx) : lp_maxstep(B->n, x, dx, s->fm);
+}
 static double maxstep(const Problem *P, BS *S, int primal, int K) {
     double a = 1e30;
     if (!g_par_blk) {
@@ -4160,20 +4374,20 @@ static double maxstep(const Problem *P, BS *S, int primal, int K) {
         int kmin = -1, imin = -1;
         for (int k = 0; k < P->nblk; k++) {
             const Block *B = &P->blk[k];
-            if (B->type != BLK_LP) continue;
+            if (B->type == BLK_SDP) continue;
             BS *s = &S[k];
-            double ak = lp_maxstep(B->n, primal ? s->X : s->Z, primal ? s->dX : s->dZ, s->fm);
+            double ak = vec_maxstep(B, s, primal);
             if (!isfinite(ak) && !(ak > 0)) ak = 0.0;
             if (ak < a) {
                 a = ak; kmin = k;
-                if (who) { const double *x = primal ? s->X : s->Z, *dx = primal ? s->dX : s->dZ; for (int i = 0; i < B->n; i++) if (dx[i] < 0 && -x[i] / dx[i] <= ak * (1 + 1e-12)) { imin = i; break; } }
+                if (who && B->type == BLK_LP) { const double *x = primal ? s->X : s->Z, *dx = primal ? s->dX : s->dZ; for (int i = 0; i < B->n; i++) if (dx[i] < 0 && -x[i] / dx[i] <= ak * (1 + 1e-12)) { imin = i; break; } }
             }
         }
         if (who) {
             double a0 = a;
             for (int k = 0; k < P->nblk; k++) {
                 const Block *B = &P->blk[k];
-                if (B->type == BLK_LP) continue;
+                if (B->type != BLK_SDP) continue;
                 BS *s = &S[k];
                 const double *V = primal ? s->X : s->Z, *dV = primal ? s->dX : s->dZ;
                 if (a < 1e29 && B->n <= SMALL_BLOCK && small_pd_at(B->n, V, dV, a)) continue;
@@ -4189,7 +4403,7 @@ static double maxstep(const Problem *P, BS *S, int primal, int K) {
         if (g_detpar) goto chunked;
         for (int k = 0; k < P->nblk; k++) {
             const Block *B = &P->blk[k];
-            if (B->type == BLK_LP) continue;
+            if (B->type != BLK_SDP) continue;
             BS *s = &S[k];
             const double *V = primal ? s->X : s->Z, *dV = primal ? s->dX : s->dZ;
             if (a < 1e29 && B->n <= SMALL_BLOCK && small_pd_at(B->n, V, dV, a)) continue;
@@ -4208,9 +4422,9 @@ chunked:
      * schedule, 5x the serial time on the 2,568 blocks of TSSOS case1354). */
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
-        if (B->type != BLK_LP) continue;
+        if (B->type == BLK_SDP) continue;
         BS *s = &S[k];
-        double ak = lp_maxstep(B->n, primal ? s->X : s->Z, primal ? s->dX : s->dZ, s->fm);
+        double ak = vec_maxstep(B, s, primal);
         if (!isfinite(ak) && !(ak > 0)) ak = 0.0;
         if (ak < a) a = ak;
     }
@@ -4228,7 +4442,7 @@ chunked:
         const int k1 = ((c) + 1) * MS_CH < nb ? ((c) + 1) * MS_CH : nb;                           \
         for (int k = (c) * MS_CH; k < k1; k++) {                                                  \
             const Block *B = &P->blk[k];                                                          \
-            if (B->type == BLK_LP) continue;                                                      \
+            if (B->type != BLK_SDP) continue;                                                     \
             BS *s = &S[k];                                                                        \
             const double *V = primal ? s->X : s->Z, *dV = primal ? s->dX : s->dZ;                \
             if (ac < 1e29 && B->n <= SMALL_BLOCK && small_pd_at(B->n, V, dV, ac)) continue;       \
@@ -4278,6 +4492,9 @@ static int try_step(const Problem *P, BS *S, int primal, double *alpha) {
             }
             if (B->type == BLK_LP) {
                 for (int i = 0; i < n; i++) if (!(V[i] > 0) && !(s->fm && s->fm[i])) { okk = 0; break; }
+            } else if (B->type == BLK_SOC) {
+                if (!soc_interior(n, V)) okk = 0;
+                memcpy(L, V, sizeof(double) * len);
             } else if (!primal && s->zon) {                  /* 5.12: the sparse factor of Z */
                 schol_gather_dense(s->zf, V);
                 if (schol_factor(s->zf, 0.0) != 0) okk = 0;
@@ -4330,6 +4547,12 @@ static int sdp_nb_ok(const Problem *P, BS *S, double al, double thr) {
         int n = B->n, info = 0;
         if (B->type == BLK_LP) {
             for (int i = 0; i < n; i++) { if (s->fm && s->fm[i]) continue; if (!((s->X[i] + al * s->dX[i]) * (s->Z[i] + al * s->dZ[i]) >= thr)) { ok = 0; break; } }
+            continue;
+        }
+        if (B->type == BLK_SOC) {
+            double *t2 = malloc(sizeof(double) * 2 * ((size_t)n + 1));
+            if (!(soc_lmin_at(n, s->X, s->dX, s->Z, s->dZ, al, t2) >= thr)) ok = 0;
+            free(t2);
             continue;
         }
         const size_t n2 = (size_t)n * n;
@@ -4492,6 +4715,9 @@ static void start_sdpt3(const Problem *P, BS *S, double *y) {
         memset(s->Z, 0, sizeof(double) * len);
         if (B->type == BLK_LP) {
             for (int i = 0; i < n; i++) { s->X[i] = xi; s->Z[i] = eta; }
+        } else if (B->type == BLK_SOC) {
+            s->X[0] = xi; s->Z[0] = eta;               /* xi e, eta e (SDPT3's start for a cone) */
+            memcpy(s->LX, s->X, sizeof(double) * len); memcpy(s->LZ, s->Z, sizeof(double) * len);
         } else {
             for (int i = 0; i < n; i++) { s->X[i + (size_t)i * n] = xi; s->Z[i + (size_t)i * n] = eta; }
             /* 5.12: the factors of the diagonal starts, without a dense factorization (the same
@@ -4511,7 +4737,7 @@ static void gram_mv(const Problem *P, BS *S, const double *v, double *out) {
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
         BS *s = &S[k];
-        if (B->type == BLK_LP || B->nd > 0) {
+        if (B->type != BLK_SDP || B->nd > 0) {
             blk_ATy(B, s, v, s->F);
             blk_Aop(B, s, s->F, out, 1.0);
             memset(s->F, 0, sizeof(double) * bsz(B));
@@ -4748,6 +4974,7 @@ static int endrules_check(EndRules *E, int it, double a, int improved, double be
 }
 
 static int g_epol_stop = 0;   /* hsd_run stopped on a passing polish probe */
+static int g_has_soc = 0;     /* 5.16: the problem of this solve has second-order cone blocks */
 static int g_epol_fb = 0;     /* ... or returned a fallback probe candidate (tol below 1e-8) */
 static Result g_epol_R;       /* ... and the measures of its candidate */
 static double probe_polish(const Problem *P, BS *S, double tau, const double *y, Schur *Sc,
@@ -5255,7 +5482,11 @@ static void nt_float_prep(const Block *B, BS *s) {
 }
 static inline int nt_use_float(const Block *B) {
     static int env = -1; if (env < 0) { const char *e = getenv("BRISK_NTSP"); env = e ? atoi(e) : 1; }
-    return env && g_ntsp && B->type == BLK_SDP && B->n >= 128 && !omp_in_parallel();
+    /* 5.16 (ISSUES 83): also inside a loop over blocks (the panels then run on one thread, the
+     * same bits). Until 5.15 the float path ran only outside a parallel region: a block of order
+     * >= 128 among several got the single-precision frames at one thread and the double ones at
+     * two or more, other bits for another thread count. */
+    return env && g_ntsp && B->type == BLK_SDP && B->n >= 128;
 }
 
 /* out = G' D G  (D symmetric) */
@@ -6296,11 +6527,41 @@ static void dump_xz(const Problem *P, const BS *S, int it, double tau) {
     fclose(f);
 }
 
+/* 5.16 (13 October): the tau column of the embedding, in the original or in shifted variables. The Newton system of the embedding has the
+ * column (-b; C) for dtau. Eliminating it through the Schur complement forms <C, H(C)>, A(H(C)) and
+ * <C, H(Rd)> (H the scaling, X (x) Z^-1 for HKM, W (x) W for NT), and the scalar of the tau equation is
+ * their difference: when X grows without bound (no strictly feasible dual point) these terms reach 1e14
+ * while the scalar is 1e-5, and dtau loses every digit. With dy = dy' + (dtau / tau) y the column becomes
+ * C^ = C - A'y / tau = (Z + Rd) / tau (Rd = tau C - A'y - Z), and H(C^) = (X + H(Rd)) / tau exactly, since
+ * H(Z) = X for HKM, NT and the cones. Every scalar is then formed from X, Z and Rd without the large terms
+ * (<C^, Z^-1> uses <Z, Z^-1> = nu, <C^, Q> uses <Z, Q> = <dX, dZ>), and the gap row's right-hand side
+ * becomes kap + <C^, X>. Exact in exact arithmetic. The shifted form has its own error: its gap row holds
+ * in dy', and in dy up to y'e / tau (e the primal row's miss), large when y grows without bound (no strictly
+ * feasible primal point: qap, |y| ~ 4e6). So each iteration takes the form whose error in the gap row was
+ * smaller at the previous one, eps <C, H C> |dtau| against |y'e| / tau (ISSUES 84). BRISK_HSDSHIFT=0: always
+ * the original column, 2: always shifted. Not with free variables (their column is c_f; the original form). */
+typedef struct { int on; double tau, theta; double **F; const char *pk; const double *bmh; } HsdShift;
+/* with the shift A(H C^) = b + (h_d - rp) / tau is close to b: b - A(H C^) is formed as the vector
+ * bmh = (rp - h_d) / tau (the products b'u and hc'u would cancel where M^-1 is large) */
+/* <Rd_k, D>: Rd is the copy F[k], or theta R0 on the pattern route */
+static double shift_dotF(const HsdShift *sh, const BS *s, int k, size_t len, const double *D) {
+    return sh->pk[k] ? sh->theta * dot_R0(s, len, D) : ddot_n(len, sh->F[k], D);
+}
+/* D += c C^_k = (c / tau) (Z + Rd) */
+static void shift_addC(const HsdShift *sh, const BS *s, int k, size_t len, double c, double *D) {
+    const double f = c / sh->tau;
+    const double *Z = s->Z;
+    if (sh->pk[k]) { PAR_LEN_FOR(len, D[i] += f * Z[i];); add_R0(s, len, f * sh->theta, D); }
+    else { const double *F = sh->F[k]; PAR_LEN_FOR(len, D[i] += f * (Z[i] + F[i]);); }
+}
+/* nu_k = <Z, Z^-1>: the order of an SDP or LP block, 1 for a cone (x'z = mu on the path) */
+static inline double shift_nu(const Block *B) { return B->type == BLK_SOC ? 1.0 : (double)B->n; }
+
 static int hsd_corrector(Problem *P, const Params *par, BS *S, Schur *Sc, double **Zv, const Pat *hp,
                          const char *pk, double tau, double kap, double *dt, double *dk, double *dyd,
                          const double *v, const double *hc, double denom, double *am, double mu_t,
                          double **bX, double **bZ, double *rhs, double *uc, double ndim1, Result *R,
-                         FreeVars *FV, const double *vf, double accf) {
+                         FreeVars *FV, const double *vf, double accf, const HsdShift *shc) {
     const int m = P->m, nb = P->nblk;
     const double bmin = par->hsd_cbmin, bmax = par->hsd_cbmax;
     const double ucap = par->hsd_cucap > 0 ? par->hsd_cucap : bmax;   /* largest downward push, in mu_t */
@@ -6314,6 +6575,11 @@ static int hsd_corrector(Problem *P, const Params *par, BS *S, Schur *Sc, double
         const int n = B->n;
         const size_t len = bsz(B);
         double trial = 0;
+        if (B->type == BLK_SOC) {          /* 5.16: <x~, z~> enters the trial mean; the cone is not pushed back */
+            for (int i = 0; i < n; i++) trial += (s->X[i] + at * s->dX[i]) * (s->Z[i] + at * s->dZ[i]);
+            pr1[2 * (size_t)k] = trial;
+            continue;
+        }
         if (B->type == BLK_LP) {
             for (int i = 0; i < n; i++) {
                 s->Xn[i] = (s->fm && s->fm[i]) ? 0.0 : (s->X[i] + at * s->dX[i]) * (s->Z[i] + at * s->dZ[i]);
@@ -6364,6 +6630,7 @@ static int hsd_corrector(Problem *P, const Params *par, BS *S, Schur *Sc, double
         const size_t len = bsz(B);
         double *K = s->Q;
         double trT = 0;
+        if (B->type == BLK_SOC) { memset(K, 0, sizeof(double) * len); pr1[2 * (size_t)k + 1] = 0; continue; }
         if (B->type == BLK_LP) {
             for (int i = 0; i < n; i++) {
                 double w = s->Xn[i], t = 0;
@@ -6461,7 +6728,9 @@ static int hsd_corrector(Problem *P, const Params *par, BS *S, Schur *Sc, double
         const double *ZI = Zv[k] ? Zv[k] : s->Zi;
         if (sh != 0) for (size_t i = 0; i < len; i++) s->Q[i] -= sh * ZI[i];
         blk_Aop(B, s, s->Q, rhs, -1.0);
-        pr1[2 * (size_t)k] = sp_inner(B, &B->C, s->Q);
+        /* <C^, K - sh Z^-1> = (<Z, K> - sh nu + <Rd, .>) / tau, <Z, K> = tr T (the frame of T is Z's) */
+        if (shc->on) pr1[2 * (size_t)k] = (pr1[2 * (size_t)k + 1] - sh * shift_nu(B) + shift_dotF(shc, s, k, len, s->Q)) / tau;
+        else pr1[2 * (size_t)k] = sp_inner(B, &B->C, s->Q);
     });
     aop_end();
     for (int k = 0; k < nb; k++) CK += pr1[2 * (size_t)k];
@@ -6471,7 +6740,7 @@ static int hsd_corrector(Problem *P, const Params *par, BS *S, Schur *Sc, double
     if (FV->nf) free_solve(P, Sc, FV, rhs, NULL, uc, ufc);
     else schur_solve(Sc, rhs, uc, 1e-7);
     R->t_chol += wtime() - tc0; g_ct[3] += wtime() - tc0;
-    const double dtc = (CK - ddot_n(m, P->b, uc) + ddot_n(m, hc, uc) + tcc / tau
+    const double dtc = (shc->on ? CK - ddot_n(m, shc->bmh, uc) + tcc / tau : CK - ddot_n(m, P->b, uc) + ddot_n(m, hc, uc) + tcc / tau
                         + (FV->nf ? ddot_n(FV->nf, FV->c, ufc) : 0.0)) / denom;
     const double dkc = (tcc - kap * dtc) / tau;
     for (int i = 0; i < m; i++) uc[i] += dtc * v[i];
@@ -6483,9 +6752,11 @@ static int hsd_corrector(Problem *P, const Params *par, BS *S, Schur *Sc, double
         const size_t len = bsz(B);
         blk_ATy(B, s, uc, s->F);
         PAR_LEN_FOR(len, s->F[i] = -s->F[i];);
-        sp_add(B, &B->C, dtc, s->F);                               /* dZc */
+        if (shc->on) shift_addC(shc, s, k, len, dtc, s->F);          /* dZc */
+        else sp_add(B, &B->C, dtc, s->F);
         const double *RX = Zv[k] ? s->Zi : s->X;
         if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = s->Zi[i] * s->F[i] * s->X[i];
+        else if (B->type == BLK_SOC) soc_H(s, n, s->F, s->G, s->stmp);
         else if (pk[k]) { prod_pat(&hp[k], n, s, s->F, RX, s->G); symmetrize(n, s->G); }
         else { prod_zi(n, s, s->F, RX, s->G); symmetrize(n, s->G); }
         memcpy(bX[k], s->dX, sizeof(double) * len);
@@ -6560,6 +6831,21 @@ static void rcand_offer(RCand *rc, const Problem *P, BS *S, const double *y, dou
     }
 }
 static const char *g_hsd_why = NULL;      /* why the embedding stopped short (printed with the retry: user reports must be diagnosable) */
+/* 5.16 (ISSUES 83): BRISK_BITSDBG=1 prints a fingerprint (FNV-1a) of the bits of X, Z, y, tau and
+ * kappa at every iteration, to find the first iteration at which two runs differ. Not inlined: code
+ * added inside hsd_run changes how the compiler contracts and vectorizes its arithmetic, and so the
+ * bits of every run. */
+static __attribute__((noinline)) void hsd_bits(const Problem *P, const BS *S, const double *y, double tau, double kap, int it) {
+    uint64_t h[3] = { 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull };
+    for (int k = 0; k < P->nblk; k++) {
+        const size_t len = bsz(&P->blk[k]);
+        for (size_t i = 0; i < len; i++) { uint64_t u, v; memcpy(&u, &S[k].X[i], 8); memcpy(&v, &S[k].Z[i], 8); h[0] = (h[0] ^ u) * 1099511628211ull; h[1] = (h[1] ^ v) * 1099511628211ull; }
+    }
+    for (int i = 0; i < P->m; i++) { uint64_t u; memcpy(&u, &y[i], 8); h[2] = (h[2] ^ u) * 1099511628211ull; }
+    uint64_t ut, uk; memcpy(&ut, &tau, 8); memcpy(&uk, &kap, 8);
+    printf("     [bits it %d X %016llx Z %016llx y %016llx tau %016llx kap %016llx]\n", it, (unsigned long long)h[0], (unsigned long long)h[1],
+           (unsigned long long)h[2], (unsigned long long)ut, (unsigned long long)uk);
+}
 static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, double *y,
                    double *ybest, double *best_score, int *it_out, int *it_best, Result *best,
                    int keep_best, RCand *rc) {
@@ -6568,7 +6854,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     for (int k = 0; k < nb; k++) S[k].zpat = 0;        /* 5.12: the pattern passes are the standard loop's (dense passes here) */
     { const char *e = getenv("BRISK_KFIX0"); if (e) g_kfix0 = atof(e); if (getenv("BRISK_NOCBOX")) g_cbox = 0; }
     double tau = 1.0, kap = 1.0, ndim = 0;
-    for (int k = 0; k < nb; k++) ndim += P->blk[k].n;
+    for (int k = 0; k < nb; k++) ndim += P->blk[k].type == BLK_SOC ? 1 : P->blk[k].n;   /* 5.16: a cone counts once (x o z = mu e) */
     if (par->hsd_corr > 0)            /* 4.25: the corrector buffers, on first use */
         for (int k = 0; k < nb; k++) {
             BS *s = &S[k];
@@ -6626,7 +6912,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         const double fz = ez ? atof(ez) : 1.0;
         if (!ex) {
             int nsdp = 0, maxn = 0;
-            for (int k = 0; k < nb; k++) if (P->blk[k].type != BLK_LP) { nsdp++; if (P->blk[k].n > maxn) maxn = P->blk[k].n; }
+            for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) { nsdp++; if (P->blk[k].n > maxn) maxn = P->blk[k].n; }
             /* the moment form of a dense conversion too (dense case9241: 63 its, 375 s
              * against 100 its, 615 s; case6468 101 s against 141 s once the collapsed endgame
              * stops early and both polishings are tried) */
@@ -6655,6 +6941,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         double tx = 0, tz = 0, nd = 0;
         for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int n = B->n;
             if (B->type == BLK_LP) for (int i = 0; i < n; i++) { tx += S[k].X[i]; tz += S[k].Z[i]; }
+            else if (B->type == BLK_SOC) { tx += S[k].X[0]; tz += S[k].Z[0]; }
             else for (int i = 0; i < n; i++) { tx += S[k].X[i + (size_t)i * n]; tz += S[k].Z[i + (size_t)i * n]; }
             nd += n; }
         printf("   SCALEDBG start trX %.3e trZ %.3e ndim %.0f normb %.3e normC %.3e bs %.3e cs %.3e\n", tx, tz, nd, P->normb2, P->normC2, P->bs, P->cs);
@@ -6776,6 +7063,25 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     double *ihist = calloc(4096, sizeof(double)), *mhist = calloc(4096, sizeof(double));
     int it_sprog = 0;   /* last iteration of score progress (caps the steady-progress extension) */
     const int steady_on = !getenv("BRISK_NOSTEADY");
+    /* 5.16: the path of the embedding. With the residual target of this method the homogeneous
+     * residuals are theta R0 in exact arithmetic (theta = prod (1 - alpha (1 - sigma))). Once a
+     * residual exceeds twice its path value, the part a step got wrong is larger than the part
+     * the method controls, and later steps only scale it with theta: progress of the current
+     * iterate no longer keeps the run going (a better iterate still does). BRISK_PATHRULE=0: off. */
+    static int path_on = -1;
+    if (path_on < 0) { const char *e = getenv("BRISK_PATHRULE"); path_on = e ? atoi(e) != 0 : 1; }
+    double pth = 1.0, pth_best = 1.0, prp0 = 0, prd0 = 0;
+    int offpath = 0;
+    static int shift_env = -1;
+    if (shift_env < 0) { const char *e = getenv("BRISK_HSDSHIFT"); shift_env = e ? atoi(e) : 1; }
+    int shift_next = 0;                 /* the formulation chosen for the next iteration (1: shifted) */
+    int shift_off = 0, shift_prev = 0;  /* the shifted form spoiled the primal rows once: not again in this run */
+    double rpo_it = 0, rpo_pred = 0;    /* this iteration's primal residual, and the next one's predicted value */
+    double hcC0 = 0;                    /* <C, H C> of this iteration (the size of the cancelling terms) */
+    HsdShift shc = { 0, 1.0, 0.0, NULL, NULL, NULL };
+    shc.F = calloc(nb, sizeof(double *));
+    double *bmh = malloc(sizeof(double) * (2 * (size_t)m + 1));
+    shc.bmh = bmh;
     { const char *e = getenv("BRISK_PFLOOR"); g_pfloor = e ? atoi(e) : 1; }
     int kfix = 0, kf_n = 0, tiny_steps = 0, small_steps = 0;
     static int epolish_on = -1; if (epolish_on < 0) { const char *e = getenv("BRISK_EPOLISH"); epolish_on = e ? atoi(e) : 1; }
@@ -6905,6 +7211,12 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 for (int i = 0; i < n; i++) s->Zi[i] = 1.0 / s->Z[i];
                 if (s->fm) for (int i = 0; i < n; i++) if (s->fm[i]) s->Zi[i] = 0;
             }
+            else if (B->type == BLK_SOC) {                         /* 5.16: z^{-1} and the NT scaling */
+                if (soc_nt(s, n, s->X, s->Z)) {
+                    _Pragma("omp atomic write")
+                    zerr = 1;
+                } else soc_inv(n, s->Z, s->Zi);
+            }
             else if (s->zon && !Zv[k]) {                           /* 5.12: Z^{-1} from the sparse factor */
                 if (getenv("BRISK_ZINVOLD")) {
                     pzero(bsz(B), s->Zi);
@@ -6975,6 +7287,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             double tx = 0, tz = 0;
             for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int n = B->n;
                 if (B->type == BLK_LP) for (int i = 0; i < n; i++) { tx += S[k].X[i]; tz += S[k].Z[i]; }
+                else if (B->type == BLK_SOC) { tx += S[k].X[0]; tz += S[k].Z[0]; }
                 else for (int i = 0; i < n; i++) { tx += S[k].X[i + (size_t)i * n]; tz += S[k].Z[i + (size_t)i * n]; } }
             printf("   SCALEDBG it %d trX/tau %.3e trZ/tau %.3e ratio %.3e tau %.3e\n", it, tx / tau, tz / tau, tz / fmax(tx, 1e-300), tau);
         }
@@ -6992,6 +7305,24 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         R->err[3] = rdo / (tau * (1 + P->normC1));
         R->err[5] = (po - dob) / den;
         R->err[6] = sc * xz / (tau * tau) / den;
+        /* a shifted step whose primal residual came out above twice its prediction (1 - alpha (1 - sigma)) rp: the shifted
+         * form's own miss in the primal rows (A(dX) through C^ = (Z + Rd) / tau) dominates there; the original form from now
+         * on (option pricing: rp 5.7e-11 -> 3.6e-6 at one shifted step) */
+        if (it > 0 && shift_prev && !shift_off && rpo > 2.0 * rpo_pred) {
+            shift_off = 1;
+            if (ENV_ON("BRISK_SHIFTDBG")) printf("     [tau column: the shifted step left rp at %.2e, %.1f times its prediction: original form from here]\n", rpo, rpo / fmax(rpo_pred, 1e-300));
+        }
+        rpo_it = rpo;
+        if (it == 0) { prp0 = rpo; prd0 = rdo; }
+        else if (!offpath && (rpo > 2.0 * pth * prp0 || rdo > 2.0 * pth * prd0)) {
+            offpath = 1;
+            if (par->verbose > 1) printf("   HSD: the residuals left the path at iteration %d (primal %.1f, dual %.1f times theta R0)\n",
+                                         it, rpo / fmax(pth * prp0, 1e-300), rdo / fmax(pth * prd0, 1e-300));
+        }
+        if (ENV_ON("BRISK_BITSDBG")) hsd_bits(P, S, y, tau, kap, it);
+        if (ENV_ON("BRISK_PATHDBG")) printf("     [path it %d theta %.2e  rp/(theta rp0) %.2e  rd/(theta rd0) %.2e  tau %.2e]\n", it, pth,
+                                          rpo / fmax(pth * prp0, 1e-300), rdo / fmax(pth * prd0, 1e-300), tau);
+        const int onpath = !(path_on && offpath);
         R->t_dense += wtime() - td;
         if (strict_gap > 0 && !looseskip_safe) {
             const int strict = bord_on || R->relgap < strict_gap;
@@ -7010,6 +7341,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             for (int k = 0; k < nb; k++) {
                 const Block *B = &P->blk[k];
                 if (B->type == BLK_LP) for (int i = 0; i < B->n; i++) { trX += S[k].X[i]; trZ += S[k].Z[i]; }
+                else if (B->type == BLK_SOC) { trX += S[k].X[0]; trZ += S[k].Z[0]; }
                 else for (int i = 0; i < B->n; i++) { trX += S[k].X[i + (size_t)i * B->n]; trZ += S[k].Z[i + (size_t)i * B->n]; }
             }
             printf("     [tau %.3e kap %.3e  trX/tau %.3e trZ/tau %.3e |y|/tau %.3e relcomp %.2e score %.2e]\n", tau, kap, trX / tau, trZ / tau,
@@ -7021,7 +7353,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         if (score < *best_score) {
             *best_score = score; *it_best = it; *best = *R;
             mu_best_it = mu;
-            kap_best = kap / tau; theta_best = theta / tau;
+            kap_best = kap / tau; theta_best = theta / tau; pth_best = pth / tau;
             for (int i = 0; i < m; i++) ybest[i] = y[i] / tau;
             if (keep_best)
                 for (int k = 0; k < nb; k++) {
@@ -7053,7 +7385,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * times the tolerance, so the next iteration is expected to meet it: no probes now */
         const int fast_conv = epolfast && score_last >= 10.0 * score && score <= 10.0 * par->tol;
         score_last = score;
-        if (epolish_on && !fast_conv && keep_best && !nf && !bord && n_epol < 4 && score > par->tol && R->relcomp > par->tol &&
+        if (epolish_on && !fast_conv && keep_best && !nf && !bord && !g_has_soc && n_epol < 4 && score > par->tol && R->relcomp > par->tol &&
             fmax(R->relgap, R->dinf) <= ptol && R->pinf <= epol_pgate * ptol &&
             fmax(R->pinf, fmax(R->relgap, R->dinf)) <= 0.5 * epol_last) {
             Result Rp = *R;
@@ -7144,7 +7476,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * have fallen by four more. A user's relaxation with a block of order 473: stop at
          * iteration 33 with 1e-10 instead of six more iterations at steps below 0.3.
          * BRISK_NORPROBE turns it off. */
-        if (rprobe_on && par->polish_r && rc && rc->have && rc->it == it && keep_best && !nf && !bord && n_rprobe < 2 && score > par->tol) {
+        if (rprobe_on && par->polish_r && rc && rc->have && rc->it == it && keep_best && !nf && !bord && !g_has_soc && n_rprobe < 2 && score > par->tol) {
             const double rs = fmax(R->dinf, fabs(R->relcomp));
             if (rs <= 0.5 * par->tol && rs <= 0.25 * rprobe_last && R->pinf >= 4.0 * pinf_lo) {
                 n_rprobe++; rprobe_last = rs;
@@ -7220,7 +7552,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     BS *s = &S[k];
                     const size_t len = bsz(B);
                     memcpy(s->X, s->Xb, sizeof(double) * len); memcpy(s->Z, s->Zb, sizeof(double) * len);
-                    if (B->type == BLK_LP) { memcpy(s->LX, s->X, sizeof(double) * len); memcpy(s->LZ, s->Z, sizeof(double) * len); }
+                    if (B->type != BLK_SDP) { memcpy(s->LX, s->X, sizeof(double) * len); memcpy(s->LZ, s->Z, sizeof(double) * len); }
                     else {
                         memcpy(s->LX, s->X, sizeof(double) * len); memcpy(s->LZ, s->Z, sizeof(double) * len);
                         if (chol_lower(B->n, s->LX) || chol_lower(B->n, s->LZ)) bad = 1;
@@ -7230,7 +7562,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 if (!bad) {
                     for (int k = 0; k < nb; k++) S[k].zon = 0;      /* the dense factors were just made */
                     for (int i = 0; i < m; i++) y[i] = ybest[i];
-                    tau = 1.0; kap = kap_best; theta = theta_best;
+                    tau = 1.0; kap = kap_best; theta = theta_best; pth = pth_best; offpath = 0;
                     g_looseskip = 0; looseskip_safe = 1; soltol = par->hsd_soltol;
                     kfix = -1; tiny_steps = 0; stall = 0;
                     continue;
@@ -7246,7 +7578,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * early best while it falls (split free pairs: their complementarity dominates
          * relcomp until they settle, and the gap measure rose from a lucky early value) */
         if (it < 4096) { shist[it] = score; phist[it] = R->pinf; ihist[it] = fmax(R->pinf, R->dinf); mhist[it] = mu; }
-        if (it >= 4 && it < 4096 && score < 0.7 * shist[it - 4] && score < 10.0 * *best_score && it > it_prog) it_prog = it;
+        if (onpath && it >= 4 && it < 4096 && score < 0.7 * shist[it - 4] && score < 10.0 * *best_score && it > it_prog) it_prog = it;
         /* 4.38 bound mode (A3): an improving tracked bound is progress: the stall rules do
          * not stop the solve while it improves (the other side may be blowing up) */
         if (par->btrack && par->btrack->have && par->btrack->it_imp == it) it_prog = it;
@@ -7256,7 +7588,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * Large AC-OPF (TSSOS case6468: the objective moves 42 -> 149 over 60 iterations at
          * alpha 0.1-0.4, as MOSEK's does) stopped at iteration 27 with 8e-5. Bounded by
          * 6 hsd_stall iterations after the last score progress. */
-        if (steady_on && it >= 8 && it < 4096 && ihist[it - 8] > 0 && ihist[it] < 0.9 * ihist[it - 8] &&
+        if (steady_on && onpath && it >= 8 && it < 4096 && ihist[it - 8] > 0 && ihist[it] < 0.9 * ihist[it - 8] &&
             mhist[it] < 0.5 * mhist[it - 8] && it - it_sprog < 6 * par->hsd_stall && it > it_prog) it_prog = it;
         if (it - it_prog >= par->stall_win && *best_score < 1e-6) { status = 4; g_hsd_why = "no progress near the accuracy floor"; break; }
         /* no better iterate for hsd_stall iterations: give up, unless mu keeps falling fast
@@ -7271,7 +7603,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * problem whose objective is decided by a tiny coefficient: a peak-power problem
          * sent by a user, value 0.0072, reached only at mu 1e-18 after a plateau at 0 with all
          * measures below 4e-8). Bounded by 12 iterations past the best. */
-        const int full_steps = small_steps == 0 && mu < 1e-2 * mu_best_it && it - *it_best < 12;
+        const int full_steps = onpath && small_steps == 0 && mu < 1e-2 * mu_best_it && it - *it_best < 12;
         if (*best_score < 10.0 * ptol && it - *it_best >= 3 && score > 10.0 * *best_score && !full_steps) { status = 4; g_hsd_why = "the errors rise past the best iterate"; break; }
         /* primal floor (4.20): the primal residual dominates the score by 10x, has not fallen
          * in 4 iterations and the best iterate is 4 old: the directions no longer reduce it
@@ -7346,6 +7678,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 BS vtmp;
                 const double ta0 = asmdbg ? wtime() : 0;
                 if (P->blk[k].type == BLK_LP) schur_lp(&P->blk[k], &S[k], m, Ma);
+                else if (P->blk[k].type == BLK_SOC) schur_soc(&P->blk[k], &S[k], m, Ma);
                 else schur_sdp(&P->blk[k], nt_view(&S[k], &vtmp, Zv[k] != NULL), m, Ma);
                 if (asmdbg) { const Block *Bk = &P->blk[k]; g_asm[Bk->type == BLK_LP ? 0 : Bk->lowrank ? 1 : Bk->dict ? 2 : 3] += wtime() - ta0; }
             }
@@ -7361,7 +7694,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
              * 792 ran at 70 GF/s, M was read at 41 GB/s; BRISK_MVFREE=0 off, 1 always, BRISK_MVFRATIO) */
             { static int mvf_env = -2; if (mvf_env == -2) { const char *e = getenv("BRISK_MVFREE"); mvf_env = e ? atoi(e) : -1; }
               static double mvf_ratio = -1; if (mvf_ratio < 0) { const char *e = getenv("BRISK_MVFRATIO"); mvf_ratio = e ? atof(e) : 1.5; }
-              if (mvf_env != 0 && !Sc->SC && !Sc->E && !bord_on && !(nf && fmode == 1)) {
+              if (mvf_env != 0 && !Sc->SC && !Sc->E && !bord_on && !(nf && fmode == 1) && !g_has_soc) {
                   double cub = 0;
                   for (int k = 0; k < nb; k++) { const double nk = P->blk[k].n; if (P->blk[k].type != BLK_LP) cub += nk * nk * nk; }
                   if (mvf_env == 1 || cub < mvf_ratio * (double)m * m) mvfree_take(Sc, P, S, Zv);
@@ -7372,7 +7705,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     const char *dir = getenv("BRISK_DUMPDIR"); char fn[512];
                     for (int k = 0; k < nb; k++) {
                         const Block *Bk = &P->blk[k];
-                        const size_t len = Bk->type == BLK_LP ? (size_t)Bk->n : (size_t)Bk->n * Bk->n;
+                        const size_t len = Bk->type != BLK_SDP ? (size_t)Bk->n : (size_t)Bk->n * Bk->n;
                         snprintf(fn, sizeof fn, "%s/W_%d_%d.bin", dir ? dir : ".", it, k);
                         FILE *fw = fopen(fn, "wb");
                         if (fw) { fwrite(Zv[k] ? S[k].Zi : S[k].X, sizeof(double), len, fw); if (!Zv[k]) fwrite(S[k].Zi, sizeof(double), len, fw); fclose(fw); }
@@ -7430,6 +7763,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         { double _t = wtime(); g_ph[1] += _t - g_ph_last; g_ph_last = _t; }
         /* ---- pieces: a0 = A(Zi), h_d = A(sym(Zi Rd X)), h_c = A(sym(Zi C X)) */
         td = wtime();
+        shc.on = nf ? 0 : shift_env == 2 ? 1 : (shift_env == 1 && shift_next); shc.tau = tau; shc.theta = theta; shc.pk = pk;
         memset(a0, 0, sizeof(double) * m);
         memset(hd, 0, sizeof(double) * m);
         memset(hc, 0, sizeof(double) * m);
@@ -7449,6 +7783,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             /* full products: in the embedding these matrices contain Z and C, so the
              * pattern-restricted route of the standard method does not apply          */
             if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = s->Zi[i] * s->F[i] * s->X[i];
+            else if (B->type == BLK_SOC) soc_H(s, n, s->F, s->G, s->stmp);
             else if (pk[k]) {                                  /* Rd = theta R0 on the pattern */
                 memset(s->G, 0, sizeof(double) * len);
                 add_R0(s, len, theta, s->G);
@@ -7461,6 +7796,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             memset(s->dX, 0, sizeof(double) * len);
             sp_add(B, &B->C, 1.0, s->dX);                              /* dense copy of C */
             if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->Q[i] = s->Zi[i] * s->dX[i] * s->X[i];
+            else if (B->type == BLK_SOC) soc_H(s, n, s->dX, s->Q, s->stmp);
             else if (pk[k]) { prod_pat(&hp[k], n, s, s->dX, RX, s->Q); symmetrize(n, s->Q); }
             else { prod_zi(n, s, s->dX, RX, s->Q); symmetrize(n, s->Q); }
             blk_Aop(B, s, s->Q, hc, 1.0);
@@ -7469,6 +7805,38 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         });
         aop_end();
         for (int k = 0; k < nb; k++) { cZi += prp3[3 * (size_t)k]; hcRd += prp3[3 * (size_t)k + 1]; hcC += prp3[3 * (size_t)k + 2]; }
+        double rgs = rg, cXs = cX;      /* the gap row's right-hand side and <C, X> of the tau column */
+        hcC0 = hcC;
+        if (shc.on) {
+            /* G = H(Rd) from the pieces; with Rd' = theta R0 on the pattern route (the model the
+             * directions use) and a copy of Rd otherwise (the correctors reuse F as a work array) */
+            double *p4 = hred(nb, 4);
+            HBLK_FOR(k, nb, {
+                const Block *B = &P->blk[k];
+                BS *s = &S[k];
+                const size_t len = bsz(B);
+                if (!pk[k]) {
+                    if (!shc.F[k]) shc.F[k] = amalloc(sizeof(double) * len);
+                    memcpy(shc.F[k], s->F, sizeof(double) * len);
+                }
+                const double *ZI = Zv[k] ? Zv[k] : s->Zi;
+                p4[4 * (size_t)k] = shift_dotF(&shc, s, k, len, s->X);
+                p4[4 * (size_t)k + 1] = shift_dotF(&shc, s, k, len, s->G);
+                p4[4 * (size_t)k + 2] = shift_dotF(&shc, s, k, len, ZI);
+                p4[4 * (size_t)k + 3] = shift_nu(B);
+            });
+            double fx = 0, fg = 0, fzi = 0, nu = 0;
+            for (int k = 0; k < nb; k++) { fx += p4[4 * (size_t)k]; fg += p4[4 * (size_t)k + 1]; fzi += p4[4 * (size_t)k + 2]; nu += p4[4 * (size_t)k + 3]; }
+            /* A(H(C^)) = (A(X) + h_d) / tau = b + (h_d - rp) / tau (rp = tau b - A(X));
+             * <C^, H C^> = (<X,Z> + 2 <Rd,X> + <Rd,H Rd>) / tau^2; <C^, H Rd> = (<Rd,X> + <Rd,H Rd>) / tau;
+             * <C^, Z^-1> = (nu + <Rd,Z^-1>) / tau; <C^, X> = (<X,Z> + <Rd,X>) / tau */
+            for (int i = 0; i < m; i++) { bmh[i] = (rp[i] - hd[i]) / tau; hc[i] = P->b[i] - bmh[i]; }
+            hcC = (xz + 2.0 * fx + fg) / (tau * tau);
+            hcRd = (fx + fg) / tau;
+            cZi = (nu + fzi) / tau;
+            cXs = (xz + fx) / tau;
+            rgs = kap + cXs;
+        }
         R->t_dense += wtime() - td;
         g_ct[8] += wtime() - td;
         tc = wtime();
@@ -7485,7 +7853,8 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         else schur_solve(Sc, rhs, v, soltol);                               /* independent of sigma */
         R->t_chol += wtime() - tc;
         double bv = ddot_n(m, P->b, v), hcv = ddot_n(m, hc, v);
-        double denom = bv + hcC - hcv + kap / tau - (nf ? ddot_n(nf, FV.c, vf) : 0.0);
+        double denom = shc.on ? ddot_n(m, bmh, v) + hcC + kap / tau
+                              : bv + hcC - hcv + kap / tau - (nf ? ddot_n(nf, FV.c, vf) : 0.0);
         if (!(fabs(denom) > 0)) { status = 4; g_hsd_why = "the embedding's scalar equation is singular or not finite"; break; }
 
         { double _t = wtime(); g_ph[2] += _t - g_ph_last; g_ph_last = _t; }
@@ -7498,7 +7867,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         if (nf) free_solve(P, Sc, &FV, rhs, rf, u0, ufa);
         else if (!par->hsd_batch) schur_solve(Sc, rhs, u0, 1e-7);
         R->t_chol += wtime() - tc;
-        double dtau_a = (rg - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0) - kap
+        double dtau_a = ((shc.on ? rgs - cXs - hcRd - ddot_n(m, bmh, u0) : rg - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0)) - kap
                          + (nf ? ddot_n(nf, FV.c, ufa) : 0.0)) / denom;
         double dkap_a = -kap - (kap / tau) * dtau_a;
         td = wtime();
@@ -7511,9 +7880,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             blk_ATy(B, s, dy, s->dZ);
             if (pk[k]) { for (size_t i = 0; i < len; i++) s->dZ[i] = -s->dZ[i]; add_R0(s, len, theta, s->dZ); }
             else for (size_t i = 0; i < len; i++) s->dZ[i] = s->F[i] - s->dZ[i];
-            sp_add(B, &B->C, dtau_a, s->dZ);
+            if (shc.on) shift_addC(&shc, s, k, len, dtau_a, s->dZ);
+            else sp_add(B, &B->C, dtau_a, s->dZ);
             const double *RX = Zv[k] ? s->Zi : s->X;
             if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = s->Zi[i] * s->dZ[i] * s->X[i];
+            else if (B->type == BLK_SOC) soc_H(s, n, s->dZ, s->G, s->stmp);
             else if (pk[k]) { prod_pat(&hp[k], n, s, s->dZ, RX, s->G); symmetrize(n, s->G); }
             else { prod_zi(n, s, s->dZ, RX, s->G); symmetrize(n, s->G); }
             PAR_LEN_FOR(len, s->dX[i] = -s->G[i] - s->X[i];);
@@ -7549,6 +7920,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 BS *s = &S[k];
                 int n = B->n;
                 if (B->type == BLK_LP) { for (int i = 0; i < n; i++) { if (s->fm && s->fm[i]) continue; double w = s->X[i] * s->Z[i] / mu; lmn = fmin(lmn, w); lmx = fmax(lmx, w); } continue; }
+                if (B->type == BLK_SOC) { const double l0 = s->lam[0], lb = soc_nb(n, s->lam); lmn = fmin(lmn, (l0 - lb) * (l0 - lb) / mu); lmx = fmax(lmx, (l0 + lb) * (l0 + lb) / mu); continue; }
                 double *T = malloc(sizeof(double) * n * n), *ev = malloc(sizeof(double) * n);
                 memcpy(T, s->Z, sizeof(double) * n * n);
                 BL(dtrmm_)("L", "L", "T", "N", &n, &n, &DONE, s->LX, &n, T, &n);
@@ -7645,6 +8017,13 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             BS *s = &S[k];
             int n = B->n;
             if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->Q[i] = s->Zi[i] * s->dZ[i] * s->dX[i];
+            else if (B->type == BLK_SOC) {
+                /* 5.16: Q = W (lam \ ((W^{-1} dX) o (W dZ))) */
+                double *t1 = s->stmp, *t2 = s->stmp + n, *t3 = s->stmp + 2 * (size_t)n;
+                soc_Winv(s, n, s->dX, t1); soc_W(s, n, s->dZ, t2);
+                soc_jprod(n, t1, t2, t3); soc_jdiv(n, s->lam, t3, t3);
+                soc_W(s, n, t3, s->Q);
+            }
             else if (Zv[k]) {
                 /* NT: Q = G L_lam^{-1}(sym(dXt dZt)) G', dXt = G^{-1} dX G^{-T}, dZt = G' dZ G */
                 nt_toX(B, s, s->dX, s->dXt);
@@ -7659,7 +8038,9 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             else { prod_zi(n, s, s->dZ, s->dX, s->Q); symmetrize(n, s->Q); }
             if (qsc != 1.0) { const size_t len = bsz(B); for (size_t i = 0; i < len; i++) s->Q[i] *= qsc; }
             blk_Aop(B, s, s->Q, qv, 1.0);
-            pq[k] = sp_inner(B, &B->C, s->Q);
+            /* <C^, Q> = (<Z, Q> + <Rd, Q>) / tau, <Z, Q> = qsc <dX, dZ> (the frames of Q are Z's) */
+            if (shc.on) { const size_t len = bsz(B); pq[k] = (qsc * ddot_n(len, s->dX, s->dZ) + shift_dotF(&shc, s, k, len, s->Q)) / tau; }
+            else pq[k] = sp_inner(B, &B->C, s->Q);
         });
         aop_end();
         g_pt[0] += wtime() - tpt0; g_pt[5] += 1;
@@ -7721,9 +8102,9 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         }
         R->t_chol += wtime() - tc;
         if (nhoc > 0 && hoc == 0) { memcpy(u0s, u0, sizeof(double) * m); if (nf) memcpy(uf0s, uf0, sizeof(double) * nf); }
-        n0 = rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0)
+        n0 = (shc.on ? rgs - cQ - cXs - hcRd - ddot_n(m, bmh, u0) : rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0))
                     + (-tau * kap - tk2) / tau + (nf ? ddot_n(nf, FV.c, uf0) : 0.0);
-        n1 = -rg + mu * cZi + hcRd - ddot_n(m, P->b, u1) + ddot_n(m, hc, u1) + mu / tau
+        n1 = (shc.on ? -rgs + mu * cZi + hcRd - ddot_n(m, bmh, u1) : -rg + mu * cZi + hcRd - ddot_n(m, P->b, u1) + ddot_n(m, hc, u1)) + mu / tau
                     + (nf ? ddot_n(nf, FV.c, uf1) : 0.0);
         dt0 = n0 / denom; dt1 = (n0 + n1) / denom;
         dk0 = (-tau * kap - tk2) / tau - (kap / tau) * dt0;
@@ -7744,9 +8125,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 blk_ATy(B, s, dy, DZ);
                 if (pk[k]) { for (size_t i = 0; i < len; i++) DZ[i] = -DZ[i]; add_R0(s, len, (1.0 - sg) * theta, DZ); }
                 else for (size_t i = 0; i < len; i++) DZ[i] = (1.0 - sg) * s->F[i] - DZ[i];
-                sp_add(B, &B->C, dt, DZ);
+                if (shc.on) shift_addC(&shc, s, k, len, dt, DZ);
+                else sp_add(B, &B->C, dt, DZ);
                 const double *RX = Zv[k] ? s->Zi : s->X, *ZI = Zv[k] ? Zv[k] : s->Zi;
                 if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = s->Zi[i] * DZ[i] * s->X[i];
+                else if (B->type == BLK_SOC) soc_H(s, n, DZ, s->G, s->stmp);
                 else if (pk[k]) { prod_pat(&hp[k], n, s, DZ, RX, s->G); symmetrize(n, s->G); }
                 else { prod_zi(n, s, DZ, RX, s->G); symmetrize(n, s->G); }
                 PAR_LEN_FOR(len, DX[i] = -s->G[i] - s->X[i] - s->Q[i] + sg * mu * ZI[i];);
@@ -7792,7 +8175,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         if (hoc_redo == 2) {
             /* recompute the scalars and the endpoints from the restored u0 */
             hoc_redo = 1;
-            n0 = rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0) + (-tau * kap - tk2) / tau + (nf ? ddot_n(nf, FV.c, uf0) : 0.0);
+            n0 = (shc.on ? rgs - cQ - cXs - hcRd - ddot_n(m, bmh, u0) : rg - cQ - (cX - cfx) - hcRd - ddot_n(m, P->b, u0) + ddot_n(m, hc, u0)) + (-tau * kap - tk2) / tau + (nf ? ddot_n(nf, FV.c, uf0) : 0.0);
             dt0 = n0 / denom; dt1 = (n0 + n1) / denom;
             dk0 = (-tau * kap - tk2) / tau - (kap / tau) * dt0;
             dk1 = (mu - tau * kap - tk2) / tau - (kap / tau) * dt1;
@@ -7808,9 +8191,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     blk_ATy(B, s, dy, DZ);
                     if (pk[k]) { for (size_t i = 0; i < len; i++) DZ[i] = -DZ[i]; add_R0(s, len, (1.0 - sg) * theta, DZ); }
                     else for (size_t i = 0; i < len; i++) DZ[i] = (1.0 - sg) * s->F[i] - DZ[i];
-                    sp_add(B, &B->C, dt, DZ);
+                    if (shc.on) shift_addC(&shc, s, k, len, dt, DZ);
+                    else sp_add(B, &B->C, dt, DZ);
                     const double *RX = Zv[k] ? s->Zi : s->X, *ZI = Zv[k] ? Zv[k] : s->Zi;
                     if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = s->Zi[i] * DZ[i] * s->X[i];
+                    else if (B->type == BLK_SOC) soc_H(s, n, DZ, s->G, s->stmp);
                     else if (pk[k]) { prod_pat(&hp[k], n, s, DZ, RX, s->G); symmetrize(n, s->G); }
                     else { prod_zi(n, s, DZ, RX, s->G); symmetrize(n, s->G); }
                     PAR_LEN_FOR(len, DX[i] = -s->G[i] - s->X[i] - s->Q[i] + sg * mu * ZI[i];);
@@ -7863,7 +8248,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     double mut = par->hsd_ctarget ? sigma * mu : 0.0;
                     const double tc0 = wtime();
                     const int acc = hsd_corrector(P, par, S, Sc, Zv, hp, pk, tau, kap, &dt, &dk, dyd, v, hc, denom,
-                                                  &best_am, mut, dX0, dZ0, rhs, u1, ndim1, R, &FV, vf, accf);
+                                                  &best_am, mut, dX0, dZ0, rhs, u1, ndim1, R, &FV, vf, accf, &shc);
                     tcorr += wtime() - tc0;
                     g_ph[9] += wtime() - tc0;
                     ntry_c++;
@@ -7964,7 +8349,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 }
                 R->t_chol += wtime() - tc;
                 td = wtime();
-                const double dte = -(ddot_n(m, P->b, u1) - ddot_n(m, hc, u1)
+                const double dte = -((shc.on ? ddot_n(m, bmh, u1) : ddot_n(m, P->b, u1) - ddot_n(m, hc, u1))
                                      - (nf ? ddot_n(nf, FV.c, dxfd) : 0.0)) / denom;
                 for (int i = 0; i < m; i++) u1[i] += dte * v[i];
                 for (int i = 0; i < m; i++) qv[i] = (1.0 - sigma) * rp[i] + P->b[i] * (dt + dte);
@@ -7975,9 +8360,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     const size_t len = bsz(B);
                     blk_ATy(B, s, u1, s->F);
                     PAR_LEN_FOR(len, s->F[i] = -s->F[i];);
-                    sp_add(B, &B->C, dte, s->F);                           /* dZ_e */
+                    if (shc.on) shift_addC(&shc, s, k, len, dte, s->F);        /* dZ_e */
+                    else sp_add(B, &B->C, dte, s->F);
                     const double *RX = Zv[k] ? s->Zi : s->X;
                     if (B->type == BLK_LP) for (int i = 0; i < n; i++) s->G[i] = -s->Zi[i] * s->F[i] * s->X[i];
+                    else if (B->type == BLK_SOC) { soc_H(s, n, s->F, s->G, s->stmp); PAR_LEN_FOR(len, s->G[i] = -s->G[i];); }
                     else {
                         if (pk[k]) prod_pat(&hp[k], n, s, s->F, RX, s->G);
                         else prod_zi(n, s, s->F, RX, s->G);
@@ -8008,6 +8395,23 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 dt += dte;
                 dk -= kap * dte / tau;
                 nrefine++;
+            }
+            /* back from the shifted variable: dy = dy' + (dtau / tau) y */
+            if (shc.on) for (int i = 0; i < m; i++) dyd[i] += dt * y[i] / tau;
+            if (shift_env == 1 && !nf) {
+                /* which form of the tau column for the next iteration: the error each puts into the gap row.
+                 * Original: its scalars cancel terms of size <C, H C>, an error of eps <C, H C> |dtau|.
+                 * Shifted: the gap row holds in dy', and in dy up to y'e / tau, e = A(dX) - b dtau - eta rp the
+                 * primal row's miss (the shifted row uses A(dX) through C^ = C - A'y / tau). */
+                double *e = bmh + m;            /* (the second half of the bmh buffer) */
+                for (int i = 0; i < m; i++) e[i] = (1.0 - sigma) * rp[i] + P->b[i] * dt;
+                aop_begin(e, NULL, NULL, NULL);
+                HBLK_FOR(k, nb, blk_Aop(&P->blk[k], &S[k], S[k].dX, e, -1.0););
+                aop_end();
+                const double err1 = fabs(ddot_n(m, y, e)) / tau, err0 = DBL_EPSILON * hcC0 * fabs(dt);
+                shift_next = !shift_off && err1 < err0;
+                if (ENV_ON("BRISK_SHIFTDBG")) printf("     [tau column it %d: %s; next %s (original %.2e, shifted %.2e)]\n", it,
+                                                    shc.on ? "shifted" : "original", shift_next ? "shifted" : "original", err0, err1);
             }
             {   /* experimental: a longer step when the new point stays in the neighbourhood */
                 static double nb_beta = -2, nb_g = 0; static int nb_always = 0;
@@ -8044,6 +8448,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 munew = (munew + tk) / ndim1;
                 lo = tk;
                 for (int k = 0; k < nb; k++) {
+                    if (P->blk[k].type == BLK_SOC) {
+                        const double w = soc_lmin_at(P->blk[k].n, S[k].X, S[k].dX, S[k].Z, S[k].dZ, alpha, S[k].stmp);
+                        if (w < lo) lo = w;
+                        continue;
+                    }
                     if (P->blk[k].type != BLK_LP) continue;
                     for (int i = 0; i < P->blk[k].n; i++) {
                         if (S[k].fm && S[k].fm[i]) continue;
@@ -8165,6 +8574,8 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             tau += a * dt;
             kap += a * dk;
             theta *= 1.0 - a * (1.0 - sigma);
+            pth *= 1.0 - a * (1.0 - sigma);
+            rpo_pred = (1.0 - a * (1.0 - sigma)) * rpo_it; shift_prev = shc.on;
             alpha = a;
             if (npk && !nf) {
                 /* x+ - x- is all that matters: shrink both by a fraction of the smaller one
@@ -8191,12 +8602,13 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 const Block *B = &P->blk[k];
                 size_t len = bsz(B);
                 PAR_LEN_FOR(len, S[k].X[i] *= f; S[k].Z[i] *= f;);
-                if (B->type == BLK_LP) for (int i = 0; i < B->n; i++) { S[k].LX[i] *= f; S[k].LZ[i] *= f; }
+                if (B->type != BLK_SDP) for (int i = 0; i < B->n; i++) { S[k].LX[i] *= f; S[k].LZ[i] *= f; }
                 else for (size_t i = 0; i < len; i++) { S[k].LX[i] *= sq; S[k].LZ[i] *= sq; }
             }
             for (int i = 0; i < m; i++) y[i] *= f;
             kap *= f;
             theta *= f;
+            pth *= f;
             tau = 1.0;
         }
     }
@@ -8226,6 +8638,7 @@ done:
         double tx = 0, tz = 0;
         for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int n = B->n;
             if (B->type == BLK_LP) for (int i = 0; i < n; i++) { tx += S[k].X[i]; tz += S[k].Z[i]; }
+            else if (B->type == BLK_SOC) { tx += S[k].X[0]; tz += S[k].Z[0]; }
             else for (int i = 0; i < n; i++) { tx += S[k].X[i + (size_t)i * n]; tz += S[k].Z[i + (size_t)i * n]; } }
         printf("   SCALEDBG end trX %.3e trZ %.3e tau %.3e its %d\n", tx, tz, tau, it);
     }
@@ -8267,6 +8680,8 @@ done:
     free(dX0); free(dZ0); free(dX1); free(dZ1);
     for (int k = 0; k < nb; k++) { free(hp[k].fr); free(hp[k].fc); free(hp[k].rows); }
     free(hp); free(pk);
+    for (int k = 0; k < nb; k++) free(shc.F[k]);
+    free(shc.F); free(bmh);
     for (int k = 0; k < nb; k++) free(Zv[k]);
     free(Zv);
     if (par->verbose > 1 && nrebase) printf("   (HSD: residual re-based %d times)\n", nrebase);
@@ -8551,7 +8966,153 @@ int brisk_threads_busy(int verbose) {
     (void)verbose;
     return -1;
 }
+/* ---- 5.16: semidefinite blocks with arrow data solved as second-order cones (REPORT_5.16 §9).
+ * A block of order d whose C and A_i are all arrow matrices Arw(a) = [[a_0, ab'], [ab, a_0 I]]
+ * (in some ordering: one hub index carries every off-diagonal entry, the diagonal is constant)
+ * is a second-order cone: Z = Arw(z) >= 0 iff z in Q, and <Arw(a), X> = a'x with x_0 = tr X,
+ * x_t = 2 X_{hub, t}, where x ranges over Q as X ranges over the semidefinite cone. This is how a
+ * cone is written into the semidefinite form (sedumi.c) and how users write norm constraints as
+ * LMIs; as a d x d block it costs O(d^3) an iteration, as a cone O(d). The embedding is run on the
+ * problem with these blocks as cones; X of the problem as given is the rank-two completion
+ * X = 1/2 [[x_0, xb'], [xb, x_0 u u']] (u = xb / ||xb||), positive semidefinite iff x in Q. */
+void spsym_finish(SpSym *S, int n, int is_lp);
+/* the hub of a block with arrow data, or -1 */
+static int arrow_hub(const Block *B) {
+    const int n = B->n;
+    static int dbg = -1; if (dbg < 0) dbg = getenv("BRISK_ARROWDBG") != NULL;
+    if (B->type != BLK_SDP || n < 2) return -1;      /* (whatever its Schur route: the cone block is rebuilt from the data) */
+    int c1 = -1, c2 = -1, offd = 0;            /* the hub candidates: in every off-diagonal entry */
+    for (int t = -1; t < B->ncon; t++) {
+        const SpSym *S = t < 0 ? &B->C : &B->A[t];
+        int nd = 0; double dv = 0;
+        for (int q = 0; q < S->nnz; q++) {
+            const int i = S->row[q], j = S->col[q];
+            const double v = S->val[q];
+            if (i == j) {
+                if (nd == 0) dv = v;
+                else if (!(fabs(v - dv) <= 1e-14 * fabs(dv))) { if (dbg) printf("   [arrow n %d: diagonal %.17g vs %.17g in matrix %d]\n", n, v, dv, t); return -1; }
+                nd++;
+                continue;
+            }
+            offd++;
+            if (c1 < 0 && c2 < 0) { c1 = i; c2 = j; continue; }
+            if (c1 >= 0 && c1 != i && c1 != j) c1 = -1;
+            if (c2 >= 0 && c2 != i && c2 != j) c2 = -1;
+            if (c1 < 0 && c2 < 0) { if (dbg) printf("   [arrow n %d: no hub, entry (%d,%d) %.3g in matrix %d]\n", n, i, j, v, t); return -1; }
+        }
+        if (nd != 0 && nd != n) { if (dbg) printf("   [arrow n %d: %d diagonal entries in matrix %d]\n", n, nd, t); return -1; }
+    }
+    if (!offd) return -1;
+    return c1 >= 0 ? c1 : c2;
+}
+int brisk_arrow_hub(const Block *B) { return arrow_hub(B); }
+/* order: ord[0] = hub, then the other indices; pos[i] = its place in the cone vector */
+static void arrow_order(int n, int hub, int *ord, int *pos) {
+    ord[0] = hub; pos[hub] = 0;
+    int c = 1;
+    for (int i = 0; i < n; i++) if (i != hub) { ord[c] = i; pos[i] = c++; }
+}
+/* the cone vector of an arrow matrix (stored upper entries) as an LP-type SpSym */
+static void arrow_vec(const SpSym *S, const int *pos, int hub, int n, SpSym *V) {
+    double *a = calloc((size_t)n + 1, sizeof(double));
+    char *in = calloc((size_t)n + 1, 1);
+    for (int q = 0; q < S->nnz; q++) {
+        const int i = S->row[q], j = S->col[q];
+        if (i == j) { a[0] = S->val[q]; in[0] = 1; }
+        else { const int o = i == hub ? j : i; a[pos[o]] = S->val[q]; in[pos[o]] = 1; }
+    }
+    int nz = 0;
+    for (int i = 0; i < n; i++) nz += in[i];
+    memset(V, 0, sizeof(*V));
+    V->nnz = nz;
+    V->row = malloc(sizeof(int) * (nz + 1)); V->col = malloc(sizeof(int) * (nz + 1)); V->val = malloc(sizeof(double) * (nz + 1));
+    int w = 0;
+    for (int i = 0; i < n; i++) if (in[i]) { V->row[w] = V->col[w] = i; V->val[w] = a[i]; w++; }
+    spsym_finish(V, n, 1);
+    free(a); free(in);
+}
+/* Q: P with the arrow blocks as cone blocks (the other blocks shared); hub[k] >= 0 marks them */
+static void soc_problem(const Problem *P, Problem *Q, const int *hub, int **ordk) {
+    *Q = *P;
+    Q->blk = calloc((size_t)P->nblk + 1, sizeof(Block));
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        if (hub[k] < 0) { Q->blk[k] = *B; continue; }
+        Block *C = &Q->blk[k];
+        const int n = B->n;
+        int *pos = malloc(sizeof(int) * (n + 1));
+        ordk[k] = malloc(sizeof(int) * (n + 1));
+        arrow_order(n, hub[k], ordk[k], pos);
+        C->type = BLK_SOC; C->n = n; C->ncon = B->ncon;
+        C->con = malloc(sizeof(int) * (B->ncon + 1));
+        memcpy(C->con, B->con, sizeof(int) * B->ncon);
+        C->A = calloc((size_t)B->ncon + 1, sizeof(SpSym));
+        for (int t = 0; t < B->ncon; t++) arrow_vec(&B->A[t], pos, hub[k], n, &C->A[t]);
+        arrow_vec(&B->C, pos, hub[k], n, &C->C);
+        /* coefficient lists by variable, as problem_prepare makes them for an LP block */
+        int *cnt = calloc((size_t)n + 2, sizeof(int)), tot = 0;
+        for (int t = 0; t < C->ncon; t++) for (int q = 0; q < C->A[t].nnz; q++) { cnt[C->A[t].row[q] + 1]++; tot++; }
+        for (int p = 0; p < n; p++) cnt[p + 1] += cnt[p];
+        C->lp_ptr = malloc(sizeof(int) * (n + 1)); memcpy(C->lp_ptr, cnt, sizeof(int) * (n + 1));
+        C->lp_con = malloc(sizeof(int) * (tot + 1)); C->lp_val = malloc(sizeof(double) * (tot + 1));
+        for (int t = 0; t < C->ncon; t++)
+            for (int q = 0; q < C->A[t].nnz; q++) { const int p = C->A[t].row[q]; C->lp_con[cnt[p]] = C->con[t]; C->lp_val[cnt[p]] = C->A[t].val[q]; cnt[p]++; }
+        free(cnt); free(pos);
+    }
+}
+/* X of the arrow block (n x n, full) from the cone vector x: the rank-two completion */
+static void arrow_complete(int n, const int *ord, const double *x, double *X) {
+    const double nb = soc_nb(n, x);
+    const size_t h = ord[0];
+    if (!(nb > 0)) {
+        memset(X, 0, sizeof(double) * (size_t)n * n);
+        X[h + h * n] = 0.5 * x[0];
+        for (int t = 1; t < n; t++) { const size_t o = ord[t]; X[h + o * n] = X[o + h * n] = 0.5 * x[t]; X[o + o * n] = 0.5 * x[0] / (n - 1); }
+        return;
+    }
+    /* every entry is written once (5.16: the columns on the threads; order 5051: 0.1 s on one) */
+    const double f = 0.5 * x[0] / (nb * nb);
+    X[h + h * n] = 0.5 * x[0];
+    for (int t = 1; t < n; t++) X[(size_t)ord[t] + h * n] = 0.5 * x[t];
+    #pragma omp parallel for schedule(static) if (n >= 512 && !in_par() && nthreads() > 1)
+    for (int t = 1; t < n; t++) {
+        const size_t o = ord[t];
+        double *c = X + o * n;
+        c[h] = 0.5 * x[t];
+        for (int r = 1; r < n; r++) c[ord[r]] = f * x[r] * x[t];
+    }
+}
+static int brisk_solve_thr(Problem *P, const Params *par_user, Result *R, double *yout, double **Xout);
+int g_soc_used = 0;          /* 5.16: a solve of this run had cone blocks (main.c's fallback) */
 int brisk_solve(Problem *P, const Params *par_user, Result *R, double *yout, double **Xout) {
+    if (!par_user->soc || par_user->dual || par_user->mfipm || par_user->btrack || par_user->bound_side || par_user->warm_X || par_user->hsd == 0)
+        return brisk_solve_thr(P, par_user, R, yout, Xout);
+    int *hub = malloc(sizeof(int) * (P->nblk + 1)), nconv = 0;
+    long dsum = 0;
+    for (int k = 0; k < P->nblk; k++) {
+        hub[k] = P->blk[k].n >= par_user->soc_minn ? arrow_hub(&P->blk[k]) : -1;
+        if (hub[k] >= 0) { nconv++; dsum += P->blk[k].n; }
+    }
+    if (!nconv) { free(hub); return brisk_solve_thr(P, par_user, R, yout, Xout); }
+    if (par_user->verbose > 0) printf("   %d semidefinite block(s) with arrow data (orders %ld in all) solved as second-order cones\n", nconv, dsum);
+    g_soc_used = 1;
+    Problem Q;
+    int **ord = calloc((size_t)P->nblk + 1, sizeof(int *));
+    soc_problem(P, &Q, hub, ord);
+    double **Xq = Xout ? calloc((size_t)P->nblk + 1, sizeof(double *)) : NULL;
+    if (Xq) for (int k = 0; k < P->nblk; k++) Xq[k] = hub[k] >= 0 ? calloc((size_t)P->blk[k].n + 1, sizeof(double)) : Xout[k];
+    const int rc = brisk_solve_thr(&Q, par_user, R, yout, Xq);
+    if (Xq) {
+        for (int k = 0; k < P->nblk; k++) if (hub[k] >= 0) { arrow_complete(P->blk[k].n, ord[k], Xq[k], Xout[k]); free(Xq[k]); }
+        free(Xq);
+    }
+    for (int k = 0; k < P->nblk; k++) if (hub[k] >= 0) { block_free_contents(&Q.blk[k]); free(ord[k]); }
+    free(Q.blk); free(ord); free(hub);
+    g_am.blk0 = NULL;     /* the slot map is keyed by the block array's address: a later array may get it */
+    g_has_soc = 0;
+    return rc;
+}
+static int brisk_solve_thr(Problem *P, const Params *par_user, Result *R, double *yout, double **Xout) {
 #ifdef _OPENMP
     const int nt0 = omp_get_max_threads();
     if (nt0 > 1) {
@@ -8602,6 +9163,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
     Params par_local = *par_user;
     const Params *par = &par_local;
     g_free_hsd = 0;
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SOC) { par_local.hsd = 1; break; }   /* 5.16: cones in the embedding */
     if (par_local.hsd < 0) {
         /* auto: standard first, retry below; but free variables given as split pairs (SOS
          * models with equality multipliers, e.g. TSSOS) go to the embedding directly: the
@@ -8665,7 +9227,12 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
     set_fast_fp();
     memset(R, 0, sizeof(*R));   /* err[2], err[4] stay 0 unless a polished point is returned */
     const int m = P->m, nb = P->nblk;
+    /* 5.16: second-order cone blocks: the embedding only; the polishing, the endgame and the
+     * re-solve with the standard method work on semidefinite and LP blocks */
     BS *S = calloc(nb, sizeof(BS));
+    int has_soc = 0;
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SOC) has_soc = 1;
+    g_has_soc = has_soc;
     double Ntot = 0, polish_bytes = 0;
     for (int k = 0; k < nb; k++) {
         const Block *B = &P->blk[k];
@@ -8692,6 +9259,11 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
             s->lam = amalloc(sizeof(double) * (n + 1));
         }
         if (B->type == BLK_LP && par->max_correctors > 0) s->Dxc = amalloc(len);
+        if (B->type == BLK_SOC) {                 /* 5.16: the cone's NT scaling (any direction of the SDP blocks) */
+            if (!s->lam) s->lam = amalloc(sizeof(double) * (n + 1));
+            s->sv = amalloc(sizeof(double) * (n + 1)); s->stmp = amalloc(sizeof(double) * (3 * (size_t)n + 1));
+            soc_nt_identity(s, n);
+        }
         s->R0 = amalloc(len);
         if (len >= ((size_t)8 << 20)) pzero(len / sizeof(double), s->R0);
         s->lr_mem = par->dense_mem;
@@ -8935,6 +9507,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
             memset(s->X, 0, sizeof(double) * len);
             memset(s->Zi, 0, sizeof(double) * len);
             if (B->type == BLK_LP) for (int i = 0; i < B->n; i++) s->X[i] = s->Zi[i] = 1.0;
+            else if (B->type == BLK_SOC) { s->X[0] = s->Zi[0] = 1.0; soc_nt_identity(s, B->n); }
             else for (int i = 0; i < B->n; i++) s->X[i + (size_t)i * B->n] = s->Zi[i + (size_t)i * B->n] = 1.0;
         }
         /* right-hand side of the dual least-squares problem: A(C) */
@@ -8961,12 +9534,14 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 memset(s->X, 0, sizeof(double) * len);
                 memset(s->Zi, 0, sizeof(double) * len);
                 if (B->type == BLK_LP) for (int i = 0; i < B->n; i++) s->X[i] = s->Zi[i] = 1.0;
+                else if (B->type == BLK_SOC) { s->X[0] = s->Zi[0] = 1.0; soc_nt_identity(s, B->n); }
                 else for (int i = 0; i < B->n; i++) s->X[i + (size_t)i * B->n] = s->Zi[i + (size_t)i * B->n] = 1.0;
             }
             {
                 double *Ma = schur_asm_begin(&Sc);
                 for (int k = 0; k < nb; k++) {
                     if (P->blk[k].type == BLK_LP) schur_lp(&P->blk[k], &S[k], m, Ma);
+                    else if (P->blk[k].type == BLK_SOC) schur_soc(&P->blk[k], &S[k], m, Ma);
                     else schur_sdp_id(&P->blk[k], &S[k], m, Ma, 1);
                 }
                 schur_asm_end(&Sc);
@@ -8997,6 +9572,8 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 for (size_t i = 0; i < len; i++) s->Z[i] = s->W[i] - s->F[i];
                 if (B->type == BLK_LP) {
                     for (int i = 0; i < n; i++) { ax = fmax(ax, -s->X[i]); az = fmax(az, -s->Z[i]); }
+                } else if (B->type == BLK_SOC) {     /* the smaller spectral value x_0 - ||xb|| */
+                    ax = fmax(ax, soc_nb(n, s->X) - s->X[0]); az = fmax(az, soc_nb(n, s->Z) - s->Z[0]);
                 } else {
                     double lx, lz;
                     sdp_maxstep_lam(n, NULL, s->X, s, par->lanczos_k, &lx);
@@ -9029,8 +9606,8 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
             if (ENV_ON("BRISK_SCALEDBG") || x0rule) {
                 double tx0 = 0, tz0 = 0, nx0 = 0, nz0 = 0, nd0 = 0;
                 for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int n = B->n; const size_t len = bsz(B);
-                    for (int i = 0; i < n; i++) { const size_t d = B->type == BLK_LP ? (size_t)i : (size_t)i * n + i; tx0 += S[k].X[d]; tz0 += S[k].Z[d]; }
-                    nx0 += ddot_n(len, S[k].X, S[k].X); nz0 += ddot_n(len, S[k].Z, S[k].Z); nd0 += n; }
+                    for (int i = 0; i < (B->type == BLK_SOC ? 1 : n); i++) { const size_t d = B->type != BLK_SDP ? (size_t)i : (size_t)i * n + i; tx0 += S[k].X[d]; tz0 += S[k].Z[d]; }
+                    nx0 += ddot_n(len, S[k].X, S[k].X); nz0 += ddot_n(len, S[k].Z, S[k].Z); nd0 += B->type == BLK_SOC ? 1 : n; }
                 if (ENV_ON("BRISK_SCALEDBG"))
                     printf("   SCALEDBG least-norm X: tr %.3e |X|F %.3e lmin %.3e; least-squares Z: tr %.3e |Z|F %.3e lmin %.3e; ndim %.0f -> shifts %.3e %.3e\n",
                            tx0, sqrt(nx0), -ax, tz0, sqrt(nz0), -az, nd0, shx, shz);
@@ -9052,8 +9629,8 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                     const Block *B = &P->blk[k];
                     BS *s = &S[k];
                     int n = B->n;
-                    for (int i = 0; i < n; i++) {
-                        size_t d = (B->type == BLK_LP) ? (size_t)i : (size_t)i * n + i;
+                    for (int i = 0; i < (B->type == BLK_SOC ? 1 : n); i++) {
+                        size_t d = (B->type != BLK_SDP) ? (size_t)i : (size_t)i * n + i;
                         s->X[d] += shx; s->Z[d] += shz;
                         trX += s->X[d]; trZ += s->Z[d];
                     }
@@ -9070,6 +9647,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 for (int k = 0; k < nb; k++) {
                     const Block *B = &P->blk[k]; BS *s = &S[k]; const int n = B->n; const size_t len = bsz(B);
                     if (B->type == BLK_LP) { for (int i = 0; i < n; i++) { s->W[i] = 1.0 / s->Z[i]; tri += s->W[i]; } continue; }
+                    if (B->type == BLK_SOC) { soc_inv(n, s->Z, s->W); tri += s->W[0]; continue; }
                     memcpy(s->W, s->Z, sizeof(double) * len);
                     int info = chol_lower(n, s->W);
                     if (info == 0) { BL(dpotri_)("L", &n, s->W, &n, &info); }
@@ -9090,6 +9668,12 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 if (B->type == BLK_LP) continue;
                 int n = B->n;
                 size_t len = bsz(B);
+                if (B->type == BLK_SOC) {             /* (the shift above made both interior) */
+                    for (double extra = 1e-8; !soc_interior(n, s->X); extra *= 10) s->X[0] += extra * (1.0 + s->X[0]);
+                    for (double extra = 1e-8; !soc_interior(n, s->Z); extra *= 10) s->Z[0] += extra * (1.0 + s->Z[0]);
+                    memcpy(s->LX, s->X, sizeof(double) * len); memcpy(s->LZ, s->Z, sizeof(double) * len);
+                    continue;
+                }
                 for (double extra = 1e-8; ; extra *= 10) {
                     memcpy(s->LX, s->X, sizeof(double) * len);
                     if (chol_lower(n, s->LX) == 0) break;
@@ -9117,6 +9701,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                 memset(s->X, 0, sizeof(double) * len); memset(s->Z, 0, sizeof(double) * len);
                 memset(s->Zi, 0, sizeof(double) * len);                 /* (as the least-squares start leaves it) */
                 if (B->type == BLK_LP) { for (int i = 0; i < n; i++) { s->X[i] = xi; s->Z[i] = eta; s->Zi[i] = 1.0; } continue; }
+                if (B->type == BLK_SOC) { s->X[0] = xi; s->Z[0] = eta; s->Zi[0] = 1.0; memcpy(s->LX, s->X, sizeof(double) * len); memcpy(s->LZ, s->Z, sizeof(double) * len); continue; }
                 for (int i = 0; i < n; i++) s->Zi[i + (size_t)i * n] = 1.0;
                 memset(s->LX, 0, sizeof(double) * len); memset(s->LZ, 0, sizeof(double) * len);
                 for (int i = 0; i < n; i++) { s->X[i + (size_t)i * n] = xi; s->Z[i + (size_t)i * n] = eta; s->LX[i + (size_t)i * n] = sqrt(xi); s->LZ[i + (size_t)i * n] = sqrt(eta); }
@@ -9196,11 +9781,12 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         int tbk = -1, tbi = -1;
         for (int k = 0; k < nb; k++) {
             const Block *B = &P->blk[k];
-            xz0 += ddot_n(bsz(B), S[k].X, S[k].Z); nd0 += B->n;
+            xz0 += ddot_n(bsz(B), S[k].X, S[k].Z); nd0 += B->type == BLK_SOC ? 1 : B->n;
             if (B->type == BLK_LP) {
                 for (int t = 0; t < B->ncon; t++) if (B->con[t] == tb_row0 && B->A[t].nnz == 1) { tbk = k; tbi = B->A[t].row[0]; }
                 continue;
             }
+            if (B->type == BLK_SOC) { trX0 += S[k].X[0]; continue; }     /* (tr of the arrow block = x_0) */
             for (int i = 0; i < B->n; i++) trX0 += S[k].X[i + (size_t)i * B->n];
         }
         if (tbk >= 0) {
@@ -10025,7 +10611,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
          * Budgeted by estimated work, not by the clock: it may cost at most dd_factor
          * times what the double-precision solve cost so far, or dd_minwork. ---- */
         const int timeout = status == ST_TIME;
-        if (par->dd_end && !par->dd_done && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop) {
+        if (par->dd_end && !par->dd_done && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc) {
             double n2 = 0;
             for (int k = 0; k < nb; k++) n2 += (double)bsz(&P->blk[k]);
             /* one dd iteration: Schur assembly through G_t = X A_t Zi (n ef_t + n^2 r_t per
@@ -10097,7 +10683,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
 
         /* polishing of the returned point (best iterate if stored, else final) */
         /* 4.25: not past the time limit (thetaG51 -timelimit 1: 5 s of polishing after the stop) */
-        if (par->polish && status != 3 && !mixed && !timeout && !g_dstop) {
+        if (par->polish && status != 3 && !mixed && !timeout && !g_dstop && !has_soc) {
             double **Xb = malloc(sizeof(double *) * nb), **Zb = malloc(sizeof(double *) * nb);
             int use_best = keep_best && best_score <= res_score(R) * (1 + 1e-12);
             for (int k = 0; k < nb; k++) {
@@ -10221,7 +10807,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         for (int k = 0; k < nb; k++) {
             const double *Xk = xsrc == 2 ? S[k].G : xsrc == 1 ? S[k].Xb : S[k].X;
             size_t len = bsz(&P->blk[k]);
-            if (P->blk[k].type == BLK_LP) for (size_t i = 0; i < len; i++) Xout[k][i] = Xk[i] * P->bs;
+            if (P->blk[k].type != BLK_SDP) for (size_t i = 0; i < len; i++) Xout[k][i] = Xk[i] * P->bs;
             else {
                 const int n = P->blk[k].n;
                 for (int j = 0; j < n; j++)
@@ -10238,7 +10824,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
     double s1 = fmax(res_score(R), fmax(R->err[2], R->err[4]));
     const int time_left = !(brisk_time_up(par));
     /* retry: standard -> embedding; with the embedding first, embedding -> standard */
-    const int do_retry = par_user->hsd < 0 && (!par_local.hsd || par_local.hsd_first_on) && status != 0 && status != 1 && status != 2 &&
+    const int do_retry = !has_soc && par_user->hsd < 0 && (!par_local.hsd || par_local.hsd_first_on) && status != 0 && status != 1 && status != 2 &&
                          !par_local.no_retry && time_left && !(s1 <= (par_local.hsd_first_on ? par->retry_hsd1 : par->retry_acc)) &&
                          !g_dstop;      /* 5.12: the returned best iterate meets the tolerance in the DIMACS measures */
     if (par->verbose && (Sc.nreg || nrefine || Sc.pcg_iters))

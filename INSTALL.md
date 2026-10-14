@@ -16,7 +16,7 @@ Contents:
 6. [Troubleshooting](#6-troubleshooting)
 7. [Reporting a problem](#7-reporting-a-problem)
 
-All commands below are run from the top directory of the unpacked package (`brisk-1.4.3/`).
+All commands below are run from the top directory of the unpacked package (`brisk-1.4.4/`).
 
 ## 1. Requirements
 
@@ -28,7 +28,7 @@ the reference BLAS works but is several times slower.
 | Debian, Ubuntu | `sudo apt install build-essential liblapack-dev libopenblas-dev` |
 | Fedora, RHEL | `sudo dnf install gcc make openblas-devel`, then build with `make BLASLIB=-lopenblas` |
 | Arch | `sudo pacman -S base-devel openblas`, then build with `make BLASLIB=-lopenblas` |
-| macOS (Apple silicon or Intel) | `xcode-select --install`. BLAS/LAPACK come from Apple's Accelerate, and the OpenMP runtime is the bundled one. With the command-line tools of Xcode 15.0 (`ld -v` reports `dyld-1015`) the Makefile links with the classic linker (`-Wl,-ld_classic`): that release of Apple's new linker corrupted an instruction of the solver. Every link on macOS is also checked (`tools/link_check.sh`: a binary with an instruction that cannot be decoded is linked again with the classic linker, or removed with a message). Updating the command-line tools is the better remedy. |
+| macOS (Apple silicon or Intel) | `xcode-select --install`. BLAS/LAPACK come from Apple's Accelerate, and the OpenMP runtime is the bundled one. With the command-line tools of Xcode 15.0 (`ld -v` reports `dyld-1015`) the Makefile links with the classic linker (`-Wl,-ld_classic`): that release of Apple's new linker corrupted an instruction of the solver. Every link on macOS is also checked (`tools/link_check.sh`: a binary with an undecodable word that the compiled objects do not have — data the compiler put in code, such as jump tables on Intel, is in both — is linked again with the classic linker, or removed with a message). Updating the command-line tools is the better remedy. |
 | Linux without root access | Python with SciPy: `make BLAS=scipy` links SciPy's bundled OpenBLAS. |
 
 On Debian and Ubuntu, `libopenblas-dev` registers OpenBLAS as the system `libblas`/`liblapack`,
@@ -115,12 +115,12 @@ Full documentation: [python/README.md](python/README.md).
 
 Requirements: Julia 1.9 or later.
 
-1. In a terminal, build the library (section 2) in the `brisk-1.4.3` directory: `make libbrisk`.
+1. In a terminal, build the library (section 2) in the `brisk-1.4.4` directory: `make libbrisk`.
 2. In Julia, add the package by its **full path**:
 
    ```julia
    using Pkg
-   Pkg.develop(path = "/path/to/brisk-1.4.3/julia/Brisk")
+   Pkg.develop(path = "/path/to/brisk-1.4.4/julia/Brisk")
    Pkg.add("JuMP")                        # for the JuMP interface
    using Brisk
    Brisk.version()
@@ -130,7 +130,7 @@ Requirements: Julia 1.9 or later.
    - A relative path such as `julia/Brisk` is read from the directory Julia was started in,
      and fails elsewhere.
    - Julia records the path and does not copy the package, and the package loads `libbrisk`
-     from the `brisk-1.4.3` directory: keep that directory in place. If you move it, run
+     from the `brisk-1.4.4` directory: keep that directory in place. If you move it, run
      `Pkg.develop` once more with the new path.
    - The installation belongs to the active Julia environment; in another environment, run
      the two `Pkg` lines again.
@@ -177,7 +177,7 @@ liboctave-dev`) and BLAS/LAPACK (section 1).
 Then, in MATLAB or Octave:
 
 ```matlab
-cd brisk-1.4.3/matlab
+cd brisk-1.4.4/matlab
 build_brisk_mex            % about a minute
 test_brisk                 % every line should say PASS
 addpath(pwd); savepath     % keeps it on the path

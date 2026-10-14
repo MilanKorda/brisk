@@ -48,6 +48,11 @@ static int64_t find_key(const SEnt *E, size_t ne, uint64_t key) {
  * relabelled by the colouring. Two leaves with equal certificates differ by a permutation
  * that is checked on the data before it is kept (so hash collisions and an incomplete search
  * are harmless: any subgroup of the automorphism group gives an exact reduction).           */
+/* 5.16 (ISSUES 62, 83): the search's budget is counted in work units (the items a refinement
+ * round hashes, its sort, the certificates), converted from the budget in seconds at a fixed rate,
+ * so that the search stops at the same point on any machine, at any load and thread count. */
+#define SYM_WORK_RATE 1.25e8      /* measured 1.13-1.41e8 units/s on equalG11, gpp500-1, neu2, a user's f24 (12 Oct 2026) */
+static double g_sym_work_s = 0;      /* the work of the last search, in seconds at that rate */
 typedef struct {
     int N, NI, m, nsdp;
     size_t ne;
@@ -57,6 +62,7 @@ typedef struct {
     uint64_t *hk; int *ord;         /* scratch */
     long nodes, maxnodes;
     double t0, tmax;
+    double work, wmax;              /* 5.16: the budget in work units (ISSUES 62, 83), not in wall-clock time */
     int *gens, *gcps; int ngen, gcap;   /* found generators, NI each, with their constraint permutations (m + 1 each) */
     int *ufp;                       /* union-find over index nodes (orbits of the found group) */
     uint64_t cert_ref; int *leaf_ref, *inv_ref;
@@ -77,6 +83,7 @@ static int as_refine(ASearch *A, int *col) {
     int K = 0;
     { uint64_t *tmp = sx(sizeof(uint64_t) * N); for (int u = 0; u < N; u++) tmp[u] = col[u]; qsort(tmp, N, sizeof(uint64_t), cmp_u64); for (int u = 0; u < N; u++) if (u == 0 || tmp[u] != tmp[u - 1]) K++; free(tmp); }
     for (int round = 0; round < 1000; round++) {
+        A->work += (double)A->adjp[N] + N * (log2((double)N + 2.0) + 4.0);   /* the items hashed, the sort */
         /* per node: sorted list of item hashes */
         for (int u = 0; u < N; u++) {
             const int d0 = A->adjp[u], d1 = A->adjp[u + 1];
@@ -128,6 +135,7 @@ static int as_target(const ASearch *A, const int *col, int *cell) {
     return n;
 }
 static uint64_t as_cert(const ASearch *A, const int *col) {
+    ((ASearch *)A)->work += 2.0 * (double)A->ne;
     uint64_t *hk = sx(sizeof(uint64_t) * A->ne);
     for (size_t e = 0; e < A->ne; e++) {
         uint64_t pa = col[A->ea[e]], pb = col[A->eb[e]], pc = A->ec[e] >= 0 ? (uint64_t)col[A->ec[e]] : 0xfffffffull;
@@ -342,6 +350,7 @@ static int as_verify(const ASearch *A, const int *g, const int *cp, const double
  * the order of their colours (constraints of one colour at a discrete leaf are identical) */
 static void as_conperm(const ASearch *A, const int *col, int *cp) {
     const int m = A->m, NI = A->NI;
+    ((ASearch *)A)->work += 2.0 * m * (log2((double)m + 2.0) + 1.0);
     KN *a = sx(sizeof(KN) * m), *r = sx(sizeof(KN) * m);
     for (int c = 0; c < m; c++) { a[c].key = (uint64_t)col[NI + c]; a[c].node = c; r[c].key = (uint64_t)A->leaf_ref[NI + c]; r[c].node = c; }
     qsort(a, m, sizeof(KN), cmp_kn); qsort(r, m, sizeof(KN), cmp_kn);
@@ -349,7 +358,7 @@ static void as_conperm(const ASearch *A, const int *col, int *cp) {
     free(a); free(r);
 }
 static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const SEnt *E, size_t ne, const int *cnt, int *path) {
-    if (A->nodes > A->maxnodes || (wtime() - A->t0 > A->tmax || brisk_stop_flag)) return;
+    if (A->nodes > A->maxnodes || (A->work > A->wmax || brisk_stop_flag)) return;
     int *cell = sx(sizeof(int) * A->NI);
     const int nc = as_target(A, col, cell);
     if (nc == 0) {
@@ -379,7 +388,7 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
     int *uf = sx(sizeof(int) * A->NI);
     for (int q = 0; q < nc; q++) {
         const int w = cell[q];
-        if (q > 0 && (A->nodes > A->maxnodes || (wtime() - A->t0 > A->tmax || brisk_stop_flag))) break;
+        if (q > 0 && (A->nodes > A->maxnodes || (A->work > A->wmax || brisk_stop_flag))) break;
         if (q > 0) {
             for (int u = 0; u < A->NI; u++) uf[u] = u;
             for (int s2 = 0; s2 < A->ngen; s2++) {
@@ -398,7 +407,7 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
             /* the reference leaf: leftmost path */
             int *cur = sx(sizeof(int) * A->N); memcpy(cur, child, sizeof(int) * A->N);
             int *cc = sx(sizeof(int) * A->NI);
-            for (;;) { const int k = as_target(A, cur, cc); if (k == 0) break; if (A->nodes > A->maxnodes || (wtime() - A->t0 > A->tmax || brisk_stop_flag)) { A->nodes = A->maxnodes + 1; break; } int *nx = sx(sizeof(int) * A->N); as_individualize(A, cur, cc[0], nx); A->nodes++; memcpy(cur, nx, sizeof(int) * A->N); free(nx); }
+            for (;;) { const int k = as_target(A, cur, cc); if (k == 0) break; if (A->nodes > A->maxnodes || (A->work > A->wmax || brisk_stop_flag)) { A->nodes = A->maxnodes + 1; break; } int *nx = sx(sizeof(int) * A->N); as_individualize(A, cur, cc[0], nx); A->nodes++; memcpy(cur, nx, sizeof(int) * A->N); free(nx); }
             if (A->nodes > A->maxnodes) { free(cur); free(cc); break; }   /* capped inside the reference descent: no leaf, no automorphisms */
             A->leaf_ref = cur; A->cert_ref = as_cert(A, cur);
             A->inv_ref = sx(sizeof(int) * A->N); for (int u = 0; u < A->N; u++) A->inv_ref[u] = -1;
@@ -406,7 +415,7 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
             free(cc);
         }
         as_dfs(A, child, depth + 1, b, E, ne, cnt, path);
-        if (A->nodes > A->maxnodes || (wtime() - A->t0 > A->tmax || brisk_stop_flag)) break;
+        if (A->nodes > A->maxnodes || (A->work > A->wmax || brisk_stop_flag)) break;
     }
     free(child); free(cell); free(uf);
 }
@@ -428,6 +437,7 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
     const int m = P->m, nb = P->nblk;
     ASearch A; memset(&A, 0, sizeof(A)); A.absval = absval;
     A.N = NI + m; A.NI = NI; A.m = m; A.nsdp = nsdp; A.verbose = verbose; A.t0 = wtime(); A.tmax = tmax; A.maxnodes = maxnodes;
+    A.work = 0; A.wmax = tmax * SYM_WORK_RATE;
     /* entries (constraints only) for the refinement */
     size_t nc = 0; for (size_t q = 0; q < ne; q++) if (E[q].con >= 0) nc++;
     A.ne = ne;
@@ -491,6 +501,8 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
     if (ncls < NI) { int *path = sx(sizeof(int) * (NI + 1)); as_dfs(&A, col, 0, P->b, E, ne, cnt, path); free(path); }
     int norb = 0; for (int u = 0; u < NI; u++) if (uf_find(A.ufp, u) == u) norb++;
     if (verbose > 0) printf("   symmetry search: %ld nodes, %d generator(s), %d index orbits, %.2fs\n", A.nodes, A.ngen, norb, wtime() - A.t0);
+    if (getenv("BRISK_SYMWORKDBG")) printf("   [symmetry search: work %.3e units in %.3f s: %.3e units/s; budget %.3e]\n", A.work, wtime() - A.t0, A.work / fmax(wtime() - A.t0, 1e-9), A.wmax);
+    g_sym_work_s = A.work / SYM_WORK_RATE;
     *ngen_out = A.ngen; *gcps_out = A.gcps;
     int *gens = A.gens;
     free(A.ea); free(A.eb); free(A.ec); free(A.ev); free(A.ed); free(A.adjp); free(A.adj); free(A.hk); free(A.ncol); free(col); free(cnt); free(A.ufp); free(A.leaf_ref); free(A.inv_ref);
@@ -980,12 +992,12 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
             free(gen); free(gsg); free(gce); free(off); free(E); return NULL;
         }
         if (verbose > 0) printf("   symmetry search: time budget %.2f s (expected solve ~%.1f s)\n", tb, est);
-        const double tsearch0 = wtime();
         int *ga = sym_auto(P, off, NI, nsdp, E, ne, &na, &gc, verbose, tb, symnodes, auto_mode ? symmin : 0.0, 0);
         /* a search that ran into the budget of the matrix-free estimate and found nothing: with the
          * standard method's budget it might have (main.c runs the pipeline again if the matrix-free
          * attempt is not made after all) */
-        g_sym_cap_bound = est < est_full && na == 0 && wtime() - tsearch0 >= 0.5 * tb;
+        const double wfirst = g_sym_work_s;    /* 5.16: the search's work, not its time */
+        g_sym_cap_bound = est < est_full && na == 0 && wfirst >= 0.5 * tb;
         autocp = sx(sizeof(int *) * cap);
         for (int s = 0; s < na; s++) { GEN_GROW(); gen[ngen] = sx(sizeof(int) * NI); memcpy(gen[ngen], ga + (size_t)s * NI, sizeof(int) * NI);
                                        autocp[ngen] = sx(sizeof(int) * (m + 1)); memcpy(autocp[ngen], gc + (size_t)s * (m + 1), sizeof(int) * m); ngen++; }
@@ -996,10 +1008,10 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
         int hasneg = 0; for (size_t q = 0; q < ne && !hasneg; q++) if (E[q].v < 0) hasneg = 1;
         for (int c = 0; c < m && !hasneg; c++) if (P->b[c] < 0) hasneg = 1;
         if (symsigned && hasneg) {
-            const double tb2 = fmax(0.05, tb - 0.5 * (wtime() - tsearch0));
+            const double tb2 = fmax(0.05, tb - 0.5 * wfirst);
             int nab = 0, *gcb = NULL;
             int *gab = sym_auto(P, off, NI, nsdp, E, ne, &nab, &gcb, verbose, tb2, symnodes, auto_mode ? symmin : 0.0, 1);
-            if (est < est_full && na == 0 && nab == 0 && wtime() - tsearch0 >= 0.5 * tb) g_sym_cap_bound = 1;      /* (the same for the signed search) */
+            if (est < est_full && na == 0 && nab == 0 && wfirst + g_sym_work_s >= 0.5 * tb) g_sym_cap_bound = 1;      /* (the same for the signed search) */
             char *islp = sx(NI + 1); for (int k = 0; k < nb; k++) for (int i = off[k]; i < off[k + 1]; i++) islp[i] = P->blk[k].type == BLK_LP;
             signed char *sg = sx(NI + 1), *ce = sx(m + 1);
             int *nl = sx(sizeof(int) * (nab + 1)), nnl = 0, nlift = 0, nsgn = 0;

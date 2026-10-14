@@ -63,7 +63,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `cliquemax`, `chordalmin` | largest clique accepted; smallest block tried | 160; 100 |
 | `sym` | exact symmetry reduction: `auto` (sign symmetries and permutation automorphisms found and used), `none`, or a file of generators | `auto` |
 | `symmin` | apply the reduction only when it shrinks the problem by this factor: the constraints, Σn³ of the blocks, or (at most 4 SDP blocks, m ≤ 20,000) the estimated work m³/3 + 30 Σn³ | 1.5 |
-| `symtime`, `symnodes` | caps of the automatic search | 20 s, 500 nodes |
+| `symtime`, `symnodes` | caps of the automatic search (the time counted in operations, not on the clock) | 20 s, 500 nodes |
 | `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra. | −1 |
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
 | `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
@@ -119,6 +119,8 @@ the end are those of the problem as read.
 | option | meaning | default |
 |---|---|---|
 | `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the cone solver; `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
+| `soc` | `1`: semidefinite blocks whose data are arrow matrices (the second-order cones of a problem with semidefinite blocks, and norm constraints written as matrix inequalities) are solved as second-order cones in the self-dual embedding, O(q) work per cone of dimension q instead of O(q³); `0`: as semidefinite blocks. A solve with cones that ends worse than reduced accuracy is repeated with them as semidefinite blocks. | 1 |
+| `socmin` | the smallest order of an arrow block that `soc` solves as a cone | 3 |
 
 The cone solver takes `tol`, `acc` (low 1e-6, default 1e-8, high 1e-10), `maxit`, `timelimit`,
 `threads`, `q`, `v`, and on the command line `-x`, `-y`, `-z` (x, y and z = c − A'y, one value
@@ -189,7 +191,8 @@ A problem in SeDuMi format without semidefinite blocks (a linear or second-order
 is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -timelimit, -q,
 -v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With
 semidefinite blocks, or with -conesolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem
-goes to the semidefinite solver (second-order cones as arrow blocks) with all the options below.
+goes to the semidefinite solver (second-order cones as arrow blocks, which its self-dual embedding
+solves as second-order cones again: -soc) with all the options below.
 output
   -q | -v          quiet | verbose   (Ctrl-C: stop and return the current point; twice: abort)
   -y <file>        write y (SDPA primal x = -y), one value per line, original numbering
@@ -292,7 +295,11 @@ presolve
   -nofr            no facial-reduction presolve
   -fr              facial reduction whatever its depth (default: skipped when of depth >= 2 and saving < frgain)
   -frgain <g>      per-iteration saving that justifies a facial reduction of depth >= 2 (4)
-  -nofrretry       do not re-solve without it when the removed duals are not recovered
+  -soc <0|1>       semidefinite blocks whose data are arrow matrices (second-order cones written
+                   as matrix inequalities; the SeDuMi reader writes cones so next to semidefinite
+                   blocks) solved as second-order cones in the self-dual embedding (1)
+  -socmin <n>      ... blocks of at least this order (3)
+  -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance
   -freeelim <k>    eliminate split free-variable pairs by pivoting: -1 auto (kernel-form SOS
                    problems: few SDP blocks, pairs >= 1% of the rows), 0 off, 1 on
   -tracebound <R>  with the elimination: the row sum tr(X) + s = R that keeps the Gram side
@@ -342,7 +349,6 @@ presolve
                    or when every constraint fixes one entry (matrix completion) and the dense
                    Schur complement does not fit in memory (the first-order engine if it misses).
                    Other constraints: an augmented Lagrangian with L-BFGS and an exact line search.
-                   Its tolerance: -tol
   -lralm <k>       experimental: low-rank augmented Lagrangian (Burer-Monteiro, X = R R')
                    for large sparse SDPs such as AC-OPF relaxations: Newton-CG on R with a sparse
                    n x n preconditioner, inequality slacks in closed form, rank 1 first and
@@ -376,8 +382,8 @@ presolve
                    the orbits and the blocks split by irreducible representation; the point is
                    mapped back to the file. <file>: generators as index permutations (line 1: SDP
                    block sizes; one per line, global 0-based SDP indices). -nosym = -sym none
-  -symtime <s>, -symnodes <k>   caps of the automatic search (20 s, 500 nodes); an incomplete
-                   search only reduces less, never wrongly
+  -symtime <s>, -symnodes <k>   caps of the automatic search (20 s, counted in operations, not
+                   on the clock; 500 nodes); an incomplete search only reduces less, never wrongly
   -symbd <k>       ... symmetry-adapted basis: the blocks split into one block per irreducible
                    representation (1 on, 0 off)
   -symsign <k>     ... -sym auto: sign symmetries (D A D = ±A, D diagonal ±1) first: blocks split by

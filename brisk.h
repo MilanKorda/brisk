@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.4.3"
+#define BRISK_VERSION "1.4.4"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -118,6 +118,7 @@ int  brisk_fprintf(FILE *f, const char *fmt, ...);
 
 #define BLK_SDP 0
 #define BLK_LP  1
+#define BLK_SOC 2       /* 5.16: a second-order cone {x : x_0 >= ||(x_1, ..)||} (solver.c; data as an LP block's) */
 
 /* Sparse symmetric matrix. Stored entries are upper-triangular (row <= col).
  * The "full" arrays hold the symmetric expansion (both triangles).
@@ -394,6 +395,8 @@ typedef struct {
     int bound_side;
     double bound_tol, bound_margin, bound_track_tol;
     struct BoundTrack *btrack;
+    int soc;                 /* 5.16: semidefinite blocks with arrow data as second-order cones in the embedding: 1 on (default), 0 off */
+    int soc_minn;            /* ... blocks of at least this order (3) */
 } Params;
 
 #define BOUND_NANCHOR 4
@@ -728,6 +731,7 @@ int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, do
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);
 int bm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);   /* 5.14: bm.c */
 int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfile, const char *zfile, const BriskData *data, BriskResult *res, int autom);   /* -1: not applicable (automatic route) */
+int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);   /* 5.16: bmip.c (-bm 2) */
 int bm_auto_candidate(const char *fname, const BriskData *data, const Params *par, int need_dense);
 extern int g_read_maxn;   /* 4.40: largest SDP block the reader accepts (46340; lralm lifts it) */
 PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, long symnodes, int symbd, double symmin, int chordal_minn, double chordal_density, int symsigned);

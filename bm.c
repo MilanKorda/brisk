@@ -994,6 +994,7 @@ int bm_run(const char *fname, Params *par, const char *yfile, const BriskData *d
 }
 
 int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfile, const char *zfile, const BriskData *data, BriskResult *res, int autom) {
+    if (par->bm == 2 && !autom) return bmip_run(fname, par, yfile, data, res);   /* 5.16: the interior-point method on the factored program */
     const double t0 = wtime();
     Problem PP, *P = &PP;
     memset(P, 0, sizeof PP);

@@ -2281,31 +2281,42 @@ BRISK_POTRSK(brisk_spotrsk, float, BL(strsm_), BL(sgemm_), brisk_spotrs1)
  * agree to 3e-15 relative. A: the factor in the lower triangle on entry, the full inverse on
  * exit. Returns LAPACK's info (from dpotri below the threshold). */
 int brisk_dpotri_full(int n, double *A, int lda) {
-    if (n < 768 || omp_in_parallel() || lda != n || ENV_ON("BRISK_POTRI")) {
+    if (n < 768 || lda != n || ENV_ON("BRISK_POTRI")) {
         int info;
         BL(dpotri_)("L", &n, A, &lda, &info);
         if (info == 0) for (int j = 0; j < n; j++) for (int i = j + 1; i < n; i++) A[j + (size_t)i * lda] = A[i + (size_t)j * lda];
         return info;
     }
     for (int j = 0; j < n; j++) if (!(A[j + (size_t)j * lda] != 0)) return j + 1;
-    static double *W = NULL; static size_t wn = 0;
-    if ((size_t)n * n > wn) { free(W); wn = (size_t)n * n; W = malloc(sizeof(double) * wn); if (!W) { wn = 0; int info; BL(dpotri_)("L", &n, A, &lda, &info); return info; } }
+    /* 5.16 (ISSUES 83): the same panels inside a parallel region (a loop over blocks runs them on
+     * one thread, with a work array of its own). Until 5.15 LAPACK's dpotri ran there: a block of
+     * order >= 768 among several blocks got other bits at one thread (no active region) than at
+     * two or more (a user's f24_fixed__007: 32 iterations at one thread, 28 at two). */
+    static double *Ws = NULL; static size_t wn = 0;
+    const int inner = omp_in_parallel();
+    double *W;
+    if (inner) { W = malloc(sizeof(double) * (size_t)n * n); if (!W) { int info; BL(dpotri_)("L", &n, A, &lda, &info); return info; } }
+    else {
+        if ((size_t)n * n > wn) { free(Ws); wn = (size_t)n * n; Ws = malloc(sizeof(double) * wn); if (!Ws) { wn = 0; int info; BL(dpotri_)("L", &n, A, &lda, &info); return info; } }
+        W = Ws;
+    }
     const double one = 1.0;
     const int nb = 128, np = (n + nb - 1) / nb;
-    #pragma omp parallel for schedule(dynamic, 1)
+    #pragma omp parallel for schedule(dynamic, 1) if (!inner)
     for (int p = 0; p < np; p++) {             /* W(j0:, J) = L(j0:, j0:)^{-1} I(j0:, J) */
         const int j0 = p * nb, nj = j0 + nb < n ? nb : n - j0, r = n - j0;
         for (int j = j0; j < j0 + nj; j++) { double *w = W + (size_t)j * n; memset(w + j0, 0, sizeof(double) * r); w[j] = 1.0; }
         BL(dtrsm_)("L", "L", "N", "N", &r, &nj, &one, A + j0 + (size_t)j0 * n, &n, W + j0 + (size_t)j0 * n, &n);
     }
-    #pragma omp parallel for schedule(dynamic, 1)
+    #pragma omp parallel for schedule(dynamic, 1) if (!inner)
     for (int p = 0; p < np; p++) {             /* A(j0:, J) = W(j0:, j0:)' W(j0:, J) */
         const int j0 = p * nb, nj = j0 + nb < n ? nb : n - j0, r = n - j0;
         for (int j = j0; j < j0 + nj; j++) memcpy(A + j0 + (size_t)j * n, W + j0 + (size_t)j * n, sizeof(double) * r);
         BL(dtrmm_)("L", "L", "T", "N", &r, &nj, &one, W + j0 + (size_t)j0 * n, &n, A + j0 + (size_t)j0 * n, &n);
     }
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if (!inner)
     for (int j = 0; j < n; j++) for (int i = j + 1; i < n; i++) A[j + (size_t)i * n] = A[i + (size_t)j * n];
+    if (inner) free(W);
     return 0;
 }
 /* 5.12: Householder tridiagonalization of a symmetric matrix (lower triangle), LAPACK's dsytrd
@@ -2509,14 +2520,20 @@ void brisk_threads_restore(void) {
 static int PD_RB = 2048, PD_CB = 512;   /* fixed tiles (BRISK_PDRB, BRISK_PDCB): they define the arithmetic */
 static int pd_cb_fixed = 0;
 static void pd_env(void) {
+    /* 5.16: called from several threads at once (pdgemm inside the parallel Schur loops; a
+     * ThreadSanitizer run reported it): the settings are read once, under a lock, and published
+     * with release/acquire order, so no thread sees the flag before the values */
     static int done = 0;
-    if (done) return;
-    const char *e;
-    if ((e = getenv("BRISK_PDRB"))) PD_RB = atoi(e);
-    if ((e = getenv("BRISK_PDCB"))) { PD_CB = atoi(e); pd_cb_fixed = 1; }
-    if ((e = getenv("BRISK_FNB"))) { FB_NB = atoi(e); g_fd_fixed = 1; }
-    if ((e = getenv("BRISK_FDRB"))) { FD_RB = atoi(e); g_fd_fixed = 1; }
-    done = 1;
+    if (__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return;
+    #pragma omp critical(brisk_pd_env)
+    if (!__atomic_load_n(&done, __ATOMIC_RELAXED)) {
+        const char *e;
+        if ((e = getenv("BRISK_PDRB"))) PD_RB = atoi(e);
+        if ((e = getenv("BRISK_PDCB"))) { PD_CB = atoi(e); pd_cb_fixed = 1; }
+        if ((e = getenv("BRISK_FNB"))) { FB_NB = atoi(e); g_fd_fixed = 1; }
+        if ((e = getenv("BRISK_FDRB"))) { FD_RB = atoi(e); g_fd_fixed = 1; }
+        __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
+    }
 }
 /* 5.12: the reference tiles and verified fast cuts. The fixed tiles below (pd_ref_*) define the
  * arithmetic: they depend on the sizes only, so the bits do not depend on the thread count. Two

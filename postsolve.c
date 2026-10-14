@@ -418,7 +418,63 @@ static int ps_lammin_sparse(int n, const double *M, double delta, double *out) {
 
 static double g_lam_cap = INFINITY;   /* largest shift the ladder may report (absolute) */
 static double lammin_eig(int n, const double *M, double *work);
+/* 5.16: lambda_min in closed form for the two matrices a second-order cone read as a semidefinite
+ * block leaves in the measures (n x n, column-major, full): 1 with *lam set to a lower bound within
+ * delta, 0 when M has neither form (a general dense matrix fails after O(n) work).
+ *  - an arrow matrix [[z0, zb'], [zb, z0 I]] (any hub h): eigenvalues z0 +- ||zb|| and z0. Entries off
+ *    the arrow must be exact zeros (a Z built from arrow data has them); a spread s of the diagonal is
+ *    allowed up to delta: lambda_min >= min diag - ||zb||, within s.
+ *  - the rank-two completion [[a, b'], [b, (a/||b||^2) b b']] of a cone point (arrow_complete): on
+ *    span{e_h, b} the 2 x 2 matrix [[a, ||b||], [||b||, a]], zero elsewhere, so lambda_min =
+ *    min(0, a - ||b||). Its hub is the index whose diagonal is half the trace. A deviation e (largest
+ *    entry) of the other block from the rank-one form moves the eigenvalues by at most n e; accepted
+ *    when n e <= delta, and subtracted. */
+static int ps_lammin_arrow(int n, const double *M, double delta, double *lam) {
+    if (n < 64 || !(delta > 0)) return 0;
+    /* arrow: the hub is the one column with two or more off-diagonal entries */
+    int h = -1;
+    for (int j = 0; j < n; j++) {
+        const double *c = M + (size_t)j * n;
+        int cnt = 0;
+        for (int i = 0; i < n && cnt < 2; i++) if (i != j && c[i] != 0) cnt++;
+        if (cnt >= 2) { if (h >= 0) { h = -2; break; } h = j; }
+    }
+    if (h >= 0) {
+        const double *ch = M + (size_t)h * n;
+        int ok = 1;
+        for (int j = 0; j < n && ok; j++) {
+            if (j == h) continue;
+            const double *c = M + (size_t)j * n;
+            for (int i = 0; i < n; i++) if (i != j && i != h && c[i] != 0) { ok = 0; break; }
+            if (ok && c[h] != ch[j]) ok = 0;
+        }
+        if (ok) {
+            double dmin = M[0], dmax = M[0], nb = 0;
+            for (int i = 0; i < n; i++) { const double d = M[i + (size_t)i * n]; dmin = fmin(dmin, d); dmax = fmax(dmax, d); if (i != h) nb += ch[i] * ch[i]; }
+            if (dmax - dmin <= delta) { *lam = fmin(0.0, dmin - sqrt(nb)); return 1; }
+            return 0;
+        }
+    }
+    /* the completion */
+    double tr = 0, dmx = -HUGE_VAL; int hc = -1;
+    for (int i = 0; i < n; i++) { const double d = M[i + (size_t)i * n]; tr += d; if (d > dmx) { dmx = d; hc = i; } }
+    if (hc < 0 || !(dmx > 0) || fabs(2.0 * dmx - tr) > 1e-12 * fabs(tr)) return 0;
+    const double *b = M + (size_t)hc * n;
+    double nb2 = 0;
+    for (int i = 0; i < n; i++) if (i != hc) nb2 += b[i] * b[i];
+    if (!(nb2 > 0)) return 0;
+    const double g = dmx / nb2;
+    double e = 0;
+    for (int j = 0; j < n; j++) {
+        if (j == hc) continue;
+        const double *c = M + (size_t)j * n, gb = g * b[j];
+        for (int i = 0; i < n; i++) { if (i == hc) continue; const double d = fabs(c[i] - gb * b[i]); if (d > e) { e = d; if ((double)n * e > delta) return 0; } }
+    }
+    *lam = fmin(0.0, dmx - sqrt(nb2)) - (double)n * e;
+    return 1;
+}
 double ps_lammin_tol(int n, const double *M, double *work, double delta) {
+    { double v; if (ps_lammin_arrow(n, M, delta, &v)) return v; }
     if (n > 1 && delta > 0) { double v; if (ps_lammin_sparse(n, M, delta, &v) == 0) return v; }
     if (n <= 1 || !(delta > 0)) return ps_lammin(n, M, work);
     /* 5.12: the verdicts by brisk_dpotrf (tiled on the solver's threads): LAPACK's dpotrf ran on

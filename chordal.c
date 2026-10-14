@@ -22,6 +22,13 @@
 #include <math.h>
 #include <stdint.h>
 
+/* 5.16: a block with arrow data is a second-order cone (solver.c, -soc): it is solved as a cone,
+ * not decomposed (its star pattern would split into n - 1 cliques of order 2) */
+int brisk_arrow_hub(const Block *B);
+static int cone_block(const Params *par, const Block *B) {
+    return par->soc && B->type == BLK_SDP && B->n >= par->soc_minn && brisk_arrow_hub(B) >= 0;
+}
+
 /* clique-tree construction helpers (file scope: nested functions are a GCC extension) */
 typedef struct { int a, b, w; } Edge;
 static int cmp_edge(const void *A2, const void *B2) {
@@ -69,7 +76,6 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
                            int *nmerge_out, int **pos_out) {
     const int n = B->n;
     Adj *adj = cm(sizeof(Adj) * n);
-    size_t pat = 0;
     for (int t = -1; t < B->ncon; t++) {
         const SpSym *S = t < 0 ? &B->C : &B->A[t];
         for (int q = 0; q < S->nnz; q++) {
@@ -77,10 +83,14 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
             if (i == j) continue;
             adj_add(&adj[i], j);
             adj_add(&adj[j], i);
-            pat++;
         }
     }
-    double dens = (double)pat / (0.5 * n * (double)(n + 1));
+    /* 5.16: the density of the union of the patterns (each entry once; until 5.15 counted
+     * once per constraint, so that a block whose entries several constraints share, as the
+     * line limits and the power balance of an AC-OPF, was skipped as dense) */
+    size_t upat = 0;
+    for (int i = 0; i < n; i++) upat += (size_t)adj[i].n;
+    double dens = (double)(upat / 2) / (0.5 * n * (double)(n + 1));
     /* Constraint supports as cliques (correlative sparsity). Without them a constraint
      * whose entries form a star (the power balance of a bus: V_i V_j for every neighbour
      * j) is split over several cliques, and every clique it touches couples it to all of
@@ -364,7 +374,7 @@ static int chordal_convert_ex(Problem *P, const Params *par, int verbose, ChUndo
     }
     for (int k = 0; k < P->nblk; k++) {
         Block *B = &P->blk[k];
-        if (B->type != BLK_SDP || B->n < par->chordal_minn) continue;
+        if (B->type != BLK_SDP || B->n < par->chordal_minn || cone_block(par, B)) continue;
         Clique *cl = NULL;
         int *repv = NULL, nmerge = 0, *epos = NULL;
         int live = chordal_cliques(B, par, &cl, &repv, &nmerge, &epos);
@@ -1087,7 +1097,7 @@ static int chordal_convert_domain(Problem *P, const Params *par, int verbose) {
     if (par->chordal == 0) return 0;
     int any = 0;
     for (int k = 0; k < P->nblk; k++)
-        if (P->blk[k].type == BLK_SDP && P->blk[k].n >= par->chordal_minn) any = 1;
+        if (P->blk[k].type == BLK_SDP && P->blk[k].n >= par->chordal_minn && !cone_block(par, &P->blk[k])) any = 1;
     if (!any) return 0;
     Params q = *par;
     q.chordal = 1;                               /* the gate below decides */
@@ -1500,7 +1510,7 @@ static int chordal_convert_moment(Problem *P, const Params *par, int verbose) {
      * block only, and any other block above 64 made the form inapplicable) */
     const int maxsmall = 64;
     int any = 0;
-    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP && P->blk[k].n >= par->chordal_minn) any = 1;
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP && P->blk[k].n >= par->chordal_minn && !cone_block(par, &P->blk[k])) any = 1;
     if (!any) return 0;
     Params q = *par;
     q.chordal = 1;
@@ -1522,7 +1532,7 @@ static int chordal_convert_moment(Problem *P, const Params *par, int verbose) {
     PSMoment *M = calloc(1, sizeof(PSMoment));
     const int nb = P->nblk;
     int *ord = malloc(sizeof(int) * (nb + 1)), nord = 0;
-    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP && (P->blk[k].n >= par->chordal_minn || P->blk[k].n > maxsmall)) ord[nord++] = k;
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP && (P->blk[k].n >= par->chordal_minn || P->blk[k].n > maxsmall) && !cone_block(par, &P->blk[k])) ord[nord++] = k;
     for (int i = 1; i < nord; i++) { const int v = ord[i]; int j = i; while (j > 0 && P->blk[ord[j - 1]].n < P->blk[v].n) { ord[j] = ord[j - 1]; j--; } ord[j] = v; }   /* largest first */
     PSChordal *rs = calloc(nord + 1, sizeof(PSChordal));
     int *kcs = malloc(sizeof(int) * (nord + 1));
