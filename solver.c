@@ -2428,7 +2428,66 @@ static LPCache *lp_cache(const Block *B, const SChol *S) {
     }
     return c;
 }
+/* M += A_L D A_L' for an LP block with dense columns, as one matrix product.
+ *
+ * The pair loops below cost sum_p d_p^2 / 2 scattered updates of M (d_p: the constraints that
+ * variable p enters) and run on one thread. Dense columns arise from free variables and inequalities
+ * that touch many constraints: the JuMP wrapper passes every linear equality constraint of a model as
+ * a free variable split into two LP variables, whose column holds that constraint's coefficients, so
+ * an equality over many variables gives two columns as long as the number of variables; SeDuMi data
+ * (MATLAB, CVXPY, solve_sedumi) and SDPA files can have them too. A model with an equality over
+ * 6,000 variables (602 such LP variables, m = 6,210): schur_lp held one thread for 82 % of a 100 s
+ * solve while the log said eight threads.
+ *
+ * Here the block's term is formed as L = A_L' (D A_L) by pdgemm (nc x nc, nc = the block's
+ * constraints; A_L as n x nc with the data of constraint t in column t), which runs on the solver's
+ * threads in tiles fixed by the sizes, and L's lower triangle is added to M column by column, every
+ * entry of M by one thread, once: the bits do not depend on the thread count. They differ from the
+ * pair loops' (another order of the sums) on the blocks that take this route only.
+ *
+ * Taken when M is the dense matrix itself (MADDL's first and last cases: the direct route of the
+ * class assembly, or a dense Schur complement), outside parallel regions (inside one, a block's
+ * caller has buffers of its own; the product would also run on one thread there), when the data are
+ * dense enough that the product's 2 nc^2 n flops beat the pair loops (sum_p d_p^2 > 0.1 nc^2 n, the
+ * rule of schur_soc), when the product is worth it at all (nc^2 n >= 1e6: below that the pair loops
+ * cost microseconds, and the route's allocations made small occupation-measure relaxations 20-60 %
+ * slower; their bits stay those of the pair loops), and when A_L, D A_L and L fit in a sixteenth of
+ * the memory limit. The sparse factor's storage (g_schol, the cached offsets below) and the
+ * envelope keep the pair loops.
+ * BRISK_LPDENSE=0: never; =1: whenever M is dense (tests). */
+static int schur_lp_dense(const Block *B, const BS *s, int m, double *M) {
+    const int n = B->n, nc = B->ncon;
+    if (n == 0 || nc == 0 || in_par()) return 0;
+    if (!((g_direct_g | g_direct_t) || (!g_pos && !g_schol && !g_env))) return 0;
+    static int env = -2; if (env == -2) { const char *e = getenv("BRISK_LPDENSE"); env = e ? atoi(e) : -1; }
+    if (env == 0) return 0;
+    double s2 = 0;
+    for (int p = 0; p < n; p++) { const double d = B->lp_ptr[p + 1] - B->lp_ptr[p]; s2 += d * d; }
+    if (env != 1 && !(s2 > 0.1 * (double)nc * nc * n && (double)nc * nc * n >= 1e6)) return 0;
+    if (16.0 * (double)nc * n + 8.0 * (double)nc * nc >= brisk_mem_limit() / 16) return 0;
+    double *Ad = calloc((size_t)n * nc + 1, sizeof(double)), *Bd = malloc(sizeof(double) * ((size_t)n * nc + 1));
+    double *L = malloc(sizeof(double) * ((size_t)nc * nc + 1));
+    if (!Ad || !Bd || !L) { free(Ad); free(Bd); free(L); return 0; }
+    for (int t = 0; t < nc; t++) { const SpSym *A = &B->A[t]; for (int q = 0; q < A->nnz; q++) Ad[(size_t)A->row[q] + (size_t)t * n] += A->val[q]; }
+    for (int t = 0; t < nc; t++) {
+        const double *a = Ad + (size_t)t * n; double *b = Bd + (size_t)t * n;
+        for (int p = 0; p < n; p++) b[p] = a[p] * (s->X[p] * s->Zi[p]);     /* D A_L: the pair loops' va = a_p d_p */
+    }
+    pdgemm("T", "N", &nc, &nc, &n, &DONE, Ad, &n, Bd, &n, &DZERO, L, &nc);
+    const int *con = B->con;
+    #pragma omp parallel for schedule(static) if (nthreads() > 1 && (double)nc * nc >= 65536.0)
+    for (int u = 0; u < nc; u++) {
+        const double *lu = L + (size_t)u * nc;
+        for (int t = u; t < nc; t++) {
+            const size_t r = (size_t)(con[t] > con[u] ? con[t] : con[u]), c = (size_t)(con[t] > con[u] ? con[u] : con[t]);
+            M[r + c * (size_t)m] += lu[t];                                  /* MADDL's dense write: lower triangle */
+        }
+    }
+    free(Ad); free(Bd); free(L);
+    return 1;
+}
 static void schur_lp(const Block *B, const BS *s, int m, double *M) {
+    if (schur_lp_dense(B, s, m, M)) return;
     LPCache *lc = (g_schol && !g_pos) ? lp_cache(B, g_schol) : NULL;
     if (lc) {
         double *pm = schol_values(g_schol), *gd = lc->gd;
@@ -9664,8 +9723,20 @@ static int brisk_solve_thr(Problem *P, const Params *par_user, Result *R, double
         int nt = nt0, cap = nt0, adapt = 0;
         double w = (double)P->m * P->m * P->m / 3.0;
         for (int k = 0; k < P->nblk; k++) {
-            const double n = P->blk[k].n;
-            w += P->blk[k].type == BLK_SDP ? 12.0 * n * n * n + (double)P->blk[k].ncon * n * n : n * (1.0 + P->blk[k].ncon);
+            const Block *B = &P->blk[k];
+            const double n = B->n;
+            if (B->type == BLK_SDP) w += 12.0 * n * n * n + (double)B->ncon * n * n;
+            else if (B->type == BLK_SOC && B->lp_ptr) {
+                /* a second-order cone: its Schur term (schur_soc), A_c A_c' at sum_p d_p^2 (d_p the
+                 * constraints on coordinate p) and the rank-two part at 3 nc^2. Counted as an LP block
+                 * (n (1 + nc)), a cone of 1501 coordinates on 151 constraints read as 2.3e5 flops
+                 * instead of 3.4e7, and the solve ran on one thread where 1.4.3, with the cone as a
+                 * semidefinite block, used them all ("Number of threads: 1" from JuMP models with a
+                 * norm constraint next to a semidefinite block). */
+                double s2 = 0;
+                for (int p = 0; p < B->n; p++) { const double d = B->lp_ptr[p + 1] - B->lp_ptr[p]; s2 += d * d; }
+                w += s2 + 3.0 * (double)B->ncon * B->ncon;
+            } else w += n * (1.0 + B->ncon);
         }
         if (w < 5e6 && !getenv("BRISK_TINYMT")) nt = cap = 1;
         else if (!getenv("BRISK_NOBUSY")) {

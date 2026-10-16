@@ -1,5 +1,28 @@
 # BRISK change log
 
+## Version 1.5.1 (October 2026)
+
+- **Threads on small problems with second-order cones next to semidefinite blocks.** A problem
+  whose work per iteration is small runs on one thread, and the estimate of that work counted a
+  second-order cone like a block of linear variables, far below its cost in the Schur complement.
+  So models with a norm constraint beside a PSD matrix and up to a few hundred constraints (JuMP,
+  for example) ran on one thread, with `Number of threads: 1` in the log. A cone is now counted by
+  its Schur complement term. The results are the same; only the number of threads changes.
+- **Linear variables that enter many constraints: their Schur complement term on all threads.**
+  The term of the free and nonnegative variables was formed pair by pair on one thread. When a
+  variable enters many constraints that was most of a solve, while the log reported all threads.
+  Such variables come, for example, from the linear equality constraints of JuMP models (the
+  wrapper passes each as a free variable whose column holds the constraint's coefficients) and
+  from SeDuMi or SDPA data. When the columns are dense, the term is now one matrix product on all
+  threads, with the same result at any thread count. A JuMP model with a PSD block, four cones of
+  1,000 coordinates and 300 equality constraints over all variables: 57.5 → 16.4 s; an SDPA file
+  with 4,000 constraints and 600 such variables: 28 → 3.4 s (Apple M3, eight threads). Problems
+  without such variables are solved as before.
+- **The Burer-Monteiro method's certified bound is the same in every run.** The bisection that
+  refines the bound at the end of the method (max-cut-type problems of order 500 and more) was
+  limited by the clock, so two runs of the same problem could end with slightly different bounds.
+  Its limit is now counted in operations: the same result run after run and at any thread count.
+
 ## Version 1.5 (October 2026)
 
 - **A double-double endgame on more problems.** A solve that stalls short of the tolerance on a

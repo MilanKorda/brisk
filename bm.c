@@ -152,7 +152,12 @@ static void pat_mul(const BB *s, const double *W, const double *U, double *O, do
 }
 
 /* lambda_min of W (on the pattern) by Lanczos with full reorthogonalization, k steps; v: its vector */
-static double g_bm_tsw = 0, g_bm_ttr = 0, g_bm_tlz = 0, g_bm_tvf = 0;   /* time in the sweeps, the trust region, Lanczos (verbose) */
+static double g_bm_tsw = 0, g_bm_ttr = 0, g_bm_tlz = 0, g_bm_tvf = 0;
+/* the work of the fixed-diagonal method so far in modelled nanoseconds, for the
+ * budget of the bound's bisection: a sweep and a product with the Hessian visit the pattern's np
+ * entries with r-vectors (about 1 ns a scattered update, IMPLEMENTATION's figure for pair loops).
+ * Counted, not timed, so the decision is the same in every run. */
+static double g_bm_work = 0;   /* time in the sweeps, the trust region, Lanczos (verbose) */
 
 /* the smallest eigenvalues of W (on the pattern) by Lanczos with full reorthogonalization, k steps;
  * returns the smallest Ritz value; vout (n x nv, column-major, may be NULL) receives the Ritz vectors
@@ -501,7 +506,7 @@ static int fd_newton(BB *s, double gtol, int maxit, double tlim, double t0, int 
             if (D < 0) D = dmax / 8;
             double ee = 0, ep = 0, pp = rz;
             for (int k = 0; k < 1000; k++) {
-                const double pq = fd_hess_dot(s, s->R, mu, Pd, Q, rowv); ncg++;
+                const double pq = fd_hess_dot(s, s->R, mu, Pd, Q, rowv); ncg++; g_bm_work += 2.0 * s->np * s->r;
                 const double a = pq > 0 ? rz / pq : 0;
                 if (pq <= 0 || ee + 2 * a * ep + a * a * pp >= D * D) {
                     const double tau = (-ep + sqrt(fmax(0, ep * ep + pp * (D * D - ee)))) / pp;
@@ -526,7 +531,7 @@ static int fd_newton(BB *s, double gtol, int maxit, double tlim, double t0, int 
         if (D < 0) D = pc ? sqrt(rz) : dmax / 8;
         double ee = 0, ep = 0, pp = rz;
         for (int k = 0; k < 1000; k++) {
-            fd_hess(s, s->R, mu, Pd, Q); ncg++;
+            fd_hess(s, s->R, mu, Pd, Q); ncg++; g_bm_work += 2.0 * s->np * s->r;
             const double pq = dotp(Pd, Q, N);
             const double a = pq > 0 ? rz / pq : 0;
             if (pq <= 0 || ee + 2 * a * ep + a * a * pp >= D * D) {
@@ -686,7 +691,9 @@ static int fixed_diag(BB *s, const Problem *P, double tol, int verbose, double t
     double *v = bx(sizeof(double) * n), *y = bz(sizeof(double) * (P->m + 1));
     double rs = 0; for (int i = 0; i < n; i++) rs += s->rho[i];
     const double rnorm = sqrt(rs);
+    g_bm_work = 0;
     double f = sweep(s), fprev = f;
+    g_bm_work += (double)s->np * s->r;
     int it = 0, nesc = 0, rc = 1, ntr = 0, nver = 0;
     if (verbose >= 0) printf("bm: fixed diagonal, n = %d, rank %d, %d colours\n", n, s->r, s->ncol);
     int dosweep = 1, fresh = 0;
@@ -694,7 +701,7 @@ static int fixed_diag(BB *s, const Problem *P, double tol, int verbose, double t
         /* sweeps until the objective settles */
         const double ts = wtime();
         for (int ns = 0; dosweep && ns < 100000; ns++) {
-            fprev = f; f = sweep(s); it++;
+            fprev = f; f = sweep(s); it++; g_bm_work += (double)s->np * s->r;
             if (fabs(fprev - f) <= g_bm_sweeptol * (1 + fabs(f)) && ns >= 3) break;
             if (tlim > 0 && wtime() - t0 > tlim) break;
         }
@@ -709,12 +716,25 @@ static int fixed_diag(BB *s, const Problem *P, double tol, int verbose, double t
                 const double eta = 0.05 * tol * (1 + fabs(M->pobj) + fabs(M->lb)) / rs;
                 double delta = fmax(-M->lmin, 0) + eta; int vr = -1;
                 const double tv0 = wtime(); double dlo = -1;
-                if (g_bm_cert && g_bm_verify) for (int q = 0; q < 12; q++, delta = fmax(-M->lmin, 0) + eta * ldexp(1.0, 2 * q)) { vr = fd_verify(s, delta); if (vr != 0) break; dlo = delta; }
+                int nv = 0;                 /* the checks (factorizations) made for this bound */
+                if (g_bm_cert && g_bm_verify) for (int q = 0; q < 12; q++, delta = fmax(-M->lmin, 0) + eta * ldexp(1.0, 2 * q)) { vr = fd_verify(s, delta); nv++; if (vr != 0) break; dlo = delta; }
                 if (vr == 1 && dlo > 0) {   /* bisect between the last shift that failed and the first that factored, while cheap */
+                    /* "cheap": the checks, the next one included, within a tenth of the
+                     * method's work, both in modelled nanoseconds: a check is a sparse factorization,
+                     * 0.05 ns a flop of schol_flops (IMPLEMENTATION's figure for products in panels) and
+                     * 1 ns an entry of its assembly; the method's work is g_bm_work. Until then the rule
+                     * compared the elapsed times of the checks and of the method: the number of bisection
+                     * steps, and with it the shift, the certified bound, the gap and the errors reported,
+                     * changed from run to run with the threads' timing (maxcut mcp500-2_s at eight
+                     * threads: three outcomes in ten runs; now the same in every run and at 1-8 threads).
+                     * BRISK_BMBISTIME=1: the timed rule (comparisons). */
+                    static int timed = -1; if (timed < 0) timed = getenv("BRISK_BMBISTIME") != NULL;
                     const double tf = wtime() - tv0;
-                    for (int b = 0; b < 6 && (wtime() - tv0) + tf < 0.1 * (wtime() - t0); b++) {
+                    const double fl = 0.05 * schol_flops(s->Fv) + (double)s->np;
+                    for (int b = 0; b < 6 && (timed ? (wtime() - tv0) + tf < 0.1 * (wtime() - t0) : (nv + 1) * fl < 0.1 * (g_bm_work + nv * fl)); b++) {
                         const double dm = sqrt(dlo * delta);
                         if (fd_verify(s, dm) == 1) delta = dm; else dlo = dm;
+                        nv++;
                     }
                 }
                 if (vr == 1) {

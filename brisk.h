@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.5"
+#define BRISK_VERSION "1.5.1"
 
 #include <stddef.h>
 #include <stdint.h>
