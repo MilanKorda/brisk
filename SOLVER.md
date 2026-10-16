@@ -1,4 +1,4 @@
-# BRISK 1.4.4: the solver in detail
+# BRISK 1.5: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -185,7 +185,7 @@ Every automatic choice below can be overridden from the command line.
   accuracy is kept; when neither the Schur complement nor the engine's factor of A A' fits,
   the matrix-free method runs as well.
 - **A double-double endgame for small problems that end short of the tolerance** (m ≤ 1,200,
-  Σ n² ≤ 2e5): a few iterations with all the linear algebra in double-double arithmetic,
+  the blocks within the memory): a few iterations with all the linear algebra in double-double arithmetic,
   within a work budget; the result is kept when it is better. `-nodd` turns it off. The log
   ends with the ways to more accuracy (`-acc high`, `-prec`) and to a guaranteed bound
   (`-bound`, `-certify`), in the syntax of the calling interface.

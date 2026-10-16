@@ -65,6 +65,11 @@ void   B64(dstev_)(const char *, const bi *, double *, double *, double *, const
 void   B64(dstedc_)(const char *, const bi *, double *, double *, double *, const bi *, double *, const bi *, bi *, const bi *, bi *);
 void   B64(dstebz_)(const char *, const char *, const bi *, const double *, const double *, const bi *, const bi *, const double *, const double *, const double *, bi *, bi *, double *, bi *, bi *, double *, bi *, bi *);
 void   B64(dstein_)(const bi *, const double *, const double *, const bi *, const double *, const bi *, const bi *, double *, const bi *, double *, bi *, bi *, bi *);
+void   B64(dscal_)(const bi *, const double *, double *, const bi *);
+void   B64(dsyr2k_)(const char *, const char *, const bi *, const bi *, const double *, const double *, const bi *, const double *, const bi *, const double *, double *, const bi *);
+void   B64(dlarfg_)(const bi *, double *, double *, const bi *, double *);
+void   B64(dsytd2_)(const char *, const bi *, double *, const bi *, double *, double *, double *, bi *);
+void   B64(dgeqrf_)(const bi *, const bi *, double *, const bi *, double *, double *, const bi *, bi *);
 void   B64(dsytrd_)(const char *, const bi *, double *, const bi *, double *, double *, double *, double *, const bi *, bi *);
 void   B64(dormtr_)(const char *, const char *, const char *, const bi *, const bi *, const double *, const bi *, const double *, double *, const bi *, double *, const bi *, bi *);
 void   B64(dsytrf_)(const char *, const bi *, double *, const bi *, bi *, double *, const bi *, bi *);
@@ -270,6 +275,29 @@ void BW(dstein_)(const int *n, const double *d, const double *e, const int *m, c
     b2i(ifail, ifl, (size_t)M);
     free(ibl); free(isp); free(iw); free(ifl); OUT(info, inf);
     (void)iwork;
+}
+/* the reduced-bandwidth tridiagonalization of sparsechol.c (brisk_dsytrd_low; 5.9) and the Gram QR of
+ * solver.c (hsd_qr_factor; 5.16) were missing here: a user's MEX build against MATLAB's libraries failed to
+ * link (reported on 1.4.3, 14 October 2026) */
+void BW(dscal_)(const int *n, const double *a, double *x, const int *incx) {
+    const bi N = I(n), IX = I(incx);
+    B64(dscal_)(&N, a, x, &IX);
+}
+void BW(dsyr2k_)(const char *u, const char *t, const int *n, const int *k, const double *al, const double *a, const int *lda, const double *b, const int *ldb, const double *be, double *c, const int *ldc) {
+    const bi N = I(n), K = I(k), LA = I(lda), LB = I(ldb), LC = I(ldc);
+    B64(dsyr2k_)(u, t, &N, &K, al, a, &LA, b, &LB, be, c, &LC);
+}
+void BW(dlarfg_)(const int *n, double *alpha, double *x, const int *incx, double *tau) {
+    const bi N = I(n), IX = I(incx);
+    B64(dlarfg_)(&N, alpha, x, &IX, tau);
+}
+void BW(dsytd2_)(const char *u, const int *n, double *a, const int *lda, double *d, double *e, double *tau, int *info) {
+    const bi N = I(n), LA = I(lda); bi inf = 0;
+    B64(dsytd2_)(u, &N, a, &LA, d, e, tau, &inf); OUT(info, inf);
+}
+void BW(dgeqrf_)(const int *m, const int *n, double *a, const int *lda, double *tau, double *work, const int *lwork, int *info) {
+    const bi M = I(m), N = I(n), LA = I(lda), LW = I(lwork); bi inf = 0;
+    B64(dgeqrf_)(&M, &N, a, &LA, tau, work, &LW, &inf); OUT(info, inf);
 }
 void BW(dsytrd_)(const char *u, const int *n, double *a, const int *lda, double *d, double *e, double *tau, double *work, const int *lwork, int *info) {
     const bi N = I(n), LA = I(lda), LW = I(lwork); bi inf = 0;

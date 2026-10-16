@@ -35,7 +35,16 @@
 #include "sedumi.h"
 
 static int g_silent = 0;
-static int mex_print(const char *s, int is_err) { if (!g_silent || is_err) mexPrintf("%s", s); return 0; }
+#include <dlfcn.h>
+/* MATLAB holds mexPrintf output until a long MEX call returns; its (undocumented) ioFlush()
+ * in libmwservices pushes it out at once, so the log of a long solve appears as it is printed.
+ * Looked up at run time: where it does not exist (Octave, other MATLAB releases) nothing is done. */
+static int mex_print(const char *s, int is_err) {
+    static void (*io_flush)(void); static int looked;
+    if (!looked) { io_flush = (void (*)(void))dlsym(RTLD_DEFAULT, "_Z7ioFlushv"); looked = 1; }
+    if (!g_silent || is_err) { mexPrintf("%s", s); if (io_flush) io_flush(); }
+    return 0;
+}
 
 static BriskData g_d;
 static int *g_bs, *g_mat, *g_blk, *g_i, *g_j; static double *g_v, *g_c;

@@ -104,7 +104,7 @@ leaves the flag out, so the step stays on).
 | `returning best iterate (iteration k)` | the iterate with the smallest error is kept and returned, not the last one | `nopolish` |
 | `HSD: polish probe …`, `polishing: score … (the probe's candidate)` | during the iterations of the embedding: the primal residual of the iterate corrected in the metric of the last iteration with the Schur factor at hand (NT direction), else its Euclidean polish; the solve stops when the corrected point meets the tolerance | `nopolish` |
 | `restoring the primal feasibility …`, `square-root-metric polishing: …` | a point that missed the tolerance in its primal residual: X ← X^½ (I + W) X^½ with W chosen so that A(X) = b (X stays positive semidefinite, the complementarity stays), from the iterate with the smallest dual residual and complementarity, during the iterations and at the end | `nopolishr` (or `nopolish`) |
-| `dd k pinf …`, `high-precision endgame: …` | a small problem (m ≤ 1,200 and Σ n² ≤ 2e5) that ends short of the tolerance is continued in double-double arithmetic within a work budget | `nodd` |
+| `dd k pinf …`, `high-precision endgame: …` | a small problem (m ≤ 1,200, the blocks within the memory) that ends short of the tolerance is continued in double-double arithmetic within a work budget | `nodd` |
 | `X-metric polishing: …` | the returned point corrected in the metric of X (X stays positive definite); also tried as a probe during the iterations | `nopolishx` (or `nopolish`) |
 | `polishing: score … (Gram CG residual …)` | the Euclidean projection onto A(X) = b, when the steps above leave the point above the tolerance | `nopolish` |
 
@@ -230,7 +230,8 @@ termination
 high precision
   -prec <p>        solve in high precision: dd (double-double, about 32 digits), qd (quad-double,
                    about 64 digits) or a number of decimal digits (variable precision; up to 31
-                   digits is dd, up to 63 qd). The data are read exactly as written in the file.
+                   digits is dd, up to 63 qd; the tolerance is limited to 1e-290, the measured
+                   errors being double-precision numbers). The data are read exactly as written in the file.
                    Blocks whose data are block diagonal after a permutation are split. The
                    reductions of the double solver are applied to the data in the working
                    precision: sign and permutation symmetry (the group verified entry by entry),
@@ -283,8 +284,9 @@ method
   -ntfast <k>      NT: form dX on the pattern of dZ (1) or by dense transforms (0, default)
   -nodd            no double-double endgame
   -ddfactor <f>    endgame work budget as a multiple of the solve's work (1.0)
-  -ddminwork <w>   ... but at least this many flop-equivalents (2e9)
+  -ddminwork <w>   ... but at least this many flop-equivalents (1e11)
   -ddmaxm <k>      size limit for the endgame (1200)
+  -ddmaxn2 <s>     ... and the largest sum of the squares of the block orders (0: from the memory limit)
   -ddit <k>        endgame iteration limit (40)
   -nopolish        no polishing: the last iterate is returned as it is (not the best one), without
                    the corrections at the end and the polish probes of the embedding (-nopolishx:
@@ -300,6 +302,11 @@ presolve
                    blocks) solved as second-order cones in the self-dual embedding (1)
   -socmin <n>      ... blocks of at least this order (3)
   -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance
+  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: the re-solve without facial
+                   reduction may take this multiple of the solve's time, else the reduced solve is returned
+                   with status SOLVED TO REDUCED ACCURACY and the dual flagged (4; 0 = no re-solve)
+  -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated
+                   without the reduction, within this multiple of the solve's time (4; 0 = never)
   -freeelim <k>    eliminate split free-variable pairs by pivoting: -1 auto (kernel-form SOS
                    problems: few SDP blocks, pairs >= 1% of the rows), 0 off, 1 on
   -tracebound <R>  with the elimination: the row sum tr(X) + s = R that keeps the Gram side

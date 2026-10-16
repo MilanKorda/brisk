@@ -1,5 +1,81 @@
 # BRISK change log
 
+## Version 1.5 (October 2026)
+
+- **A double-double endgame on more problems.** A solve that stalls short of the tolerance on a
+  small problem (at most 1,200 constraints and a work budget) is continued for a few iterations
+  with all the linear algebra in double-double arithmetic. The endgame now starts from a point
+  moved inside the cone (the final iterate of the main solve is outside it by rounding on
+  degenerate problems), its work budget has a floor, its result is judged by the solver's own
+  measure and accepted only after the polish, its Schur assembly is several times cheaper and
+  its dense factorization runs on exact double products that scale with the threads. SDPLIB: 70 →
+  74 problems at the tolerance 1e-8 (the qap family), a set of occupation-measure relaxations 35 →
+  42, option-pricing relaxations 68 → 69; a set of 491 problems run by a user: four more at 1e-6
+  at 2 % more time. `-ddfactor` raises the budget (`-ddfactor 4 -ddmaxm 10000`: a structural
+  relaxation with 6,034 constraints from reduced accuracy to the tolerance at four times the
+  solve's cost), `-nodd` turns the endgame off.
+- **High precision: the ladder follows long creeps instead of giving up.** On moment-SOS
+  hierarchies whose certificates have huge norms (Gram matrices of norm 1e13, condition numbers
+  1e21; a user's problems with exact reference values), the interior-point method creeps for a
+  hundred iterations and more before it takes off, and three rules of the precision ladder ended
+  every level inside the creep and restarted it from an old iterate. A level is now exhausted only
+  when its measures no longer follow its steps (an infeasible-start method reduces each residual
+  by the product of 1 − α over its steps; a residual that stays where the steps should have halved
+  it is at the floor of the precision), the iterate handed to the next precision may have a gap
+  below zero down to the complementarity, and on a step below a tenth of the step to the boundary
+  the fraction taken is 0.5 instead of 0.9 (the latter drove the iterate off the central path on
+  every tiny step). Two of the user's hierarchies are solved to 1e-49 where every setting failed
+  before; SDPLIB and the occupation-measure set at `-prec dd` keep their statuses and values on
+  every file, six of the H∞ files a decade more accurate.
+- **High precision: two measurement defects.** The dual error's search for the smallest shift that
+  makes Z positive definite stopped at the end of a grid and reported an error of 1.0 at 100
+  digits for an iterate at 4.6e-4; it now searches until the factorization succeeds. The
+  tolerances and the measured errors are double-precision numbers: beyond about 400 digits they
+  underflowed, and the solve ran until its errors read 0.0e+00. The tolerance is now limited to
+  1e-290 and the log says so.
+- **Threads on problems with many small blocks and a few huge ones** (a user's structural designs:
+  hundreds of blocks of order 3–20 beside one or two of order 1,000–3,000). The loop over the blocks
+  ran in parallel over them, and inside it every dense kernel on one thread, so the huge blocks,
+  where the work is, ran single-threaded. The few large blocks now run after the loop with all
+  threads in their kernels. Same results; the user's 24 files at two threads 1.11 times faster on
+  average (one file 2.2×), SDPLIB unchanged.
+- **Portability and interfaces.** The task clauses of the threaded sparse Cholesky passed const
+  scalars, which gcc before version 9 shares among the tasks instead of copying: wrong
+  factorizations with those compilers (a user's cluster with gcc 8); fixed. The MATLAB MEX build on
+  Linux failed to link against 64-bit BLAS (five routines without a wrapper); fixed, with a check
+  script in the build. The MEX file flushes its log line by line where MATLAB allows it.
+- **Facial reduction: a correct dual, or a status that says it is missing.** When the duals of the
+  constraints a facial reduction removed could not be rebuilt from the reduced solve, the run was
+  reported OPTIMAL by the reduced solve's accuracy while the returned y was infeasible on the problem
+  as read (a benchmark of 491 problems: taha1b and four chained-Wood SOS relaxations, dual error 1.0).
+  The reduced solve's dual need not extend to the removed constraints even when the dual optimum is
+  attained, so the problem is now solved again without the reduction, within `-frfallback` (4) times
+  the solve's time, and the better answer returned; failing that, the status is SOLVED TO REDUCED
+  ACCURACY with a note that y is not dual feasible for the removed constraints, never OPTIMAL.
+- **A symmetry reduction that hurts is undone.** Two CBLIB clique-partitioning problems converged
+  badly after an exact automorphism reduction (NUMERICAL DIFFICULTIES at 3e-3 after 50 iterations;
+  1e-9 in 12 without it). A solve after such a reduction that ends short of reduced accuracy is now
+  repeated without the reduction within `-symfallback` (4) times the solve's time.
+- **The automorphism search keeps to its budget.** Its colour refinement ran outside the work budget
+  and the gain test came after it: on large sparse polynomial relaxations whose data are all
+  distinct the search announced 0.2 s and spent 5 s finding nothing (pop_broyden_1000: 9.2 → 3.9 s
+  on one thread). The refinement now counts against the budget, round by round, inside the search
+  as well, and stops as soon as its classes rule out a gain.
+- **The double-double endgame on larger blocks.** Its fixed size cap (a block of order about 450,
+  silent) is replaced by what the memory holds, the work budget deciding (`-ddfactor 4` brings
+  trto4, vibra3 and shmup3 to the tolerance); the log says when the endgame is skipped and why. Two
+  rules corrected: a first step that leaves the measure where it was no longer ends the endgame,
+  and the polished iterate is kept when it wins the comparison with the endgame's point.
+- **A dense constraint of low rank** (the row ⟨J, X⟩ = 0 of min-bisection relaxations) has a route
+  of its own: 3 n² r operations instead of 2 n³ (G40_mb: the Schur assembly 10.4 → 1.1 s).
+- **Memory and input.** A retry with the other method that would not fit in memory is not started:
+  the result in hand is returned with a note (diamond_patch had been killed by the system in that
+  retry). A non-numeric token in the data section of an SDPA file is an error, no longer a warning
+  followed by a solve of a garbled problem.
+- **Status notes.** A high-precision run that ends short of its tolerance with a trace of X far
+  beyond the data says that either the optimum is not attained or the solution's scale is that
+  large (moment-SOS certificates of high order are), and that the primal objective is still a bound.
+
 ## Version 1.4.4 (October 2026)
 
 - **Second-order cones next to semidefinite blocks are solved as cones** (`-soc`, `-socmin`). In a

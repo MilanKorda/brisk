@@ -93,6 +93,7 @@ else
             error('brisk:build', 'blas must be ''auto'', ''matlab'', ''system'' or ''system64''');
     end
 end
+if ~ismac, libs{end + 1} = '-ldl'; end   % dlsym (ioFlush in brisk_mex.c) is in libdl before glibc 2.34
 switch omp
     case 'bundled'
         % the pragmas are compiled by clang (which lowers them to the LLVM runtime interface,

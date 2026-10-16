@@ -68,7 +68,11 @@ typedef struct {
     uint64_t cert_ref; int *leaf_ref, *inv_ref;
     int verbose;
     int absval;                     /* 4.37: the search on |data| (signed permutations: the signs are lifted afterwards) */
+    /* 5.16 (ISSUES 95): the gain test after every round of the initial refinement, and the budget inside it */
+    const Problem *P; const int *off; double symmin; int gain_check, no_gain, budget_hit;
 } ASearch;
+static int g_sym_budget_hit = 0;     /* the last search ran into its work budget (the second pass is then not worth starting) */
+static int as_gain_possible(const ASearch *A, const int *col);
 
 static uint64_t h64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
 static uint64_t hval(double v) { union { double d; uint64_t u; } w; w.d = v; return h64(w.u + 0x1234567ull); }
@@ -83,7 +87,16 @@ static int as_refine(ASearch *A, int *col) {
     int K = 0;
     { uint64_t *tmp = sx(sizeof(uint64_t) * N); for (int u = 0; u < N; u++) tmp[u] = col[u]; qsort(tmp, N, sizeof(uint64_t), cmp_u64); for (int u = 0; u < N; u++) if (u == 0 || tmp[u] != tmp[u - 1]) K++; free(tmp); }
     for (int round = 0; round < 1000; round++) {
-        A->work += (double)A->adjp[N] + N * (log2((double)N + 2.0) + 4.0);   /* the items hashed, the sort */
+        /* 5.16 (ISSUES 95): the refinement counts against the budget like the search (it ran outside it:
+         * 2 x 2.3 s on a sparse POP with a budget of 0.21 s), and the initial refinement stops as soon as
+         * its classes rule out the gain asked for (automorphisms preserve the classes of every round) */
+        const double wround = (double)A->adjp[N] + N * (log2((double)N + 2.0) + 4.0);   /* the items hashed, the sort */
+        /* (inside the search as well: a node's refinement on 3,000 indices of one class took 20 s on G48_mb and
+         * four nodes 79 s against a budget of 20 s; a refinement cut short gives a coarser leaf, whose candidate
+         * is verified on the data like any other; the first round always, the gain test needs its classes) */
+        if (brisk_stop_flag || (round > 0 && A->work + wround > A->wmax)) { A->budget_hit = 1; break; }
+        if (A->gain_check && round > 0 && !as_gain_possible(A, col)) { A->no_gain = 1; break; }
+        A->work += wround;
         /* per node: sorted list of item hashes */
         for (int u = 0; u < N; u++) {
             const int d0 = A->adjp[u], d1 = A->adjp[u + 1];
@@ -433,11 +446,32 @@ static double sym_cost_gain(const Problem *P, int m, int mr, double c0, double c
     const double t0 = (double)m * m * m / 3.0 + 30.0 * c0, t1 = (double)mr * mr * mr / 3.0 + 30.0 * c1;
     return t0 / fmax(t1, 1.0);
 }
+/* can an automorphism group give the gain symmin, given the colour classes col (a bound: the constraint
+ * orbits number at least the constraint classes, the trivial component of a block at least its index
+ * classes; 4.34: the whole cube sum over the blocks) */
+static int as_gain_possible(const ASearch *A, const int *col) {
+    if (!(A->symmin > 1)) return 1;
+    const Problem *P = A->P; const int m = A->m, NI = A->NI, nb = P->nblk;
+    int *seen = calloc(A->N, sizeof(int)); int ccls = 0;
+    for (int c = 0; c < m; c++) if (!seen[col[NI + c]]++) ccls++;
+    int can = (double)m / ccls >= A->symmin;
+    double c0 = 0, c1 = 0;
+    for (int k = 0; k < nb && !can; k++) {
+        if (P->blk[k].type != BLK_SDP) continue;
+        memset(seen, 0, sizeof(int) * A->N); int bc = 0;
+        for (int i = A->off[k]; i < A->off[k + 1]; i++) if (!seen[col[i]]++) bc++;
+        c0 += pow((double)P->blk[k].n, 3.0); c1 += pow((double)bc, 3.0);
+    }
+    if (!can && c1 > 0 && c0 / c1 >= A->symmin) can = 1;
+    free(seen);
+    return can;
+}
 static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const SEnt *E, size_t ne, int *ngen_out, int **gcps_out, int verbose, double tmax, long maxnodes, double symmin, int absval) {
     const int m = P->m, nb = P->nblk;
     ASearch A; memset(&A, 0, sizeof(A)); A.absval = absval;
     A.N = NI + m; A.NI = NI; A.m = m; A.nsdp = nsdp; A.verbose = verbose; A.t0 = wtime(); A.tmax = tmax; A.maxnodes = maxnodes;
     A.work = 0; A.wmax = tmax * SYM_WORK_RATE;
+    A.P = P; A.off = off; A.symmin = symmin; A.gain_check = 0; A.no_gain = 0; A.budget_hit = 0;
     /* entries (constraints only) for the refinement */
     size_t nc = 0; for (size_t q = 0; q < ne; q++) if (E[q].con >= 0) nc++;
     A.ne = ne;
@@ -469,31 +503,21 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
         int K = 0; for (int q = 0; q < A.N; q++) { if (q > 0 && kn[q].key != kn[q - 1].key) K++; col[kn[q].node] = K; }
         free(kn); free(ch);
     }
+    A.gain_check = 1;
     const int K0 = as_refine(&A, col);
+    A.gain_check = 0;
     int ncls = 0; { int *seen = calloc(A.N, sizeof(int)); for (int u = 0; u < NI; u++) if (!seen[col[u]]++) ncls++; free(seen); }
     if (verbose > 0) printf("   symmetry search: refinement %d classes (%d among the %d indices), %.2fs\n", K0, ncls, NI, wtime() - A.t0);
     /* automorphisms preserve the colours, so the orbits refine the classes: the constraint
      * orbits number at least the constraint classes, and the trivial component of a block at
-     * least its index classes. When neither bound leaves a gain of symmin, no search */
-    if (symmin > 1) {
-        int *seen = calloc(A.N, sizeof(int)); int ccls = 0;
-        for (int c = 0; c < m; c++) if (!seen[col[NI + c]]++) ccls++;
-        int can = (double)m / ccls >= symmin;
-        /* 4.34: the whole cube sum (a block's trivial component alone has at least its number
-         * of index classes): sum n^3 / sum classes^3, not the best single block */
-        double c0 = 0, c1 = 0;
-        for (int k = 0; k < nb && !can; k++) {
-            if (P->blk[k].type != BLK_SDP) continue;
-            memset(seen, 0, sizeof(int) * A.N); int bc = 0;
-            for (int i = off[k]; i < off[k + 1]; i++) if (!seen[col[i]]++) bc++;
-            c0 += pow((double)P->blk[k].n, 3.0); c1 += pow((double)bc, 3.0);
-        }
-        if (!can && c1 > 0 && c0 / c1 >= symmin) can = 1;
-        free(seen);
-        if (!can) {
-            if (verbose > 0) printf("   symmetry search: no automorphism group can give a gain of %g (%d constraint classes, index classes per block): no search\n", symmin, ccls);
-            ncls = NI;   /* no search */
-        }
+     * least its index classes. When neither bound leaves a gain of symmin, no search (5.16: the
+     * test is also made after every round of the refinement, as_refine) */
+    if (A.no_gain || (symmin > 1 && !as_gain_possible(&A, col))) {
+        if (verbose > 0) printf("   symmetry search: no automorphism group can give a gain of %g (the constraint classes, the index classes per block%s): no search\n", symmin, A.no_gain ? ", seen during the refinement" : "");
+        ncls = NI;   /* no search */
+    } else if (A.budget_hit) {
+        if (verbose > 0) printf("   symmetry search: the budget was spent in the refinement: no search\n");
+        ncls = NI;
     }
     int *cnt = calloc(m, sizeof(int)); for (size_t q = 0; q < ne; q++) if (E[q].con >= 0) cnt[E[q].con]++;
     A.ufp = sx(sizeof(int) * NI); for (int u = 0; u < NI; u++) A.ufp[u] = u;
@@ -503,6 +527,7 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
     if (verbose > 0) printf("   symmetry search: %ld nodes, %d generator(s), %d index orbits, %.2fs\n", A.nodes, A.ngen, norb, wtime() - A.t0);
     if (getenv("BRISK_SYMWORKDBG")) printf("   [symmetry search: work %.3e units in %.3f s: %.3e units/s; budget %.3e]\n", A.work, wtime() - A.t0, A.work / fmax(wtime() - A.t0, 1e-9), A.wmax);
     g_sym_work_s = A.work / SYM_WORK_RATE;
+    g_sym_budget_hit = A.work > A.wmax || A.budget_hit;
     *ngen_out = A.ngen; *gcps_out = A.gcps;
     int *gens = A.gens;
     free(A.ea); free(A.eb); free(A.ec); free(A.ev); free(A.ed); free(A.adjp); free(A.adj); free(A.hk); free(A.ncol); free(col); free(cnt); free(A.ufp); free(A.leaf_ref); free(A.inv_ref);
@@ -1007,7 +1032,9 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
          * product may). Only when the data have negative values (otherwise |data| = data). */
         int hasneg = 0; for (size_t q = 0; q < ne && !hasneg; q++) if (E[q].v < 0) hasneg = 1;
         for (int c = 0; c < m && !hasneg; c++) if (P->b[c] < 0) hasneg = 1;
-        if (symsigned && hasneg) {
+        if (symsigned && hasneg && na == 0 && g_sym_budget_hit) {
+            if (verbose > 0) printf("   symmetry search on |data| not started: the first search ran into its budget without a generator\n");
+        } else if (symsigned && hasneg) {
             const double tb2 = fmax(0.05, tb - 0.5 * wfirst);
             int nab = 0, *gcb = NULL;
             int *gab = sym_auto(P, off, NI, nsdp, E, ne, &nab, &gcb, verbose, tb2, symnodes, auto_mode ? symmin : 0.0, 1);

@@ -153,6 +153,10 @@ restoretest: brisk
 advicetest: brisk
 	tools/advice_test.sh ./brisk
 
+# the dual after a facial reduction whose removed duals cannot be rebuilt (the re-solve, the status without it)
+frtest: brisk
+	tools/fr_test.sh ./brisk
+
 pytest: $(LIBBRISK)
 	cd python && python3 -m pytest -q tests
 

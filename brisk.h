@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.4.4"
+#define BRISK_VERSION "1.5"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -140,12 +140,14 @@ typedef struct Block {
     int *con;            /* their ids, ascending */
     SpSym *A;            /* matrices, parallel to con */
     SpSym C;
-    unsigned char *route;/* Schur route per constraint: 0 sparse-sparse, 1 row-product, 2 dense BLAS3, 3 row-product on the union pattern */
+    unsigned char *route;/* Schur route per constraint: 0 sparse-sparse, 1 row-product, 2 dense BLAS3, 3 row-product on the union pattern, 5 monomial (allmono) */
+    int allmono;         /* 16 October 2026 (ISSUES 96a): every constraint of the block a monomial matrix (one entry per row and column): the products X A_a Zi batched into one BLAS-3 call per chunk, the pairs by gathers */
     double asm_cost;     /* estimated work of the block's Schur assembly by the chosen routes, in BLAS-3 flops (0 for the low-rank route) */
     int nd, ns;          /* number of dense / sparse constraints */
     int *dlist, *slist;  /* positions (into con/A) of dense and sparse constraints */
     int *dpos;           /* dense index of position t, or -1 */
     double *Ad;          /* dense copies: nd columns of length n*n */
+    int *drk; double **drW, **drS;   /* 15 October 2026 (ISSUES 96): a dense constraint of low rank r <= 8 at dense index a: drk[a] = r, A = sum_k drS[a][k] w_k w_k' with w_k the columns of drW[a] (n x r); 0 = not low-rank */
     int *foff;           /* flattened full entries of sparse constraints (ns+1 offsets) */
     int *ffr, *ffc;
     int *ffp;            /* 5.7 (a user's patch): their flat positions ffr + ffc*n for the gather of the row products (NULL when n*n >= 2^31) */
@@ -290,6 +292,8 @@ typedef struct {
     int hsd_first_on;    /* internal: this run is the embedding-first attempt */
     int crossover;       /* 0 off, 1 on, -1 auto (when cheap) */
     double fr_gain;      /* facial reduction of depth >= 2 kept only if it cuts the cost per iteration this much (4) */
+    double fr_fallback;  /* removed duals not rebuilt: the re-solve without facial reduction may take this multiple of the solve's time (4; 0 = none) */
+    double sym_fallback; /* a solve after an automorphism reduction that ends worse than reduced accuracy is repeated without it within this multiple of the solve's time (4; 0 = never) */
     int std_slow;        /* standard method: stop on slow progress when a retry follows (iterations, 0 off) */
     double sigma_min;    /* floor for the centering parameter (a zero sigma makes the corrector affine) */
     double feas_grow;    /* cap the primal step so the predicted residual grows at most this much (0 = off) */
@@ -523,8 +527,11 @@ void   problem_clone(const Problem *P, Problem *Q);   /* 4.30: exact copy of an 
 double dict_build(Block *B, const Params *par);
 double class_build(Block *B, const Params *par);
 void   class_free(Block *B);
+/* 5.16: the solver's double-precision measure of a candidate (X, Z, y), for the endgame's choice of the
+ * iterate it returns (ddend.c) */
+typedef double (*brisk_dd_measure)(void *ctx, double **X, double **Z, const double *y);
 int  dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Params *par,
-                int maxit, double tol, int verbose);
+                int maxit, double tol, int verbose, brisk_dd_measure meas, void *mctx);
 void   dict_free(Block *B);
 void params_default(Params *par);
 void params_accuracy(Params *par, int level);

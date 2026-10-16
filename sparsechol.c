@@ -1824,17 +1824,17 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, FScr *w) {
 static int fpanel_tiled(double *P, int nr, int w, int par) {
     int bad = 0;
     for (int c0 = 0; c0 < w && !bad; c0 += FB_NB) {
-        const int cb = (w - c0 < FB_NB) ? w - c0 : FB_NB;
+        int cb = (w - c0 < FB_NB) ? w - c0 : FB_NB;
         double *D = P + (size_t)c0 * nr + c0;
         int info = 0;
         BL(dpotrf_)("L", &cb, D, &nr, &info);
         if (info) { bad = 1; break; }
         const int rb0 = c0 + cb;
         for (int r = rb0; r < nr; r += FB_RB) {
-            const int rr = (nr - r < FB_RB) ? nr - r : FB_RB;
+            int rr = (nr - r < FB_RB) ? nr - r : FB_RB;
             double *B = P + (size_t)c0 * nr + r;
             if (par) {
-                #pragma omp task firstprivate(B, rr) shared(D, nr, cb)
+                #pragma omp task firstprivate(B, rr) shared(D, nr)
                 BL(dtrsm_)("R", "L", "T", "N", &rr, &cb, &DONE, D, &nr, B, &nr);
             } else BL(dtrsm_)("R", "L", "T", "N", &rr, &cb, &DONE, D, &nr, B, &nr);
         }
@@ -1843,19 +1843,19 @@ static int fpanel_tiled(double *P, int nr, int w, int par) {
         }
         const double mone = -1.0;
         for (int c1 = rb0; c1 < w; c1 += FB_NB) {
-            const int cb1 = (w - c1 < FB_NB) ? w - c1 : FB_NB;
+            int cb1 = (w - c1 < FB_NB) ? w - c1 : FB_NB;
             const double *A1 = P + (size_t)c0 * nr + c1;         /* rows c1.., columns of tile c0 */
             double *Cd = P + (size_t)c1 * nr + c1;
             if (par) {
-                #pragma omp task firstprivate(A1, Cd, cb1) shared(nr, cb)
+                #pragma omp task firstprivate(A1, Cd, cb1) shared(nr)
                 BL(dsyrk_)("L", "N", &cb1, &cb, &mone, A1, &nr, &DONE, Cd, &nr);
             } else BL(dsyrk_)("L", "N", &cb1, &cb, &mone, A1, &nr, &DONE, Cd, &nr);
             for (int r = c1 + cb1; r < nr; r += FB_RB) {
-                const int rr = (nr - r < FB_RB) ? nr - r : FB_RB;
+                int rr = (nr - r < FB_RB) ? nr - r : FB_RB;
                 const double *Ar = P + (size_t)c0 * nr + r;
                 double *Cr = P + (size_t)c1 * nr + r;
                 if (par) {
-                    #pragma omp task firstprivate(A1, Ar, Cr, rr, cb1) shared(nr, cb)
+                    #pragma omp task firstprivate(A1, Ar, Cr, rr, cb1) shared(nr)
                     BL(dgemm_)("N", "T", &rr, &cb1, &cb, &mone, Ar, &nr, A1, &nr, &DONE, Cr, &nr);
                 } else BL(dgemm_)("N", "T", &rr, &cb1, &cb, &mone, Ar, &nr, A1, &nr, &DONE, Cr, &nr);
             }
@@ -1951,16 +1951,16 @@ static int fpanel_tiled_ld(double *P, int nr, int w, int ld, int par) {
     int bad = 0;
     const double mone = -1.0;
     for (int c0 = 0; c0 < w && !bad; c0 += FB_NB) {
-        const int cb = (w - c0 < FB_NB) ? w - c0 : FB_NB;
+        int cb = (w - c0 < FB_NB) ? w - c0 : FB_NB;
         double *D = P + (size_t)c0 * ld + c0;
         int info = 0;
         BL(dpotrf_)("L", &cb, D, &ld, &info);
         if (info) { bad = 1; break; }
         for (int r = c0 + cb; r < nr; r += FD_RB) {
-            const int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
+            int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
             double *B = P + (size_t)c0 * ld + r;
             if (par) {
-                #pragma omp task firstprivate(B, rr) shared(D, ld, cb)
+                #pragma omp task firstprivate(B, rr) shared(D, ld)
                 BL(dtrsm_)("R", "L", "T", "N", &rr, &cb, &DONE, D, &ld, B, &ld);
             } else BL(dtrsm_)("R", "L", "T", "N", &rr, &cb, &DONE, D, &ld, B, &ld);
         }
@@ -1968,19 +1968,19 @@ static int fpanel_tiled_ld(double *P, int nr, int w, int ld, int par) {
             #pragma omp taskwait
         }
         for (int c1 = c0 + cb; c1 < w; c1 += FB_NB) {
-            const int cb1 = (w - c1 < FB_NB) ? w - c1 : FB_NB;
+            int cb1 = (w - c1 < FB_NB) ? w - c1 : FB_NB;
             const double *A1 = P + (size_t)c0 * ld + c1;
             double *Cd = P + (size_t)c1 * ld + c1;
             if (par) {
-                #pragma omp task firstprivate(A1, Cd, cb1) shared(ld, cb)
+                #pragma omp task firstprivate(A1, Cd, cb1) shared(ld)
                 BL(dsyrk_)("L", "N", &cb1, &cb, &mone, A1, &ld, &DONE, Cd, &ld);
             } else BL(dsyrk_)("L", "N", &cb1, &cb, &mone, A1, &ld, &DONE, Cd, &ld);
             for (int r = c1 + cb1; r < nr; r += FD_RB) {
-                const int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
+                int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
                 const double *Ar = P + (size_t)c0 * ld + r;
                 double *Cr = P + (size_t)c1 * ld + r;
                 if (par) {
-                    #pragma omp task firstprivate(A1, Ar, Cr, rr, cb1) shared(ld, cb)
+                    #pragma omp task firstprivate(A1, Ar, Cr, rr, cb1) shared(ld)
                     BL(dgemm_)("N", "T", &rr, &cb1, &cb, &mone, Ar, &ld, A1, &ld, &DONE, Cr, &ld);
                 } else BL(dgemm_)("N", "T", &rr, &cb1, &cb, &mone, Ar, &ld, A1, &ld, &DONE, Cr, &ld);
             }
@@ -1995,16 +1995,16 @@ static int fpanel_tiled_s(float *P, int nr, int w, int ld, int par) {
     int bad = 0;
     const float one = 1.0f, mone = -1.0f;
     for (int c0 = 0; c0 < w && !bad; c0 += FB_NB) {
-        const int cb = (w - c0 < FB_NB) ? w - c0 : FB_NB;
+        int cb = (w - c0 < FB_NB) ? w - c0 : FB_NB;
         float *D = P + (size_t)c0 * ld + c0;
         int info = 0;
         BL(spotrf_)("L", &cb, D, &ld, &info);
         if (info) { bad = 1; break; }
         for (int r = c0 + cb; r < nr; r += FD_RB) {
-            const int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
+            int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
             float *B = P + (size_t)c0 * ld + r;
             if (par) {
-                #pragma omp task firstprivate(B, rr) shared(D, ld, cb, one)
+                #pragma omp task firstprivate(B, rr) shared(D, ld)
                 BL(strsm_)("R", "L", "T", "N", &rr, &cb, &one, D, &ld, B, &ld);
             } else BL(strsm_)("R", "L", "T", "N", &rr, &cb, &one, D, &ld, B, &ld);
         }
@@ -2012,19 +2012,19 @@ static int fpanel_tiled_s(float *P, int nr, int w, int ld, int par) {
             #pragma omp taskwait
         }
         for (int c1 = c0 + cb; c1 < w; c1 += FB_NB) {
-            const int cb1 = (w - c1 < FB_NB) ? w - c1 : FB_NB;
+            int cb1 = (w - c1 < FB_NB) ? w - c1 : FB_NB;
             const float *A1 = P + (size_t)c0 * ld + c1;
             float *Cd = P + (size_t)c1 * ld + c1;
             if (par) {
-                #pragma omp task firstprivate(A1, Cd, cb1) shared(ld, cb, one, mone)
+                #pragma omp task firstprivate(A1, Cd, cb1) shared(ld)
                 BL(ssyrk_)("L", "N", &cb1, &cb, &mone, A1, &ld, &one, Cd, &ld);
             } else BL(ssyrk_)("L", "N", &cb1, &cb, &mone, A1, &ld, &one, Cd, &ld);
             for (int r = c1 + cb1; r < nr; r += FD_RB) {
-                const int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
+                int rr = (nr - r < FD_RB) ? nr - r : FD_RB;
                 const float *Ar = P + (size_t)c0 * ld + r;
                 float *Cr = P + (size_t)c1 * ld + r;
                 if (par) {
-                    #pragma omp task firstprivate(A1, Ar, Cr, rr, cb1) shared(ld, cb, one, mone)
+                    #pragma omp task firstprivate(A1, Ar, Cr, rr, cb1) shared(ld)
                     BL(sgemm_)("N", "T", &rr, &cb1, &cb, &mone, Ar, &ld, A1, &ld, &one, Cr, &ld);
                 } else BL(sgemm_)("N", "T", &rr, &cb1, &cb, &mone, Ar, &ld, A1, &ld, &one, Cr, &ld);
             }
@@ -2049,15 +2049,15 @@ static int NAME(T *A, int n, int ld, int NB, int RB) {                          
     int bad = 0;                                                                                     \
     const T one = 1, mone = -1;                                                                      \
     for (int J = 0; J < nJ; J++) {                                                                   \
-        const int c0 = J * NB, cb = c0 + NB < n ? NB : n - c0, gd = c0 / RB;                         \
+        int c0 = J * NB, cb = c0 + NB < n ? NB : n - c0, gd = c0 / RB;                         \
         T *D = A + c0 + (size_t)c0 * ld;                                                             \
         char *tdj = tok + (size_t)gd * nJ + J; (void)tdj;                                            \
         _Pragma("omp task depend(inout: tdj[0]) shared(bad)")                                       \
         { int info = 0; if (!bad) { POTRF("L", &cb, D, &ld, &info); if (info) { _Pragma("omp atomic write") bad = 1; } } } \
         for (int G = gd; G < nG; G++) {                         /* the column block below its diagonal */ \
-            const int r0 = G == gd ? c0 + cb : G * RB, r1 = (G + 1) * RB < n ? (G + 1) * RB : n;      \
+            int r0 = G == gd ? c0 + cb : G * RB, r1 = (G + 1) * RB < n ? (G + 1) * RB : n;      \
             if (r0 >= r1) continue;                                                                  \
-            const int rr = r1 - r0;                                                                  \
+            int rr = r1 - r0;                                                                  \
             T *B = A + r0 + (size_t)c0 * ld;                                                         \
             char *tg = tok + (size_t)G * nJ + J; (void)tg;                                           \
             if (G == gd) {                                      /* (the diagonal block's own group) */ \
@@ -2069,16 +2069,16 @@ static int NAME(T *A, int n, int ld, int NB, int RB) {                          
             }                                                                                        \
         }                                                                                            \
         for (int K = J + 1; K < nJ; K++) {                      /* the updates of column block K */  \
-            const int k0 = K * NB, kb = k0 + NB < n ? NB : n - k0, gk = k0 / RB;                     \
+            int k0 = K * NB, kb = k0 + NB < n ? NB : n - k0, gk = k0 / RB;                     \
             const T *AK = A + k0 + (size_t)c0 * ld;                     /* rows of K in panel J */  \
             char *tkj = tok + (size_t)gk * nJ + J, *tkk = tok + (size_t)gk * nJ + K; (void)tkj; (void)tkk; \
             T *DK = A + k0 + (size_t)k0 * ld;                                                        \
             _Pragma("omp task depend(in: tkj[0]) depend(inout: tkk[0]) shared(bad)")                \
             { if (!bad) SYRK("L", "N", &kb, &cb, &mone, AK, &ld, &one, DK, &ld); }                   \
             for (int G = gk; G < nG; G++) {                                                          \
-                const int r0 = G == gk ? k0 + kb : G * RB, r1 = (G + 1) * RB < n ? (G + 1) * RB : n;  \
+                int r0 = G == gk ? k0 + kb : G * RB, r1 = (G + 1) * RB < n ? (G + 1) * RB : n;  \
                 if (r0 >= r1) continue;                                                              \
-                const int rr = r1 - r0;                                                              \
+                int rr = r1 - r0;                                                              \
                 const T *AR = A + r0 + (size_t)c0 * ld;                                              \
                 T *CR = A + r0 + (size_t)k0 * ld;                                                    \
                 char *tgj = tok + (size_t)G * nJ + J, *tgk = tok + (size_t)G * nJ + K; (void)tgj; (void)tgk; \
@@ -2866,7 +2866,7 @@ int schol_factor(SChol *S, double shift) {
     #pragma omp single
     {
         for (int i = 0; i < nunit; i++) {
-            const int u = units[i];
+            int u = units[i];
             #pragma omp task firstprivate(u)
             {
                 fsubtree(S, u, shift);
@@ -2883,7 +2883,7 @@ int schol_factor(SChol *S, double shift) {
         }
         for (int k = 0; k < ns; k++)
             if (big[k] && S->sfd[k] == k) {             /* a big leaf (no descendants at all) */
-                const int kk = k;
+                int kk = k;
                 #pragma omp task firstprivate(kk)
                 fnode_chain(S, kk, shift, nodepar);
             }
@@ -3085,7 +3085,7 @@ static void tps_bwd_task(const SChol *S, int k, double *xt, int nr_, const char 
         free(t);
         int next = -1;
         for (int u = S->sch_ptr[k]; u < S->sch_ptr[k + 1]; u++) {
-            const int c = S->sch_idx[u];
+            int c = S->sch_idx[u];
             if (!big[c]) {
                 #pragma omp task firstprivate(c)
                 { double *tt = malloc(sizeof(double) * tmax); tps_bwd_unit(S, c, xt, nr_, tt); free(tt); }
@@ -3143,7 +3143,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
         {
             for (int k = 0; k < ns; k++) {
                 if (!big[k] && (S->spar[k] < 0 || big[S->spar[k]])) {
-                    const int u = k;
+                    int u = k;
                     #pragma omp task firstprivate(u)
                     {
                         tps_fwd_unit(S, u, xt, nr_);
@@ -3156,7 +3156,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
                             if (left == 0) tps_fwd_chain(S, p, xt, nr_); }
                     }
                 } else if (big[k] && S->sfd[k] == k) {
-                    const int kk = k;
+                    int kk = k;
                     #pragma omp task firstprivate(kk)
                     tps_fwd_chain(S, kk, xt, nr_);
                 }
@@ -3168,7 +3168,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
         #pragma omp single
         {
             for (int k = 0; k < ns; k++) if (S->spar[k] < 0) {
-                const int kk = k;
+                int kk = k;
                 if (big[kk]) {
                     #pragma omp task firstprivate(kk)
                     tps_bwd_task(S, kk, xt, nr_, big, tmax);

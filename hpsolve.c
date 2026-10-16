@@ -989,6 +989,10 @@ HP_API long long brisk_hp_text(int what, int block, char *buf, long long len) {
     return pos - 1;
 }
 
+/* 5.16: the tolerances and the measured errors are doubles, so below 1e-290 they underflow (ISSUES 90: at
+ * -prec 500 the tolerance read 0 and the last level iterated 42 times until the errors did too); the floor
+ * caps the tolerance at 1e-290, which the log says */
+static double hp_tolf(double v) { return v < 1e-290 ? 1e-290 : v; }
 int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, const BriskResult *warm, const Params *par, int kind, int digits, double tol, const char *yfile, const char *xfile, const char *zfile) {
     HPJob J_, *J = &J_;
     memset(J, 0, sizeof(*J));
@@ -1095,7 +1099,7 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     if (kind == 3) { int b2 = 424; while (b2 < target_bits) { lk[nl] = 3; lb[nl++] = b2; b2 *= 2; } lk[nl] = 3; lb[nl++] = target_bits; }
     if (kind == 3 && target_bits <= 212) nl = target_bits <= 106 ? 2 : 3;
     const int final_bits = lb[nl - 1];
-    J->tol = tol > 0 ? tol : ldexp(1.0, -(int)((J->method ? 0.60 : 0.75) * final_bits));   /* the first-order methods: 0.6 */
+    J->tol = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)((J->method ? 0.60 : 0.75) * final_bits)));   /* the first-order methods: 0.6 */
     const char *lname[4] = { "double", "double-double", "quad-double", "variable precision" };
     if (J->verbose) {
         printf("BRISK %s high precision: %s\n", BRISK_VERSION, J->method == 1 ? "augmented Lagrangian method with semismooth Newton-CG" : J->method == 2 ? "low-rank augmented Lagrangian method" : "interior-point method");
@@ -1103,7 +1107,7 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
         printf("problem %s: m = %d, %d SDP blocks (max n = %d), %d blocks in all, read %.2fs\n", fname, m, nsdp, maxn, nb, wtime() - J->tstart);
         printf("precision: %s", lname[lk[nl - 1]]);
         if (lk[nl - 1] == 3) printf(" (%d bits, about %d digits)", final_bits, (int)(final_bits * 0.30103));
-        printf(", tolerance %.1e; ladder:", J->tol);
+        printf(", tolerance %.1e%s; ladder:", J->tol, J->tol == 1e-290 && !(tol > 0) ? " (limited to 1e-290: the measures are double-precision numbers)" : "");
         for (int l = 0; l < nl; l++) { if (lk[l] == 3) printf(" mp%d", lb[l]); else printf(" %s", l == 0 ? "d" : lk[l] == 1 ? "dd" : "qd"); }
         printf("\n");
         if (J->verbose > 1) printf("  it prec      pobj                  dobj              pinf     dinf      gap       mu      ap     ad    sigma    time\n");
@@ -1204,16 +1208,22 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     HPJob keep; int have_keep = 0, keep_lev = 0, keep_it[40];
     if (lev0 == 1 && J->method == 0) start_err = hp_start_err;
     levs = lev0;
+    /* experiment (14 October, a user's suggestion: "start with the selected high precision right from the
+     * first iteration"): BRISK_HPLEV0=<k> starts the ladder cold at level k (1 dd, 2 qd, 3 the first mp level)
+     * instead of from the double solution */
+    if (getenv("BRISK_HPLEV0")) { const int k = atoi(getenv("BRISK_HPLEV0")); if (k >= 0 && k < nl) { J->have_iter = 0; lev0 = 0; levs = k; if (J->verbose > 1) printf("     cold start at level %d\n", k); } }
+/* BRISK_HPDBG: the iterate remeasured (Z = C - A*(y) formed again) at the bookkeeping points after the ladder */
+#define HP_DBG_MEASURE(tag) do { if (getenv("BRISK_HPDBG") && J->have_iter) { const double e0 = J->best_err, p0 = J->best_pinf, d0 = J->best_dinf; hp_measure(J, J->X, J->y, J->Z, J->tol); printf("       [%s: remeasured err %.1e pinf %.1e dinf %.1e (recorded err %.1e pinf %.1e dinf %.1e)]\n", tag, J->best_err, J->best_pinf, J->best_dinf, e0, p0, d0); J->best_err = e0; J->best_pinf = p0; J->best_dinf = d0; } } while (0)
 hp_again:
     for (lev = levs; lev < nl; lev++) {
         const double t0 = wtime(); const int it0 = J->iters;
-        J->level_tol = lev == nl - 1 ? 0.0 : ldexp(1.0, -(int)(0.58 * lb[lev]));
+        J->level_tol = lev == nl - 1 ? 0.0 : hp_tolf(ldexp(1.0, -(int)(0.58 * lb[lev])));
         {   /* can a higher precision follow? (the next level, or an extension: see below) */
             const int nbx = lk[nl - 1] == 1 ? 212 : 2 * lb[nl - 1] > 64 * (J->Lm - 1) ? 64 * (J->Lm - 1) : 2 * lb[nl - 1];
             J->more = J->method == 0 && lev >= 1 && (lev < nl - 1 || (next < max_ext && nl < 39 && nbx > lb[nl - 1] + 32));
             J->sick = getenv("BRISK_HPSICK") ? atof(getenv("BRISK_HPSICK")) : 0.0;
             if (getenv("BRISK_HPNOHAND")) J->more = 0;
-            J->accept = J->level_tol > J->tol ? J->level_tol : tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            J->accept = J->level_tol > J->tol ? J->level_tol : tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
         }
         if (lk[lev] == 3) { mpx_set_prec(lb[lev]); if (mpx_L > J->Lm) { mpx_L = J->Lm; mpx_W = mpx_L + 2; } }
         else { mpx_L = J->Lm; mpx_W = mpx_L + 2; }
@@ -1278,7 +1288,7 @@ hp_again:
             }
             if (!(rc == 0 || rc == 1) || !J->have_iter) J->level_best = 1e300;
             /* (the second run would be the same run when no pivot is, or would be, skipped) */
-            const double accept = tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            const double accept = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
             const double target = J->level_tol > J->tol ? J->level_tol : accept;
             const int differs = skip_pref ? J->ndyn > 0 : J->nwould > 0;
             if (retry && rc == 1 && !start_fail && J->level_best > target && differs) {
@@ -1335,6 +1345,7 @@ hp_again:
         levs = 0;
         goto hp_again;
     }
+    HP_DBG_MEASURE("after the ladder loop");
     if (have_keep) {
         const int cold_better = (rc == 0 || rc == 1) && J->have_iter && J->best_err < keep.best_err;
         if (J->verbose > 1) printf("     cold start: error %.1e against %.1e of the first attempt\n", J->best_err, keep.best_err);
@@ -1353,7 +1364,7 @@ hp_again:
     }
     if (J->method == 0 && rc == 1 && lev == nl && next < max_ext && nl < 39 && !brisk_stop_flag
         && (next == 0 || J->sick_exit || J->chol_exit || J->best_err < 0.1 * ext_err)      /* (a further one only while the last gained a digit, or when it ended on a factorization that needs more digits) */
-        && J->best_err > (tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits))) && J->best_err < 1e-3) {
+        && J->best_err > (tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)))) && J->best_err < 1e-3) {
         /* Extension: the precision asked for is exhausted short of the tolerance (a problem
          * without an interior ends near eps^0.45). The solve continues from its last iterate in
          * the next precision (dd -> qd -> twice the bits ...), with the tolerance unchanged. */
@@ -1370,6 +1381,7 @@ hp_again:
     if (lev == nl) lev = nl - 1;
     /* a level that handed over an earlier iterate kept its best one: taken back when the
      * levels after it ended worse */
+    HP_DBG_MEASURE("after the keep decision");
     if (champ_.have && (rc == 1 || rc == 2 || rc == 3) && (!J->have_iter || rc == 3 || champ_.m[4] < J->best_err)) {
         if (rc == 3) rc = 1;
         if (J->verbose > 1) printf("     the best iterate is the one before the handover (error %.1e against %.1e)\n", champ_.m[4], J->best_err);
@@ -1378,6 +1390,7 @@ hp_again:
         J->best_pinf = champ_.m[0]; J->best_dinf = champ_.m[1]; J->best_gap = champ_.m[2]; J->best_compl = champ_.m[3]; J->best_err = champ_.m[4];
         J->have_iter = 1;
     }
+    HP_DBG_MEASURE("after the champion decision");
     for (int k = 0; k < nb; k++) { free(champ_.X[k]); free(champ_.Z[k]); free(spare_.X[k]); free(spare_.Z[k]); }
     free(champ_.X); free(champ_.Z); free(champ_.y); free(champ_.pobj); free(champ_.dobj);
     free(spare_.X); free(spare_.Z); free(spare_.y); free(spare_.pobj); free(spare_.dobj);
@@ -1385,7 +1398,7 @@ hp_again:
     /* Without -hptol the solve aims at 2^(-0.75 bits) and a result within 2^(-0.6 bits) counts
      * as optimal: ill-conditioned problems (control) end between the two, as accurate as the
      * precision allows. */
-    if (rc == 1 && !(tol > 0) && J->best_err <= ldexp(1.0, -(int)(0.60 * final_bits))) rc = 0;
+    if (rc == 1 && !(tol > 0) && J->best_err <= hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)))) rc = 0;
     /* -bound: the anchors and the direction of the face multiplier on the problem as read */
     HPPoint ap[HP_NANC]; int nap = 0;
     uint64_t **DirX = NULL, *diry = NULL;
@@ -1431,7 +1444,7 @@ hp_again:
         J->have_iter = JR->have_iter;
         if (JR->have_iter) {
             const double red_err = JR->best_err;
-            const double accept0 = tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            const double accept0 = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
             if (getenv("BRISK_HPDBG")) { const double e0 = JR->best_err, p0 = JR->best_pinf; hp_measure(JR, JR->X, JR->y, JR->Z, JR->tol); printf("       [reduced problem remeasured: err %.1e pinf %.1e dinf %.1e gap %.1e (solver: err %.1e pinf %.1e)]\n", JR->best_err, JR->best_pinf, JR->best_dinf, JR->best_gap, e0, p0); }
             hp_postsolve(pre, J, JR, JR->X, JR->y, J->X, J->y, 0.0);
             hp_measure(J, J->X, J->y, J->Z, JR->tol);
@@ -1456,7 +1469,7 @@ hp_again:
                 }
             }
             if (J->verbose > 1) printf("     postsolve: error %.1e on the reduced problem, %.1e on the problem as read\n", red_err, J->best_err);
-            const double accept = tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            const double accept = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
             if (rc == 0 && J->best_err > 10.0 * accept) rc = 1;
         }
         if (JR->method == 2) { lr_rmax = 0; for (int k = 0; k < JR->nblk; k++) if (JR->bs[k] > 0 && JR->lr_rk[k] > lr_rmax) lr_rmax = JR->lr_rk[k]; J->lr_delta = JR->lr_delta; }
@@ -1488,7 +1501,7 @@ hp_again:
             hp_measure(J, J->X, J->y, J->Z, JD->tol);
             if (xpsd > J->best_err) J->best_err = xpsd;
             if (J->verbose > 1) printf("     dual form undone: error %.1e on the problem as read (X positive semidefinite to %.1e)\n", J->best_err, xpsd);
-            const double accept = tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            const double accept = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
             if (rc == 0 && J->best_err > 10.0 * accept) rc = 1;
             if (rc == 1 && !(tol > 0) && J->best_err <= accept) rc = 0;
         }
@@ -1521,7 +1534,7 @@ hp_again:
         if (have) {
             hp_measure(J, J->X, J->y, J->Z, J->tol);
             if (J->verbose > 1 || getenv("BRISK_HPDBG")) printf("     reductions undone: error %.1e on the reduced problem, %.1e on the problem before them\n", red_err, J->best_err);
-            const double accept = tol > 0 ? tol : ldexp(1.0, -(int)(0.60 * final_bits));
+            const double accept = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
             if (rc <= 1 && J->best_err > 10.0 * J->tol && J->best_err > 100.0 * red_err) {
                 /* a reduction that does not hold in the working precision (a symmetry of the
                  * data rounded to doubles only): the solve is repeated without them */
@@ -1571,6 +1584,23 @@ hp_again:
         mpx_to_str(s1, J->pobj, nd); mpx_to_str(s2, J->dobj, nd);
         printf("  primal obj <C,X> = %s\n  dual obj b'y     = %s\n", s1, s2);
         printf("  errors (in the working precision, on the data as read): pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
+        if ((rc == 1 || rc == 0) && J->have_iter) {
+            /* 5.16: the double solver's diagnosis of a side without an attained optimum (main.c, the same rule), which
+             * no precision changes: a user's SOS problem crept at every precision with tr X = 6e7 (ISSUES 88). Also on
+             * OPTIMAL (15 October 2026, the owner's benchmark, ISSUES 101b): hinf12 at -prec dd meets 1e-24 in the working
+             * precision with |y|_1 = 5e29, a dual growing like 1/mu; evaluated in double precision that point is not usable */
+            const size_t Wm_ = (size_t)mpx_W;
+            double trX = 0, nb1 = 0, nC1 = 0, y1 = 0;
+            for (int k = 0; k < nb; k++) { const int n = abs(J->bs[k]); for (int i = 0; i < n; i++) trX += mpx_getd(J->X[k] + (J->bs[k] < 0 ? (size_t)i : (size_t)i * n + i) * Wm_); for (size_t e = J->cptr[k]; e < J->cptr[k + 1]; e++) nC1 += fabs(mpx_getd(J->Cv + e * Wm_)); }
+            for (int c = 0; c < m; c++) { nb1 += fabs(mpx_getd(J->b + (size_t)c * Wm_)); y1 += fabs(mpx_getd(J->y + (size_t)c * Wm_)); }
+            const double po = mpx_getd(J->pobj), dob = mpx_getd(J->dobj), obj = fabs(po) > fabs(dob) ? po : dob;
+            if (trX > 1e5 * (1 + nb1) && trX > 1e4 * (1 + fabs(obj)))
+                printf("  note: tr X = %.1e is large against the data: either the optimum is not attained ((D) without a strictly feasible\n  point) or the solution's scale is that large (the certificates of a moment-SOS hierarchy of high order are);\n  <C,X> is still an upper bound (-bound p)%s\n", trX,
+                       rc == 0 ? "; the status holds in the working precision, in double precision the primal is not usable" : "");
+            else if (y1 > 1e5 * (1 + nC1) && y1 > 1e4 * (1 + fabs(obj)))
+                printf("  note: |y|_1 = %.1e is large against the data: either the optimum is not attained ((P) without a strictly feasible\n  point) or the solution's scale is that large; b'y is still a lower bound (-bound d)%s\n", y1,
+                       rc == 0 ? "; the status holds in the working precision, in double precision the dual is not usable" : "");
+        }
         if (J->method == 2) {
             int rmax = lr_rmax; if (J->lr_rk) for (int k = 0; k < nb; k++) if (J->bs[k] > 0 && J->lr_rk[k] > rmax) rmax = J->lr_rk[k];
             printf("  X = R R' (largest rank %d); Z + d I is positive definite for d = %.1e (Cholesky in the working precision)\n", rmax, J->lr_delta);

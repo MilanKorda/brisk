@@ -1048,6 +1048,7 @@ static double part_t_sdp(const PSOrig *O, const ConIndex *CI, const PSRecord *r,
         }
         t = lammax_small(kw, S);
         if (!isfinite(t)) { *fail = 1; t = 0; }
+        if (getenv("BRISK_PSDEBUG")) { double gn = 0; for (size_t q = 0; q < (size_t)nn * kw; q++) gn = fmax(gn, fabs(G[q])); printf("   [ps part blk %d: kw %d H00 %.3e |Y|max %.3e Aw00(chol) %.3e S00(scaled) %.3e t %.3e]\n", pp->blk, kw, H[0], gn, Aw[0], S[0], t); }
     }
 out:
     free(S); free(Aw); free(Zn); free(G); free(H);

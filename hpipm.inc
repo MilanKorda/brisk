@@ -533,6 +533,43 @@ static double HPN(lanczos_min)(HPN(st) *S, int k, const HPT *L, const HPT *D, in
 }
 /* largest alpha with X + alpha D >= 0: -1 / lambda_min(L^{-1} D L^{-T}); the eigenvalue in
  * double (the matrix is formed in the working precision) */
+static double HPN(maxstep)(HPN(st) *S, int k, const HPT *L, const HPT *D, const HPT *x);
+/* experiment (15 October, BRISK_HPSPEC=1): the spectral summary of a user's paper (arXiv 2610.17261) per
+ * block and iteration, to see what limits the steps through the creep of ISSUES 91: the extreme eigenvalues
+ * of X and Z (in double: a condition number beyond 1e16 reads as about that), the step of each block to its
+ * boundary along dX and dZ, and the size of the direction against the iterate. */
+static void HPN(spec_eig)(HPN(st) *S, int k, const HPT *A, double *lmin, double *lmax) {
+    const int n = S->n[k];
+    for (int i = 0; i < n; i++) for (int j = 0; j <= i; j++) S->wd[(size_t)i * n + j] = HP_GETD(EL(A, (size_t)i * n + j));
+    int info = 0, lw = 3 * n + 8;
+    BL(dsyev_)("N", "U", &n, S->wd, &n, S->ev, S->lw, &lw, &info);          /* (the fill above is column-major upper) */
+    *lmin = info ? 0.0 / 0.0 : S->ev[0]; *lmax = info ? 0.0 / 0.0 : S->ev[n - 1];
+}
+static void HPN(spec_diag)(HPN(st) *S, const char *tag, double mu_d) {
+    for (int k = 0; k < S->nb; k++) {
+        if (S->lp[k]) continue;
+        double xl, xh, zl, zh;
+        HPN(spec_eig)(S, k, S->X[k], &xl, &xh); HPN(spec_eig)(S, k, S->Z[k], &zl, &zh);
+        const double ap = HPN(maxstep)(S, k, S->Lx[k], S->dX[k], S->X[k]), ad = HPN(maxstep)(S, k, S->Lz[k], S->dZ[k], S->Z[k]);
+        const double nx = HPN(norm)((size_t)S->n[k] * S->n[k], S->X[k]), ndx = HPN(norm)((size_t)S->n[k] * S->n[k], S->dX[k]);
+        const double nz = HPN(norm)((size_t)S->n[k] * S->n[k], S->Z[k]), ndz = HPN(norm)((size_t)S->n[k] * S->n[k], S->dZ[k]);
+        /* centrality: the eigenvalues of X Z are those of L' Z L (X = L L', the lower factor at hand), against mu */
+        double cl = 0, ch = 0;
+        {
+            const int n = S->n[k];
+            HPT *A = HPN(alloc)((size_t)n * n), *Bm = HPN(alloc)((size_t)n * n), *Cm = HPN(alloc)((size_t)n * n);
+            HPN(copy)((size_t)n * n, S->Lx[k], A);
+            for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) HP_SETD(EL(A, (size_t)i * n + j), 0.0);   /* the strict upper part of the stored factor may hold anything */
+            HPN(gemm)(n, S->Z[k], A, Bm);                            /* Z L */
+            HPN(transpose)(n, A);                                    /* L' */
+            HPN(gemm)(n, A, Bm, Cm);                                 /* L' Z L */
+            HPN(spec_eig)(S, k, Cm, &cl, &ch);
+            free(A); free(Bm); free(Cm);
+        }
+        printf("       [%s blk %d n %d: X %.1e..%.1e kappa %.1e | Z %.1e..%.1e kappa %.1e | XZ/mu %.1e..%.1e | ap %.3f ad %.3f | |dX|/|X| %.1e |dZ|/|Z| %.1e]\n",
+               tag, k, S->n[k], xl, xh, xh / xl, zl, zh, zh / zl, cl / mu_d, ch / mu_d, ap > 1e299 ? 9.999 : ap, ad > 1e299 ? 9.999 : ad, ndx / nx, ndz / nz);
+    }
+}
 static double HPN(maxstep)(HPN(st) *S, int k, const HPT *L, const HPT *D, const HPT *x) {
     const int n = S->n[k];
     if (S->lp[k]) {
@@ -698,6 +735,7 @@ static const char *HPN(name) = HP_NAME;
  * Returns 0: tolerance reached; 1: this precision is exhausted (or its level target is
  * reached) and the best iterate is exported; 2: iteration or time limit; 3: failure. */
 static int HPN(ipm)(HPJob *J) {
+    HPT *dya = NULL;                    /* the affine dy of the iteration (BRISK_HPCURVE; allocated with the level's state) */
     HPN(st) S_, *S = &S_;
     memset(S, 0, sizeof(*S));
     S->J = J; S->m = J->m; S->nb = J->nblk;
@@ -777,9 +815,28 @@ static int HPN(ipm)(HPJob *J) {
     int redo = 0, frozen_ok = 1, cen_gaveup = 0, nsick = 0, have_h = 0, at_floor = 0;
     double besth = 1e300, hm[5] = { 0, 0, 0, 0, 0 };
     TMP(hpo); TMP(hdo); HP_SETD(hpo, 0.0); HP_SETD(hdo, 0.0);
+    /* (tried on 15 October: handing over the candidate as it stood before the window in which the level stopped
+     * following its steps (for qap8's quad-double end, whose last candidate has a gap of -3 <X,Z>): on Problem 3 at
+     * order 11 the dd level then hands over an iterate from 50 iterations back and the creep restarts, 382
+     * iterations for 180; the band on the gap below does the job for qap8) */
     J->sick_exit = 0; J->chol_exit = 0;
     for (int k = 0; k < nb; k++) if (!S->lp[k]) sn3 += (double)S->n[k] * S->n[k] * S->n[k];
-    double stall_ref = 1e300, min_err = 1e300;
+    double stall_ref = 1e300, min_err = 1e300, stall_ref_e = 1e300;   /* (rule: the full error's own reference; either halving restarts the window) */
+    double rho_now = -1;   /* BRISK_HPRHO: the Cholesky inverse residuum of the iteration (printed) */
+    dya = HPN(alloc)((size_t)m);        /* the affine dy (BRISK_HPCURVE) */
+    /* The level's progress judged against its steps (15 October 2026, ISSUES 91; BRISK_HPRULE=0 restores the rules
+     * of 1.4.4 for comparison). The
+     * handover iterate is chosen by the intrinsic error max(pinf, dinf, <X,Z>) (the gap is <X,Z> plus the
+     * residuals seen through the iterate, (<Rd,X> - y'rp)/den, negative through the long creep of a moment-SOS
+     * hierarchy whose certificates are huge; the next precision removes that part with the residuals), and
+     * a level is exhausted when its error has not halved in 8 iterations AND the residuals that count (a tenth
+     * of a percent of <X,Z> or more) did not follow the steps taken: an infeasible-start method reduces each
+     * residual by the product of 1 - alpha over its steps, and a residual that stays where the steps should
+     * have halved it is at the floor of this precision. A creep (steps of a percent, every measure following)
+     * goes on; the two-short-steps rule (alpha < 1e-3 twice) stays. */
+    static int rule = -1; if (rule < 0) { const char *e = getenv("BRISK_HPRULE"); rule = e ? atoi(e) : 1; }
+    double lp_sum = 0, ld_sum = 0;
+    struct { double pinf, dinf, compl, lp, ld, po, dob, gap, err; } rec[51];
     for (it = 0; ; it++) {
         /* residuals, measures */
         HPN(Aop)(S, S->X, S->v1);
@@ -805,9 +862,19 @@ static int HPN(ipm)(HPJob *J) {
         const double den = 1 + fabs(po) + fabs(dob), gap = HP_GETD(t) / den, compl = HP_GETD(xz) / den;
         const double err = fmax(fmax(pinf, dinf), fmax(fabs(gap), compl));
         J->pinf = pinf; J->dinf = dinf; J->gap = gap; J->compl = compl; J->err = err;
-        if (J->verbose > 1 && !redo)
+        const double erri = fmax(fmax(pinf, dinf), compl);                /* the error without the gap */
+        if (!redo) {
+            if (it > 0) { lp_sum += log1p(-fmin(ap, 1 - 1e-12)); ld_sum += log1p(-fmin(ad, 1 - 1e-12)); }
+            rec[it % 51].pinf = pinf; rec[it % 51].dinf = dinf; rec[it % 51].compl = compl; rec[it % 51].lp = lp_sum; rec[it % 51].ld = ld_sum;
+            rec[it % 51].po = po; rec[it % 51].dob = dob; rec[it % 51].gap = gap; rec[it % 51].err = err;
+        }
+        if (J->verbose > 1 && !redo) {
+            if (rho_now >= 0) printf("      (rho = |Z Z^-1 - I| = %.1e)\n", rho_now);
             printf("%4d %-3s %+.14e %+.14e %8.1e %8.1e %9.1e %8.1e %6.3f %6.3f %7.1e %7.1fs\n", J->iters, HPN(name), po, dob, pinf, dinf, gap,
                    HP_GETD(mu), ap, ad, sigma, wtime() - J->tstart);
+        }
+        /* (the best by the intrinsic error instead was tried on 15 October: qap6 then exports the exhausted end of
+         * its dd level, whose gap is y'rp, and ends at 3e-18 for 8e-25; the handover iterate serves the next level) */
         if (err < best) {
             best = err; have_best = 1;
             for (int k = 0; k < nb; k++) { HPN(copy)(S->len[k], S->X[k], S->Xb[k]); HPN(copy)(S->len[k], S->Z[k], S->Zb[k]); }
@@ -821,7 +888,12 @@ static int HPN(ipm)(HPJob *J) {
          * problem without an interior, or with multipliers that diverge (qap), a level ends
          * with mu below the infeasibility it cannot remove and a gap that is y'(b - A(X)); the
          * next precision makes no step to speak of from such a point. */
-        if (J->more && compl >= 0.1 * err && gap > -0.1 * compl && err < besth) {
+        /* (rule: a negative gap is allowed down to -<X,Z> instead of -<X,Z>/10: the creep's gap is -0.7 <X,Z>
+         * (its residual part, (<Rd,X> - y'rp)/den, is -1.7 <X,Z>), while qap8's quad-double end has a gap of
+         * -11 <X,Z>, the exhausted iterate the sign test was made for, and from it the 320-bit level ends at 3e-19
+         * where it reaches 3e-25 from the iterate before (15 October: the sign test dropped altogether cost that).
+         * An iterate whose gap is 1e4 times its <X,Z> (hinf6's cold double-double end) stays out by the first test.) */
+        if (J->more && compl >= 0.1 * err && gap > -(rule ? 1.0 : 0.1) * compl && err < besth) {
             besth = err; have_h = 1;
             for (int k = 0; k < nb; k++) { HPN(copy)(S->len[k], S->X[k], S->Xh[k]); HPN(copy)(S->len[k], S->Z[k], S->Zh[k]); }
             HPN(copy)((size_t)m, S->y, S->yh);
@@ -876,12 +948,58 @@ static int HPN(ipm)(HPJob *J) {
              * in the last 8 iterations of this level */
             if (fmax(ap, ad) < 1e-3 && !cen_gaveup) nbad++; else if (!cen_gaveup) nbad = 0;
             cen_gaveup = 0;
-            if (err < 0.5 * stall_ref) { stall_ref = err; stall_it = it; }
+            if ((rule ? erri : err) < 0.5 * stall_ref || (rule && err < 0.5 * stall_ref_e)) {
+                if ((rule ? erri : err) < 0.5 * stall_ref) stall_ref = rule ? erri : err;
+                if (rule && err < 0.5 * stall_ref_e) stall_ref_e = err;
+                stall_it = it;
+            }
             /* (BRISK_HPSICK: the level ends once mu has outrun the error twice in a row; off) */
             if (J->sick > 0 && J->more && have_h && err > J->accept && compl < J->sick * err) { if (++nsick >= 2) { rc = 1; break; } } else nsick = 0;
             /* (once the error is within 10 times the tolerance, which the driver accepts, two
              * iterations without halving it are enough: the precision's floor for the residuals) */
-            if (nbad >= 2 || it - stall_it >= (stall_ref <= 10.0 * J->tol ? 2 : 8) || !(err == err)) {
+            /* experiment (15 October, BRISK_HPPATIENCE=<n>): the halving window n instead of 8, and the two-short-steps
+             * rule off: on a user's moment-SOS hierarchies the reference solver creeps for a hundred iterations
+             * before it takes off, where this rule ended the level (ISSUES 91) */
+            static int patience = -1; if (patience < 0) { const char *e = getenv("BRISK_HPPATIENCE"); patience = e ? atoi(e) : 0; }
+            if (patience > 0) nbad = 0;
+            int exhausted = nbad >= 2 || !(err == err);
+            if (!exhausted && it - stall_it >= (stall_ref <= 10.0 * J->tol ? 2 : (patience > 0 ? patience : 8))) {
+                if (!rule) exhausted = 1;
+                else {
+                    const int back = it - stall_it < 50 ? it - stall_it : 50;
+                    const double op = rec[(it - back) % 51].pinf, od = rec[(it - back) % 51].dinf, oc = rec[(it - back) % 51].compl;
+                    const double Pp = exp(lp_sum - rec[(it - back) % 51].lp), Pd = exp(ld_sum - rec[(it - back) % 51].ld);
+                    /* progress: <X,Z> down, or both objectives moving one way through the whole window (the
+                     * creep: mu stays while the iterate travels; a floor wobbles) */
+                    int mono = 1;
+                    for (int q = it - back + 1; q <= it && mono; q++) {
+                        const double dp = rec[q % 51].po - rec[(q - 1) % 51].po, dd_ = rec[q % 51].dob - rec[(q - 1) % 51].dob;
+                        const double dp0 = rec[(it - back + 1) % 51].po - rec[(it - back) % 51].po, dd0 = rec[(it - back + 1) % 51].dob - rec[(it - back) % 51].dob;
+                        if (dp * dp0 <= 0 || dd_ * dd0 <= 0) mono = 0;
+                    }
+                    int follow = 1, prog = compl < oc || mono || err <= 0.5 * rec[(it - back) % 51].err;   /* (the error halved: progress, as in the rule of old) */
+                    /* (a residual counts from a hundredth of <X,Z>: below that the refinement of the Schur solve leaves
+                     * it where it is, by its own target 1e-2 <X,Z>; a halved residual that counts is progress too) */
+                    /* (a residual counts when it is a hundredth of <X,Z> at either end of the window: one that was below
+                     * that and grew back above it while <X,Z> fell, roa_brockett_d6_K's primal residual 5e-16 -> 5e-11 at
+                     * <X,Z> 6e-24, is at its floor, the direction's accuracy in this precision. Counting by the end alone
+                     * was tried for Problem 1 of a user's paper at order 25, whose residual reaches the refinement's own
+                     * target inside the window: no gain there, and Problem 3 at order 11 then takes 408 iterations for 180.) */
+                    if (op >= 1e-2 * oc || pinf >= 1e-2 * compl) { if (!(pinf <= sqrt(Pp) * op)) follow = 0; if (pinf <= 0.5 * op) prog = 1; }
+                    if (od >= 1e-2 * oc || dinf >= 1e-2 * compl) { if (!(dinf <= sqrt(Pd) * od)) follow = 0; if (dinf <= 0.5 * od) prog = 1; }
+                    /* (a gap that is not the complementarity, ten times <X,Z> and more, is the residuals seen through the
+                     * iterate, and must follow the steps like them: a gap at the floor with <X,Z> running below it is
+                     * the exhausted level of a problem without an interior, roa_brockett_d6_K at dd: 5.3e-14 for 43 more
+                     * iterations before this test) */
+                    const double og = fabs(rec[(it - back) % 51].gap);
+                    if (og >= 10.0 * oc && fabs(gap) >= 10.0 * compl) { if (!(fabs(gap) <= sqrt(fmin(Pp, Pd)) * og)) follow = 0; if (fabs(gap) <= 0.5 * og) prog = 1; }
+                    follow = follow && prog;
+                    if (getenv("BRISK_HPDBG")) printf("       [exhaustion test over %d iterations: pinf %.1e -> %.1e (steps predict %.1e), dinf %.1e -> %.1e (%.1e), <X,Z> %.1e -> %.1e, gap %.1e -> %.1e, objectives %s: %s]\n",
+                                                      back, op, pinf, Pp, od, dinf, Pd, oc, compl, og, fabs(gap), mono ? "monotone" : "wobbling", follow ? "the measures follow the steps, the level goes on" : "exhausted");
+                    if (!follow) exhausted = 1;
+                }
+            }
+            if (exhausted) {
                 /* a level that stops far from a solution along a ray that is improving to
                  * 1e-4 (the steps vanish before the ray reaches the 1e-8 of the test above) */
                 rc = 1;
@@ -897,6 +1015,20 @@ static int HPN(ipm)(HPJob *J) {
         for (int k = 0; k < nb; k++) {
             if (S->lp[k]) continue;
             HPN(inv_from_chol)(S->n[k], S->Lz[k], S->Zi[k], S->T1[k]);
+        }
+        /* experiment (15 October, BRISK_HPRHO=1): the Cholesky inverse residuum of a user's paper (arXiv 2610.17261),
+         * rho = max over the blocks of |Z Z^-1 - I|, the accuracy of the inverse action in this precision; proposed
+         * there as the signal that a higher precision is needed, measured here through the creep of ISSUES 91 */
+        static int want_rho = -1; if (want_rho < 0) want_rho = getenv("BRISK_HPRHO") != NULL;
+        rho_now = -1;
+        if (want_rho) {
+            rho_now = 0;
+            for (int k = 0; k < nb; k++) {
+                if (S->lp[k]) continue;
+                const int n = S->n[k];
+                HPN(gemm)(n, S->Z[k], S->Zi[k], S->T1[k]);
+                for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) { const double v = fabs(HP_GETD(EL(S->T1[k], (size_t)i * n + j)) - (i == j ? 1.0 : 0.0)); if (v > rho_now) rho_now = v; }
+            }
         }
         /* Schur complement and its factor. An iteration that follows a centring step from a
          * point already close to the path (delta < 0.05) keeps the factor of that step:
@@ -970,6 +1102,7 @@ static int HPN(ipm)(HPJob *J) {
             HPN(msolve)(S, S->dy);
             HPN(direction)(S, S->dy, zero_, 0);
             if (frozen) HPN(refine)(S, zero_, 0, 14, 1e-2 * fmin(goal_err, compl), nb_);   /* mu_aff decides the jump: the predictor must be the true one */
+            HPN(copy)((size_t)m, S->dy, dya);
             apa = 1e300; ada = 1e300;
             for (int k = 0; k < nb; k++) {
                 apa = fmin(apa, HPN(maxstep)(S, k, S->Lx[k], S->dX[k], S->X[k]));
@@ -988,11 +1121,57 @@ static int HPN(ipm)(HPJob *J) {
                 HP_MUL(w1, w1, w2); HP_ADDMUL(acc, w1, u3);
                 muaff = HP_GETD(acc) / N;
             }
+            /* (BRISK_HPSPEC: the affine direction against its equation: (<dX,Z> + <X,dZ>)/<X,Z> is -1 when X dZ + dX Z = -XZ
+             * holds, <dX,dZ>/<X,Z> is the second-order term) */
+            { static int ws = -1; if (ws < 0) ws = getenv("BRISK_HPSPEC") != NULL;
+              if (ws) printf("       [affine direction: (<dX,Z> + <X,dZ>)/<X,Z> = %.4f (exact -1), <dX,dZ>/<X,Z> = %.3e, steps %.3f %.3f]\n",
+                             (HP_GETD(u1) + HP_GETD(u2)) / HP_GETD(xz), HP_GETD(u3) / HP_GETD(xz), apa, ada); }
             amin = fmin(apa, ada);
             const double ex = amin > 0.57735 ? fmax(1.0, 3.0 * amin * amin) : 1.0;
             sigma = fmin(1.0, pow(fmax(muaff, 0.0) / mud, ex));
             if (!(sigma >= 0)) sigma = 0.5;
+            /* experiment (15 October, BRISK_HPSIGMAX=<s>; ISSUES 91): sigma capped at s. Through a creep the affine step is
+             * tiny, Mehrotra's rule gives sigma = 1 and the corrector's steps (a tenth and more once the iterate is kept
+             * central) reduce mu by nothing */
+            { static double smax = -1; if (smax < 0) { const char *e = getenv("BRISK_HPSIGMAX"); smax = e ? atof(e) : 1.0; }
+              if (sigma > smax) sigma = smax; }
             for (int k = 0; k < nb; k++) { HPN(copy)(S->len[k], S->dX[k], S->dXa[k]); HPN(copy)(S->len[k], S->dZ[k], S->dZa[k]); }
+            /* (BRISK_HPSPEC, diagnostic: the step along the second-order curve X + a dXa + a^2 dX2 against the composite
+             * line X + a (dXa + dX2), dX2 the pure second-order term (the corrector's direction at sigma = 0 less the
+             * affine one): whether a predictor with curvature would lengthen the creep's steps) */
+            { static int wc = -1; if (wc < 0) wc = getenv("BRISK_HPSPEC") != NULL;
+              if (wc) {
+                HPN(make_rhs)(S, zero_, 1, S->v2); HPN(copy)((size_t)m, S->rhs, S->dy); HPN(msolve)(S, S->dy); HPN(direction)(S, S->dy, zero_, 1);
+                HPT **X2 = (HPT **)malloc(sizeof(HPT *) * (size_t)nb), **Z2 = (HPT **)malloc(sizeof(HPT *) * (size_t)nb), **W = (HPT **)malloc(sizeof(HPT *) * (size_t)nb);
+                for (int k = 0; k < nb; k++) {
+                    X2[k] = HPN(alloc)(S->len[k]); Z2[k] = HPN(alloc)(S->len[k]); W[k] = HPN(alloc)(S->len[k]);
+                    for (size_t i = 0; i < S->len[k]; i++) { HP_SUB(EL(X2[k], i), EL(S->dX[k], i), EL(S->dXa[k], i)); HP_SUB(EL(Z2[k], i), EL(S->dZ[k], i), EL(S->dZa[k], i)); }
+                }
+                double res[6];
+                for (int which = 0; which < 6; which++) {       /* 0,1: curve p/d; 2,3: composite line p/d; 4,5: affine line p/d */
+                    const int dual = which & 1, kind = which >> 1;
+                    double lo = 0.0, hi = 2.0;
+                    for (int pass = 0; pass < 24; pass++) {
+                        const double a = pass == 0 ? hi : 0.5 * (lo + hi);
+                        int ok = 1;
+                        for (int k = 0; k < nb && ok; k++) {
+                            const HPT *B = dual ? S->Z[k] : S->X[k], *D1 = dual ? S->dZa[k] : S->dXa[k], *D2 = dual ? Z2[k] : X2[k];
+                            TMP(c1); TMP(c2); HP_SETD(c1, a); HP_SETD(c2, kind == 0 ? a * a : (kind == 1 ? a : 0.0));
+                            for (size_t i = 0; i < S->len[k]; i++) { TMP(t); HP_MUL(t, c1, EL(D1, i)); HP_ADD(EL(W[k], i), EL(B, i), t); HP_MUL(t, c2, EL(D2, i)); HP_ADD(EL(W[k], i), EL(W[k], i), t); }
+                            if (S->lp[k]) { for (int i = 0; i < S->n[k]; i++) if (HP_SGN(EL(W[k], i)) <= 0) ok = 0; }
+                            else if (HPN_chol(S->n[k], W[k])) ok = 0;
+                        }
+                        if (pass == 0) { if (ok) { lo = hi; break; } continue; }
+                        if (ok) lo = a; else hi = a;
+                    }
+                    res[which] = lo;
+                }
+                printf("       [curvature it %d: step to the boundary along the curve %.4f %.4f, the composite line %.4f %.4f, the affine line %.4f %.4f]\n",
+                       J->iters, res[0], res[1], res[2], res[3], res[4], res[5]);
+                for (int k = 0; k < nb; k++) { free(X2[k]); free(Z2[k]); free(W[k]); }
+                free(X2); free(Z2); free(W);
+                for (int k = 0; k < nb; k++) { HPN(copy)(S->len[k], S->dXa[k], S->dX[k]); HPN(copy)(S->len[k], S->dZa[k], S->dZ[k]); }
+              } }
             /* corrector */
             HP_SETD(t, sigma); HP_MUL(smu, mu, t);
             HPN(make_rhs)(S, smu, 1, S->v2);
@@ -1005,6 +1184,62 @@ static int HPN(ipm)(HPJob *J) {
                 ap = fmin(ap, HPN(maxstep)(S, k, S->Lx[k], S->dX[k], S->X[k]));
                 ad = fmin(ad, HPN(maxstep)(S, k, S->Lz[k], S->dZ[k], S->Z[k]));
             }
+            /* experiment (15 October, BRISK_HPCURVE=1; ISSUES 91, IDEAS): the step along the second-order curve
+             * X + a L + a^2 Q instead of the composite line X + a (L + Q), Q the pure second-order term (the corrector's
+             * direction at sigma = 0 less the affine one, one more Schur solve) and L the rest of the corrector's
+             * direction. Measured on the creeps of a user's hierarchies, the curve admits 2.8-3.9 times the line's step.
+             * The step to the boundary along the curve by bisection with Cholesky factorizations; when it beats the
+             * line's, the direction is folded as L + a Q so that the update code below takes X + a L + a^2 Q. */
+            { static int wcurve = -1; if (wcurve < 0) wcurve = getenv("BRISK_HPCURVE") != NULL;
+              if (wcurve && fmin(ap, ad) < 0.9) {
+                HPT **Lc = (HPT **)malloc(sizeof(HPT *) * (size_t)nb), **Lz = (HPT **)malloc(sizeof(HPT *) * (size_t)nb);
+                HPT **Qx = (HPT **)malloc(sizeof(HPT *) * (size_t)nb), **Qz = (HPT **)malloc(sizeof(HPT *) * (size_t)nb), **W = (HPT **)malloc(sizeof(HPT *) * (size_t)nb);
+                HPT *Ly = HPN(alloc)((size_t)m), *Qy = HPN(alloc)((size_t)m);
+                for (int k = 0; k < nb; k++) { Lc[k] = HPN(alloc)(S->len[k]); Lz[k] = HPN(alloc)(S->len[k]); Qx[k] = HPN(alloc)(S->len[k]); Qz[k] = HPN(alloc)(S->len[k]); W[k] = HPN(alloc)(S->len[k]);
+                    HPN(copy)(S->len[k], S->dX[k], Lc[k]); HPN(copy)(S->len[k], S->dZ[k], Lz[k]); }
+                HPN(copy)((size_t)m, S->dy, Ly);
+                /* Q = direction(sigma 0, with the second-order term) - affine */
+                HPN(make_rhs)(S, zero_, 1, S->v2); HPN(copy)((size_t)m, S->rhs, S->dy); HPN(msolve)(S, S->dy); HPN(direction)(S, S->dy, zero_, 1);
+                for (int k = 0; k < nb; k++) for (size_t i = 0; i < S->len[k]; i++) { HP_SUB(EL(Qx[k], i), EL(S->dX[k], i), EL(S->dXa[k], i)); HP_SUB(EL(Qz[k], i), EL(S->dZ[k], i), EL(S->dZa[k], i)); }
+                for (int p = 0; p < m; p++) HP_SUB(EL(Qy, p), EL(S->dy, p), EL(dya, p));   /* Q_y pairs with Q_z = -A*(Q_y): the dual residual stays (1 - a) Rd along the curve */
+                /* L = corrector direction - Q */
+                for (int k = 0; k < nb; k++) for (size_t i = 0; i < S->len[k]; i++) { HP_SUB(EL(Lc[k], i), EL(Lc[k], i), EL(Qx[k], i)); HP_SUB(EL(Lz[k], i), EL(Lz[k], i), EL(Qz[k], i)); }
+                for (int p = 0; p < m; p++) HP_SUB(EL(Ly, p), EL(Ly, p), EL(Qy, p));
+                double res[2];
+                for (int dual = 0; dual < 2; dual++) {
+                    double lo = 0.0, hi = 1.0;
+                    for (int pass = 0; pass < 20; pass++) {
+                        const double a = pass == 0 ? hi : 0.5 * (lo + hi);
+                        int ok = 1;
+                        for (int k = 0; k < nb && ok; k++) {
+                            const HPT *B = dual ? S->Z[k] : S->X[k], *D1 = dual ? Lz[k] : Lc[k], *D2 = dual ? Qz[k] : Qx[k];
+                            TMP(c1); TMP(c2); HP_SETD(c1, a); HP_SETD(c2, a * a);
+                            for (size_t i = 0; i < S->len[k]; i++) { TMP(t); HP_MUL(t, c1, EL(D1, i)); HP_ADD(EL(W[k], i), EL(B, i), t); HP_MUL(t, c2, EL(D2, i)); HP_ADD(EL(W[k], i), EL(W[k], i), t); }
+                            if (S->lp[k]) { for (int i = 0; i < S->n[k]; i++) if (HP_SGN(EL(W[k], i)) <= 0) ok = 0; }
+                            else if (HPN_chol(S->n[k], W[k])) ok = 0;
+                        }
+                        if (pass == 0) { if (ok) { lo = hi; break; } continue; }
+                        if (ok) lo = a; else hi = a;
+                    }
+                    res[dual] = lo;
+                }
+                if (getenv("BRISK_HPDBG")) printf("       [curve: steps %.4f %.4f against the line's %.4f %.4f]\n", res[0], res[1], ap, ad);
+                if (fmin(res[0], res[1]) > fmin(ap, ad)) {
+                    ap = res[0] >= 1.0 ? 1e300 : res[0]; ad = res[1] >= 1.0 ? 1e300 : res[1];
+                    const double fp = res[0] >= 1.0 ? 1.0 : res[0], fd = res[1] >= 1.0 ? 1.0 : res[1];
+                    TMP(cp); TMP(cd); HP_SETD(cp, fp); HP_SETD(cd, fd);
+                    for (int k = 0; k < nb; k++) for (size_t i = 0; i < S->len[k]; i++) {
+                        TMP(t); HP_MUL(t, cp, EL(Qx[k], i)); HP_ADD(EL(S->dX[k], i), EL(Lc[k], i), t);
+                        HP_MUL(t, cd, EL(Qz[k], i)); HP_ADD(EL(S->dZ[k], i), EL(Lz[k], i), t);
+                    }
+                    for (int p = 0; p < m; p++) { TMP(t); HP_MUL(t, cd, EL(Qy, p)); HP_ADD(EL(S->dy, p), EL(Ly, p), t); }
+                } else {
+                    for (int k = 0; k < nb; k++) { for (size_t i = 0; i < S->len[k]; i++) { HP_ADD(EL(S->dX[k], i), EL(Lc[k], i), EL(Qx[k], i)); HP_ADD(EL(S->dZ[k], i), EL(Lz[k], i), EL(Qz[k], i)); } }
+                    for (int p = 0; p < m; p++) HP_ADD(EL(S->dy, p), EL(Ly, p), EL(Qy, p));
+                }
+                for (int k = 0; k < nb; k++) { free(Lc[k]); free(Lz[k]); free(Qx[k]); free(Qz[k]); free(W[k]); }
+                free(Lc); free(Lz); free(Qx); free(Qz); free(W); free(Ly); free(Qy);
+              } }
             /* Safeguard: on degenerate problems the second-order term can spoil the direction (a
              * step of a few percent, after which the iteration loses the path: SDPLIB hinf1 at
              * mu = 4e-10 in quad-double). Then the plain centred Newton direction with the same
@@ -1034,6 +1269,14 @@ static int HPN(ipm)(HPJob *J) {
              * superlinear end (mu falls by about rho per iteration, and rho falls with mu) */
             rho = fmax(muaff, 0.0) / mud;
             gam = 0.9 + 0.09 * fmin(fmin(ap, ad), 1.0);
+            /* On a step to the boundary below a tenth the fraction 0.5 instead of 0.9 + 0.09 alpha (15 October 2026,
+             * ISSUES 91): the fraction 0.9 of a step of half a percent moves the iterate hardly at all but still drives
+             * the limiting eigenvalue to a tenth of its value, and the creep's off-centring (lambda_min(XZ)/mu falling
+             * 8e-2 -> 7e-4) was of that making. BRISK_HPGAM=<g> sets another fraction (0: the rule of 1.4.4, 0.9 + 0.09 alpha throughout; -1: the
+             * fraction 0.5 + 0.4 alpha throughout, an experiment that cost qap6 272 iterations for 140) */
+            { static double gshort = -1; if (gshort < 0) { const char *e = getenv("BRISK_HPGAM"); gshort = e ? atof(e) : 0.5; }
+              if (gshort > 0 && fmin(ap, ad) < 0.1) gam = gshort;
+              else if (gshort < 0) gam = 0.5 + 0.4 * fmin(fmin(ap, ad), 1.0); }   /* (-1: the fraction 0.5 + 0.4 alpha_max throughout) */
             if (J->fast && amin > 0.9 && rho < 0.01) {
                 /* 1 - gamma can be far below 1e-16: it is kept apart and the step 1 - omega is
                  * formed in the working precision */
@@ -1114,6 +1357,14 @@ static int HPN(ipm)(HPJob *J) {
                 continue;
             }
         }
+        static int want_spec = -1; if (want_spec < 0) want_spec = getenv("BRISK_HPSPEC") != NULL;
+        if (want_spec) {
+            const double ny = HPN(norm)((size_t)m, S->y), nxx = HPN(normb)(S, S->X), nzz = HPN(normb)(S, S->Z);
+            TMP(g1); TMP(g2); HPN(inner)(S, S->Rd, S->X, g1); HPN(dot)((size_t)m, S->y, S->rp, g2); HP_SUB(g1, g1, g2);
+            printf("       [spec it %d: |X| %.2e |Z| %.2e |y| %.2e  gap - <X,Z> = (<Rd,X> - y'rp)/den = %.2e  sigma %.2f centring %d  predictor steps %.3f %.3f]\n",
+                   J->iters, nxx, nzz, ny, HP_GETD(g1) / den, sigma, centring, apa, ada);
+            HPN(spec_diag)(S, "spec", mud);
+        }
         ap = fmin(1.0, gam * ap); ad = fmin(1.0, gam * ad);
         /* update, with the new factors; shorter steps while a factor fails */
         double om_p = omega, om_d = omega;
@@ -1153,7 +1404,8 @@ static int HPN(ipm)(HPJob *J) {
     J->level_best = have_best ? best : 1e300;
     /* export the best iterate, or the handover iterate when the best one is of no use to the
      * next precision */
-    if (have_best && rc == 1 && !at_floor && J->more && have_h && J->best_err > J->accept && besth > J->best_err && besth < 1e4 * J->best_err && J->champ) {
+    const double hcmp = besth;                                       /* the error of the handover iterate */
+    if (have_best && rc == 1 && !at_floor && J->more && have_h && J->best_err > J->accept && hcmp > J->best_err && hcmp < 1e4 * J->best_err && J->champ) {
         struct HPChamp *Cc = J->champ;
         if (!Cc->have || J->best_err < Cc->m[4]) {
             if (!Cc->y) {
@@ -1181,7 +1433,7 @@ static int HPN(ipm)(HPJob *J) {
         J->have_iter = 1;
         /* the handover iterate is kept as a spare: a best iterate at the rounding level of
          * this precision can fail the Cholesky test of the next one (hpsolve.c) */
-        if (rc == 1 && J->more && have_h && besth > J->best_err && J->spare) {
+        if (rc == 1 && J->more && have_h && hcmp > J->best_err && J->spare) {
             struct HPChamp *Cc = J->spare;
             if (!Cc->y) {
                 for (int k = 0; k < nb; k++) { Cc->X[k] = (uint64_t *)calloc(S->len[k] * Wm, sizeof(uint64_t)); Cc->Z[k] = (uint64_t *)calloc(S->len[k] * Wm, sizeof(uint64_t)); }
@@ -1198,6 +1450,7 @@ static int HPN(ipm)(HPJob *J) {
 done:
     for (int a = 0; a < narr; a++) { for (int k = 0; k < nb; k++) free((*arr[a])[k]); free(*arr[a]); }
     free(S->Av); free(S->Cv); free(S->b); free(S->n); free(S->lp); free(S->len);
+    free(dya);
     free(S->y); free(S->dy); free(S->yb); free(S->yh); free(S->rp); free(S->rhs); free(S->v1); free(S->v2); free(S->M); free(S->vp);
     free(S->wd); free(S->ev); free(S->lw); free(S->mask);
     return rc;

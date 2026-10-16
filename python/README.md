@@ -44,8 +44,8 @@ the default `-llapack -lblas` links OpenBLAS.
 interface. A virtual environment keeps things separate:
 
 ```sh
-unzip brisk-1.4.4.zip        # or: tar xzf brisk-1.4.4.tar.gz
-cd brisk-1.4.4
+unzip brisk-1.5.zip        # or: tar xzf brisk-1.5.tar.gz
+cd brisk-1.5
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -95,8 +95,8 @@ Homebrew packages are required.
 **2. Python.** Python 3.9 or later: from python.org, Homebrew (`brew install python`) or conda.
 
 ```sh
-unzip brisk-1.4.4.zip        # or: tar xzf brisk-1.4.4.tar.gz
-cd brisk-1.4.4
+unzip brisk-1.5.zip        # or: tar xzf brisk-1.5.tar.gz
+cd brisk-1.5
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip

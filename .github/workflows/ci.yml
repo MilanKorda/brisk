@@ -18,7 +18,7 @@ jobs:
             ./brisk "$f" -q || { echo "$f failed"; exit 1; }
           done
       - name: High-precision reductions and bound threads
-        run: make hpredtest bindtest restoretest advicetest
+        run: make hpredtest bindtest restoretest advicetest frtest
       - name: C library
         run: make libbrisk capitest
       - uses: actions/setup-python@v5

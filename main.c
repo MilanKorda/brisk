@@ -134,7 +134,8 @@ static void usage(void) {
         "high precision\n"
         "  -prec <p>        solve in high precision: dd (double-double, about 32 digits), qd (quad-double,\n"
         "                   about 64 digits) or a number of decimal digits (variable precision; up to 31\n"
-        "                   digits is dd, up to 63 qd). The data are read exactly as written in the file.\n"
+        "                   digits is dd, up to 63 qd; the tolerance is limited to 1e-290, the measured\n"
+        "                   errors being double-precision numbers). The data are read exactly as written in the file.\n"
         "                   Blocks whose data are block diagonal after a permutation are split. The\n"
         "                   reductions of the double solver are applied to the data in the working\n"
         "                   precision: sign and permutation symmetry (the group verified entry by entry),\n"
@@ -179,8 +180,8 @@ static void usage(void) {
         "  -ntfast <k>      NT: form dX on the pattern of dZ (1) or by dense transforms (0, default)\n"
         "  -nodd            no double-double endgame\n"
         "  -ddfactor <f>    endgame work budget as a multiple of the solve's work (1.0)\n"
-        "  -ddminwork <w>   ... but at least this many flop-equivalents (2e9)\n"
-        "  -ddmaxm <k>      size limit for the endgame (1200)\n"
+        "  -ddminwork <w>   ... but at least this many flop-equivalents (1e11)\n"
+        "  -ddmaxm <k>      size limit for the endgame (1200)\n  -ddmaxn2 <s>     ... and the largest sum of the squares of the block orders (0: from the memory limit)\n"
         "  -ddit <k>        endgame iteration limit (40)\n"
         "  -nopolish        no polishing: the last iterate is returned as it is (not the best one), without\n"
         "                   the corrections at the end and the polish probes of the embedding (-nopolishx:\n"
@@ -192,6 +193,8 @@ static void usage(void) {
         "                   blocks) solved as second-order cones in the self-dual embedding (1)\n"
         "  -socmin <n>      ... blocks of at least this order (3)\n"
         "  -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance\n"
+        "  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: the re-solve without facial\n                   reduction may take this multiple of the solve's time, else the reduced solve is returned\n                   with status SOLVED TO REDUCED ACCURACY and the dual flagged (4; 0 = no re-solve)\n"
+        "  -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated\n                   without the reduction, within this multiple of the solve's time (4; 0 = never)\n"
         "  -freeelim <k>    eliminate split free-variable pairs by pivoting: -1 auto (kernel-form SOS\n"
         "                   problems: few SDP blocks, pairs >= 1%% of the rows), 0 off, 1 on\n"
         "  -tracebound <R>  with the elimination: the row sum tr(X) + s = R that keeps the Gram side\n"
@@ -495,6 +498,7 @@ typedef struct {
     BoundCert cert;         /* 4.37 bound mode: the best certificate of this run, on the problem as read */
     int fom_check;          /* 4.39: the first-order decision deferred until after the dual form and free elimination */
     int fom_chordal;        /* 4.40: ... until after the chordal conversion (a very sparse large block) */
+    double fr_cost;      /* per-iteration cost of the problem as read over that of the reduced problem (the model of the fr_gain rule) */
 } Run;
 
 static void run_free(Run *u) {
@@ -1030,6 +1034,8 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
          * as read is not attained) and the problem is solved a second time without facial
          * reduction. Unless the reduction makes the solve much cheaper (e_moment: 145x),
          * solve without it from the start (rose13, taha1a, roa_acrobot: 1.9-3.4x). */
+        u->fr_cost = c1 > 0 ? c0 / c1 : 1.0;
+        if (par->verbose >= 1 && P->ps->nrec > 0) printf("presolve: facial reduction: the per-iteration cost model gives %.2fx for the problem as read\n", c0 / c1);
         if (do_fr == 1 && P->fr_depth >= 2 && P->ps->nrec > 0 && c0 < par->fr_gain * c1) {
             if (par->verbose >= 0)
                 printf("presolve: facial reduction of depth %d saves only %.1fx per iteration; solving without it\n", P->fr_depth, c0 / c1);
@@ -1162,7 +1168,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     problem_prepare(P, par);
     u->tpre = wtime() - tpre0;
     if (getenv("BRISK_SETUPT")) printf("   [setup: problem_prepare done at %.2fs]\n", u->tpre);
-    long nroute[4] = { 0, 0, 0, 0 };
+    long nroute[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     int maxn = 0, nsdp = 0, nlp = 0, nlr = 0, ndict = 0, dq = 0, dstr = 0, ncls = 0;
     long lrR = 0, ncK = 0, ncC = 0;
     for (int k = 0; k < P->nblk; k++) {
@@ -1183,8 +1189,9 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         printf("problem %s: m = %d, %d SDP blocks (max n = %d), %d LP variables, read %.2fs\n",
                fname, P->m, nsdp, maxn, nlp, u->tread);
         if (par->verbose >= 2) printf("memory limit: %.1f GB (the machine's memory, or the container's or the process's limit when lower)\n", brisk_mem_limit() / 1e9);
-        printf("Schur routes: %ld sparse-sparse, %ld row-product, %ld pattern row-product, %ld dense-BLAS3; %d low-rank block(s), total rank %ld\n",
-               nroute[0], nroute[1], nroute[3], nroute[2], nlr, lrR);
+        printf("Schur routes: %ld sparse-sparse, %ld row-product, %ld pattern row-product, %ld dense-BLAS3%s; %d low-rank block(s), total rank %ld\n",
+               nroute[0], nroute[1], nroute[3], nroute[2], "", nlr, lrR);
+        if (nroute[5]) printf("Schur routes: %ld monomial constraints in batched products (one BLAS-3 call per chunk, the pairs by gathers)\n", nroute[5]);
         if (ndict)
             printf("Dictionary route: %d block(s), lifted size %d, %d constraint parts through shared vectors\n",
                    ndict, dq, dstr);
@@ -1454,7 +1461,7 @@ static double run_rank(const Run *u) {
 /* 5.8: the events of a run (method switches, the endgame, crossover, bounds, ...) for the
  * summary at the end of the log; cleared by brisk_main */
 #include <stdarg.h>
-static char g_notes[24][200]; static int g_nnotes = 0;
+static char g_notes[24][400]; static int g_nnotes = 0;
 void brisk_note(const char *fmt, ...) {
     if (g_nnotes >= 24) return;
     va_list ap; va_start(ap, fmt); vsnprintf(g_notes[g_nnotes], sizeof g_notes[0], fmt, ap); va_end(ap);
@@ -2230,10 +2237,10 @@ int brisk_main(int argc, char **argv) {
         OPT_D("-feasgrow", feas_grow) OPT_D("-sigmamin", sigma_min) OPT_D("-dualrho", dual_rho)
         OPT_I("-dualcert", dual_cert) OPT_D("-dualmargin", dual_margin) OPT_I("-dualgiveup", dual_giveup) OPT_D("-dualtau", dual_tau) OPT_D("-dualtaulong", dual_tau_long) OPT_D("-dualgamma", dual_gamma) OPT_I("-dualmurule", dual_murule) OPT_I("-dualls", dual_ls) OPT_I("-dualcorr", dual_corr) OPT_I("-dualmured", dual_mured) OPT_D("-dualtaunb", dual_tau_nb) OPT_D("-dualtauub", dual_tau_ub) OPT_I("-dualsparse", dual_sparse_n) OPT_I("-zsparse", zsparse_n) OPT_D("-zsparsefill", zsparse_fill) OPT_I("-dualcorrauto", dual_corr_auto) OPT_I("-dualgstart", dual_gstart) OPT_D("-dualmudrop", dual_mudrop) OPT_I("-dualverifyn", dual_verify_n)
         OPT_I("-chordal", chordal) OPT_I("-cliquemax", chordal_maxclique) OPT_I("-chordalsup", chordal_sup) OPT_D("-chordalmerge", chordal_merge) OPT_D("-chordaldens", chordal_density) OPT_I("-chordalform", chordal_form) OPT_I("-freeelim", free_elim) OPT_D("-freefill", free_elim_fill) OPT_I("-chordalmin", chordal_minn)
-        OPT_I("-hsdsig", hsd_sig) OPT_D("-hsdbeta", hsd_beta) OPT_I("-hsddir", hsd_dir) OPT_I("-hsdcorr", hsd_corr) OPT_I("-hsdrefine", hsd_refine) OPT_I("-hsdfree", hsd_free) OPT_I("-hsdstall", hsd_stall) OPT_D("-hsdpshrink", hsd_pshrink) OPT_I("-hsdreghint", hsd_reghint) OPT_I("-hsdqscale", hsd_qscale) OPT_I("-hsdbatch", hsd_batch) OPT_I("-hsdctrace", hsd_ctrace) OPT_I("-hsdctarget", hsd_ctarget) OPT_D("-hsdcbmin", hsd_cbmin) OPT_D("-hsdcbmax", hsd_cbmax) OPT_D("-hsdcacc", hsd_cacc) OPT_D("-hsdsoltol", hsd_soltol) OPT_D("-hsdcfrac", hsd_cfrac) OPT_D("-hsdfomega", hsd_fomega) OPT_D("-hsdpivtol", hsd_pivtol) OPT_D("-hsdcucap", hsd_cucap) OPT_D("-hsdcgain", hsd_cgain) OPT_I("-ddit", dd_iters) OPT_I("-ddmaxm", dd_maxm)
+        OPT_I("-hsdsig", hsd_sig) OPT_D("-hsdbeta", hsd_beta) OPT_I("-hsddir", hsd_dir) OPT_I("-hsdcorr", hsd_corr) OPT_I("-hsdrefine", hsd_refine) OPT_I("-hsdfree", hsd_free) OPT_I("-hsdstall", hsd_stall) OPT_D("-hsdpshrink", hsd_pshrink) OPT_I("-hsdreghint", hsd_reghint) OPT_I("-hsdqscale", hsd_qscale) OPT_I("-hsdbatch", hsd_batch) OPT_I("-hsdctrace", hsd_ctrace) OPT_I("-hsdctarget", hsd_ctarget) OPT_D("-hsdcbmin", hsd_cbmin) OPT_D("-hsdcbmax", hsd_cbmax) OPT_D("-hsdcacc", hsd_cacc) OPT_D("-hsdsoltol", hsd_soltol) OPT_D("-hsdcfrac", hsd_cfrac) OPT_D("-hsdfomega", hsd_fomega) OPT_D("-hsdpivtol", hsd_pivtol) OPT_D("-hsdcucap", hsd_cucap) OPT_D("-hsdcgain", hsd_cgain) OPT_I("-ddit", dd_iters) OPT_I("-ddmaxm", dd_maxm) OPT_D("-ddmaxn2", dd_maxn2)
         OPT_D("-ddbudget", dd_budget) OPT_D("-ddtime", dd_time) OPT_D("-ddfactor", dd_factor)
         OPT_D("-ddminwork", dd_minwork) OPT_D("-regill", reg_ill) OPT_D("-cblas", c_blas)
-        OPT_I("-hsdhoc", hsd_hoc) OPT_D("-hsdnb", hsd_nb) OPT_I("-lanczos", lanczos_k) OPT_I("-ntfast", nt_fast) OPT_I("-hsdpat", hsd_pat) OPT_I("-parblocks", par_blocks) OPT_I("-knownfeas", known_feasible) OPT_D("-retryacc", retry_acc) OPT_D("-warm", warm_lam) OPT_D("-tracebound", tracebound) OPT_I("-dualize", dualize) OPT_I("-fom", fom) OPT_I("-fomhalpern", fom_halpern) OPT_I("-fommaxit", fom_maxit) OPT_D("-fomtol", fom_tol) OPT_D("-fomsigma", fom_sigma) OPT_D("-fomsigma0", fom_sigma0) OPT_I("-fomaadr", fom_aadr) OPT_D("-fomsingle", fom_single) OPT_I("-fomssnstall", fom_ssn_stall) OPT_I("-fomsigrule", fom_sigrule) OPT_I("-fomsigint", fom_sigint) OPT_I("-fomaa", fom_aa) OPT_I("-fombm", fom_bm) OPT_I("-fombmrank0", fom_bm_rank0) OPT_I("-fombmouter", fom_bm_outer) OPT_I("-fombminner", fom_bm_inner) OPT_D("-fombmrho", fom_bm_rho) OPT_D("-fombmgtol", fom_bm_gtol) OPT_D("-fombmnegtol", fom_bm_negtol) OPT_I("-fomssn", fom_ssn) OPT_I("-fomssnafter", fom_ssn_after) OPT_D("-fomssnres", fom_ssn_res) OPT_D("-fomssnrho", fom_ssn_rho) OPT_I("-fomssnprec", fom_ssn_prec) OPT_D("-fomssnsig0", fom_ssn_sig0) OPT_D("-fomssneta", fom_ssn_eta) OPT_I("-fomssnwarm", fom_ssn_warm) OPT_I("-fomssnouter", fom_ssn_outer) OPT_I("-fomssnnewton", fom_ssn_newton) OPT_I("-fomssncg", fom_ssn_cg) OPT_D("-fomaasafe", fom_aasafe) OPT_D("-fomsigmax", fom_sigmax) OPT_I("-hsdfirst", hsd_first) OPT_D("-hsdfirstc", hsd_first_c) OPT_D("-hsdfirstasm", hsd_first_asm) OPT_I("-stdslow", std_slow) OPT_I("-crossover", crossover) OPT_D("-frgain", fr_gain) OPT_I("-soc", soc) OPT_I("-socmin", soc_minn)
+        OPT_I("-hsdhoc", hsd_hoc) OPT_D("-hsdnb", hsd_nb) OPT_I("-lanczos", lanczos_k) OPT_I("-ntfast", nt_fast) OPT_I("-hsdpat", hsd_pat) OPT_I("-parblocks", par_blocks) OPT_I("-knownfeas", known_feasible) OPT_D("-retryacc", retry_acc) OPT_D("-warm", warm_lam) OPT_D("-tracebound", tracebound) OPT_I("-dualize", dualize) OPT_I("-fom", fom) OPT_I("-fomhalpern", fom_halpern) OPT_I("-fommaxit", fom_maxit) OPT_D("-fomtol", fom_tol) OPT_D("-fomsigma", fom_sigma) OPT_D("-fomsigma0", fom_sigma0) OPT_I("-fomaadr", fom_aadr) OPT_D("-fomsingle", fom_single) OPT_I("-fomssnstall", fom_ssn_stall) OPT_I("-fomsigrule", fom_sigrule) OPT_I("-fomsigint", fom_sigint) OPT_I("-fomaa", fom_aa) OPT_I("-fombm", fom_bm) OPT_I("-fombmrank0", fom_bm_rank0) OPT_I("-fombmouter", fom_bm_outer) OPT_I("-fombminner", fom_bm_inner) OPT_D("-fombmrho", fom_bm_rho) OPT_D("-fombmgtol", fom_bm_gtol) OPT_D("-fombmnegtol", fom_bm_negtol) OPT_I("-fomssn", fom_ssn) OPT_I("-fomssnafter", fom_ssn_after) OPT_D("-fomssnres", fom_ssn_res) OPT_D("-fomssnrho", fom_ssn_rho) OPT_I("-fomssnprec", fom_ssn_prec) OPT_D("-fomssnsig0", fom_ssn_sig0) OPT_D("-fomssneta", fom_ssn_eta) OPT_I("-fomssnwarm", fom_ssn_warm) OPT_I("-fomssnouter", fom_ssn_outer) OPT_I("-fomssnnewton", fom_ssn_newton) OPT_I("-fomssncg", fom_ssn_cg) OPT_D("-fomaasafe", fom_aasafe) OPT_D("-fomsigmax", fom_sigmax) OPT_I("-hsdfirst", hsd_first) OPT_D("-hsdfirstc", hsd_first_c) OPT_D("-hsdfirstasm", hsd_first_asm) OPT_I("-stdslow", std_slow) OPT_I("-crossover", crossover) OPT_D("-frgain", fr_gain) OPT_D("-frfallback", fr_fallback) OPT_D("-symfallback", sym_fallback) OPT_I("-soc", soc) OPT_I("-socmin", soc_minn)
         else if (!strcmp(a, "-acc")) {
             /* accuracy level: the tolerance and the thresholds derived from it */
             i = need(i, argc, a);
@@ -2699,6 +2706,45 @@ int brisk_main(int argc, char **argv) {
             }
         }
     }
+    /* 5.16 (the owner's benchmark of 15 October 2026, its issue 2, ISSUES 94): a solve after an automorphism
+     * reduction that ends worse than reduced accuracy is repeated without the reduction, within -symfallback
+     * times the solve's time, and the better answer kept (two CBLIB clique problems: the reduced problem,
+     * m 1,770 -> 900, one block 60 -> 2 x 30, ends at 3e-3 and 2e-6 after 50-60 iterations; without the
+     * reduction OPTIMAL at 1e-9 in 12-13; the reduction is exact, so the reduced problem's conditioning is
+     * the cause, open). The per-iteration cost model is not consulted: it reads 7.6x on these files (m 1,770
+     * against 900, cubed) while the unreduced solve takes half the reduced one's time (the LP part and the
+     * sparsity are not in the model); the time cap is the rule. */
+    if (u->sym && par.symfile && !strcmp(par.symfile, "auto") && par.sym_fallback > 0 && u->measured && u->acc > par.red_acc
+        && u->status != ST_PINFEAS && u->status != ST_DINFEAS && u->status != ST_TIME
+        && (!brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit))) {
+        const double tfirst = u->R.t_total + u->tpre + u->pr.t + u->tread;
+        {
+            Params p2 = par;
+            p2.symfile = NULL;
+            const double lim = (wtime() - par.t_start) + fmax(0.5, par.sym_fallback * fmax(tfirst, 0.01));
+            if (!(p2.timelimit > 0) || lim < p2.timelimit) p2.timelimit = lim;
+            if (par.verbose >= 0) printf("symmetry reduction: the solve ended at %.1e on the original data, solving without the reduction (at most %gx the solve's time; -symfallback)\n", u->acc, par.sym_fallback);
+            Run second;
+            if (run_pipeline(fname, &p2, do_fr, force_route, &second) == 0) {
+                const double tsecond = second.R.t_total + second.tpre + second.pr.t + second.tread;
+                att_log("the problem without the symmetry reduction", tsecond, &second);
+                if (run_better(&second, u)) {
+                    g_att[g_natt - 1].kept = 1;
+                    if (par.verbose >= 0) printf("  the new solve is better, keeping it\n");
+                    brisk_note("symmetry reduction: the reduced solve ended at %.1e; the problem was solved again without the reduction and that solve is returned", u->acc);
+                    second.R.iters += u->R.iters;
+                    run_free(u);
+                    run = second;
+                    textra += tfirst;
+                } else {
+                    if (par.verbose >= 0) printf("  the new solve is not better%s, keeping the previous one\n", second.status == ST_TIME ? " (it did not finish within its time)" : "");
+                    u->R.iters += second.R.iters;
+                    run_free(&second);
+                    textra += tsecond;
+                }
+            }
+        }
+    }
     /* 4.20: a result that misses 1e-6 on the original data and came from one method only
      * (the in-solver score can pass while the measured error does not: hinf11's endgame
      * point has lambda_min(Z) = -1.6e-5) is re-solved with the other method */
@@ -2766,25 +2812,35 @@ int brisk_main(int argc, char **argv) {
             const double dred = fmax(u->R.err[3], u->R.err[4]);
             const double acc_k = fmax(fmax(u->pr.err[1], u->pr.err[2]), fmax(dred, fmax(fabs(u->pr.err[5]), fabs(u->pr.err[6]))));
             if (acc_k <= par.red_acc) {
+                /* 5.16 (the owner's benchmark of 15 October 2026, ISSUES 93): never OPTIMAL with a dual that is
+                 * infeasible on the problem as read (taha1b and the chained-Wood SOS relaxations ended OPTIMAL at a
+                 * dual error of 1.0 while MOSEK returns a dual at 2e-10); the reduced solve's accuracy is kept for
+                 * the record, the run's accuracy is that of the returned point. The reduced solve's dual need not
+                 * extend to the removed constraints even when the dual optimum of the problem as read is attained:
+                 * the reduced dual optimal face is larger than the projection of the original one (the coupling
+                 * of a removed index with the kept ones must lie in the range of the reduced slack, which the
+                 * reduced solve knows nothing about), so the re-solve below is the way to that dual. */
                 if (par.verbose >= 0)
                     printf("postsolve: the duals of the %d removed constraint(s) are not rebuilt (dual error %.1e on the problem as read); "
-                           "the reduced solve is returned (accuracy %.1e without that error)\n", u->fr_removed, u->pr.err[4], acc_k);
-                brisk_note("facial reduction: the duals of the %d removed constraint(s) could not be rebuilt (dual error %.1e on the problem as read: "
-                           "the dual optimum of the problem as read may not be attained). The reduced solve is returned: X is that of the problem "
-                           "as read, the optimal value lies in [b'y, <C,X>] = [%.10g, %.10g], y is not dual feasible for the removed constraints",
-                           u->fr_removed, u->pr.err[4], u->pr.dobj, u->pr.pobj);
-                u->status = acc_k <= par.tol ? ST_OPTIMAL : ST_REDUCED;
-                u->acc = acc_k;
+                           "the reduced solve is kept (accuracy %.1e without that error)\n", u->fr_removed, u->pr.err[4], acc_k);
+                brisk_note("facial reduction: y is not dual feasible for the %d removed constraint(s), whose duals could not be rebuilt (dual error %.1e "
+                           "on the problem as read; hence the status). The reduced solve is returned, accurate to %.1e apart from that: X is that of the problem "
+                           "as read, the optimal value lies in [b'y, <C,X>] = [%.10g, %.10g]. The reduced solve's dual does not extend to those constraints, "
+                           "or the dual optimum of the problem as read is not attained",
+                           u->fr_removed, u->pr.err[4], acc_k, u->pr.dobj, u->pr.pobj);
+                u->status = ST_REDUCED;
+                u->acc = fmax(acc_k, fmin(u->pr.err[4], 1.0));
                 fr_kept = 1;
             }
         }
     }
     for (int stage = 0; stage < 2; stage++) {
-        const int need = !fr_kept && do_fr && fr_retry && u->fr_removed > 0 && u->measured && u->status != ST_OPTIMAL
+        const int need = do_fr && fr_retry && u->fr_removed > 0 && u->measured && u->status != ST_OPTIMAL
             && u->status != ST_PINFEAS && u->status != ST_DINFEAS
             && u->pr.err[4] > fmax(100.0 * fmax(par.tol, 1e-8), 1e-3 * u->acc) && u->pr.err[4] >= 0.5 * u->acc
+            && (!fr_kept || (stage == 1 && par.fr_fallback > 0))
             && (!brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit));
-        if (!need) break;
+        if (!need) { if (fr_kept && stage == 0) continue; break; }
         const int used_hsd = par.hsd == 1 || u->R.retried || (u->R.methods & 2);
         if (stage == 0 && used_hsd) continue;
         Params p2 = par;
@@ -2795,12 +2851,25 @@ int brisk_main(int argc, char **argv) {
         p2.known_feasible = fmax(fmax(u->pr.err[1], u->pr.err[2]), fmax(fabs(u->pr.err[5]), fabs(u->pr.err[6]))) <= 1e-6;
         int fr2 = 1;
         if (stage == 0) p2.hsd = 1; else fr2 = 0;
-        if (par.verbose >= 0)
-            printf("postsolve: dual of the removed constraints not recovered to tolerance (err4 %.1e), %s\n",
-                   u->pr.err[4], stage == 0 ? "re-solving the reduced problem with the self-dual embedding"
-                                            : "re-solving without facial reduction");
-        Run second;
         const double tfirst = u->R.t_total + u->tpre + u->pr.t + u->tread;
+        const int nrem = u->fr_removed;
+        /* the reduced solve is good in itself: the re-solve without the reduction is worth a bounded
+         * multiple of its time (the owner's benchmark: 1.7-3.9x on taha1b and pop_wood; a user's
+         * mbb14compl 18x, where the reduced solve is returned instead) */
+        if (fr_kept) {
+            /* (the per-iteration cost model of the fr_gain rule, u->fr_cost, does not predict the re-solve's
+             * time: pop_wood_20 reads 16x and the re-solve takes 6x, a user's mbb14compl reads small and the
+             * re-solve does not finish within 4x; the time cap is the bound) */
+            const double lim = (wtime() - par.t_start) + fmax(0.5, par.fr_fallback * fmax(tfirst, 0.01));
+            if (!(p2.timelimit > 0) || lim < p2.timelimit) p2.timelimit = lim;
+        }
+        if (par.verbose >= 0) {
+            if (fr_kept) printf("postsolve: re-solving without facial reduction for the dual (at most %gx the solve's time; -frfallback)\n", par.fr_fallback);
+            else printf("postsolve: dual of the removed constraints not recovered to tolerance (err4 %.1e), %s\n",
+                        u->pr.err[4], stage == 0 ? "re-solving the reduced problem with the self-dual embedding"
+                                                 : "re-solving without facial reduction");
+        }
+        Run second;
         if (run_pipeline(fname, &p2, fr2, force_route, &second) != 0) break;
         const double tsecond = second.R.t_total + second.tpre + second.pr.t + second.tread;
             att_log(stage == 0 ? "the reduced problem with the self-dual embedding" : "the problem without facial reduction", tsecond, &second);
@@ -2815,8 +2884,12 @@ int brisk_main(int argc, char **argv) {
             run_free(u);
             run = second;
             textra += tfirst;
+            if (fr_kept) { fr_kept = 0; brisk_note("facial reduction: the reduced solve's dual did not extend to the %d removed constraint(s); the problem was solved again without the reduction and that solve is returned", nrem); }
         } else {
-            if (par.verbose >= 0) printf("  the new solve is not better, keeping the previous one\n");
+            if (par.verbose >= 0) {
+                if (fr_kept && second.status == ST_TIME) printf("  the re-solve did not finish within %gx the solve's time; the reduced solve is returned\n", par.fr_fallback);
+                else printf("  the new solve is not better, keeping the previous one\n");
+            }
             u->R.iters += second.R.iters;
             run_free(&second);
             textra += tsecond;

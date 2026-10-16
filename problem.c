@@ -403,9 +403,14 @@ int read_sdpa(const char *fname, Problem *P) {
         T[nt].v = (mat == 0) ? -e[4] : e[4];      /* C = -F0 */
         nt++;
     }
+    /* 15 October 2026 (the owner's benchmark, ISSUES 101): a non-numeric token in the data section is an error, not a
+     * warning (a file whose entries read np.float64(0.75) was solved as a garbled problem with status OPTIMAL) */
+    if (g_skipped_words) {
+        fprintf(stderr, "brisk: %ld non-numeric token(s) in the data section of %s (every entry is \"matrix block i j value\", numbers only)\n", g_skipped_words, fname);
+        g_skipped_words = 0;
+        free(T); goto bad;
+    }
     free(buf);
-    if (g_skipped_words)
-        fprintf(stderr, "brisk: warning: %ld non-numeric token(s) skipped in the data section\n", g_skipped_words);
     build_blocks(P, T, nt, lower_entries);
     free(T);
     return 0;
@@ -667,11 +672,29 @@ double analyze_sdp_block(Block *B, const Params *par) {
     double budget = par->dense_mem;
     int nd = 0;
     double cost_now = 0;
+    /* 15 October 2026 (the owner's benchmark, ISSUES 96): a dense constraint of low rank (the row <J, X> = 0 of a
+     * min-bisection relaxation, J = 11' written out with n(n+1)/2 entries) is a dense row whose product X A Zi is
+     * sum_k sig_k (X w_k)(Zi w_k)': 3 n^2 r instead of 2 n^3 (G48_mb, n = 3000: the row cost 165 s of 313 on the
+     * owner's machine; the block-level low-rank route is not taken there, every constraint of the block counted) */
+    int *drk = xcalloc(ncand ? ncand : 1, sizeof(int)); double **drW = xcalloc(ncand ? ncand : 1, sizeof(double *)), **drS = xcalloc(ncand ? ncand : 1, sizeof(double *));
     for (int c = 0; c < ncand; c++) {
         const SpSym *S = &B->A[cand[c].t];
         double dense_cost = cb * (2 * n3 + ncand * n2) + cs * fmax(0.0, Stot - cand[c].ef * ncand);
         double row_cost = cb * S->nr * n2 + cs * (S->ef * n + 0.5 * Stot);
-        if (dense_cost < row_cost && (nd + 1) * n2 * 8.0 <= budget) { B->dpos[cand[c].t] = nd++; cost_now += dense_cost; }
+        int r = 0; double *W = NULL, *sg = NULL;
+        /* (where the dense product costs 2e9 flops or more, n >= 1000: below that it takes a tenth of a second an
+         * iteration at most, and the old path keeps the rounding of the small files: gpp500-1, n = 500, ended
+         * at 1.5e-8 instead of 2.5e-9 by the other order of the operations) */
+        if (par->lowrank != 0 && S->ef >= 0.25 * n2 && 2.0 * n3 >= 2e9 && !getenv("BRISK_NODRLR")) {
+            r = lowrank_factor(S, n, 8, &W, &sg);     /* (the randomized range finder samples 8 directions at least) */
+            if (r <= 0 || r > 8) { free(W); free(sg); W = NULL; sg = NULL; r = 0; }
+        }
+        if (r > 0) dense_cost = cb * 3.0 * n2 * r + cs * fmax(0.0, Stot - cand[c].ef * ncand);
+        if ((r > 0 || dense_cost < row_cost) && (nd + 1) * n2 * 8.0 <= budget) {
+            if (r > 0) { drk[nd] = r; drW[nd] = W; drS[nd] = sg; W = NULL; sg = NULL; }
+            B->dpos[cand[c].t] = nd++; cost_now += dense_cost;
+        }
+        free(W); free(sg);
     }
     free(cand);
     /* dry run of the sparse-route costs, then the low-rank decision (before any dense copies) */
@@ -710,8 +733,11 @@ double analyze_sdp_block(Block *B, const Params *par) {
     }
     if (B->lowrank || B->cls) {                /* all constraints treated as sparse */
         for (int t = 0; t < nc; t++) B->dpos[t] = -1;
+        for (int a = 0; a < nd; a++) { free(drW[a]); free(drS[a]); }
         nd = 0;
     }
+    /* (the dense indices are renumbered in con order below: the low-rank data follow their constraint) */
+    B->drk = xcalloc(nd ? nd : 1, sizeof(int)); B->drW = xcalloc(nd ? nd : 1, sizeof(double *)); B->drS = xcalloc(nd ? nd : 1, sizeof(double *));
     B->nd = nd;
     B->ns = nc - nd;
     B->dlist = xmalloc(sizeof(int) * (nd ? nd : 1));
@@ -726,6 +752,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
         for (int t = 0; t < nc; t++) {
             if (B->dpos[t] >= 0) {
                 /* renumber dense ids in con order */
+                { const int a0 = B->dpos[t]; B->drk[di] = drk[a0]; B->drW[di] = drW[a0]; B->drS[di] = drS[a0]; }
                 B->dpos[t] = di;
                 B->dlist[di] = t;
                 double *D = B->Ad + (size_t)di * n * n;
@@ -735,6 +762,8 @@ double analyze_sdp_block(Block *B, const Params *par) {
                 di++;
             } else B->slist[si++] = t;
         }
+        free(drk); free(drW); free(drS);
+        if (getenv("BRISK_DRLRDBG")) for (int a = 0; a < nd; a++) if (B->drk[a]) printf("   [block n %d: dense constraint %d of rank %d: the low-rank row route]\n", n, B->con[B->dlist[a]], B->drk[a]);
     }
 
     /* flattened full entries of sparse constraints */
@@ -787,6 +816,27 @@ double analyze_sdp_block(Block *B, const Params *par) {
         double cr = cb * S->nr * n2 + cs * (S->ef * n + suf);
         double cu = allow3 ? cs * (S->ef * n + 0.5 * (double)B->unf * S->nr + suf) : 1e300;
         B->route[B->slist[a]] = (c3 <= cr && c3 <= cu) ? 0 : (cr <= cu ? 1 : 3);
+    }
+    /* 16 October 2026 (the owner's benchmark, ISSUES 96a): a block whose constraints are all monomial matrices (one
+     * entry per row and per column, at least half the rows: the Pauli-string constraints of quantum state
+     * tomography, R(P) a signed permutation of order 2^(q+1)) takes the batched route: A_a Zi is a signed gather of
+     * the rows of Zi, the products X (A_a Zi) of a chunk of constraints are one BLAS-3 call, and M_ab = <A_b, X A_a Zi>
+     * is a gather of n entries per pair. The row products ran one small product per constraint at 7 GF/s. */
+    /* (measured on qst_7q_15, n = 256, 2,458 constraints, two threads: the row-product route 2.3 s an assembly, the
+     * batched route 2.3 s as well, its product at 71 GF/s in 1.15 s but the gather of the pairs 0.8 s and the row
+     * gathers and the interleaving 0.4 s; both routes are bound by the gather of n entries per pair, m^2 n / 2 random
+     * reads an assembly; an experiment, BRISK_MONO=1, until the gather is made to use the structure of the permutations) */
+    B->allmono = 0;
+    if (!B->lowrank && !B->dict && !B->cls && B->nd == 0 && B->ns >= 16 && n >= 32 && ENV_ON("BRISK_MONO")) {
+        int ok = 1; char *mk = xcalloc(n, 1);
+        for (int a = 0; a < B->ns && ok; a++) {
+            const SpSym *S = &B->A[B->slist[a]];
+            if (S->ef != S->nr || 2 * S->ef < n) { ok = 0; break; }
+            memset(mk, 0, n);
+            for (int e = 0; e < S->ef; e++) { if (mk[S->fc[e]]) { ok = 0; break; } mk[S->fc[e]] = 1; }
+        }
+        free(mk);
+        if (ok) { B->allmono = 1; for (int a = 0; a < B->ns; a++) B->route[B->slist[a]] = 5; }
     }
 
     /* 5.5: the live region of the row products. X A_a Zi is read only at the entries of the
@@ -1008,6 +1058,8 @@ void block_free_contents(Block *B) {
     spsym_free(&B->C);
     free(B->route); free(B->urows); free(B->ufr); free(B->ufc);
     free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad);
+    if (B->drk) { for (int a = 0; a < B->nd; a++) { free(B->drW[a]); free(B->drS[a]); } }
+    free(B->drk); free(B->drW); free(B->drS);
     free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv); free(B->ffp);
     free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
     free(B->lu_cp); free(B->lu_ca); free(B->lu_cr); free(B->lu_ch); free(B->lu_cv);

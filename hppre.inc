@@ -637,14 +637,24 @@ static void hp_measure(HPJob *J, uint64_t *const *X, const uint64_t *y, uint64_t
     for (int k = 0; k < nb && tolgoal >= 0; k++) {
         const int n = abs(J->bs[k]);
         if (J->bs[k] < 0) { for (int i = 0; i < n; i++) { const double z = mpx_getd(Z[k] + (size_t)i * Wm); if (-z / (1 + ncn) > dinf) dinf = -z / (1 + ncn); } continue; }
+        /* the smallest shift on a grid: up by 1e4 from 1e-3 tolgoal until the Cholesky succeeds (at
+         * most 1: a cap), then a bisection in the exponent to a factor 2. (Until 5.16 the grid was 30
+         * steps of 4 and 9 of 1e3 from the same start, which at a 100-digit target reaches 1e-35: an
+         * iterate whose Z needs 1e-11 was then reported at the cap 1.0, the ladder's decisions and the
+         * status with it; a user's SOS problem, ISSUES 89.) */
+        #define HP_PD_AT(dd_) (memcpy(W, Z[k], sizeof(uint64_t) * (size_t)n * n * Wm), \
+            ((dd_) > 0 ? (mpx_setd(u, (dd_) * (1 + ncn)), ({ for (int i = 0; i < n; i++) mpx_add(W + ((size_t)i * n + i) * Wm, W + ((size_t)i * n + i) * Wm, u); 0; })) : 0), \
+            cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL) == 0)
         double d = 0;
-        for (int tries = 0; tries < 40; tries++) {
-            memcpy(W, Z[k], sizeof(uint64_t) * (size_t)n * n * Wm);
-            if (d > 0) { mpx_setd(u, d * (1 + ncn)); for (int i = 0; i < n; i++) mpx_add(W + ((size_t)i * n + i) * Wm, W + ((size_t)i * n + i) * Wm, u); }
-            if (cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL) == 0) break;
-            d = d > 0 ? d * (tries < 30 ? 4.0 : 1e3) : 1e-3 * tolgoal;
-            if (tries == 39) d = 1.0;
+        if (!HP_PD_AT(0.0)) {
+            double lo = 0, hi = -1;
+            double d0 = 1e-3 * tolgoal; if (!(d0 >= 1e-300)) d0 = 1e-300;   /* (a tolerance that underflowed to 0: -prec 500) */
+            for (d = d0; d < 1.0; d *= 1e4) { if (HP_PD_AT(d)) { hi = d; break; } lo = d; }
+            if (hi < 0) hi = 1.0;                                  /* the cap: not positive definite within a shift of 1 */
+            else while (lo > 0 && hi > 2.0 * lo) { const double mid = sqrt(lo * hi); if (HP_PD_AT(mid)) hi = mid; else lo = mid; }
+            d = hi;
         }
+        #undef HP_PD_AT
         if (d > dinf) dinf = d;
     }
     free(W);

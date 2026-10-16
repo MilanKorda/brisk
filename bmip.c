@@ -48,6 +48,7 @@ typedef struct {
     double *R;               /* n x r, by rows */
     int *vid;                /* variable of R[j][c] (by rows), -1 when fixed */
     char *fz;                /* n x r, by rows: entries fixed at 0 (a column kept on its support; NULL: none) */
+    int *gr, ngr;            /* the triangular gauge: column k >= 1 is 0 on rows gr[0..k-1] (gr[0] the fixed or gauge row) */
 } IBlk;
 
 typedef struct {
@@ -65,6 +66,7 @@ typedef struct {
     double *rs, cs;          /* row scaling (A_i, b_i times rs_i) and objective scaling (C, c divided by cs) */
     char *dead;              /* constraints X_jj = 0 of a zero row: satisfied identically, set aside in the solve */
     int deepmu;              /* the barrier down to the duality gap (a last round once the certificate holds) */
+    int mono;                /* this round with the monotone barrier from the start (experiment, BRISK_BM2ESCMU) */
 } IP;
 
 /* ---------------------------------------------------------------------------------------------------- */
@@ -198,7 +200,7 @@ static void ip_build(IP *Q, const Problem *P) {
 }
 
 static void ip_free(IP *Q) {
-    for (int k = 0; k < Q->K; k++) { IBlk *B = &Q->bk[k]; free(B->pj); free(B->pk); free(B->sp); free(B->sj); free(B->spos); free(B->R); free(B->vid); free(B->zr); free(B->fz); }
+    for (int k = 0; k < Q->K; k++) { IBlk *B = &Q->bk[k]; free(B->pj); free(B->pk); free(B->sp); free(B->sj); free(B->spos); free(B->R); free(B->vid); free(B->zr); free(B->fz); free(B->gr); }
     free(Q->bk); free(Q->poff); free(Q->pb); free(Q->cE); free(Q->arp); free(Q->api); free(Q->av); free(Q->acp); free(Q->aci); free(Q->acv);
     free(Q->lrp); free(Q->lri); free(Q->lrv); free(Q->lcp); free(Q->lci); free(Q->lcv); free(Q->cl); free(Q->b); free(Q->rs); free(Q->dead);
 }
@@ -597,7 +599,7 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
     const int m = Q->m, nx = Q->nx, nR = Q->nR, nl = Q->nl, N = Kt->N;
     double mu = *mu_io;
     const double kap_eps = 10, kap_mu = 0.2, th_mu = 1.5, tau_min = 0.99, s_th = 1.1, s_ph = 2.3, dlt = 1.0, eta = 1e-8, g_th = 1e-5, g_ph = 1e-8, g_al = 0.05, kap_sig = 1e10, smax = 100;
-    const double dwmin = getenv("BRISK_BM2DWMIN") ? atof(getenv("BRISK_BM2DWMIN")) : 1e-8;
+    const double dwmin = getenv("BRISK_BM2DWMIN") ? atof(getenv("BRISK_BM2DWMIN")) : getenv("BRISK_BM2OLDGAUGE") ? 1e-8 : 0.0;   /* no symmetry is left with the triangular gauge */
     const double dcfloor = getenv("BRISK_BM2DC") ? atof(getenv("BRISK_BM2DC")) : 0.0;
     const double kap_d = getenv("BRISK_BM2KD") ? atof(getenv("BRISK_BM2KD")) : 1e-5;   /* the damping of one-sided bounds (Waechter-Biegler 3.7) */
     double *u = ix(sizeof(double) * (Q->E + 1)), *g = ix(sizeof(double) * (m + 1)), *vE = ix(sizeof(double) * (Q->E + 1));
@@ -608,7 +610,7 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
     double **Gk = ix(sizeof(double *) * (Q->K + 1));
     for (int k = 0; k < Q->K; k++) Gk[k] = ix(sizeof(double) * ((size_t)Q->bk[k].n * Q->bk[k].r + 1));
     FEnt *filt = NULL; int nf = 0, capf = 0;
-    double dw_last = 0, f = 0, fT0 = 0, Eref = 0; int nstall = 0, freemode = getenv("BRISK_BM2MU") ? atoi(getenv("BRISK_BM2MU")) : 1;
+    double dw_last = 0, f = 0, fT0 = 0, Eref = 0; int nstall = 0, freemode = getenv("BRISK_BM2MU") ? atoi(getenv("BRISK_BM2MU")) : !Q->mono;
     int status = 1, it, nfac = 0, nres = 0;
     x_get(Q, xl, x);
     ip_eval(Q, xl, u, g, &f);
@@ -625,6 +627,12 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
     double Ebest = INFINITY, mub = mu, *xb = ix(sizeof(double) * (nx + 1)), *lb_ = ix(sizeof(double) * (m + 1)), *zb = ix(sizeof(double) * (nl + 1));
     double dwforce = 0, dc_last = 0; int nretry = 0;
     const int dumpkkt = getenv("BRISK_BM2DUMPKKT") ? atoi(getenv("BRISK_BM2DUMPKKT")) : -1;
+    /* the watchdog (Ipopt's): after 10 shortened steps in a row, up to 3 full steps without the filter test; kept
+     * when one of them is acceptable to the filter and decreases theta or phi enough against the stored point,
+     * otherwise back to that point and no watchdog for 10 iterations */
+    const int wdon = getenv("BRISK_BM2WD") != NULL;   /* experiment: no gain on the ladder, every start on case588 and case19402 failed */ int nshort = 0, wd = 0, wdcool = 0, wdrevert = 0, nwd = 0;
+    double thW = 0, fW = 0, lbW = 0, sxW = 0;
+    double *xW = ix(sizeof(double) * (nx + 1)), *lamW = ix(sizeof(double) * (m + 1)), *zW = ix(sizeof(double) * (nl + 1));
     const int lsm = getenv("BRISK_BM2LSM") != NULL; int lsm_it = -1, lsm_last = -100, nlsm = 0;
     const double sigmax = getenv("BRISK_BM2SIGMAX") ? atof(getenv("BRISK_BM2SIGMAX")) : 100.0;
     if (nrmi(lam, m) == 0 && th0 > 1e-6 && getenv("BRISK_BM2PH1")) {
@@ -686,7 +694,9 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
         const double th = nrm1(g, m);
         if (verbose >= 1) printf("  %3d f %.10e pinf %.1e dinf %.1e comp %.1e mu %.1e dw %.1e  %.1fs\n", it, f * Q->cs, pinf, dinf, c0, mu, dw_last, wtime() - t0);
         st->E0 = E0;
-        if (E0 < Ebest) {   /* the best iterate so far: what a failure returns */
+        if (E0 < Ebest && (it > 0 || E0 <= fmax(1e2 * tol, 1e-6))) {   /* the best iterate so far: what a failure returns (the
+            * round's own start only when it is nearly converged: an unconverged start reads a small error only through
+            * its multipliers, which are 0 at a new start; returning to it threw the round's progress away) */
             Ebest = E0; memcpy(xb, x, sizeof(double) * nx); memcpy(lb_, lam, sizeof(double) * m); memcpy(zb, z, sizeof(double) * nl); mub = mu;
         }
         if (it == 0 && getenv("BRISK_BM2CHECK")) {   /* finite-difference check of J and W = 2 (S (x) I) */
@@ -727,7 +737,7 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
          * estimate at the current point, min |grad f - z + J'lam| (Ipopt's start), is taken when it halves the dual
          * infeasibility; at most every fifth iteration (an experiment, BRISK_BM2LSM=1: case588 to OPTIMAL in
          * 13 s from the iteration limit, but case1888 fails) */
-        if (lsm && it > 0 && it != lsm_it && it - lsm_last >= 5 && dw_last > 1e-6 && dinf / sd > 10 * fmax(pinf, c0 / sc)) {
+        if (lsm && it > 0 && it != lsm_it && it - lsm_last >= 5 && (dw_last > 1e-6 || nshort >= 5) && dinf / sd > 10 * fmax(pinf, c0 / sc)) {
             lsm_it = it; lsm_last = it;
             for (int j = 0; j < nl; j++) dl[j] = 1.0;
             kkt_assemble(Kt, Q, vE, 0, 1.0, dl, 1e-10);
@@ -748,7 +758,7 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
         /* barrier parameter: monotone (Fiacco-McCormick) or, in the free mode, by a probing step */
         if (!freemode) {
             double Emu = fmax(fmax(dinf / sd, pinf), cmu / sc);
-            while (Emu <= kap_eps * mu && mu > mumin) {
+            while (Emu <= kap_eps * mu && mu > mumin && !(Q->mono && it < 5)) {
                 mu = fmax(mumin, fmin(kap_mu * mu, pow(mu, th_mu)));
                 nf = 0;
                 cmu = 0; for (int j = 0; j < nl; j++) cmu = fmax(cmu, fabs(xl[j] * z[j] - mu));
@@ -816,7 +826,17 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
                 else { a = x1; x1 = x2; q1 = q2; x2 = a + gr * (c - a); QF(pow(10, x2), q2); }
             }
             #undef QF
-            const double sg = pow(10, 0.5 * (a + c));
+            double sg = pow(10, 0.5 * (a + c));
+            if (getenv("BRISK_BM2PROBE")) {   /* experiment: Mehrotra's probing (Ipopt's mu_oracle=probing), sigma = (mu_aff / mu)^3 */
+                double ap = 1, ad = 1, maff = 0;
+                for (int j = 0; j < nl; j++) { const double dx_ = sol[nR + j], dz_ = -z[j] - dl[j] * dx_;
+                    if (dx_ < 0) ap = fmin(ap, -tau_min * xl[j] / dx_);
+                    if (dz_ < 0) ad = fmin(ad, -tau_min * z[j] / dz_); }
+                for (int j = 0; j < nl; j++) { const double dx_ = sol[nR + j], dz_ = -z[j] - dl[j] * dx_; maff += (xl[j] + ap * dx_) * (z[j] + ad * dz_); }
+                maff /= nl > 0 ? nl : 1;
+                sg = fmin(sigmax, pow(fmax(maff, 0.0) / mavg, 3));
+            }
+            if (getenv("BRISK_BM2MUSAFE")) sg = fmax(sg, atof(getenv("BRISK_BM2MUSAFE")) * fmin(1.0, pinf));   /* experiment: no deep barrier while far from feasible */
             const double munew = fmax(mumin, fmin(sg * mavg, mu_max));
             if (munew != mu && !getenv("BRISK_BM2OLDLS")) nf = 0;   /* the filter's entries belong to the previous barrier problem */
             else if (munew < mu) nf = 0;
@@ -878,7 +898,25 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
         double gph = 0; for (int v = 0; v < nx; v++) gph += gf[v] * sol[v]; for (int j = 0; j < nl; j++) gph -= bw * sol[nR + j] / xl[j] - kap_d * bw * sol[nR + j];
         const double amin = gph < 0 ? g_al * fmin(g_th, fmin(g_ph * th / -gph, dlt * pow(th, s_th) / pow(-gph, s_ph))) : g_al * g_th;
         double al = amax; int acc = 0, ftype = 0; double fT = 0, thT = 0, phT = 0;
-        for (int ls = 0; ls < 60 && al >= amin; ls++) {
+        if (wdcool > 0) wdcool--;
+        if (wdon && wd == 0 && wdcool == 0 && nshort >= 10) {
+            memcpy(xW, x, sizeof(double) * nx); memcpy(lamW, lam, sizeof(double) * m); memcpy(zW, z, sizeof(double) * nl);
+            thW = th; fW = f; lbW = logb; sxW = sxl; wd = 3; nshort = 0; nwd++;
+            if (verbose >= 2) printf("      watchdog: full steps from here\n");
+        }
+        if (wd > 0) {   /* a watchdog step: the full step, the filter not augmented */
+            for (int v = 0; v < nx; v++) xt[v] = x[v] + al * sol[v];
+            x_set(Q, xt, xlt); ip_eval(Q, xlt, ut, gt, &fT);
+            double lb2 = 0, sx2 = 0; for (int j = 0; j < nl; j++) { lb2 += log(xlt[j]); sx2 += xlt[j]; }
+            thT = nrm1(gt, m); phT = fT - bw * lb2 + kap_d * bw * sx2;
+            const double phW = fW - bw * lbW + kap_d * bw * sxW;
+            int succ = thT <= th_max && (thT <= (1 - g_th) * thW || phT <= phW - g_ph * thW);
+            for (int q = 0; q < nf && succ; q++) if (thT >= filt[q].th && phT >= filt[q].ph) succ = 0;
+            acc = 3; ftype = 1;
+            if (succ) wd = 0; else if (--wd == 0) wdrevert = 1;
+            if (verbose >= 2) printf("      watchdog step: %s\n", succ ? "accepted" : wd ? "not yet" : "failed, back");
+        }
+        for (int ls = 0; ls < 60 && al >= amin && acc == 0; ls++) {
             for (int v = 0; v < nx; v++) xt[v] = x[v] + al * sol[v];
             x_set(Q, xt, xlt);
             ip_eval(Q, xlt, ut, gt, &fT);
@@ -1026,6 +1064,11 @@ static int ipm(IP *Q, KKT *Kt, double *xl, double *lam, double *z, double *mu_io
         else for (int i = 0; i < m; i++) lam[i] += sol[nx + i] * al;
         for (int j = 0; j < nl; j++) { z[j] += az * dz[j]; z[j] = fmin(fmax(z[j], mu / (kap_sig * xl[j])), kap_sig * mu / xl[j]); }
         ip_eval(Q, xl, u, g, &f);
+        if (acc == 1 || acc == 2) { if (al < 0.999 * amax) nshort++; else nshort = 0; }
+        if (wdrevert) {
+            memcpy(x, xW, sizeof(double) * nx); x_set(Q, x, xl); memcpy(lam, lamW, sizeof(double) * m); memcpy(z, zW, sizeof(double) * nl);
+            ip_eval(Q, xl, u, g, &f); wdrevert = 0; wdcool = 10; nshort = 0;
+        }
         (void)thT; (void)phT;
     }
 done:
@@ -1037,7 +1080,8 @@ done:
         if (verbose >= 1) printf("      back to the best iterate (error %.2e)\n", Ebest);
         if (Ebest <= fmax(1e2 * tol, 1e-6) && status == 2) status = 1;
     }
-    free(xb); free(lb_); free(zb);
+    free(xb); free(lb_); free(zb); free(xW); free(lamW); free(zW);
+    if (verbose >= 1 && nwd) printf("      watchdog started %d time%s\n", nwd, nwd > 1 ? "s" : "");
     if (verbose >= 1 && nlsm) printf("      least-squares multipliers taken %d time%s\n", nlsm, nlsm > 1 ? "s" : "");
     st->its = it; st->status = status; st->nfac = nfac; st->nres = nres; st->f = f;
     *mu_io = mu;
@@ -1678,6 +1722,7 @@ static void ip_fixrows(IP *Q) {
         IBlk *B = &Q->bk[k];
         if (B->fixrow >= 0 && B->zr[B->fixrow]) { fprintf(stderr, "brisk: -bm 2: block %d: row %d is fixed both at zero and at a positive value (infeasible)\n", k, B->fixrow); B->fixrow = -1; }
         if (B->fixrow < 0) { B->grow = 0; while (B->grow < B->n - 1 && B->zr[B->grow]) B->grow++; }
+        B->gr = ix(sizeof(int) * (B->n + 1)); B->ngr = 1; B->gr[0] = B->fixrow >= 0 ? B->fixrow : B->grow;
     }
 }
 
@@ -1712,23 +1757,43 @@ static int dcmp_desc(const void *a, const void *b) { const double x = *(const do
  * rows where it may be nonzero, the others are fixed at 0 */
 static void ip_addcol_on(IBlk *B, const double *v, double rel, const char *keep) {
     const int n = B->n, r = B->r;
+    /* the triangular gauge (the rotations R Q of the columns leave X = R R' unchanged): the new column r is 0 on
+     * gr[0..r-1]; a missing gauge row is the row of the largest weight in the present columns (any R is rotated
+     * into this form by an LQ decomposition of its gauge rows, so nothing is lost), unless the old gauge is asked */
+    const int trig = !getenv("BRISK_BM2OLDGAUGE");
+    char *gz = iz(n + 1);
+    if (trig) {
+        while (B->ngr < r) {
+            int best = -1; double bw = -1;
+            for (int j = 0; j < n; j++) {
+                if (j == B->fixrow || B->zr[j]) continue;
+                int isg = 0; for (int t = 0; t < B->ngr; t++) if (B->gr[t] == j) { isg = 1; break; }
+                if (isg) continue;
+                double w = 0; for (int c = 0; c < r; c++) w += B->R[(size_t)j * r + c] * B->R[(size_t)j * r + c];
+                if (w > bw) { bw = w; best = j; }
+            }
+            if (best < 0) break;
+            B->gr[B->ngr++] = best;
+        }
+        for (int t = 0; t < B->ngr && t < r; t++) gz[B->gr[t]] = 1;
+    }
     double *Rn = iz(sizeof(double) * ((size_t)n * (r + 1) + 1));
     double c0 = 0, vm = 0;
-    for (int j = 0; j < n; j++) { c0 = fmax(c0, fabs(B->R[(size_t)j * r])); if (j != B->fixrow && j != B->grow && !B->zr[j] && (!keep || keep[j])) vm = fmax(vm, fabs(v[j])); }
+    for (int j = 0; j < n; j++) { c0 = fmax(c0, fabs(B->R[(size_t)j * r])); if (j != B->fixrow && j != B->grow && !B->zr[j] && !gz[j] && (!keep || keep[j])) vm = fmax(vm, fabs(v[j])); }
     const double sc = vm > 0 ? rel * c0 / vm : 0;
     for (int j = 0; j < n; j++) {
         memcpy(Rn + (size_t)j * (r + 1), B->R + (size_t)j * r, sizeof(double) * r);
-        Rn[(size_t)j * (r + 1) + r] = (j == B->fixrow || j == B->grow || B->zr[j] || (keep && !keep[j])) ? 0.0 : sc * v[j];
+        Rn[(size_t)j * (r + 1) + r] = (j == B->fixrow || j == B->grow || B->zr[j] || gz[j] || (keep && !keep[j])) ? 0.0 : sc * v[j];
     }
-    if (keep || B->fz) {
+    if (keep || B->fz || (trig && r >= 2)) {
         char *fz = iz((size_t)n * (r + 1) + 1);
         for (int j = 0; j < n; j++) {
             if (B->fz) memcpy(fz + (size_t)j * (r + 1), B->fz + (size_t)j * r, r);
-            fz[(size_t)j * (r + 1) + r] = keep && !keep[j];
+            fz[(size_t)j * (r + 1) + r] = (keep && !keep[j]) || (gz[j] && j != B->grow && j != B->fixrow);
         }
         free(B->fz); B->fz = fz;
     }
-    free(B->R); B->R = Rn; B->r = r + 1;
+    free(B->R); B->R = Rn; B->r = r + 1; free(gz);
 }
 static void ip_addcol(IBlk *B, const double *v, double rel) { ip_addcol_on(B, v, rel, NULL); }
 
@@ -1801,6 +1866,8 @@ static double block_bound(const IBlk *B, double *vk, double T, double TB, const 
  *  - u_j: a row with x_j as its only LP variable gives |a_ij| x_j <= |b_i| + sum_k ||A_ik||_F T_k.
  * On the problem as read after the sign reduction (which keeps the optimal value); exact up to the rounding of
  * the factorizations. Returns -inf when a needed bound is missing. lam is not changed. */
+static double *g_trace = NULL;       /* experiment (BRISK_BM2CERTT): when set, ip_lower_bound leaves each block's trace bound here */
+static double **g_hom_dout = NULL;   /* experiment (BRISK_BM2HOM): when set, ip_lower_bound leaves each block's shifts d here */
 static double ip_lower_bound(const IP *Q, const double *lam0, double tol, double nC1, int verbose) {
     const int m = Q->m, K = Q->K;
     double *lam = ix(sizeof(double) * (m + 1)); memcpy(lam, lam0, sizeof(double) * m);
@@ -1882,7 +1949,7 @@ static double ip_lower_bound(const IP *Q, const double *lam0, double tol, double
     for (int k = 0; k < K; k++) {
         double t = 0, tb = 0; bd[k] = iz(Q->bk[k].n + 1);
         for (int j = 0; j < Q->bk[k].n; j++) { t += U[k][j]; if (isfinite(U[k][j])) { tb += U[k][j]; bd[k][j] = !fr[k][j]; } }
-        T[k] = t; TB[k] = tb;
+        T[k] = t; TB[k] = tb; if (g_trace) g_trace[k] = tb;
     }
     double L = 0; for (int i = 0; i < m; i++) L -= Q->b[i] * lam[i];
     const double eps = tol * (1 + nC1) / Q->cs;
@@ -1921,6 +1988,10 @@ static double ip_lower_bound(const IP *Q, const double *lam0, double tol, double
                     vk2[dpos[j]] += dd; d[j] += dd;
                     if (U[k][j] > 0) cost += dd * U[k][j];
                 }
+            }
+            if (g_hom_dout && g_hom_dout[k]) {   /* the shifts, and what is left of lambda_min spread over the bounded indices */
+                int c3; const double l3 = block_lmin(B, vk2, eps, u, &c3);
+                for (int j = 0; j < n; j++) g_hom_dout[k][j] = dpos[j] < 0 ? 0.0 : d[j] + (l3 < 0 && bd[k][j] ? -l3 : 0.0);
             }
             if (steps > 0) {
                 const double cb2 = block_bound(B, vk2, T[k], TB[k], bd[k], eps, big, Q->cs, k, -1) - cost;
@@ -2087,12 +2158,37 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
     const int m = Q.m;
     double *xl = iz(sizeof(double) * (Q.nl + 1)), *lam = iz(sizeof(double) * (m + 1)), *z = ix(sizeof(double) * (Q.nl + 1));
     ip_start(&Q, xl);
+    if (getenv("BRISK_BM2START") && SG) {   /* research: a rank-one start from a file, one value per index of the problem as
+                                              * read; each index goes to the block of its sign class (matched by order) */
+        FILE *fi = fopen(getenv("BRISK_BM2START"), "r"); int nr = 0, nset = 0;
+        if (fi) {
+            double v;
+            for (int i = 0; i < SG->NI && fscanf(fi, "%lf", &v) == 1; i++, nr++) {
+                const int c = SG->cls[i], sz = SG->csz[c];
+                for (int k = 0; k < Q.K; k++) if (Q.bk[k].n == sz && Q.bk[k].r == 1) {
+                    if (SG->cpos[i] != Q.bk[k].fixrow && !Q.bk[k].zr[SG->cpos[i]]) { Q.bk[k].R[SG->cpos[i]] = v; nset++; }
+                    break;
+                }
+            }
+            fclose(fi);
+            double *u = ix(sizeof(double) * (Q.E + 1)), *g = ix(sizeof(double) * (Q.m + 1));
+            for (int j = 0; j < Q.nl; j++) xl[j] = 0;
+            ip_eval(&Q, xl, u, g, NULL);
+            for (int j = 0; j < Q.nl; j++) {
+                double w = 1.0;
+                if (Q.lcp[j + 1] - Q.lcp[j] == 1) { const int i = Q.lci[Q.lcp[j]]; w = -g[i] / Q.lcv[Q.lcp[j]]; }
+                xl[j] = fmax(w, 1e-2);
+            }
+            free(u); free(g);
+        }
+        if (verbose >= 0) printf("bm2: start read from %s: %d values, %d set\n", getenv("BRISK_BM2START"), nr, nset);
+    }
     if (getenv("BRISK_BM2R0")) {   /* experiment: start the blocks without a fixed row at rank r0, the extra columns small and random */
         const int r0 = atoi(getenv("BRISK_BM2R0")); const double sc = getenv("BRISK_BM2R0S") ? atof(getenv("BRISK_BM2R0S")) : 1e-1;
         unsigned hh = 2463534242u;
         for (int k = 0; k < Q.K; k++) {
-            IBlk *B = &Q.bk[k]; if (B->fixrow >= 0) continue;
-            while (B->r < r0) {
+            IBlk *B = &Q.bk[k]; const int r0k = B->fixrow < 0 ? r0 : getenv("BRISK_BM2R0G") ? atoi(getenv("BRISK_BM2R0G")) : 1;   /* (blocks with a fixed row: BRISK_BM2R0G) */
+            while (B->r < r0k) {
                 double *v = ix(sizeof(double) * (B->n + 1));
                 for (int j = 0; j < B->n; j++) { hh ^= hh << 13; hh ^= hh >> 17; hh ^= hh << 5; v[j] = (hh & 0xffff) / 65535.0 - 0.5; }
                 ip_addcol(B, v, sc); free(v);
@@ -2114,6 +2210,15 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
     double *vE = ix(sizeof(double) * (Q.E + 1)), *lmin = ix(sizeof(double) * (Q.K + 1));
     double Lbest = -INFINITY;   /* every round's lower bound is valid: the best of them is the run's */
     int status = 1, totits = 0, polish = 0;
+    /* experiment (BRISK_BM2HOM=kappa): a homotopy in the objective. When the first round's point is not certified, the
+     * per-index shifts d of its S (S + Diag(d) nearly semidefinite) are added to C as kappa Diag(d), which makes the
+     * point (nearly) the optimum of the shifted problem; the shift is then taken down to 0 in BRISK_BM2HOMN steps,
+     * each step once the present problem is certified, the rank raised as usual in between. The optimum of the
+     * shifted problems moves continuously, so no step has to leave a local optimum by a finite move */
+    const double homk = getenv("BRISK_BM2HOM") ? atof(getenv("BRISK_BM2HOM")) : 0.0;
+    const int homn = getenv("BRISK_BM2HOMN") ? atoi(getenv("BRISK_BM2HOMN")) : 10;
+    int hom = 0, homstep = 0; double **Dh = NULL;
+    double *gtr = NULL, *epsk = ix(sizeof(double) * (Q.K + 1));
     IStat st; memset(&st, 0, sizeof st);
     for (int round = 0; ; round++) {
         for (int i = 0; i < m; i++) if (Q.dead[i]) lam[i] = 0;
@@ -2123,6 +2228,8 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
         const int maxit2 = getenv("BRISK_BM2MAXIT") ? atoi(getenv("BRISK_BM2MAXIT")) : 3000;
         if (round > 0) mu = fmax(mu, tol / 10);   /* a new round from a barrier no deeper than tol / 10 per pair: from the
                                                     * final one (down to the duality gap) the iterate stayed at the old point */
+        Q.mono = round > 0 && getenv("BRISK_BM2ESCMU") && !polish;   /* experiment: a rank increase from a shallower, monotone barrier */
+        if (Q.mono) mu = fmax(mu, atof(getenv("BRISK_BM2ESCMU")));
         const int rc = getenv("BRISK_BM2ALM") ? ipm_alm(&Q, &Kt, xl, lam, z, &mu, tol, maxit2, verbose >= 1 ? (getenv("BRISK_BM2V") ? 2 : 1) : 0, tlim, t0, &st) :
                        !getenv("BRISK_BM2PEN") ? ipm(&Q, &Kt, xl, lam, z, &mu, tol, maxit2, verbose >= 1 ? (getenv("BRISK_BM2V") ? 2 : 1) : 0, tlim, t0, &st)
                                                 : ipm_pen(&Q, &Kt, xl, lam, z, &mu, &rho, tol, maxit2, verbose >= 1 ? 1 : 0, tlim, t0, &st);
@@ -2149,17 +2256,43 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
         }
         ip_svals(&Q, lam, vE);
         /* the certificate per block */
-        const double eps = tol * (1 + nC1) / Q.cs;
+        const double eps = tol * (1 + nC1) / Q.cs * (getenv("BRISK_BM2CERTF") ? atof(getenv("BRISK_BM2CERTF")) : 1.0);   /* (experiment: a tighter certificate) */
         ip_fixmult(&Q, lam, vE, eps);
         int all = 1, grow = 0;
         double **vv = ix(sizeof(double *) * (Q.K + 1));
         for (int k = 0; k < Q.K; k++) {
             int cert = 0; vv[k] = ix(sizeof(double) * (Q.bk[k].n + 1));
-            lmin[k] = block_lmin(&Q.bk[k], vE + Q.poff[k], eps, vv[k], &cert);
+            if (getenv("BRISK_BM2CERTT")) {   /* experiment: the threshold from the trace bound, so that a certified round's bound is within tol */
+                if (!gtr) { gtr = iz(sizeof(double) * (Q.K + 1)); g_trace = gtr; (void)ip_lower_bound(&Q, lam, tol, nC1, -1); g_trace = NULL; }
+                epsk[k] = gtr[k] > 0 ? fmin(eps, tol * (1 + fabs(st.f * Q.cs)) / Q.cs / (Q.K * gtr[k])) : eps;
+            } else epsk[k] = eps;
+            lmin[k] = block_lmin(&Q.bk[k], vE + Q.poff[k], epsk[k], vv[k], &cert);
             if (!cert) all = 0;
             if (verbose >= 0) printf("bm2: block %d (order %d, rank %d): lambda_min(S) = %.3e%s\n", k, Q.bk[k].n, Q.bk[k].r, lmin[k] * Q.cs, cert ? " (certified)" : "");
         }
-        if (rc == 0 && all) {
+        if (homk > 0 && hom == 0 && round == 0 && !all && rc <= 1) {   /* the homotopy's start */
+            Dh = iz(sizeof(double *) * (Q.K + 1)); for (int k = 0; k < Q.K; k++) Dh[k] = iz(sizeof(double) * (Q.bk[k].n + 1));
+            g_hom_dout = Dh; (void)ip_lower_bound(&Q, lam, tol, nC1, -1); g_hom_dout = NULL;
+            double tot = 0;
+            for (int k = 0; k < Q.K; k++) { IBlk *B = &Q.bk[k];
+                for (int p = 0; p < B->np; p++) if (B->pj[p] == B->pk[p]) { const int j = B->pj[p]; Dh[k][j] *= homk; Q.cE[Q.poff[k] + p] += Dh[k][j];
+                    double xjj = 0; for (int c = 0; c < B->r; c++) xjj += B->R[(size_t)j * B->r + c] * B->R[(size_t)j * B->r + c]; tot += Dh[k][j] * xjj; } }
+            hom = 1; homstep = 0;
+            if (verbose >= 0) printf("bm2: homotopy: kappa %.2g, the shift's value at this point %.4e; down to 0 in %d steps\n", homk, tot * Q.cs, homn);
+            for (int k = 0; k < Q.K; k++) free(vv[k]);
+            free(vv); continue;
+        }
+        if (hom == 1 && rc == 0 && all) {   /* certified for the shifted problem: the next step */
+            homstep++;
+            for (int k = 0; k < Q.K; k++) { IBlk *B = &Q.bk[k];
+                for (int p = 0; p < B->np; p++) if (B->pj[p] == B->pk[p]) Q.cE[Q.poff[k] + p] -= Dh[k][B->pj[p]] / homn; }
+            if (homstep == homn) hom = 2;
+            if (verbose >= 0) printf("bm2: homotopy: step %d of %d (shift factor %.2f)\n", homstep, homn, 1.0 - (double)homstep / homn);
+            for (int k = 0; k < Q.K; k++) free(vv[k]);
+            free(vv); continue;
+        }
+        if (hom == 1) ;   /* not certified for the shifted problem: no bound (it is not the problem's), the rank is raised below */
+        else if (rc == 0 && all) {
             status = 0;
             /* certified: what is left of the gap is the barrier's, sum x_j z_j (about nl mu, mu = tol / 10 per pair);
              * when it exceeds tol, one more round at this rank with mu down to the gap. Not in every round: from such
@@ -2181,16 +2314,16 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
             if (verbose >= 0) printf("bm2: lower bound %.10e, primal value %.10e, gap %.1e\n", Lr, pr, gr);
             if (gr <= tol && !getenv("BRISK_BM2NOGAPSTOP")) { status = 4; if (verbose >= 0) printf("bm2: the gap to the lower bound is within the tolerance\n"); }
         }
-        if (status == 4) ;
+        if (status == 4 && hom != 1) ;
         else if (rc == 0 || rc == 1) {
             /* a column for every clearly negative eigenvalue (at most three a round; a tenth of the most negative one or
              * below), by subspace inverse iteration (one along lambda_min's vector if that finds none); the new columns
              * enter along the escape curve (ip_escape), else small */
             double **Vn = iz(sizeof(double *) * (Q.K + 1)); int *qn = iz(sizeof(int) * (Q.K + 1));
-            for (int k = 0; k < Q.K; k++) if (lmin[k] < -eps && Q.bk[k].r < rmax && Q.bk[k].r < Q.bk[k].n) {
+            for (int k = 0; k < Q.K; k++) if (lmin[k] < -epsk[k] && Q.bk[k].r < rmax && Q.bk[k].r < Q.bk[k].n) {
                 IBlk *B = &Q.bk[k]; const int kk = getenv("BRISK_BM2ONECOL") ? 1 : 3, n = B->n;
                 double vals[3]; double *vecs = ix(sizeof(double) * ((size_t)n * 3 + 1));
-                const int nneg = kk > 1 ? block_negvecs(B, vE + Q.poff[k], lmin[k], eps, kk, vals, vecs) : 0;
+                const int nneg = kk > 1 ? block_negvecs(B, vE + Q.poff[k], lmin[k], epsk[k], kk, vals, vecs) : 0;
                 Vn[k] = ix(sizeof(double) * ((size_t)n * 3 + 1));
                 for (int a = 0; a < nneg && B->r + qn[k] < rmax && B->r + qn[k] < n; a++) if (vals[a] <= 0.1 * vals[0]) { memcpy(Vn[k] + (size_t)qn[k] * n, vecs + (size_t)a * n, sizeof(double) * n); qn[k]++; }
                 if (!qn[k]) { memcpy(Vn[k], vv[k], sizeof(double) * n); qn[k] = 1; }
@@ -2214,6 +2347,7 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
             if (grow) {
                 const int esc = getenv("BRISK_BM2ESC") && ip_escape(&Q, xl, lam, Vn, qn, verbose >= 1 ? (getenv("BRISK_BM2V") ? 2 : 1) : 0);   /* (experiment: off) */
                 const double ncs = getenv("BRISK_BM2NEWCOL") ? atof(getenv("BRISK_BM2NEWCOL")) : 1e-2;
+                const double fwth = getenv("BRISK_BM2FW") ? atof(getenv("BRISK_BM2FW")) : 0.0;
                 const double spe = getenv("BRISK_BM2SPARSECOL") ? atof(getenv("BRISK_BM2SPARSECOL")) : 0;   /* experiment */
                 if (!esc) for (int k = 0; k < Q.K; k++) for (int c = 0; c < qn[k]; c++) {
                     const int n = Q.bk[k].n; const double *v = Vn[k] + (size_t)c * n;
@@ -2226,7 +2360,15 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
                         if (verbose >= 0) printf("bm2: block %d: new column on %d of %d rows\n", k, nk, n);
                         free(a2);
                     }
-                    ip_addcol_on(&Q.bk[k], v, ncs, keep); free(keep);
+                    if (fwth > 0 && Q.bk[k].fixrow < 0) {   /* experiment: X <- (1 - theta) X + theta t v v' (t = tr X), shared by the new columns */
+                        IBlk *B = &Q.bk[k]; const int r = B->r; double tr = 0, c0 = 0, vi = 0;
+                        if (c == 0) for (size_t q = 0; q < (size_t)B->n * r; q++) B->R[q] *= sqrt(1 - fwth);
+                        for (size_t q = 0; q < (size_t)B->n * r; q++) tr += B->R[q] * B->R[q];
+                        tr /= 1 - fwth;
+                        for (int j = 0; j < n; j++) { c0 = fmax(c0, fabs(B->R[(size_t)j * r])); vi = fmax(vi, fabs(v[j])); }
+                        ip_addcol_on(B, v, c0 > 0 ? sqrt(fwth * tr / qn[k]) * vi / c0 : ncs, keep);
+                    } else ip_addcol_on(&Q.bk[k], v, ncs, keep);
+                    free(keep);
                 }
             }
             for (int k = 0; k < Q.K; k++) free(Vn[k]);
@@ -2240,6 +2382,14 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
         ip_number(&Q);
         mu = fmin(mu, 1e-6);
         for (int j = 0; j < Q.nl; j++) { xl[j] = fmax(xl[j], 1e-9); z[j] = fmax(z[j], 1e-9); }
+    }
+    free(gtr); free(epsk);
+    if (Dh) {   /* the homotopy: the objective as read again (the shift left when the run ended within it) */
+        if (hom == 1) for (int k = 0; k < Q.K; k++) { IBlk *B = &Q.bk[k];
+            for (int p = 0; p < B->np; p++) if (B->pj[p] == B->pk[p]) Q.cE[Q.poff[k] + p] -= Dh[k][B->pj[p]] * (1.0 - (double)homstep / homn); }
+        if (hom == 1) { ip_svals(&Q, lam, vE); for (int k = 0; k < Q.K; k++) { int c_; lmin[k] = block_lmin(&Q.bk[k], vE + Q.poff[k], tol * (1 + nC1) / Q.cs, NULL, &c_); } }
+        for (int k = 0; k < Q.K; k++) free(Dh[k]);
+        free(Dh);
     }
     /* measures on the problem as read (the reduced problem has the file's rows minus the dropped ones) */
     double *u = ix(sizeof(double) * (Q.E + 1)), *g = ix(sizeof(double) * (m + 1)); double f;
