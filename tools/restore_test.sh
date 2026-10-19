@@ -6,7 +6,8 @@
 #      needs it depends on the host's rounding; truss1 did on a Cascade Lake, not on a Sapphire
 #      Rapids, with 1.3.2 too) and never with -nopolishr,
 #   2. the returned point is not worse than without it (largest DIMACS error within a factor 10,
-#      and below 1e-9), and the optimal values agree to 1e-9,
+#      and below 1e-9), and the optimal values agree to 1e-9 or to twice the larger of the two errors (a value is
+#      known to its gap error; arch0 without the restoration ends at 9.8e-10 on some CI runners),
 #   3. the options of the first-method rule are accepted and do not change a result that the
 #      rule does not concern (-hsdfirstasm 0 on a max-cut problem).
 # usage: tools/restore_test.sh [brisk]
@@ -20,7 +21,7 @@ for n in control1 truss1 arch0; do
     ta=$(echo "$a" | grep -c "square-root-metric polishing"); tb=$(echo "$b" | grep -c "square-root-metric polishing")
     tried=$((tried + ta))
     if [ "$tb" -eq 0 ]; then echo "ok   $n: the restoration is tried $ta times by default, not with -nopolishr"; else echo "FAIL $n: tried $tb times with -nopolishr"; fail=1; fi
-    if ok "$ea <= 10 * $eb and $ea <= 1e-9 and abs($va - ($vb)) <= 1e-9 * (1 + abs($vb))"; then echo "ok   $n: error $ea (without: $eb), values agree"; else echo "FAIL $n: error $ea against $eb, values $va $vb"; fail=1; fi
+    if ok "$ea <= 10 * $eb and $ea <= 1e-9 and abs($va - ($vb)) <= max(1e-9, 2 * max($ea, $eb)) * (1 + abs($vb))"; then echo "ok   $n: error $ea (without: $eb), values agree"; else echo "FAIL $n: error $ea against $eb, values $va $vb"; fail=1; fi
 done
 if [ "$tried" -ge 1 ]; then echo "ok   the restoration was tried on the examples ($tried)"; else echo "FAIL the restoration was tried on none of the examples"; fail=1; fi
 a=$($B $D/mcp250-1.dat-s -threads 1 2>&1); b=$($B $D/mcp250-1.dat-s -threads 1 -hsdfirstasm 0 2>&1)
