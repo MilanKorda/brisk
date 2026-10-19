@@ -15,6 +15,9 @@ jobs:
       - name: Examples
         run: |
           for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat; do
+            # pop_wood_20 ends with reduced accuracy by design (the facial reduction's duals cannot be
+            # rebuilt; the log says so and how to solve without it): make frtest checks that outcome
+            [ "$f" = examples/pop_wood_20.dat-s ] && continue
             ./brisk "$f" -q || { echo "$f failed"; exit 1; }
           done
       - name: High-precision reductions and bound threads
