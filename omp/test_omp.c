@@ -79,7 +79,9 @@ static int dep_test(int T, int K, unsigned seed) {
                 { dep_spin(w); dep_check(&ver[a], ea); dep_check(&ver[b], eb); dep_write(&ver[c], ec); }
             } else {                               /* readers only */
                 const int ea = sim[a], eb = sim[b];
-                #pragma omp task depend(in: tok[a], tok[b]) firstprivate(a, b, ea, eb, w)
+                /* every fifth reader undeferred (if(0)): it waits for its dependences first (clang's
+                 * __kmpc_omp_taskwait_deps_51; the sparse factor's task graph with if(par)) */
+                #pragma omp task if(t % 5 != 0) depend(in: tok[a], tok[b]) firstprivate(a, b, ea, eb, w)
                 { dep_spin(w); dep_check(&ver[a], ea); dep_check(&ver[b], eb); }
             }
             if (t % 997 == 996) {                  /* a taskwait in the middle: the table restarts */

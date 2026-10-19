@@ -90,7 +90,12 @@ static int as_refine(ASearch *A, int *col) {
         /* 5.16 (ISSUES 95): the refinement counts against the budget like the search (it ran outside it:
          * 2 x 2.3 s on a sparse POP with a budget of 0.21 s), and the initial refinement stops as soon as
          * its classes rule out the gain asked for (automorphisms preserve the classes of every round) */
-        const double wround = (double)A->adjp[N] + N * (log2((double)N + 2.0) + 4.0);   /* the items hashed, the sort */
+        /* 5.18: an item costs twice as much when the entry arrays (about 24 bytes an entry) do not fit in the last-level
+         * cache (32 MB): G48_mb, whose dense row <J, X> = 0 has 4.5 million entries, ran at 7.5e7 items a second against
+         * the calibrated 1.25e8, and its 20 s budget took 33 s (69 s on a slower machine); BRISK_SYMMEM=0 off */
+        static int symmem = -1; if (symmem < 0) { const char *e = getenv("BRISK_SYMMEM"); symmem = e ? atoi(e) : 1; }
+        const double fmem = symmem && 24.0 * (double)A->ne > 32.0 * 1048576.0 ? 2.0 : 1.0;
+        const double wround = fmem * (double)A->adjp[N] + N * (log2((double)N + 2.0) + 4.0);   /* the items hashed, the sort */
         /* (inside the search as well: a node's refinement on 3,000 indices of one class took 20 s on G48_mb and
          * four nodes 79 s against a budget of 20 s; a refinement cut short gives a coarser leaf, whose candidate
          * is verified on the data like any other; the first round always, the gain test needs its classes) */
@@ -148,7 +153,7 @@ static int as_target(const ASearch *A, const int *col, int *cell) {
     return n;
 }
 static uint64_t as_cert(const ASearch *A, const int *col) {
-    ((ASearch *)A)->work += 2.0 * (double)A->ne;
+    ((ASearch *)A)->work += (24.0 * (double)A->ne > 32.0 * 1048576.0 && !(getenv("BRISK_SYMMEM") && atoi(getenv("BRISK_SYMMEM")) == 0) ? 4.0 : 2.0) * (double)A->ne;
     uint64_t *hk = sx(sizeof(uint64_t) * A->ne);
     for (size_t e = 0; e < A->ne; e++) {
         uint64_t pa = col[A->ea[e]], pb = col[A->eb[e]], pc = A->ec[e] >= 0 ? (uint64_t)col[A->ec[e]] : 0xfffffffull;
@@ -673,6 +678,14 @@ static const char *bd_block(int k, int n, int nh, int **hg, signed char **hs, BD
                 if (!puf_union(&U2, a + b2 * s, ga + gb * s, sa ^ sb)) z2[a + b2 * s] = 1; } }
             for (size_t p = 0; p < ss; p++) if (z2[p]) { int pr; z2[puf_find(&U2, (int)p, &pr)] = 2; }
         }
+        /* 17 October 2026: the commutant of the orbit has dimension r (its orbitals that carry a value) >= sum m_i^2
+         * >= sum m_i over the irreducibles of multiplicity m_i and dimension d_i, and s = sum m_i d_i <= d_max r: an
+         * orbit with s > SYM_BDMAXD r has an irreducible above the limit, known without the eigendecompositions
+         * below (hamming_9_8: one orbit of 512 indices, 10 orbitals, so d_max >= 52; 1.5 s of attempts saved) */
+        {   size_t r = 0;
+            for (size_t p = 0; p < ss; p++) if (par2[p] == (int)p && z2[p] != 2) r++;
+            if ((size_t)s > (size_t)SYM_BDMAXD * r) { why = "an irreducible representation is too large"; break; }
+        }
         int attempt, ok = 0;
         const int ncp0 = *ncp, ntype0 = ntype;
         for (attempt = 0; attempt < 4 && !ok; attempt++) {
@@ -687,6 +700,13 @@ static const char *bd_block(int k, int n, int nh, int **hg, signed char **hs, BD
             if (info) break;
             double lmax = 0; for (int a = 0; a < s; a++) if (fabs(lam[a]) > lmax) lmax = fabs(lam[a]);
             const double gap = 1e-7 * (1 + lmax);
+            /* 17 October 2026: an eigenvalue cluster above the limit ends the attempts at once, before the
+             * intertwiner tests of the clusters below it (singular value decompositions of 18 d^2 x d^2 there): the
+             * basis is not applied whatever a later attempt finds (hamming_9_8: four attempts, 1.3 s) */
+            {   int big = 0;
+                for (int j0 = 0; j0 < s && !big; ) { int j1 = j0 + 1; while (j1 < s && lam[j1] - lam[j1 - 1] <= gap) j1++; big = j1 - j0 > SYM_BDMAXD; j0 = j1; }
+                if (big) { why = "an irreducible representation is too large"; break; }
+            }
             ok = 1;
             for (int j0 = 0; j0 < s && ok; ) {
                 int j1 = j0 + 1; while (j1 < s && lam[j1] - lam[j1 - 1] <= gap) j1++;
@@ -1005,7 +1025,20 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
         double est = (double)m * m * m / 3.0, sp = m;
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) sp += (double)P->blk[k].ncon * P->blk[k].ncon;
         if (pow(sp, 1.5) < est) est = pow(sp, 1.5);     /* a sparse Schur complement (many small blocks) factors for about nnz^1.5 */
+        {   /* 5.18: ... or for what its symbolic analysis says, when that is less (a chain of blocks
+             * fills linearly; BRISK_SYMEST=0: the nnz^1.5 estimate alone) */
+            static int se = -1; if (se < 0) { const char *e = getenv("BRISK_SYMEST"); se = e ? atoi(e) : 1; }
+            extern double schur_sparse_cost(const Problem *P, double cap);
+            if (se && m >= 200) {
+                const double c = schur_sparse_cost(P, est);
+                if (c > 0 && c < est) est = c;
+            }
+        }
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) est += 20.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
+        /* 5.18: and a fixed cost per semidefinite block (the step lengths, factorizations and
+         * products of a small block cost about 30 us an iteration whatever its flops: 998 blocks of
+         * 10 spend 0.4 s of a 1.0 s solve there), in the units above */
+        if (getenv("BRISK_SYMEST") == NULL || atoi(getenv("BRISK_SYMEST")) != 0) { int nbs = 0; for (int k = 0; k < nb; k++) nbs += P->blk[k].type == BLK_SDP; est += 4e5 * nbs; }
         est /= 1e9;
         const double est_full = est;
         if (g_sym_est_cap > 0 && est > g_sym_est_cap) est = g_sym_est_cap;   /* 5.7: the matrix-free method was asked for (main.c) */
@@ -1654,7 +1687,10 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
             problem_free(P); *P = Q;
             if (verbose >= 0) {
                 printf("presolve: sign symmetry: %d generator(s), %d -> %d constraints, blocks", ngen, m, mk);
-                for (int k = 0; k < nb; k++) { if (S->bs[k] < 0) continue; printf(" %d ->", S->bs[k]); int c1 = 0; for (int q = bcls0[k]; q < (k + 1 < nb ? bcls0[k + 1] : ncls); q++) { if (S->csz[q] >= 2) printf(" %d", S->csz[q]); else c1++; } if (c1) printf(" %dx1", c1); printf(k + 1 < nb && S->bs[k + 1] > 0 ? "," : ""); }
+                /* 5.18: the first eight blocks, then the count (a chain of 500 small blocks printed 500 entries) */
+                int npr = 0, nsk = 0;
+                for (int k = 0; k < nb; k++) { if (S->bs[k] < 0) continue; if (npr == 8) { nsk++; continue; } npr++; printf(" %d ->", S->bs[k]); int c1 = 0; for (int q = bcls0[k]; q < (k + 1 < nb ? bcls0[k + 1] : ncls); q++) { if (S->csz[q] >= 2) printf(" %d", S->csz[q]); else c1++; } if (c1) printf(" %dx1", c1); printf(k + 1 < nb && S->bs[k + 1] > 0 ? "," : ""); }
+                if (nsk) printf(" ... (%d more block(s))", nsk);
                 printf("%s\n", n1 ? " (1 x 1 pieces are LP variables)" : "");
             }
             free(newc); free(tc); free(tb); free(ti); free(tj); free(tv); free(bsz); free(bn);

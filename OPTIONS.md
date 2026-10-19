@@ -63,7 +63,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `cliquemax`, `chordalmin` | largest clique accepted; smallest block tried | 160; 100 |
 | `sym` | exact symmetry reduction: `auto` (sign symmetries and permutation automorphisms found and used), `none`, or a file of generators | `auto` |
 | `symmin` | apply the reduction only when it shrinks the problem by this factor: the constraints, Σn³ of the blocks, or (at most 4 SDP blocks, m ≤ 20,000) the estimated work m³/3 + 30 Σn³ | 1.5 |
-| `symtime`, `symnodes` | caps of the automatic search (the time counted in operations, not on the clock) | 20 s, 500 nodes |
+| `symtime`, `symnodes` | the automatic search's budget: at least `symtime` and 1 % of the expected solve (up to 900 s), at most 15 % of it, counted in operations, not on the clock; the node cap | 20 s, 500 nodes |
 | `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra. | −1 |
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
 | `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
@@ -86,7 +86,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off | 0.2 |
 | `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
-| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
+| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block and each LP variable is in one constraint at most); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
 | `bm` | the Burer-Monteiro solver (X = R Rᵀ, nothing of size n² formed): `1` always, `0` never, `-1` automatically for one block of order n ≥ 500 whose constraints fix its diagonal (max-cut and its relatives; stopped on a certified bound, the interior-point method if it misses), or for one block whose constraints each fix one entry (matrix completion) when the dense Schur complement does not fit in memory (the first-order engine if it misses) | -1 |
 | `blkscale` | diagonal congruence scaling of the semidefinite blocks (X = D X' D, D from the data): `1` on, `-1` when a block's factors spread by 4 or more, `0` off | 0 |
@@ -302,9 +302,10 @@ presolve
                    blocks) solved as second-order cones in the self-dual embedding (1)
   -socmin <n>      ... blocks of at least this order (3)
   -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance
-  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: the re-solve without facial
-                   reduction may take this multiple of the solve's time, else the reduced solve is returned
-                   with status SOLVED TO REDUCED ACCURACY and the dual flagged (4; 0 = no re-solve)
+  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: with f > 0 the problem is solved again
+                   without facial reduction, within f times the solve's time (0, the default: no re-solve; the reduced
+                   solve is returned as SOLVED TO REDUCED ACCURACY, the log says that the recovery failed, what is
+                   correct, and how to solve again without the reduction for the dual)
   -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated
                    without the reduction, within this multiple of the solve's time (4; 0 = never)
   -freeelim <k>    eliminate split free-variable pairs by pivoting: -1 auto (kernel-form SOS
@@ -323,7 +324,8 @@ presolve
   -mftry <k>       the matrix-free method first, automatically (1; 0 off): on problems with one
                    to four dense blocks of order >= 100 whose Schur factorization is
                    estimated at 3.5 times a matrix-free solve or more (at least equal when
-                   every constraint has an entry in an LP block), and that the presolve
+                   every constraint has an entry in an LP block and each LP variable is in
+                   one constraint at most: a diagonal LP part), and that the presolve
                    leaves unchanged; not on moment relaxations (see -hsddir). The attempt
                    ends when a solve away from the
                    optimum needs more CG steps than a sixth of a Schur factorization costs,
@@ -380,8 +382,8 @@ presolve
   -fomtol <t>      ... stopping tolerance on the residuals (max(tol, 1e-6))
   -fomsigma <s>    ... fixed penalty parameter (0: adaptive)
   -fomsigma0 <s>   ... starting penalty when adaptive (1); -fomaasafe <f>: an Anderson step
-                   is rejected when its residual exceeds f times the last (1; 2 on the
-                   degenerate moment relaxations); -fomaa <k>: Anderson memory (25, up to 32,
+                   is rejected when its residual exceeds f times the last (2); -fomaa <k>:
+                   Anderson memory (25, up to 32,
                    capped by a 1.5 GB history budget); -fomaadr <k>: the acceleration on the
                    Douglas-Rachford variable X/sigma + A*y - C, step 1 (1), or on (X, Z), step 1.618 (0)
   -sym auto|none|<file>  exact symmetry reduction (default auto): sign symmetries and
@@ -389,8 +391,9 @@ presolve
                    the orbits and the blocks split by irreducible representation; the point is
                    mapped back to the file. <file>: generators as index permutations (line 1: SDP
                    block sizes; one per line, global 0-based SDP indices). -nosym = -sym none
-  -symtime <s>, -symnodes <k>   caps of the automatic search (20 s, counted in operations, not
-                   on the clock; 500 nodes); an incomplete search only reduces less, never wrongly
+  -symtime <s>, -symnodes <k>   the automatic search's budget: at least s (20 s) and 1 % of the
+                   expected solve up to 900 s, at most 15 % of it; counted in operations, not on the
+                   clock; 500 nodes; an incomplete search only reduces less, never wrongly
   -symbd <k>       ... symmetry-adapted basis: the blocks split into one block per irreducible
                    representation (1 on, 0 off)
   -symsign <k>     ... -sym auto: sign symmetries (D A D = ±A, D diagonal ±1) first: blocks split by
@@ -433,7 +436,8 @@ Schur complement and linear algebra
                    cores). Tiny problems use one thread; on Linux the interior-point solve
                    uses fewer while other processes occupy its cores (at the start, and when its
                    threads wait for cores) and more again when they are free (BRISK_NOBUSY=1:
-                   exactly k)
+                   exactly k). The LP method runs its factorizations on them; the cone solver
+                   runs on one thread
   -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on
   -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)
   -densemem <MB>   memory for dense constraint copies (768)

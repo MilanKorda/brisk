@@ -902,13 +902,58 @@ static double iter_cost_keep(const Problem *P, double *sp_flops, double budget, 
     g_keep_on = 0;
     return c;
 }
-/* 4.22: fill limit of the Schur factor, ~64 bytes per entry (panel, assembled copy, hash):
- * 6e7 is ~3.8 GB (2e7 rejected every AC-OPF case from 6468 buses up) */
-double g_fillmax = 6e7;
+/* 4.22: fill limit of the Schur factor, the factor at about half the memory: 6e7 per 8 GB at ~64 bytes per entry
+ * (2e7 rejected every AC-OPF case from 6468 buses up); 18 October 2026: 1e8 per 8 GB at the ~35-40 bytes measured
+ * since the offset tables and the trim (IMPLEMENTATION 10.2) */
+double g_fillmax = 1e8;
 static double g_ic_t0;
+static double iter_cost_raw(const Problem *P, double *sp_flops, double budget, int *complete);
+/* 17 October 2026: the estimate of a pattern is computed once. The symmetry search's budget (schur_sparse_cost)
+ * and the chordal decision (the problem as it stands) asked for the same symbolic analysis of the same Schur pattern
+ * one after the other (broyden25: 3.3 s each). The memo is keyed by the pattern (m, the blocks' constraint lists,
+ * the LP rows), holds an estimate that ran to its end, and answers a query whose budget it fits (a query with a
+ * smaller budget could have stopped early, and is computed). The kept analyses of the conversion's candidates
+ * are not memoized. BRISK_ICMEMO=0 off. */
+static uint64_t g_icm_key = 0; static double g_icm_c = 0, g_icm_spf = 0; static int g_icm_ok = 0;
+/* 17 October 2026: the symbolic analysis of the last memoized estimate, with the key of the adjacency lists it was
+ * made from, for the solver's analysis of the same pattern (chordal_take_estimate): broyden25's two analyses were
+ * 3.7 s each at one thread. Taken once; dropped by the next estimate. */
+static SChol *g_icm_sc = NULL; static uint64_t g_icm_adj = 0; static int g_icm_scm = -1;
+static int g_ic_memo = 0;   /* (the estimate in progress is memoized) */
+static uint64_t pattern_key(const Problem *P) {
+    uint64_t h = 1469598103934665603ull;
+    #define HK(x) do { h ^= (uint64_t)(x) + 0x9E3779B97F4A7C15ull; h *= 1099511628211ull; } while (0)
+    HK(P->m); HK(P->nblk);
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        HK(B->type); HK(B->n); HK(B->ncon);
+        for (int t = 0; t < B->ncon; t++) {
+            HK(B->con[t]);
+            if (B->type == BLK_LP) for (int q = 0; q < B->A[t].nnz; q++) HK(B->A[t].row[q]);
+        }
+    }
+    #undef HK
+    return h;
+}
 static double iter_cost(const Problem *P, double *sp_flops, double budget) {
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_ICMEMO"); on = e ? atoi(e) : 1; }
+    if (!on || g_keep_on) return iter_cost_raw(P, sp_flops, budget, NULL);
+    const uint64_t key = pattern_key(P);
+    if (g_icm_ok && key == g_icm_key && (budget <= 0 || g_icm_c <= budget)) {
+        if (sp_flops) *sp_flops = g_icm_spf;
+        return g_icm_c;
+    }
+    double spf = -1; int complete = 0;
+    g_ic_memo = 1;
+    const double c = iter_cost_raw(P, &spf, budget, &complete);
+    g_ic_memo = 0;
+    if (sp_flops) *sp_flops = spf;
+    if (complete) { g_icm_ok = 1; g_icm_key = key; g_icm_c = c; g_icm_spf = spf; }
+    return c;
+}
+static double iter_cost_raw(const Problem *P, double *sp_flops, double budget, int *complete) {
     g_ic_t0 = wtime();
-    { const char *e = getenv("BRISK_FILLMAX"); g_fillmax = e ? atof(e) : 6e7 * brisk_mem_scale(); }   /* 5.7: 6e7 per 8 GB */
+    { const char *e = getenv("BRISK_FILLMAX"); g_fillmax = e ? atof(e) : 1e8 * brisk_mem_scale(); }   /* 5.7: per 8 GB (6e7 until 18 October 2026) */
     const int m = P->m;
     double dense = 0;
     for (int k = 0; k < P->nblk; k++) {
@@ -1067,7 +1112,12 @@ static double iter_cost(const Problem *P, double *sp_flops, double budget) {
         double fcap = (double)m * m * m / 3.0 * 0.5;
         if (budget > 0 && budget / 3.0 < fcap) fcap = budget / 3.0;
         schol_set_flopcap(fcap);
-        SChol *SC = schol_analyze_adj(m, deg, nbr, cap);
+        /* (the estimate needs the symbolic analysis alone; a kept one, the pattern of M too) */
+        static int peo_on = -1; if (peo_on < 0) { const char *e = getenv("BRISK_PEO"); peo_on = e && atoi(e) != 0; }   /* 19 October 2026: off by default (BRISK_PEO=1 on): two statuses lost on ill-conditioned chordal files for 3 % on broyden25 */
+        const int peo_prev = schol_set_peo(peo_on);     /* (as the solve's analysis of the Schur pattern: sparse_build) */
+        SChol *SC = g_keep_on ? schol_analyze_adj(m, deg, nbr, cap) : schol_analyze_sym(m, deg, nbr, cap);
+        schol_set_peo(peo_prev);
+        if (SC && schol_peo_used() && getenv("BRISK_ICDBG")) printf("   [iter_cost: the pattern is chordal: perfect elimination ordering]\n");
         schol_set_flopcap(0);
         if (getenv("BRISK_ICDBG")) printf("   [iter_cost: analysis %s at %.3fs (flop cap %.1e)]\n", SC ? "done" : "stopped", wtime() - g_ic_t0, fcap);
         if (!SC && budget > 0 && budget / 3.0 < (double)m * m * m / 6.0) {     /* over the budget: not a candidate */
@@ -1080,6 +1130,7 @@ static double iter_cost(const Problem *P, double *sp_flops, double budget) {
             sched = 3.0 * schol_flops(SC) + 200.0 * (double)schol_nnz(SC);
             if (sp_flops) *sp_flops = schol_flops(SC);
             if (g_keep_on) { schol_free(g_keep_sc); g_keep_sc = SC; }
+            else if (g_ic_memo) { schol_free(g_icm_sc); g_icm_sc = SC; g_icm_scm = m; g_icm_adj = schol_adj_key(m, deg, nbr); }
             else schol_free(SC);
         }
         free(deg); free(nbr);
@@ -1087,7 +1138,29 @@ static double iter_cost(const Problem *P, double *sp_flops, double budget) {
     if (sched == 0) { sched = (double)m * m * m / 3.0 + 20.0 * (double)m * m; if (sp_flops) *sp_flops = -1; }
     for (int i = 0; i < m; i++) free(ad[i].a);
     free(ad); free(mark); free(lst);
+    if (complete) *complete = 1;
     return dense + sched;
+}
+
+/* 5.18: the per-iteration cost of the sparse Schur factorization of P as it stands (3 x the
+ * factor's flops plus 200 per factor entry, as in iter_cost), from the symbolic analysis of its
+ * pattern; -1 when the pattern is not sparse or the analysis would cost more than cap flops. The
+ * symmetry search's budget is a share of the expected solve, and the estimate it had for a sparse
+ * Schur complement, nnz^1.5 of the pattern, is that of a two-dimensional grid: on a chain of
+ * small blocks (the chained sparse SOS relaxations) the fill is linear and the estimate was ten
+ * to seventy times the solve, the budget spent in the refinement for nothing. */
+double schur_sparse_cost(const Problem *P, double cap) {
+    double spf = -1;
+    double dense = 0;
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_SDP) continue;
+        const double n3 = (double)B->n * B->n * B->n;
+        dense += B->n >= 64 ? 4.0 * n3 : 20.0 * n3;
+    }
+    const double c = iter_cost(P, &spf, cap > 0 ? dense + cap : 0);
+    if (!(spf > 0) || !(c < 1e299)) return -1;
+    return c - dense;
 }
 
 /* Chordal conversion with the choice made on the estimated iteration cost: the support-
@@ -1624,6 +1697,16 @@ int chordal_convert(Problem *P, const Params *par, int verbose) {
 static SChol *g_cache_sc = NULL;
 static int g_cache_m = -1;
 void chordal_keep_analysis(SChol *S, int m) { schol_free(g_cache_sc); g_cache_sc = S; g_cache_m = S ? m : -1; }
+/* the estimate's analysis when it was made from these very adjacency lists and is the one the caps (fillcap,
+ * flopcap) give (schol_analysis_fits), with the pattern of M attached; NULL otherwise. Taken or dropped. */
+SChol *chordal_take_estimate(int m, int *deg, int **nbr, size_t fillcap, double flopcap) {
+    SChol *S = g_icm_sc;
+    g_icm_sc = NULL;
+    if (getenv("BRISK_ICDBG")) printf("   [take estimate: kept %d, m %d/%d, fits %d, key %d]\n", S != NULL, g_icm_scm, m, S ? schol_analysis_fits(S, fillcap, flopcap) : -1, S ? schol_adj_key(m, deg, nbr) == g_icm_adj : -1);
+    if (S && (g_icm_scm != m || !schol_analysis_fits(S, fillcap, flopcap) || schol_adj_key(m, deg, nbr) != g_icm_adj)) { schol_free(S); S = NULL; }
+    if (S) schol_attach_pattern(S, deg, nbr);
+    return S;
+}
 SChol *chordal_take_analysis(int m, size_t patnnz) {
     SChol *S = NULL;
     if (g_cache_sc && g_cache_m == m && schol_mpat_nnz(g_cache_sc) == patnnz) S = g_cache_sc;

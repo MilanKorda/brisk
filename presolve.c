@@ -391,22 +391,41 @@ static int find_part(const Block *B, int i) {
     return -1;
 }
 
-static void remove_constraint(Problem *P, int i) {
-    for (int k = 0; k < P->nblk; k++) {
-        Block *B = &P->blk[k];
+/* 5.18: the parts of constraint i in the blocks blks[0..nb) taken out, and the parts those
+ * blocks' reduction left empty dropped: the constraint numbering is kept until the end of the
+ * sweep (compact_removed). Until 5.17 every reduction removed the constraint from every block
+ * and pruned the empty parts of all blocks, walking every part of every block and shifted b, b0, orig: (reductions x parts) work, 2.8 s
+ * of a 4 s run on a chained-Wood SOS relaxation with 1,000 variables (16,972 reductions). */
+static void remove_parts_of(Problem *P, int i, const int *parts, int np) {
+    for (int q = 0; q < np; q++) {
+        Block *B = &P->blk[parts[2 * q]];
         int w = 0;
         for (int t = 0; t < B->ncon; t++) {
-            if (B->con[t] == i) { sp_release(&B->A[t]); continue; }
-            B->A[w] = B->A[t];
-            B->con[w] = B->con[t] > i ? B->con[t] - 1 : B->con[t];
-            w++;
+            if (B->con[t] == i || B->A[t].nnz == 0) { sp_release(&B->A[t]); continue; }
+            B->A[w] = B->A[t]; B->con[w] = B->con[t]; w++;
         }
         B->ncon = w;
     }
-    memmove(P->b + i, P->b + i + 1, sizeof(double) * (P->m - i - 1));
-    memmove(P->b0 + i, P->b0 + i + 1, sizeof(double) * (P->m - i - 1));
-    memmove(P->orig + i, P->orig + i + 1, sizeof(int) * (P->m - i - 1));
-    P->m--;
+}
+/* the constraints marked dead[] removed at once: the others renumbered in order (the con lists
+ * stay sorted), b, b0, orig and the levels clev compacted */
+static void compact_removed(Problem *P, const char *dead, int *clev) {
+    int *nw = malloc(sizeof(int) * (P->m + 1)), w = 0;
+    for (int i = 0; i < P->m; i++) {
+        nw[i] = dead[i] ? -1 : w;
+        if (!dead[i]) { P->b[w] = P->b[i]; P->b0[w] = P->b0[i]; P->orig[w] = P->orig[i]; clev[w] = clev[i]; w++; }
+    }
+    for (int k = 0; k < P->nblk; k++) {
+        Block *B = &P->blk[k];
+        int u = 0;
+        for (int t = 0; t < B->ncon; t++) {
+            if (nw[B->con[t]] < 0) { sp_release(&B->A[t]); continue; }
+            B->A[u] = B->A[t]; B->con[u] = nw[B->con[t]]; u++;
+        }
+        B->ncon = u;
+    }
+    P->m = w;
+    free(nw);
 }
 
 /* drop constraint parts that became empty */
@@ -436,6 +455,95 @@ static void fr_touch(const Block *B, const unsigned char *mask, int L, int *clev
     }
 }
 
+/* 5.17 (ISSUES 93): does the data couple the directions a reduction removes to the face it keeps?
+ * The recovery of the removed dual through the certificate needs the coupling g (the slack between
+ * the removed directions W and the face) in the range of the reduced slack Z_n; with no data entry
+ * between W and the face, g = 0 and the recovery always succeeds; with such entries it succeeds
+ * only when the reduced slack happens to be nonsingular on them (a moment matrix of finitely
+ * many atoms leaves Z_n singular, and the recovery fails). The test is on the block as it is at
+ * the reduction (its current coordinates), matrix by matrix, the removed constraint left out. */
+static int fr_coupled(const Block *B, int skip, int kind, const char *del, const double *a,
+                      const int *Sx, int sx, const double *Nx, int kx, const double *Ux) {
+    const int n = B->n;
+    if (kind == 2) return 0;                   /* an LP variable: its dual is free of the others */
+    double *v = NULL, *T = NULL, *Y = NULL; int *pos = NULL;
+    double amax = 0, aa = 0;
+    if (kind == 0) { v = malloc(sizeof(double) * n); for (int r = 0; r < n; r++) { amax = fmax(amax, fabs(a[r])); aa += a[r] * a[r]; } }
+    if (kind == 3) {
+        pos = malloc(sizeof(int) * n);
+        for (int i = 0; i < n; i++) pos[i] = -1;
+        for (int i = 0; i < sx; i++) pos[Sx[i]] = i;
+        T = malloc(sizeof(double) * ((size_t)sx * sx + 1)); Y = malloc(sizeof(double) * ((size_t)sx * sx + 1));
+    }
+    int coupled = 0;
+    for (int u = -1; u < B->ncon && !coupled; u++) {
+        if (u == skip) continue;
+        const SpSym *M = u < 0 ? &B->C : &B->A[u];
+        if (M->nnz == 0) continue;
+        if (kind == 1) {
+            for (int e = 0; e < M->nnz; e++) if (del[M->row[e]] != del[M->col[e]]) { coupled = 1; break; }
+        } else if (kind == 0) {
+            /* M a must be parallel to a (the removed direction is a; the face is its complement) */
+            double mmax = 0;
+            for (int r = 0; r < n; r++) v[r] = 0;
+            for (int q = 0; q < M->ef; q++) { v[M->fr[q]] += M->fv[q] * a[M->fc[q]]; mmax = fmax(mmax, fabs(M->fv[q])); }
+            double av = 0;
+            for (int r = 0; r < n; r++) av += a[r] * v[r];
+            const double c = aa > 0 ? av / aa : 0, tol = 1e-10 * mmax * amax * n;
+            for (int r = 0; r < n; r++) if (fabs(v[r] - c * a[r]) > tol) { coupled = 1; break; }
+        } else {
+            /* U' M V with V = [N on the support S; the identity off S]: an entry between S and its
+             * complement couples (U has full row rank on S); on S, Y = U' M_SS N must vanish */
+            double mmax = 0; int inS = 0;
+            for (size_t q = 0; q < (size_t)sx * sx; q++) T[q] = 0;
+            for (int e = 0; e < M->nnz; e++) {
+                const int r = M->row[e], cc = M->col[e];
+                const int pr = pos[r], pc = pos[cc];
+                mmax = fmax(mmax, fabs(M->val[e]));
+                if ((pr >= 0) != (pc >= 0)) { coupled = 1; break; }
+                if (pr >= 0) { T[pr + (size_t)pc * sx] += M->val[e]; if (pr != pc) T[pc + (size_t)pr * sx] += M->val[e]; inS = 1; }
+            }
+            if (coupled || !inS) continue;
+            const int kw = sx - kx;
+            if (kw <= 0 || kx <= 0) continue;
+            /* Y = (U' T) N */
+            for (int b = 0; b < kx; b++) for (int aw = 0; aw < kw; aw++) {
+                double s = 0;
+                for (int i = 0; i < sx; i++) { double ti = 0; for (int j = 0; j < sx; j++) ti += T[i + (size_t)j * sx] * Nx[j + (size_t)b * sx]; s += Ux[i + (size_t)aw * sx] * ti; }
+                if (fabs(s) > 1e-10 * mmax * sx) { coupled = 1; break; }
+            }
+        }
+    }
+    free(v); free(T); free(Y); free(pos);
+    return coupled;
+}
+
+/* 5.18: can the facial reduction remove anything? A reduction needs b_i = 0 and every part of constraint i
+ * semidefinite of one sign (an LP part: coefficients of one sign; semidef_quick is necessary for that), and a
+ * constraint that fails it can only become a candidate after some other reduction; so when no constraint passes,
+ * the facial reduction records nothing (unused indices aside) and the copy of the problem kept for undoing it
+ * (main.c) is not needed: 1 s on an A-optimal design file of 8 million entries. */
+int fr_has_candidate(const Problem *P) {
+    char *bad = calloc(P->m + 1, 1), *seen = calloc(P->m + 1, 1);
+    for (int i = 0; i < P->m; i++) if (P->b[i] != 0.0) bad[i] = 1;
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        for (int t = 0; t < B->ncon; t++) {
+            const int i = B->con[t];
+            if (bad[i]) continue;
+            const SpSym *S = &B->A[t];
+            seen[i] = 1;
+            if (S->nnz == 0) continue;
+            if (B->type == BLK_LP) { double sg; if (!samesign_diag(S, &sg)) bad[i] = 1; }
+            else if (!semidef_quick(S, B->n)) bad[i] = 1;
+        }
+    }
+    int any = 0;
+    for (int i = 0; i < P->m && !any; i++) if (!bad[i]) any = 1;     /* (an empty constraint with b = 0 counts) */
+    free(bad); free(seen);
+    return any;
+}
+
 int facial_reduction(Problem *P, int verbose) {
     int removed = 0, reduced_dims = 0;
     if (!P->orig) {                        /* read_sdpa normally sets the identity map */
@@ -454,7 +562,7 @@ int facial_reduction(Problem *P, int verbose) {
      * sweep continues with the next constraint; sweeps repeat until one finds nothing
      * (a reduction can make earlier constraints reducible). Restarting from the first
      * constraint after every reduction, as before, costs (reductions x m) tests.     */
-    int progress = 1, maxlev = 0;
+    int progress = 1, maxlev = 0, ncoupled = 0;
     int *clev = calloc(P->m + 1, sizeof(int));
     unsigned char *mask = calloc(maxn + 1, 1);
     prune_empty_parts(P);
@@ -473,14 +581,14 @@ int facial_reduction(Problem *P, int verbose) {
             for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) cbk[fp[P->blk[k].con[t]]++] = k;
             free(fp);
         }
-        const int m_sweep = P->m;
+        /* 5.18: the removed constraints keep their numbers until the end of the sweep */
+        char *dead = calloc(P->m + 1, 1);
+        int ndead = 0;
         for (int i = 0; i < P->m; i++) {
             if (P->b[i] != 0.0) continue;
             int np = 0, ok = 1;
             double sgn0 = 0;
-            /* constraints are removed in increasing order within a sweep, each shifting the
-             * later ones down by one: i is sweep-start constraint i + (removed so far) */
-            const int i0 = i + (m_sweep - P->m);
+            const int i0 = i;
             const int nk = cbp[i0 + 1] - cbp[i0];
             for (int kk = 0; kk < nk && ok; kk++) {
                 const int k = cbk[cbp[i0] + kk];
@@ -510,6 +618,7 @@ int facial_reduction(Problem *P, int verbose) {
             PSRecord *rec = g_ps_P ? ps_record_begin(P, P->orig[i], sgn0 != 0 ? sgn0 : 1.0) : NULL;
             const int L = clev[i] + 1;
             if (L > maxlev) maxlev = L;
+            int coupled = 0;
             for (int q = 0; q < np; q++) {
                 Block *B = &P->blk[parts[2 * q]];
                 int t = find_part(B, i);
@@ -540,12 +649,14 @@ int facial_reduction(Problem *P, int verbose) {
                         ps_record_part(P, rec, B, PS_RANK1, NULL, wv, p, NULL, 0, NULL, 0, NULL);
                         free(wv);
                     }
+                    coupled |= fr_coupled(B, t, 0, NULL, a, NULL, 0, NULL, 0, NULL);
                     block_rank1_reduce(B, a, p);
                     reduced_dims++;
                 } else if (parts[2 * q + 1] == 3) {
                     int *Sx = NULL, sx = 0, kx = 0; double *Nx = NULL, *Ux = NULL, sg;
                     if (psd_nullspace(&B->A[t], B->n, 400, &sg, &Sx, &sx, &Nx, &kx, &Ux)) {
                         if (rec) ps_record_part(P, rec, B, PS_FACE, NULL, NULL, 0, Sx, sx, Nx, kx, Ux);
+                        coupled |= fr_coupled(B, t, 3, NULL, NULL, Sx, sx, Nx, kx, Ux);
                         block_face_reduce(B, Sx, sx, Nx, kx);
                         reduced_dims += sx - kx;
                     }
@@ -556,22 +667,26 @@ int facial_reduction(Problem *P, int verbose) {
                     for (int e = 0; e < S->nnz; e++) del[S->row[e]] = 1;
                     reduced_dims += S->nnz;
                     if (rec) ps_record_part(P, rec, B, B->type == BLK_LP ? PS_LP : PS_DIAG, del, NULL, 0, NULL, 0, NULL, 0, NULL);
+                    coupled |= fr_coupled(B, t, B->type == BLK_LP ? 2 : 1, del, NULL, NULL, 0, NULL, 0, NULL);
                     block_delete_indices(B, del);
                     free(del);
                 }
             }
-            remove_constraint(P, i);
-            memmove(clev + i, clev + i + 1, sizeof(int) * (P->m - i));
+            if (rec) rec->coupled = coupled;
+            ncoupled += coupled;
+            remove_parts_of(P, i, parts, np);
+            dead[i] = 1; ndead++;
             removed++;
             progress = 1;
-            prune_empty_parts(P);
-            i--;                       /* constraint i + 1 moved to position i */
         }
+        if (ndead) compact_removed(P, dead, clev);
+        free(dead);
         free(cbp); free(cbk);
     }
     free(a); free(parts); free(clev); free(mask);
     P->fr_removed = removed;
     P->fr_depth = maxlev;
+    P->fr_coupled = ncoupled;
     unused += remove_unused_indices(P);
     /* drop blocks that vanished (after the second unused-index pass, which can empty
      * a block too; a size-0 block must never reach LAPACK) */
@@ -590,8 +705,11 @@ int facial_reduction(Problem *P, int verbose) {
     P->nblk = w;
     if (P->ps) { P->ps->nblk_after = w; P->ps->blk0 = NULL; }
     g_ps_P = NULL;
-    if (verbose && (removed || unused))
+    if (verbose && (removed || unused)) {
         printf("presolve: facial reduction removed %d constraint(s), %d cone dimension(s), depth %d; %d unused index(es)\n",
                removed, reduced_dims, maxlev, unused);
+        if (removed && verbose >= 2) printf("presolve: facial reduction: %d of the %d removed constraint(s) coupled to the kept indices by the data (their duals are rebuilt only if the reduced slack allows), %d not\n",
+                            ncoupled, removed, removed - ncoupled);
+    }
     return removed;
 }

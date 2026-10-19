@@ -402,7 +402,7 @@ static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nm
         const char *a = argv[i];
         if (!a) continue;
         if (!strcmp(a, "-q")) o->verbose = 0;
-        else if (!strcmp(a, "-v")) o->verbose = 2;
+        else if (!strcmp(a, "-v") || !strcmp(a, "-vv")) o->verbose = 2;     /* (18 October 2026: -vv too; it printed no iteration log) */
         else if (!strcmp(a, "-tol") && i + 1 < argc) o->tol = atof(argv[++i]);
         else if (!strcmp(a, "-acc") && i + 1 < argc) { const char *l = argv[++i]; o->tol = !strcmp(l, "low") ? 1e-6 : !strcmp(l, "high") ? 1e-10 : 1e-8; }
         else if (!strcmp(a, "-maxit") && i + 1 < argc) o->maxit = atoi(argv[++i]);

@@ -33,7 +33,13 @@
 #include <stdint.h>
 
 typedef struct { uint64_t k; double v; } RE;
-typedef struct { RE *e; int n, cap; } Row;
+/* 5.18: a row is a sorted prefix e[0..ns) and an unsorted tail e[ns..n) of at most ROW_TAIL entries;
+ * entries cancelled by an update stay as zeros until the next compaction and count as absent (live
+ * is the number of entries the merge form would hold). Until 5.17 every update merged the pivot row
+ * into the whole row: on the dual form of an occupation-measure relaxation (29,745 pairs) the pivot
+ * rows have two entries and the rows they update grow to thousands, 1.1e10 merged entries, 29 s. */
+typedef struct { RE *e; int n, cap, ns, live, touched; } Row;
+#define ROW_TAIL 64
 
 #define KEY(b, i, j) (((uint64_t)(b) << 42) | ((uint64_t)(i) << 21) | (uint64_t)(j))
 #define KB(k) ((int)((k) >> 42))
@@ -59,13 +65,69 @@ static void row_sort(Row *R) {                  /* sort and merge duplicates */
     }
     R->n = w;
 }
+static void row_sorted(Row *R) {                /* after row_sort: as the merge form had it (explicit zeros of the data count) */
+    R->ns = R->n; R->live = R->n; R->touched = 0;
+}
+static int row_find(const Row *R, uint64_t k) {
+    int lo = 0, hi = R->ns - 1;
+    while (lo <= hi) { int mid = (lo + hi) / 2; if (R->e[mid].k == k) return mid; if (R->e[mid].k < k) lo = mid + 1; else hi = mid - 1; }
+    for (int q = R->ns; q < R->n; q++) if (R->e[q].k == k) return q;
+    return -1;
+}
 static double row_get(const Row *R, uint64_t k) {
-    int lo = 0, hi = R->n - 1;
-    while (lo <= hi) { int mid = (lo + hi) / 2; if (R->e[mid].k == k) return R->e[mid].v; if (R->e[mid].k < k) lo = mid + 1; else hi = mid - 1; }
-    return 0.0;
+    const int q = row_find(R, k);
+    return q >= 0 ? R->e[q].v : 0.0;
+}
+/* the merge form: sorted, without zeros (as every update of the merge left the row) */
+static void row_compact(Row *R) {
+    if (R->ns == R->n && (R->live == R->n || !R->touched)) return;
+    if (R->n > R->ns) qsort(R->e + R->ns, R->n - R->ns, sizeof(RE), cmp_re);
+    RE *o = malloc(sizeof(RE) * (R->n + 1));
+    int p = 0, q = R->ns, w = 0;
+    while (p < R->ns || q < R->n) {
+        RE x;
+        if (q >= R->n || (p < R->ns && R->e[p].k < R->e[q].k)) x = R->e[p++]; else x = R->e[q++];
+        if (x.v != 0 || !R->touched) o[w++] = x;
+    }
+    memcpy(R->e, o, sizeof(RE) * w);
+    free(o);
+    R->n = R->ns = w; R->live = w;
+}
+static void row_touch(Row *R) {                 /* the first update: the merge form drops the data's zeros */
+    if (R->touched) return;
+    int z = 0;
+    for (int q = 0; q < R->n; q++) z += R->e[q].v == 0;
+    R->live = R->n - z; R->touched = 1;
 }
 /* R <- R - a S (both sorted); exact cancellation of key kz enforced; tiny results dropped */
 static void row_axpy(Row *R, double a, const Row *S, uint64_t kz, RE **buf, int *bcap) {
+    if (S->ns == S->n && (S->n <= 8 || 16 * S->n < R->n)) {
+        /* a short pivot row: each of its entries updated in place (the same operations as the merge) */
+        row_touch(R);
+        for (int q = 0; q < S->n; q++) {
+            const uint64_t k = S->e[q].k;
+            const int p = row_find(R, k);
+            if (p >= 0) {
+                const double old = R->e[p].v;
+                double v = old - a * S->e[q].v;
+                const double sc = fabs(old) + fabs(a * S->e[q].v);
+                if (fabs(v) <= 1e-14 * sc) v = 0;
+                if (k == kz) v = 0;
+                if ((old != 0) != (v != 0)) R->live += v != 0 ? 1 : -1;
+                R->e[p].v = v;
+            } else {
+                double v = -a * S->e[q].v;
+                if (k == kz) v = 0;
+                if (v == 0) continue;
+                if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 8; R->e = realloc(R->e, sizeof(RE) * R->cap); }
+                R->e[R->n].k = k; R->e[R->n].v = v; R->n++; R->live++;
+            }
+        }
+        if (R->n - R->ns > ROW_TAIL) row_compact(R);
+        return;
+    }
+    row_touch(R);
+    row_compact(R);
     int need = R->n + S->n;
     if (need > *bcap) { *bcap = 2 * need; *buf = realloc(*buf, sizeof(RE) * *bcap); }
     RE *o = *buf;
@@ -82,7 +144,7 @@ static void row_axpy(Row *R, double a, const Row *S, uint64_t kz, RE **buf, int 
     }
     if (w > R->cap) { R->cap = w; R->e = realloc(R->e, sizeof(RE) * R->cap); }
     memcpy(R->e, o, sizeof(RE) * w);
-    R->n = w;
+    R->n = R->ns = R->live = w;
 }
 
 typedef struct { uint64_t h; int p; } HP;
@@ -170,11 +232,12 @@ int free_pairs_detect(const Problem *P, FreePair **out) {
     return npr;
 }
 
+static int g_fe_cheaponly = 0;   /* (the fill-free retry of a rejected elimination by cost, below) */
 PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automatic) {
     const int m = P->m, nb = P->nblk;
     typedef FreePair Pair;
     Pair *pr = NULL;
-    int cheap = 0;
+    int cheap = 0, bycost = 0;
     const double tfe0 = wtime(); const int fedbg = getenv("BRISK_FEDBG") != NULL;
     int npr = free_pairs_detect(P, &pr);
     if (fedbg) printf("   [free-elim: %d pairs detected %.2fs]\n", npr, wtime() - tfe0);
@@ -194,7 +257,15 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
              * lone objective variable (NCTSSOS: the bound of a state polynomial) otherwise
              * sends an 11 346-row dense problem through the saddle factorization, 2.5x the
              * Cholesky per iteration. */
-            cheap = 1; maxfill = 4.0;
+            /* 18 October 2026: outside the class the full elimination is tried first and kept when the cost model
+             * below accepts it (fewer rows of a dense Schur complement against the nonzeros it adds), else the
+             * fill-free mode as before. A sphere SOS with 153 multiplier coefficients (3 % of its 4,845 rows; the
+             * owner's benchmark) went through the saddle form, 6.6 s, where its moment form, which the elimination
+             * gives (4,692 rows, fewer nonzeros), takes 2.2 s. No trace bound for it (bycost): the bound is for the
+             * kernel forms of the class above, whose Gram side is unattained. BRISK_FEBYCOST=0: as before */
+            static int bc_env = -1; if (bc_env < 0) { const char *e = getenv("BRISK_FEBYCOST"); bc_env = !(e && atoi(e) == 0); }
+            if (bc_env && !g_fe_cheaponly && npr <= m) bycost = 1;
+            else { cheap = 1; maxfill = 4.0; }
         }
     }
     /* ---- rows (and the objective as row m) over entry keys; pairs by their '+' key */
@@ -221,7 +292,7 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
             }
         }
     }
-    for (int i = 0; i <= m; i++) row_sort(&R[i]);
+    for (int i = 0; i <= m; i++) { row_sort(&R[i]); row_sorted(&R[i]); }
     /* ---- columns of the free variables (row lists; stale entries checked lazily) */
     uint64_t *fk = fx(sizeof(uint64_t) * npr);
     for (int f = 0; f < npr; f++) fk[f] = KEY(pr[f].blk, pr[f].ip, pr[f].ip);
@@ -288,11 +359,12 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
             int r = cl[f][q];
             double a = row_get(&R[r], fk[f]);
             if (fabs(a) < g_fepiv * amax) continue;
-            double mkz = (double)(R[r].n - 1) * (cn[f] - 1);
+            double mkz = (double)(R[r].live - 1) * (cn[f] - 1);
             if (mkz < pmk || (mkz == pmk && fabs(a) > fabs(pa))) { pmk = mkz; piv = r; pa = a; }
         }
         if (piv < 0 || pmk > maxfill) { skip[f] = 1; continue; }
         /* record the step (row and column as they are now) */
+        row_compact(&R[piv]);
         PSFreeStep *S = &F->st[F->ns++];
         S->blk = pr[f].blk; S->ip = pr[f].ip; S->im = pr[f].im;
         S->row = piv; S->a = pa; S->b = b[piv]; S->c = row_get(&R[m], fk[f]);
@@ -326,9 +398,12 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
     for (int f = 0; f < npr; f++) if (!elim[f]) nskip++;
     /* rows that became empty: dependent (dropped, dual 0) when their rhs vanished */
     int nempty = 0;
+    for (int r = 0; r <= m; r++) row_compact(&R[r]);
     for (int r = 0; r < m; r++) if (!dead[r] && R[r].n == 0) {
         if (fabs(b[r]) <= 1e-12 * (1.0 + fabs(P->b[r]))) { dead[r] = 2; nempty++; }
     }
+    if (getenv("BRISK_FEDUMP")) { FILE *fd = fopen(getenv("BRISK_FEDUMP"), "w"); for (int r = 0; r <= m; r++) { if (r < m && dead[r]) continue; fprintf(fd, "row %d n %d b %.17g\n", r, R[r].n, r < m ? b[r] : 0.0); for (int q = 0; q < R[r].n; q++) fprintf(fd, " %llu %.17g\n", (unsigned long long)R[r].e[q].k, R[r].e[q].v); }
+      for (int s2 = 0; s2 < F->ns; s2++) { fprintf(fd, "step %d row %d a %.17g nr %d nc %d\n", s2, F->st[s2].row, F->st[s2].a, F->st[s2].nr, F->st[s2].nc); for (int q = 0; q < F->st[s2].nc; q++) fprintf(fd, "  c %d %.17g\n", F->st[s2].ce[q], F->st[s2].cv[q]); } fclose(fd); }
     for (int r = 0; r < m; r++) if (!dead[r]) fill1 += R[r].n;
     /* 4.30 auto rule, second part: the elimination is abandoned when it fills too much or
      * leaves most of the pairs behind (butcher: 3197 of 11256 eliminated, nonzeros x7,
@@ -353,13 +428,20 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         if (fedbg) printf("   [free-elim: cost ratio %.3f (rows %d -> %ld, nonzeros %ld -> %ld, clique density %.3f)]\n", cost_ratio, m, mn_est, fill0, fill1, dens);
     }
     if (automatic && !cheap && (fill1 > 8 * fill0 || 4 * nelim < 3 * npr || cost_ratio > 1.0)) {
-        if (verbose)
+        if (verbose && !bycost)
             printf("presolve: free elimination not used (%d of %d pairs eliminated, nonzeros %ld -> %ld, estimated cost ratio %.2f)\n", nelim, npr, fill0, fill1, cost_ratio);
+        if (fedbg && bycost) printf("   [free-elim: by cost rejected (%d of %d, nonzeros %ld -> %ld, cost ratio %.2f): the fill-free mode]\n", nelim, npr, fill0, fill1, cost_ratio);
         for (int r = 0; r <= m; r++) free(R[r].e);
         free(R); free(b); free(mk); free(fk); free(kf);
         for (int f = 0; f < npr; f++) free(cl[f]);
         free(cl); free(cn); free(cc); free(dead); free(elim); free(skip); free(tmp); free(seen); free(buf); free(pr);
         free_elim_free(F);
+        if (bycost) {          /* (the problem is untouched so far: the fill-free mode instead) */
+            g_fe_cheaponly = 1;
+            PSFreeElim *F2 = free_eliminate(P, verbose, maxfill, automatic);
+            g_fe_cheaponly = 0;
+            return F2;
+        }
         return NULL;
     }
     /* ---- rebuild the problem: surviving rows, the skipped pairs restored as pairs */
@@ -500,7 +582,7 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
     for (int i = 0; i < mn; i++) P->orig[i] = i;
     P->morig = mn;
     F->offset = offset;
-    F->cheap = cheap;
+    F->cheap = cheap; F->bycost = bycost;
     P->obj_off += offset;
     if (fedbg) printf("   [free-elim: rebuilt %.2fs]\n", wtime() - tfe0);
     if (verbose)

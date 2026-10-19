@@ -62,7 +62,8 @@ static int g_rr_refresh = 40;        /* 4.39: a full decomposition at least ever
 static FILE *g_ftrace = NULL;        /* 4.37: BRISK_FOMTRACE (both phases) */
 static double g_split_rate = 0;      /* 4.37: the splitting's recent rate (log residual per second) at phase II entry */
 
-static void *fo_malloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (first-order engine)\n"); exit(1); } return p; }
+void brisk_fom_oom_advice(void);
+static void *fo_malloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (first-order engine)\n"); brisk_fom_oom_advice(); exit(1); } return p; }
 static size_t fbsz(const Block *B) { return B->type == BLK_LP ? (size_t)B->n : (size_t)B->n * B->n; }
 
 /* F = sum_i y_i A_i (dense full / vector) */
@@ -309,7 +310,7 @@ static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int v
                     continue;
                 }
                 for (size_t q = p + 1; q < b; q++) {
-                    if (np == cp) { cp *= 2; pr = realloc(pr, sizeof(Pair) * cp); if (!pr) { fprintf(stderr, "brisk: out of memory (Gram matrix)\n"); exit(1); } }
+                    if (np == cp) { cp *= 2; pr = realloc(pr, sizeof(Pair) * cp); if (!pr) { fprintf(stderr, "brisk: out of memory (Gram matrix)\n"); brisk_fom_oom_advice(); exit(1); } }
                     pr[np].i = E[p].con; pr[np].j = E[q].con; pr[np].v = w * E[p].val * E[q].val; np++;
                 }
             }

@@ -47,7 +47,7 @@ for k = 1:numel(files)
 end
 
 isoct = exist('OCTAVE_VERSION', 'builtin') ~= 0;
-cflags = '-std=gnu11 -O3 -funroll-loops -Wno-unknown-pragmas -DBRISK_LIBRARY -DNDEBUG -frounding-math';   % -frounding-math: boundcert.c changes the rounding mode
+cflags = '-std=gnu11 -O3 -funroll-loops -ffp-contract=off -Wno-unknown-pragmas -DBRISK_LIBRARY -DNDEBUG -frounding-math';   % -ffp-contract=off: as the Makefile   % -frounding-math: boundcert.c changes the rounding mode
 defs = {};
 incs = {['-I' src]};
 libs = {};

@@ -317,13 +317,27 @@ static void vertex_cover(const Gr *g, const char *part, char *sep) {
  * vertex moves to a side and draws its neighbours of the other side into the separator; the
  * gain is its weight minus theirs. Moves by gain from a heap per side, moves of negative gain
  * allowed, back to the smallest separator of the pass. */
-static int node_gain(const Gr *g, const char *st, int v, int side) {
-    int pull = 0;
-    for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) if (st[g->adj[p]] == 1 - side) pull += g->vw[g->adj[p]];
-    return g->vw[v] - pull;
+/* (sparsechol-dev) the gain from the weights of each vertex's neighbours on either side, pw[2 v + s], kept current by
+ * nd_setst at every change of a state: the same numbers as the scan of the neighbours at the same moment (so the
+ * same moves and the same order), for O(1) instead of O(degree) per gain (node_refine was 7 % of the LP pds-20).
+ * The LP/SOCP branch made the same change (nbw_add; a DC power flow's normal equations 3 s of 4.7 in the scans);
+ * at the merge of 19 October 2026 this version was kept, the same gains and orders as either. */
+static inline int node_gain(const Gr *g, const int *pw, int v, int side) { return g->vw[v] - pw[2 * v + 1 - side]; }
+static inline void nd_setst(const Gr *g, char *st, int *pw, int v, int s) {
+    const int a = st[v], w = g->vw[v];
+    if (a == s) return;
+    st[v] = (char)s;
+    for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
+        int *q = pw + 2 * g->adj[p];
+        if (a < 2) q[a] -= w;
+        if (s < 2) q[s] += w;
+    }
 }
 static void node_refine(const Gr *g, char *st, int npass) {
     const int n = g->n;
+    int *pw = calloc(2 * (size_t)n + 2, sizeof(int));
+    for (int v = 0; v < n; v++)
+        for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (st[u] < 2) pw[2 * v + st[u]] += g->vw[u]; }
     char *lock = malloc((size_t)n + 1);
     int *mv = malloc(sizeof(int) * (n + 1)), *ms = malloc(sizeof(int) * (n + 1)), *mp = malloc(sizeof(int) * (n + 2));
     int *pulled = NULL, npl = 0, plcap = 0;
@@ -334,7 +348,7 @@ static void node_refine(const Gr *g, char *st, int npass) {
     for (int pass = 0; pass < npass; pass++) {
         memset(lock, 0, (size_t)n);
         H[0].n = H[1].n = 0; npl = 0;
-        for (int v = 0; v < n; v++) if (st[v] == 2) { hpush(&H[0], node_gain(g, st, v, 0), v); hpush(&H[1], node_gain(g, st, v, 1), v); }
+        for (int v = 0; v < n; v++) if (st[v] == 2) { hpush(&H[0], node_gain(g, pw, v, 0), v); hpush(&H[1], node_gain(g, pw, v, 1), v); }
         long cur = w[2], best = w[2];
         int nm = 0, bestk = 0, bad = 0;
         const int limit = 60 + n / 100;
@@ -343,7 +357,7 @@ static void node_refine(const Gr *g, char *st, int npass) {
                 while (H[s].n > 0) {
                     const int v = H[s].v[0];
                     if (st[v] != 2 || lock[v]) { hpop(&H[s]); continue; }
-                    const int gn = node_gain(g, st, v, s);
+                    const int gn = node_gain(g, pw, v, s);
                     if (gn != H[s].g[0]) { hpop(&H[s]); hpush(&H[s], gn, v); continue; }
                     break;
                 }
@@ -356,32 +370,32 @@ static void node_refine(const Gr *g, char *st, int npass) {
             if (w[side] + g->vw[H[side].v[0]] > maxside) { if (H[1 - side].n > 0 && w[1 - side] + g->vw[H[1 - side].v[0]] <= maxside) side = 1 - side; else break; }
             const int v = H[side].v[0], gain = H[side].g[0];
             hpop(&H[side]);
-            st[v] = (char)side; lock[v] = 1; w[2] -= g->vw[v]; w[side] += g->vw[v];
+            nd_setst(g, st, pw, v, side); lock[v] = 1; w[2] -= g->vw[v]; w[side] += g->vw[v];
             mv[nm] = v; ms[nm] = side; mp[nm] = npl;
             for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
                 const int u = g->adj[p];
                 if (st[u] != 1 - side) continue;
-                st[u] = 2; w[1 - side] -= g->vw[u]; w[2] += g->vw[u];
+                nd_setst(g, st, pw, u, 2); w[1 - side] -= g->vw[u]; w[2] += g->vw[u];
                 if (npl == plcap) { plcap = 2 * plcap + 256; pulled = realloc(pulled, sizeof(int) * plcap); }
                 pulled[npl++] = u;
-                if (!lock[u]) { hpush(&H[0], node_gain(g, st, u, 0), u); hpush(&H[1], node_gain(g, st, u, 1), u); }
+                if (!lock[u]) { hpush(&H[0], node_gain(g, pw, u, 0), u); hpush(&H[1], node_gain(g, pw, u, 1), u); }
                 /* the separator neighbours of u no longer draw it in when they go to the side of v */
-                for (int q = g->xadj[u]; q < g->xadj[u + 1]; q++) { const int x = g->adj[q]; if (st[x] == 2 && !lock[x] && x != u) hpush(&H[side], node_gain(g, st, x, side), x); }
+                for (int q = g->xadj[u]; q < g->xadj[u + 1]; q++) { const int x = g->adj[q]; if (st[x] == 2 && !lock[x] && x != u) hpush(&H[side], node_gain(g, pw, x, side), x); }
             }
             /* the separator neighbours of v can now go to its side for less */
-            for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (st[u] == 2 && !lock[u]) hpush(&H[side], node_gain(g, st, u, side), u); }
+            for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (st[u] == 2 && !lock[u]) hpush(&H[side], node_gain(g, pw, u, side), u); }
             nm++; mp[nm] = npl;
             cur -= gain;
             if (cur < best || (cur == best && labs(w[0] - w[1]) < 0)) { best = cur; bestk = nm; bad = 0; } else bad++;
         }
         for (int k = nm - 1; k >= bestk; k--) {
             const int v = mv[k], side = ms[k];
-            for (int q = mp[k]; q < mp[k + 1]; q++) { const int u = pulled[q]; st[u] = (char)(1 - side); w[1 - side] += g->vw[u]; w[2] -= g->vw[u]; }
-            st[v] = 2; w[side] -= g->vw[v]; w[2] += g->vw[v];
+            for (int q = mp[k]; q < mp[k + 1]; q++) { const int u = pulled[q]; nd_setst(g, st, pw, u, 1 - side); w[1 - side] += g->vw[u]; w[2] -= g->vw[u]; }
+            nd_setst(g, st, pw, v, 2); w[side] -= g->vw[v]; w[2] += g->vw[v];
         }
         if (bestk == 0) break;
     }
-    free(lock); free(mv); free(ms); free(mp); free(pulled); free(H[0].g); free(H[0].v); free(H[1].g); free(H[1].v);
+    free(pw); free(lock); free(mv); free(ms); free(mp); free(pulled); free(H[0].g); free(H[0].v); free(H[1].g); free(H[1].v);
 }
 
 /* AMD on the graph g; its vertices' original names in name[]; appended to perm at *np */
@@ -396,6 +410,9 @@ static void leaf_order(const Gr *g, const int *name, int *perm, int *np) {
     free(P);
 }
 
+/* 18 October 2026 (LP/SOCP): 0 = no hub rule (a second trial of the LP method's analysis, sparsechol.c) */
+static int g_nd_hubs = 1;
+void nd_set_hubs(int on) { g_nd_hubs = on; }
 static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
     const int n = g->n;
     if (n <= leaf || depth > 60) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
@@ -404,6 +421,7 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
     {
         static double hubf = -1;
         if (hubf < 0) hubf = getenv("BRISK_NDHUB") ? atof(getenv("BRISK_NDHUB")) : 5;
+        if (!g_nd_hubs) goto nohubs;
         const double avg = (double)g->xadj[n] / n;
         int nh = 0;
         if (hubf > 0) for (int v = 0; v < n; v++) if (g->xadj[v + 1] - g->xadj[v] > hubf * avg && g->xadj[v + 1] - g->xadj[v] > 16) nh++;
@@ -426,10 +444,13 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
             return;
         }
     }
+nohubs:;
     char *part = malloc((size_t)n + 1), *sep = malloc((size_t)n + 1), *bpart = malloc((size_t)n + 1), *bsep = malloc((size_t)n + 1);
     if (!part || !sep || !bpart || !bsep) { free(part); free(sep); free(bpart); free(bsep); leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     /* several bisections (the matching and the seeds are random), the smallest separator kept */
-    const int ntry = getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : 4;
+    /* (the trial without hubs, 18 October 2026: two attempts; on staircase 50 x 500 they gave 9.7e9 flops in 2.5 s
+     * against 1.11e10 in 5.6 s with four, one gave 1.35e10) */
+    const int ntry = getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : g_nd_hubs ? 4 : 2;
     long bestscore = -1;
     for (int t = 0; t < ntry; t++) {
         if (bisect(g, part, t & 1)) break;

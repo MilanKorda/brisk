@@ -209,10 +209,11 @@ def _caller_args(tag):
     """The option pair that tells libbrisk which interface and command called it, so that the
     advice at the end of the log (more accuracy, a guaranteed bound) is written in that
     command's syntax. Libraries before 1.3.2 do not know it and are not given it."""
-    try:
-        v = tuple(int(x) for x in version().split(".")[:3])
-    except ValueError:
+    import re
+    m = re.match(r"(\d+)\.(\d+)\.?(\d*)", version())    # (a suffix such as "-experimental" is allowed)
+    if not m:
         return []
+    v = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
     return ["-caller", tag] if tag and v >= (1, 3, 2) else []
 
 

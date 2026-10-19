@@ -1,4 +1,4 @@
-# BRISK 1.5.1: the solver in detail
+# BRISK 1.5.3: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -8,7 +8,7 @@ BRISK solves block-diagonal semidefinite programs with LP blocks:
 
 It reads SDPA sparse files (`.dat-s`), so SDPLIB and Mittelmann's instances run unchanged.
 It can also be called from Python/CVXPY, Julia/JuMP and MATLAB/Octave. All interfaces run the
-same C code (about 46,000 lines on BLAS/LAPACK).
+same C code (about 57,000 lines on BLAS/LAPACK).
 
 **Installation: see [INSTALL.md](INSTALL.md).** In short: `make && ./brisk examples/theta1.dat-s`.
 
@@ -122,8 +122,9 @@ Every automatic choice below can be overridden from the command line.
     many split free pairs, or in the chordal moment form.
   - The infeasible start runs first only on large dense blocks with a cheap Schur complement
     (max-cut and graph-partitioning type problems).
-  - Each method is the other's fallback, and a result that misses 1e-6 on the original data
-    is re-solved with the other one.
+  - Each method is the other's fallback, and a first run that ends above 1e-7 (1e-6 for
+    the embedding) is followed by the other one, and so is a result that misses 1e-6 on the
+    original data.
   - `-hsd` / `-nohsd` force one method.
   - The solve stops once the best iterate meets the tolerance, with a factor two to spare, in
     the DIMACS errors the status is set from, and an iteration does not improve on it.
@@ -137,8 +138,9 @@ Every automatic choice below can be overridden from the command line.
   dense (`-zsparse`, `-zsparsefill`). One large block uses all cores (a task-graph Cholesky,
   threaded products and solves) with the same bits for any thread count.
 - **Schur complement.** Assembled by fused sparse kernels, row products, dense BLAS-3, a
-  low-rank route, a dictionary route or an entry-class route (localizing matrices of moment
-  relaxations), chosen by a cost model. It is factored dense (mixed
+  low-rank route, a dictionary route (also over the factors of low-rank constraints among sparse
+  ones), an entry-class route (localizing matrices of moment relaxations) or a Walsh–Hadamard route
+  for Pauli-string constraints, chosen by a cost model. It is factored dense (mixed
   precision: factored in single precision far from the solution, with conjugate-gradient
   refinement, where the self-dual embedding also forms its large products in single precision;
   in double precision once the residuals and the gap are below 1e-6), by envelope, or by a
@@ -174,7 +176,7 @@ Every automatic choice below can be overridden from the command line.
 - **The matrix-free method first.** On problems with one to four dense blocks of order 100 or
   more that the presolve leaves unchanged and whose Schur factorization is estimated at 3.5
   times a matrix-free solve or more — at least equal when every constraint has an entry in an
-  LP block — (truss topology problems, SOS relaxations with a low-rank Gram matrix; not moment
+  LP block and each LP variable is in one constraint at most — (truss topology problems, SOS relaxations with a low-rank Gram matrix; not moment
   relaxations with localizing blocks), the matrix-free interior-point method (`-mfipm 1` below) runs first. The
   attempt is stopped when a solve away from the optimum needs more CG steps than a sixth of
   one factorization costs, when the steps of a solve grow geometrically (three times the last

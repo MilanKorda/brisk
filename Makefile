@@ -43,7 +43,10 @@ else ifeq ($(OMP),bundled)
 else
   OMPFLAG := -Wno-unknown-pragmas
 endif
-CFLAGS  ?= -O3 $(ARCHFLAG) -funroll-loops $(OMPFLAG) -std=gnu11 -Wall -Wextra -Wno-unused-parameter
+# -ffp-contract=off (5.18): each expression is rounded as written; with gcc's default (fast) the fusion of a*b + c into
+# an FMA follows the inlining, so an edit of one function moved the last bits of others (the ill-posed files of the
+# regression sets moved with every switch of a change off); the time per iteration is the same within the noise
+CFLAGS  ?= -O3 $(ARCHFLAG) -funroll-loops -ffp-contract=off $(OMPFLAG) -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c momaff.c blkscale.c fom.c mfipm.c lralm.c bm.c bmip.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c
 BLAS    ?= system
 
@@ -153,7 +156,7 @@ restoretest: brisk
 advicetest: brisk
 	tools/advice_test.sh ./brisk
 
-# the dual after a facial reduction whose removed duals cannot be rebuilt (the re-solve, the status without it)
+# the dual after a facial reduction whose removed duals cannot be rebuilt: the default (no re-solve, the message), -nofr, -frfallback 4, BRISK_FRFIX=1
 frtest: brisk
 	tools/fr_test.sh ./brisk
 

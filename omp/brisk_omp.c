@@ -812,6 +812,20 @@ kmp_int32 __kmpc_omp_taskwait(ident_t *loc, kmp_int32 gtid) {
     if (cur->deps) dep_tab_clear(cur->deps);
     return 0;
 }
+/* An undeferred task with dependences (if(0), or a task outside a parallel region) waits for them first: clang
+ * calls __kmpc_omp_taskwait_deps_51 (clang 14 and later; __kmpc_omp_wait_deps before). Waiting for every child of
+ * the current task covers every earlier sibling the dependences can name (19 October 2026: the sparse factor's task
+ * graph per supernode, `#pragma omp task if(par) depend(...)`, did not link with the bundled runtime) */
+void __kmpc_omp_wait_deps(ident_t *loc, kmp_int32 gtid, kmp_int32 ndeps, kmp_depend_info_t *dl, kmp_int32 ndeps_noalias,
+                          kmp_depend_info_t *nl) {
+    (void)ndeps; (void)dl; (void)ndeps_noalias; (void)nl;
+    __kmpc_omp_taskwait(loc, gtid);
+}
+void __kmpc_omp_taskwait_deps_51(ident_t *loc, kmp_int32 gtid, kmp_int32 ndeps, kmp_depend_info_t *dl,
+                                 kmp_int32 ndeps_noalias, kmp_depend_info_t *nl, kmp_int32 has_no_wait) {
+    (void)has_no_wait;
+    __kmpc_omp_wait_deps(loc, gtid, ndeps, dl, ndeps_noalias, nl);
+}
 /* if(0) tasks: the compiler runs the body itself between these calls */
 void __kmpc_omp_task_begin_if0(ident_t *loc, kmp_int32 gtid, kmp_task_t *k) {
     Task *t = task_of(k), *par = current_task();

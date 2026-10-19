@@ -193,7 +193,7 @@ static void usage(void) {
         "                   blocks) solved as second-order cones in the self-dual embedding (1)\n"
         "  -socmin <n>      ... blocks of at least this order (3)\n"
         "  -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance\n"
-        "  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: the re-solve without facial\n                   reduction may take this multiple of the solve's time, else the reduced solve is returned\n                   with status SOLVED TO REDUCED ACCURACY and the dual flagged (4; 0 = no re-solve)\n"
+        "  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: with f > 0 the problem is solved again\n                   without facial reduction, within f times the solve's time (0, the default: no re-solve; the reduced\n                   solve is returned as SOLVED TO REDUCED ACCURACY, the log says that the recovery failed, what is\n                   correct, and how to solve again without the reduction for the dual)\n"
         "  -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated\n                   without the reduction, within this multiple of the solve's time (4; 0 = never)\n"
         "  -freeelim <k>    eliminate split free-variable pairs by pivoting: -1 auto (kernel-form SOS\n"
         "                   problems: few SDP blocks, pairs >= 1%% of the rows), 0 off, 1 on\n"
@@ -211,7 +211,8 @@ static void usage(void) {
         "  -mftry <k>       the matrix-free method first, automatically (1; 0 off): on problems with one\n"
         "                   to four dense blocks of order >= 100 whose Schur factorization is\n"
         "                   estimated at 3.5 times a matrix-free solve or more (at least equal when\n"
-        "                   every constraint has an entry in an LP block), and that the presolve\n"
+        "                   every constraint has an entry in an LP block and each LP variable is in\n"
+        "                   one constraint at most: a diagonal LP part), and that the presolve\n"
         "                   leaves unchanged; not on moment relaxations (see -hsddir). The attempt\n"
         "                   ends when a solve away from the\n"
         "                   optimum needs more CG steps than a sixth of a Schur factorization costs,\n"
@@ -268,8 +269,8 @@ static void usage(void) {
         "  -fomtol <t>      ... stopping tolerance on the residuals (max(tol, 1e-6))\n"
         "  -fomsigma <s>    ... fixed penalty parameter (0: adaptive)\n"
         "  -fomsigma0 <s>   ... starting penalty when adaptive (1); -fomaasafe <f>: an Anderson step\n"
-        "                   is rejected when its residual exceeds f times the last (1; 2 on the\n"
-        "                   degenerate moment relaxations); -fomaa <k>: Anderson memory (25, up to 32,\n"
+        "                   is rejected when its residual exceeds f times the last (2); -fomaa <k>:\n"
+        "                   Anderson memory (25, up to 32,\n"
         "                   capped by a 1.5 GB history budget); -fomaadr <k>: the acceleration on the\n"
         "                   Douglas-Rachford variable X/sigma + A*y - C, step 1 (1), or on (X, Z), step 1.618 (0)\n"
         "  -sym auto|none|<file>  exact symmetry reduction (default auto): sign symmetries and\n"
@@ -277,8 +278,9 @@ static void usage(void) {
         "                   the orbits and the blocks split by irreducible representation; the point is\n"
         "                   mapped back to the file. <file>: generators as index permutations (line 1: SDP\n"
         "                   block sizes; one per line, global 0-based SDP indices). -nosym = -sym none\n"
-        "  -symtime <s>, -symnodes <k>   caps of the automatic search (20 s, counted in operations, not\n"
-        "                   on the clock; 500 nodes); an incomplete search only reduces less, never wrongly\n"
+        "  -symtime <s>, -symnodes <k>   the automatic search's budget: at least s (20 s) and 1 %% of the\n"
+        "                   expected solve up to 900 s, at most 15 %% of it; counted in operations, not on the\n"
+        "                   clock; 500 nodes; an incomplete search only reduces less, never wrongly\n"
         "  -symbd <k>       ... symmetry-adapted basis: the blocks split into one block per irreducible\n"
         "                   representation (1 on, 0 off)\n"
         "  -symsign <k>     ... -sym auto: sign symmetries (D A D = ±A, D diagonal ±1) first: blocks split by\n"
@@ -320,7 +322,8 @@ static void usage(void) {
         "                   cores). Tiny problems use one thread; on Linux the interior-point solve\n"
         "                   uses fewer while other processes occupy its cores (at the start, and when its\n"
         "                   threads wait for cores) and more again when they are free (BRISK_NOBUSY=1:\n"
-        "                   exactly k)\n"
+        "                   exactly k). The LP method runs its factorizations on them; the cone solver\n"
+        "                   runs on one thread\n"
         "  -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on\n"
         "  -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)\n"
         "  -densemem <MB>   memory for dense constraint copies (768)\n"
@@ -685,7 +688,7 @@ static void run_finish(Run *u, const Params *par) {
     ps_measure(O, Xo, yo, &pr);
     if (getenv("BRISK_FEDBG")) printf("   [finish: reduced pobj %.12e dobj %.12e gap %.2e | file pobj %.12e dobj %.12e gap %.2e]\n",
                                        u->pr.pobj, u->pr.dobj, u->pr.err[5], pr.pobj, pr.dobj, pr.err[5]);
-    pr.recovered = u->pr.recovered; pr.unrecovered = u->pr.unrecovered; pr.t += u->pr.t;
+    pr.recovered = u->pr.recovered; pr.unrecovered = u->pr.unrecovered; pr.fr_corrected = u->pr.fr_corrected; pr.t += u->pr.t;
     u->pr = pr;
     const double acc = fmax(fmax(pr.err[1], pr.err[2]), fmax(pr.err[4], fmax(fabs(pr.err[5]), fabs(pr.err[6]))));
     int status = u->status;
@@ -818,7 +821,8 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) for (int t = 0; t < P->blk[k].ncon; t++) nz += P->blk[k].A[t].nnz;
         const double ipm_s = ((double)P->m * P->m * P->m / 3.0 + 20.0 * mf_s3) / 6e9, mf_s = 250.0 * (mf_s3 + 20.0 * nz) / 1e9;
         static double rmin = -1, smin = -1; if (rmin < 0) { const char *e = getenv("BRISK_MFTRYR"); rmin = e ? atof(e) : 3.5; e = getenv("BRISK_MFTRYS"); smin = e ? atof(e) : 5.0; }
-        /* lower thresholds (1 and 1.5) when every constraint has an entry in an LP block: the LP
+        /* lower thresholds (1 and 1.5) when every constraint has an entry in an LP block (and each LP variable is in
+         * one constraint at most, 18 October 2026): the LP
          * part of the Schur complement is then a positive diagonal in every row, which the
          * preconditioner's base has exactly (the truss and vibration problems with their 2m
          * bounds: tru9 and vib9, m = 3,240, 11 and 15 s by the standard method against 1.1 and
@@ -826,8 +830,20 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
          * (mc_100x80, rose15, rabmo, butcher) none has such a block on all constraints. */
         double rm = rmin, sm = smin;
         if (!getenv("BRISK_MFTRYR") && nsdp >= 1 && nsdp <= 4 && maxn >= 100) {
+            /* (18 October 2026) and each LP variable in one constraint at most, as the diagonal needs: a random
+             * LP part with five constraints a column (the owner's benchmark, an SDP with 20,000 LP variables) has
+             * an entry in every row but a sparse, not a diagonal, LP part, and the attempt failed (3.6 s of 7.4) */
             char *has = calloc((size_t)P->m + 1, 1); int all = has != NULL, nlp = 0;
-            for (int k = 0; k < P->nblk && has; k++) if (P->blk[k].type == BLK_LP) { nlp++; for (int t = 0; t < P->blk[k].ncon; t++) if (P->blk[k].A[t].nnz > 0) has[P->blk[k].con[t]] = 1; }
+            for (int k = 0; k < P->nblk && has && all; k++) if (P->blk[k].type == BLK_LP) {
+                nlp++;
+                char *own = calloc((size_t)P->blk[k].n + 1, 1);
+                for (int t = 0; t < P->blk[k].ncon && all; t++) {
+                    const SpSym *A = &P->blk[k].A[t];
+                    if (A->nnz > 0) has[P->blk[k].con[t]] = 1;
+                    for (int q = 0; q < A->nnz && own; q++) { if (own[A->row[q]]) { all = 0; break; } own[A->row[q]] = 1; }
+                }
+                free(own);
+            }
             for (int c = 0; c < P->m && all; c++) if (!has[c]) all = 0;
             free(has);
             if (all && nlp > 0) { rm = 1.0; sm = 1.5; }
@@ -1012,7 +1028,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         if (par->verbose >= 0) printf("first-order engine: m = %d after the dual form and free elimination still does not fit; restarting with the first-order engine\n", P->m);
         return 4;
     }
-    if (par->tracebound > 0 || (par->tracebound < 0 && u->fe && !u->fe->cheap)) {
+    if (par->tracebound > 0 || (par->tracebound < 0 && u->fe && !u->fe->cheap && !u->fe->bycost)) {
         double bmax = 0;
         for (int i = 0; i < P->m; i++) bmax = fmax(bmax, fabs(P->b[i]));
         u->tbR = par->tracebound > 0 ? par->tracebound : 1e7 * (1.0 + bmax);
@@ -1025,7 +1041,10 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     if (do_fr) {
         double c0 = (double)P->m * P->m * P->m / 3.0;
         for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) c0 += 10.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
-        Problem Pc; problem_clone(P, &Pc);       /* 4.30: restored if the reduction is rejected */
+        /* 4.30: restored if the reduction is rejected; 5.18: not copied when nothing can be reduced */
+        extern int fr_has_candidate(const Problem *P);
+        const int frc = getenv("BRISK_FRCLONE") ? 1 : fr_has_candidate(P);
+        Problem Pc; if (frc) problem_clone(P, &Pc);
         facial_reduction(P, par->verbose);
         double c1 = (double)P->m * P->m * P->m / 3.0;
         for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) c1 += 10.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
@@ -1036,14 +1055,14 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
          * solve without it from the start (rose13, taha1a, roa_acrobot: 1.9-3.4x). */
         u->fr_cost = c1 > 0 ? c0 / c1 : 1.0;
         if (par->verbose >= 1 && P->ps->nrec > 0) printf("presolve: facial reduction: the per-iteration cost model gives %.2fx for the problem as read\n", c0 / c1);
-        if (do_fr == 1 && P->fr_depth >= 2 && P->ps->nrec > 0 && c0 < par->fr_gain * c1) {
+        if (frc && do_fr == 1 && P->fr_depth >= 2 && P->ps->nrec > 0 && c0 < par->fr_gain * c1) {
             if (par->verbose >= 0)
                 printf("presolve: facial reduction of depth %d saves only %.1fx per iteration; solving without it\n", P->fr_depth, c0 / c1);
             ps_free(P->ps);
             problem_free(P);
             *P = Pc;
             P->ps = ps_new(P);
-        } else problem_free(&Pc);
+        } else if (frc) problem_free(&Pc);
     }
     u->fr_removed = P->ps->nrec;
     if (getenv("BRISK_SETUPT")) printf("   [setup: facial reduction done at %.2fs]\n", wtime() - tpre0);
@@ -1461,7 +1480,7 @@ static double run_rank(const Run *u) {
 /* 5.8: the events of a run (method switches, the endgame, crossover, bounds, ...) for the
  * summary at the end of the log; cleared by brisk_main */
 #include <stdarg.h>
-static char g_notes[24][400]; static int g_nnotes = 0;
+static char g_notes[24][512]; static int g_nnotes = 0;
 void brisk_note(const char *fmt, ...) {
     if (g_nnotes >= 24) return;
     va_list ap; va_start(ap, fmt); vsnprintf(g_notes[g_nnotes], sizeof g_notes[0], fmt, ap); va_end(ap);
@@ -1588,6 +1607,15 @@ static const char *syn_head(void) {
     default:       o[0] = 0;
     }
     return o;
+}
+/* 18 October 2026: the first-order engine ran out of memory (its Gram matrix: the large AC-OPF relaxations,
+ * whose chordal extension is beyond the interior-point method's clique limit, ended with the bare message);
+ * the low-rank augmented Lagrangian forms nothing of size n^2 or m^2: say so, in the caller's syntax */
+void brisk_fom_oom_advice(void) {
+    printf("The first-order engine needs more memory than there is. For a large sparse semidefinite block with a\n"
+           "low-rank solution (relaxations of AC optimal power flow, for example) the low-rank augmented Lagrangian\n"
+           "forms nothing of size n^2 or m^2%s:\n  %s   (experimental; the objectives, errors and y, no X)\n", syn_head(), syn_kv("lralm", "1", 0));
+    fflush(stdout);
 }
 /* 5.9: the last lines of a standard-precision log say how to get more accuracy; 5.10: in the
  * caller's syntax, and how to get a guaranteed bound (also at the end of a high-precision log).
@@ -1977,6 +2005,17 @@ static void sedumi_write_vec(const char *fname, const double *v, int n) {
     fclose(f);
 }
 /* 5.8: the summary of a cone solve (SeDuMi form without PSD blocks: the cone solver) */
+/* 17 October 2026: the summary's thread line of the cone solver: its large factor blocks take the threads
+ * (schol_set_panel_threads in socp_solve), the rest of it is sequential */
+static void cone_threads_line(void) {
+    int nth = 1;
+#ifdef _OPENMP
+    nth = omp_get_max_threads();
+#endif
+    { const char *e = getenv("BRISK_CONEPANEL"); if (e && atoi(e) == 0) nth = 1; }
+    if (nth > 1) printf("  Threads:           %d (the large blocks of the factorization; the rest of the cone solver is sequential)\n", nth);
+    else printf("  Threads:           1\n");
+}
 static void cone_summary(const SedumiProb *P, const SedumiRes *R) {
     char cm[32], cn[32]; fmt_count(cm, sizeof cm, P->m); fmt_count(cn, sizeof cn, P->n);
     int qmax = 0; for (int k = 0; k < P->nq; k++) if (P->q[k] > qmax) qmax = P->q[k]; for (int k = 0; k < P->nr; k++) if (P->r[k] > qmax) qmax = P->r[k];
@@ -1987,7 +2026,7 @@ static void cone_summary(const SedumiProb *P, const SedumiRes *R) {
     printf("  Solve:             cone solver (homogeneous self-dual model, Nesterov-Todd scaling, L D L' of the reduced system), %d iterations\n", R->iters);
     for (int i = 0; i < g_nnotes; i++) if (strncmp(g_notes[i], "presolve: ", 10)) printf("                     %s\n", g_notes[i]);
     if (R->status == 6) printf("                     stopped by the time limit\n"); else if (R->status == 3) printf("                     stopped at the iteration limit\n");
-    printf("  Time:              %.2f s\n  Threads:           1 (the cone solver is sequential)\n", R->time);
+    printf("  Time:              %.2f s\n", R->time); cone_threads_line();
     if (R->status == 1 || R->status == 2) { printf("  Verdict:           the problem is %s infeasible (the returned %s is a certificate)\n%s\n", R->status == 1 ? "primal" : "dual", R->status == 1 ? "y" : "x", R->status == 1 ? "Primal infeasible" : "Dual infeasible"); return; }
     printf("  DIMACS errors:     pinf %.1e  x in K %.1e  dinf %.1e  z in K* %.1e  gap %.1e  compl %.1e\n", R->err[0], R->err[1], R->err[2], R->err[3], R->err[4], R->err[5]);
     double e = 0; for (int i = 0; i < 6; i++) e = fmax(e, fabs(R->err[i]));
@@ -2048,7 +2087,13 @@ static void lp_summary(const LpProb *L, const SedumiProb *P, const SedumiRes *R,
     printf("  Solve:             %s, %d iterations\n", lpipm ? "LP interior-point method (normal equations, Mehrotra predictor-corrector)" : "cone solver (homogeneous self-dual model)", R->iters);
     for (int i = 0; i < g_nnotes; i++) if (strncmp(g_notes[i], "presolve: ", 10)) printf("                     %s\n", g_notes[i]);
     if (R->status == 6) printf("                     stopped by the time limit\n"); else if (R->status == 3) printf("                     stopped at the iteration limit\n");
-    printf("  Time:              %.2f s\n  Threads:           1 (the solver for linear programs is sequential)\n", ttot);
+    {   int nth = 1;
+#ifdef _OPENMP
+        nth = omp_get_max_threads();
+#endif
+        if (lpipm) printf("  Time:              %.2f s\n  Threads:           %d (the factorizations of the normal equations and, on large problems, the products with A; the rest of the method is sequential)\n", ttot, nth);
+        else { printf("  Time:              %.2f s\n", ttot); cone_threads_line(); }
+    }
     if (R->status == 1 || R->status == 2) { printf("  Verdict:           the problem is %s\n%s\n", R->status == 1 ? "primal infeasible" : "dual infeasible (unbounded)", R->status == 1 ? "Primal infeasible" : "Dual infeasible"); return; }
     printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (relative); of the solve: pinf %.1e  dinf %.1e  gap %.1e\n", eb, er, R->err[0], R->err[2], R->err[4]);
     printf("Solved to relative error %.1e\n", fmax(fmax(eb, er), fmax(fmax(fabs(R->err[0]), fabs(R->err[2])), fabs(R->err[4]))));
@@ -2099,6 +2144,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                     if (i + 1 < ac && !strcmp(av[i], "-tol")) o.tol = atof(av[i + 1]);
                     if (i + 1 < ac && !strcmp(av[i], "-maxit")) o.maxit = atoi(av[i + 1]);
                     if (i + 1 < ac && !strcmp(av[i], "-timelimit")) o.timelimit = atof(av[i + 1]);
+                    if (i + 1 < ac && !strcmp(av[i], "-threads") && atoi(av[i + 1]) >= 1) omp_set_num_threads(atoi(av[i + 1]));   /* (the factorizations run on the threads) */
                     if (!strcmp(av[i], "-v") || !strcmp(av[i], "-vv")) o.verbose = 2;
                 }
                 memset(&R, 0, sizeof R);
@@ -2318,6 +2364,7 @@ int brisk_main(int argc, char **argv) {
     if ((cert_x || cert_y) && par.hp_kind > 0)      /* 5.2: in the master precision of -prec (hpsolve.c) */
         return brisk_hp_certify_given(fname, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result, cert_x, cert_y, par.hp_kind, par.hp_digits, par.verbose);
     if (cert_x || cert_y) return certify_given(fname, cert_x, cert_y);
+    { extern int g_ps_fr_correct; const char *ef = getenv("BRISK_FRFIX"); g_ps_fr_correct = ef ? atoi(ef) != 0 : 0; }   /* 5.17: opt-in (BRISK_FRFIX=1): the default path pays nothing and says plainly that the recovery failed */
     { extern int g_ps_need_x; g_ps_need_x = (xfile != NULL || getenv("BRISK_XOUT") != NULL || par.crossover != 0 || par.bound_side != 0 || (g_brisk_result != NULL && par.returnx > 0)) ? 1
                                          : (g_brisk_result != NULL && par.returnx < 0) ? 2 : 0; }
     g_rank_par = &par;
@@ -2800,7 +2847,12 @@ int brisk_main(int argc, char **argv) {
      * the gap and complementarity, and the reduced solve's own dual errors. Until 5.15 the reduced
      * problem was solved again with the embedding and then the problem without facial reduction
      * (a user's mbb14compl_msos_tspmin1__d3: 3.6 s and a value right to 1e-8, then 66 s and a value
-     * 1.3e-6 off returned). BRISK_FRKEEP=0: the re-solves as before. */
+     * 1.3e-6 off returned). BRISK_FRKEEP=0: the re-solves as before.
+     * 5.16 then solved the problem again without the reduction within -frfallback (4) times the solve's time;
+     * 5.17 (the owner, 16 October 2026): no re-solve by default (-frfallback 0): the status is not OPTIMAL, the
+     * log and the note say that the recovery failed, what is correct, and how to solve again without the
+     * reduction in the caller's syntax; -frfallback f > 0 gives the re-solve of 5.16. The correction of the
+     * dual through complementarity with the primal (postsolve.c) is opt-in, BRISK_FRFIX=1. */
     int fr_kept = 0;
     {
         static int frkeep = -1;
@@ -2820,24 +2872,42 @@ int brisk_main(int argc, char **argv) {
                  * the reduced dual optimal face is larger than the projection of the original one (the coupling
                  * of a removed index with the kept ones must lie in the range of the reduced slack, which the
                  * reduced solve knows nothing about), so the re-solve below is the way to that dual. */
-                if (par.verbose >= 0)
-                    printf("postsolve: the duals of the %d removed constraint(s) are not rebuilt (dual error %.1e on the problem as read); "
-                           "the reduced solve is kept (accuracy %.1e without that error)\n", u->fr_removed, u->pr.err[4], acc_k);
-                brisk_note("facial reduction: y is not dual feasible for the %d removed constraint(s), whose duals could not be rebuilt (dual error %.1e "
-                           "on the problem as read; hence the status). The reduced solve is returned, accurate to %.1e apart from that: X is that of the problem "
-                           "as read, the optimal value lies in [b'y, <C,X>] = [%.10g, %.10g]. The reduced solve's dual does not extend to those constraints, "
-                           "or the dual optimum of the problem as read is not attained",
-                           u->fr_removed, u->pr.err[4], acc_k, u->pr.dobj, u->pr.pobj);
+                /* 5.17 (the owner, 16 October 2026): no re-solve by default; the user is told that the recovery failed,
+                 * what is correct, and how to solve again without the reduction, in the caller's syntax (the command
+                 * line, Python, CVXPY, Julia, JuMP, MATLAB: the machinery of the advice at the end of the log) */
+                const int resolve_follows = fr_retry && par.fr_fallback > 0;
+                if (par.verbose >= 0) {
+                    printf("postsolve: facial reduction: the duals of the %d removed constraint(s) could not be rebuilt (dual error %.1e on the problem as read); "
+                           "the reduced solve is returned, accurate to %.1e apart from that\n", u->fr_removed, u->pr.err[4], acc_k);
+                    if (!resolve_follows) printf("  for a dual feasible on the problem as read, solve again without facial reduction: %s%s\n", syn_kv("nofr", NULL, 0), syn_head());
+                }
+                brisk_note("facial reduction: the recovery of the duals of the %d removed constraint(s) failed: y is not dual feasible for them (dual error %.1e "
+                           "on the problem as read; hence the status). The rest is correct to %.1e: X solves the problem as read, the optimal value lies in "
+                           "[b'y, <C,X>] = [%.10g, %.10g]. For a correct dual, solve again without facial reduction: %s%s",
+                           u->fr_removed, u->pr.err[4], acc_k, u->pr.dobj, u->pr.pobj, syn_kv("nofr", NULL, 0), syn_head());
                 u->status = ST_REDUCED;
                 u->acc = fmax(acc_k, fmin(u->pr.err[4], 1.0));
                 fr_kept = 1;
             }
         }
+        /* 5.17 (ISSUES 93): the removed duals were rebuilt through complementarity with the primal, but not
+         * to the tolerance (pop_wood: 1e-7 where the status needs 1e-8): the point is returned as it is,
+         * with the status its errors give, and the re-solve without the reduction is tried within the same
+         * budget for the last decade */
+        if (!lost && frkeep && do_fr && u->fr_removed > 0 && u->measured && u->status != ST_OPTIMAL
+            && u->status != ST_PINFEAS && u->status != ST_DINFEAS && u->pr.fr_corrected
+            && u->pr.err[4] > par.tol && u->pr.err[4] >= 0.5 * u->acc) {
+            if (par.verbose >= 0)
+                printf("postsolve: the duals of the %d removed constraint(s) are rebuilt through complementarity with the primal to a dual error of %.1e on the problem as read (the certificate recovery failed)\n", u->fr_removed, u->pr.err[4]);
+            brisk_note("facial reduction: the duals of the %d removed constraint(s) could not be rebuilt from the reduction certificates; y was corrected through "
+                       "complementarity with the primal to a dual error of %.1e on the problem as read", u->fr_removed, u->pr.err[4]);
+            fr_kept = 1;
+        }
     }
     for (int stage = 0; stage < 2; stage++) {
         const int need = do_fr && fr_retry && u->fr_removed > 0 && u->measured && u->status != ST_OPTIMAL
             && u->status != ST_PINFEAS && u->status != ST_DINFEAS
-            && u->pr.err[4] > fmax(100.0 * fmax(par.tol, 1e-8), 1e-3 * u->acc) && u->pr.err[4] >= 0.5 * u->acc
+            && u->pr.err[4] > (fr_kept ? fmax(par.tol, 1e-3 * u->acc) : fmax(100.0 * fmax(par.tol, 1e-8), 1e-3 * u->acc)) && u->pr.err[4] >= 0.5 * u->acc
             && (!fr_kept || (stage == 1 && par.fr_fallback > 0))
             && (!brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit));
         if (!need) { if (fr_kept && stage == 0) continue; break; }
@@ -2936,7 +3006,7 @@ int brisk_main(int argc, char **argv) {
         if (replaced && (u->Xo || par.bound_side == 2)) {
             PSResult pb;
             ps_measure(Ob, u->Xo, u->yo, &pb);
-            pb.recovered = u->pr.recovered; pb.unrecovered = u->pr.unrecovered; pb.t += u->pr.t;
+            pb.recovered = u->pr.recovered; pb.unrecovered = u->pr.unrecovered; pb.fr_corrected = u->pr.fr_corrected; pb.t += u->pr.t;
             if (pb.have_x || !u->measured) {
                 u->pr = pb;
                 if (pb.have_x) {
@@ -2965,7 +3035,9 @@ int brisk_main(int argc, char **argv) {
     if (status == ST_NUMERIC && acc > par.red_acc && acc <= 100.0 * par.red_acc) near_miss = 1;
     /* 4.37 (B2b): the likely cause of a result that misses the tolerance */
     char cause[320] = "";
-    if ((status == ST_REDUCED || status == ST_NUMERIC || status == ST_MAXIT || status == ST_TIME) && acc > 10.0 * par.tol)
+    if (fr_kept)     /* 5.17: the cause is known, the note at the end says it in full (the diagnosis below would blame the multipliers) */
+        snprintf(cause, sizeof cause, "the recovery of the duals of the %d constraint(s) removed by the facial reduction failed (the note below says what is correct and how to solve without the reduction)", u->fr_removed);
+    else if ((status == ST_REDUCED || status == ST_NUMERIC || status == ST_MAXIT || status == ST_TIME) && acc > 10.0 * par.tol)
         diagnose_cause(u, &par, O, Xo, yo, &pr, acc, cause, sizeof(cause));
     if (near_miss)
         printf("status: %s (max rel error %.1e, within 100x the %.0e reduced-accuracy level)   iterations: %d\n", status_str[status], acc, par.red_acc, R.iters);

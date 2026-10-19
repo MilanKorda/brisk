@@ -372,6 +372,35 @@ int read_sdpa(const char *fname, Problem *P) {
     double e[5];
     for (;;) {
         int got = 0;
+        {   /* 5.18: text after the last entry (Mittelmann's neosfbr25 ends with a BEGIN.COMMENT ... END.COMMENT block,
+             * which 1.5's strict reading of ISSUES 101 rejected as malformed): at an entry boundary, a token that does
+             * not start a number, with no line of numbers after it, ends the data with a note; text inside an entry
+             * or before more entries stays an error */
+            char *q = p;
+            while (*q && isspace((unsigned char)*q)) q++;
+            if (*q && !(isdigit((unsigned char)*q) || *q == '-' || *q == '+' || *q == '.')) {
+                int more = 0; long nl = 0;
+                for (char *r = q; *r && !more; ) {
+                    char *eol = strchr(r, '\n');
+                    const size_t len = eol ? (size_t)(eol - r) : strlen(r);
+                    nl++;
+                    char *t = r; int nnum = 0;
+                    while (t < r + len) {
+                        while (t < r + len && isspace((unsigned char)*t)) t++;
+                        if (t >= r + len) break;
+                        char *e2; (void)strtod(t, &e2);
+                        if (e2 == t) break;
+                        nnum++; t = e2;
+                    }
+                    if (nnum >= 5) more = 1;
+                    r = eol ? eol + 1 : r + len;
+                }
+                if (!more) {
+                    fprintf(stderr, "brisk: note: %ld line(s) of text after the last entry of %s ignored\n", nl, fname);
+                    break;
+                }
+            }
+        }
         for (got = 0; got < 5; got++) if (!next_num(&p, &e[got])) break;
         if (got < 5) {
             if (got > 0) fprintf(stderr, "brisk: warning: incomplete last entry (%d of 5 numbers) ignored\n", got);
@@ -592,6 +621,7 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
     }
     double cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R;
     double mem = 8.0 * (double)R * R;         /* single-buffer mode */
+    if (getenv("BRISK_LRDBG")) printf("   [low-rank block: n %d, %d constraints, rank %ld (ok %d): cost %.3g against the routes' %.3g, memory %.3g of %.3g]\n", n, nc, R, ok, cost_lr, cost_now, mem, par->dense_mem);
     if (ok && (par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) {
         B->lowrank = 1;
         B->lrR = (int)R;
@@ -611,6 +641,115 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
     }
     for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); }
     free(Ws); free(Ss); free(rk);
+}
+
+/* 5.18: a rank-one factor from the data's pivot column, w = A e_p / sqrt|A_pp| with s = sign A_pp (p the largest
+ * diagonal entry): w w' s reproduces the column p exactly and the rest to the rounding of the data, where the
+ * eigendecomposition of lowrank_factor carries about n u (an occupation-measure dual form ended a decade less
+ * accurate through the dictionary built on it). Kept when it reproduces the entries better. */
+static void rank1_exact(const SpSym *S, int n, double *W, double *sg) {
+    int p = -1; double best = 0;
+    for (int q = 0; q < S->ef; q++) if (S->fr[q] == S->fc[q] && fabs(S->fv[q]) > best) { best = fabs(S->fv[q]); p = S->fr[q]; }
+    if (p < 0) return;
+    double *w = xcalloc(n, sizeof(double));
+    double dpp = 0;
+    for (int q = 0; q < S->ef; q++) if (S->fr[q] == p && S->fc[q] == p) dpp = S->fv[q];
+    const double s = dpp > 0 ? 1.0 : -1.0, rt = sqrt(fabs(dpp));
+    for (int q = 0; q < S->ef; q++) if (S->fc[q] == p) w[S->fr[q]] = S->fv[q] / (s * rt);
+    double e_new = 0, e_old = 0;
+    for (int q = 0; q < S->ef; q++) {
+        const int i = S->fr[q], j = S->fc[q];
+        e_new = fmax(e_new, fabs(s * w[i] * w[j] - S->fv[q]));
+        e_old = fmax(e_old, fabs(sg[0] * W[i] * W[j] - S->fv[q]));
+    }
+    if (e_new <= e_old) { memcpy(W, w, sizeof(double) * n); sg[0] = s; }
+    free(w);
+}
+double analyze_sdp_block(Block *B, const Params *par);
+int brisk_block_as_cone(const Params *par, const Block *B);
+typedef struct { int r, c; double v; } LDTrip;
+static int cmp_ldtrip(const void *a, const void *b) {
+    const LDTrip *x = a, *y = b;
+    if (x->r != y->r) return x->r < y->r ? -1 : 1;
+    return (x->c > y->c) - (x->c < y->c);
+}
+/* 5.18 (the owner's benchmark, ISSUES 97: A-optimal design, one LMI of order 180 with 2,000 dense rank-one
+ * constraints v v' and 4,095 sparse ones): the dictionary route with the factors of the constraints of low rank as
+ * its shared columns. A constraint whose factor is smaller than its entries (A_t = sum_k s_k w_k w_k', rank r <= 8,
+ * 4 n r <= its entries) contributes the columns w_k with S_t = diag(s_k) on them; every other constraint keeps its
+ * entries on unit columns (exact). Then tr(A_t X A_u Zi) = tr(S_t P S_u Q) with P = D'XD, Q = D'Zi D, the virtual
+ * block holds 1 to 2 entries a constraint, and the pairs of two rank-one constraints are P_tu Q_tu. The dense route
+ * took 2 n^3 per such constraint and m_d^2 n^2 for their pairs (2.7 s an assembly); the block-level low-rank route
+ * counts every sparse constraint's factor too (R = 10,100 against 2,000). BRISK_LRDICT=0 off. */
+static double lrdict_build(Block *B, const Params *par) {
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_LRDICT"); on = e ? atoi(e) : 1; }
+    const int n = B->n, nc = B->ncon;
+    const double n2 = (double)n * n;
+    if (!on || par->dict == 0 || par->lowrank == 0 || nc < 2 || n < 16) return 1e300;
+    int *rk = xcalloc(nc, sizeof(int)); double **Ws = xcalloc(nc, sizeof(double *)), **Ss = xcalloc(nc, sizeof(double *));
+    int nl = 0; long nv = 0;
+    for (int t = 0; t < nc; t++) {
+        const SpSym *S = &B->A[t];
+        if (S->ef < 0.25 * n2) continue;
+        double *W = NULL, *sg = NULL;
+        int r = lowrank_factor(S, n, 8, &W, &sg);
+        if (r == 1) rank1_exact(S, n, W, sg);
+        if (r > 0 && r <= 8 && 4.0 * n * r <= S->ef) { rk[t] = r; Ws[t] = W; Ss[t] = sg; nl++; nv += r; }
+        else { free(W); free(sg); }
+    }
+    if (nl < 2) { for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); } free(rk); free(Ws); free(Ss); return 1e300; }
+    double *V = xmalloc(sizeof(double) * (size_t)n * nv);
+    SpSym *SS = xcalloc(nc, sizeof(SpSym));
+    int *ucol = xcalloc(n + 1, sizeof(int)), nu = 0;
+    for (int t = 0; t < nc; t++) if (!rk[t]) {
+        const SpSym *A = &B->A[t];
+        for (int q = 0; q < A->nnz; q++) {
+            if (!ucol[A->row[q]]) ucol[A->row[q]] = ++nu;
+            if (!ucol[A->col[q]]) ucol[A->col[q]] = ++nu;
+        }
+    }
+    long c = 0;
+    for (int t = 0; t < nc; t++) {
+        SpSym *S = &SS[t];
+        const SpSym *A = &B->A[t];
+        const int ne = rk[t] ? rk[t] : A->nnz;
+        LDTrip *T = xmalloc(sizeof(LDTrip) * (ne + 1));
+        if (rk[t]) {
+            for (int k = 0; k < rk[t]; k++) {
+                memcpy(V + (size_t)(c + k) * n, Ws[t] + (size_t)k * n, sizeof(double) * n);
+                T[k] = (LDTrip){ (int)(nu + c + k), (int)(nu + c + k), Ss[t][k] };
+            }
+            c += rk[t];
+        } else for (int q = 0; q < A->nnz; q++) T[q] = (LDTrip){ ucol[A->row[q]] - 1, ucol[A->col[q]] - 1, A->val[q] };
+        qsort(T, ne, sizeof(LDTrip), cmp_ldtrip);
+        S->nnz = ne;
+        S->row = xmalloc(sizeof(int) * (ne + 1)); S->col = xmalloc(sizeof(int) * (ne + 1)); S->val = xmalloc(sizeof(double) * (ne + 1));
+        for (int q = 0; q < ne; q++) { S->row[q] = T[q].r; S->col[q] = T[q].c; S->val[q] = T[q].v; }
+        free(T);
+    }
+    const int qd = nu + (int)nv;
+    for (int t = 0; t < nc; t++) spsym_finish(&SS[t], qd, 0);
+    B->dunit = xmalloc(sizeof(int) * (nu + 1));
+    for (int p = 0; p < n; p++) if (ucol[p]) B->dunit[ucol[p] - 1] = p;
+    free(ucol);
+    for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); }
+    free(rk); free(Ws); free(Ss);
+    Block *vb = xcalloc(1, sizeof(Block));
+    vb->type = BLK_SDP; vb->n = qd; vb->ncon = nc;
+    vb->con = xmalloc(sizeof(int) * (nc + 1));
+    memcpy(vb->con, B->con, sizeof(int) * nc);
+    vb->A = SS;
+    vb->C.nnz = 0;
+    vb->C.row = xmalloc(sizeof(int)); vb->C.col = xmalloc(sizeof(int)); vb->C.val = xmalloc(sizeof(double));
+    spsym_finish(&vb->C, qd, 0);
+    Params pv = *par;
+    pv.lowrank = 0; pv.dict = 0; pv.cls = 0;               /* P is singular: no factor-based route inside */
+    const double cost_vb = analyze_sdp_block(vb, &pv);
+    B->vb = vb; B->dV = V; B->dnu = nu; B->dnv = (int)nv; B->dstruct = nl; B->dlr = 1;
+    const double nd = n;
+    const double form = par->c_blas * 2.0 * (nd * nd * nv + nd * (double)nv * nv) + par->c_sparse * (double)qd * qd;
+    if (getenv("BRISK_LRDBG")) printf("   [low-rank dictionary: n %d, %d of %d constraints by %ld factor columns, %d unit columns: cost %.3g + %.3g]\n", n, nl, nc, nv, nu, cost_vb, form);
+    return cost_vb + form;
 }
 
 static double g_fact_ref = 0;   /* the work of a dense factorization of the Schur complement (problem_prepare) */
@@ -712,6 +851,17 @@ double analyze_sdp_block(Block *B, const Params *par) {
     /* dictionary route first (linear-time detection with gates), then low-rank;
      * the cheapest of {current routes, dictionary, low-rank} wins */
     double cost_dict = (par->dict != 0) ? dict_build(B, par) : 1e300;
+    if (!B->vb) {
+        /* 5.18: the factors of low-rank constraints as the shared columns, with the gate of the entry-class route
+         * below: cheaper by a fifth by the model, on a block whose assembly matters, and a saving of at least 4 % of a
+         * dense factorization of the Schur complement (where it saves less it only moves the rounding: an
+         * occupation-measure dual form, nn_n20_m100_K, OPTIMAL 1.0e-11 -> 1.0e-8 for no time) */
+        const double c_lrd = lrdict_build(B, par);
+        if (B->vb && !(par->dict > 0 || (c_lrd < 0.8 * cost_now && cost_now > 1e7 && cost_now - c_lrd >= 0.04 * g_fact_ref))) {
+            if (getenv("BRISK_LRDBG")) printf("   [low-rank dictionary not taken: %.3g against %.3g, the factorization %.3g]\n", c_lrd, cost_now, g_fact_ref);
+            dict_free(B); B->dlr = 0; cost_dict = 1e300;
+        } else cost_dict = c_lrd;
+    }
     if (!(B->vb && par->dict > 0)) lowrank_block(B, par, fmin(cost_now, cost_dict));
     if (B->lowrank) dict_free(B);
     else if (B->vb && (par->dict > 0 || cost_dict < cost_now)) { B->dict = 1; cost_now = cost_dict; }
@@ -743,7 +893,57 @@ double analyze_sdp_block(Block *B, const Params *par) {
     B->dlist = xmalloc(sizeof(int) * (nd ? nd : 1));
     B->slist = xmalloc(sizeof(int) * (B->ns ? B->ns : 1));
     B->Ad = NULL;
-    if (nd) {
+    B->dfac = 0;
+    if (nd && B->dict && B->dlr && !getenv("BRISK_NODFAC")) {
+        /* 5.18: with the low-rank dictionary the assembly reads no dense copy; the operators then take each dense
+         * constraint through its factor (A_t(D) = sum s_k w_k' D w_k, A*(y) = W diag(s y) W': two products of n x n x R
+         * instead of passes over nd n^2 copies; A-optimal design: 520 MB read a dozen times an iteration), when every
+         * dense constraint has a factor that gives its entries back to 32 u of the largest */
+        int *rk = xcalloc(nc, sizeof(int)); double **Ws = xcalloc(nc, sizeof(double *)), **Ss = xcalloc(nc, sizeof(double *));
+        int okf = 1; long Rd = 0;
+        for (int t = 0; t < nc && okf; t++) {
+            if (B->dpos[t] < 0) continue;
+            const SpSym *S = &B->A[t];
+            const int r = lowrank_factor(S, n, 8, &Ws[t], &Ss[t]);
+            if (r <= 0 || r > 8) { okf = 0; break; }
+            if (r == 1) rank1_exact(S, n, Ws[t], Ss[t]);
+            double amax = 0, emax = 0;
+            for (int q = 0; q < S->ef; q++) {
+                double v = 0;
+                for (int k = 0; k < r; k++) v += Ss[t][k] * Ws[t][S->fr[q] + (size_t)k * n] * Ws[t][S->fc[q] + (size_t)k * n];
+                amax = fmax(amax, fabs(S->fv[q])); emax = fmax(emax, fabs(v - S->fv[q]));
+            }
+            /* (entries outside the pattern: the factor's own values there) */
+            /* the operators define the problem the solver sees, so the factor must give the entries back to the
+             * rounding of data written with 15 to 16 digits (32 u of the largest: 2.3e-15 measured on such data): the rank-one factor from the pivot
+             * column does; an eigendecomposition's n u does not (an occupation-measure dual form, factors of rank 4,
+             * n = 120: OPTIMAL 1e-11 -> 1e-8 through them) */
+            const double ftol = 32.0 * 1.1102230246251565e-16;
+            if (getenv("BRISK_LRDBG") && emax > ftol * amax) printf("   [dense constraint %d: factor of rank %d gives its entries to %.2e of the largest]\n", t, r, emax / amax);
+            if (emax > ftol * amax) okf = 0;
+            rk[t] = r; Rd += r;
+        }
+        if (getenv("BRISK_LRDBG")) printf("   [low-rank dictionary: the operators through the factors: %s (%d dense constraints)]\n", okf ? "yes" : "no", nd);
+        if (okf) {
+            B->dfac = 1;
+            B->dfoff = xmalloc(sizeof(int) * (nd + 1));
+            B->dfW = xmalloc(sizeof(double) * (size_t)n * (Rd ? Rd : 1));
+            B->dfS = xmalloc(sizeof(double) * (Rd ? Rd : 1));
+            long c = 0; int a = 0;
+            for (int t = 0; t < nc; t++) {
+                if (B->dpos[t] < 0) continue;
+                B->dfoff[a++] = (int)c;
+                memcpy(B->dfW + (size_t)c * n, Ws[t], sizeof(double) * (size_t)n * rk[t]);
+                memcpy(B->dfS + c, Ss[t], sizeof(double) * rk[t]);
+                c += rk[t];
+            }
+            B->dfoff[a] = (int)c;
+        }
+        for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); }
+        free(rk); free(Ws); free(Ss);
+    }
+    B->Adl = NULL;
+    if (nd && !B->dfac) {
         if (posix_memalign((void **)&B->Ad, 64, (size_t)nd * n * n * sizeof(double))) exit(1);
         memset(B->Ad, 0, (size_t)nd * n * n * sizeof(double));
     }
@@ -755,14 +955,28 @@ double analyze_sdp_block(Block *B, const Params *par) {
                 { const int a0 = B->dpos[t]; B->drk[di] = drk[a0]; B->drW[di] = drW[a0]; B->drS[di] = drS[a0]; }
                 B->dpos[t] = di;
                 B->dlist[di] = t;
-                double *D = B->Ad + (size_t)di * n * n;
-                const SpSym *S = &B->A[t];
-                for (int q = 0; q < S->ef; q++) D[S->fr[q] + (size_t)S->fc[q] * n] = S->fv[q];
+                if (B->Ad) {
+                    double *D = B->Ad + (size_t)di * n * n;
+                    const SpSym *S = &B->A[t];
+                    for (int q = 0; q < S->ef; q++) D[S->fr[q] + (size_t)S->fc[q] * n] = S->fv[q];
+                }
                 B->route[t] = 2;
                 di++;
             } else B->slist[si++] = t;
         }
         free(drk); free(drW); free(drS);
+        /* 17 October 2026: small blocks: the dense constraints' lower triangles packed by columns, so that A(D) and
+         * A*(y) are one pass over n(n+1)/2 entries each, without a BLAS call per block (mater-5: 2,440 blocks of order
+         * 11, 1.2 million calls of a 121 x 16 dgemv, 2.6 us each). BRISK_NOADL=1: the dgemv on the full copies. */
+        if (B->Ad && n <= ADL_MAXN && !getenv("BRISK_NOADL")) {
+            const int nl = n * (n + 1) / 2;
+            B->Adl = xmalloc(sizeof(double) * (size_t)nd * nl);
+            for (int a = 0; a < nd; a++) {
+                const double *D = B->Ad + (size_t)a * n * n; double *o = B->Adl + (size_t)a * nl;
+                int k = 0;
+                for (int j = 0; j < n; j++) for (int i = j; i < n; i++) o[k++] = D[i + (size_t)j * n];
+            }
+        }
         if (getenv("BRISK_DRLRDBG")) for (int a = 0; a < nd; a++) if (B->drk[a]) printf("   [block n %d: dense constraint %d of rank %d: the low-rank row route]\n", n, B->con[B->dlist[a]], B->drk[a]);
     }
 
@@ -838,6 +1052,43 @@ double analyze_sdp_block(Block *B, const Params *par) {
         free(mk);
         if (ok) { B->allmono = 1; for (int a = 0; a < B->ns; a++) B->route[B->slist[a]] = 5; }
     }
+    /* 5.18 (ISSUES 96a): Weyl operators. When n = 2^p and every constraint is A[c ^ x, c] = k (-1)^(z . c) for all c
+     * (the Pauli strings of quantum state tomography in their real form: a translation of Z_2^p and a character), the
+     * pair <A_b, X A_a Zi> = k_b sum_c (-1)^(z_b . c) G_a[c ^ x_b, c] is entry z_b of the Walsh-Hadamard transform of
+     * the x_b-th XOR diagonal of G_a: n^2 log n an a for all b instead of a gather of n entries a pair (m^2 n / 2
+     * random reads an assembly). BRISK_WEYL=0 off. */
+    free(B->wx); free(B->wz); free(B->wk); B->wx = B->wz = NULL; B->wk = NULL; B->allweyl = 0;
+    if (getenv("BRISK_WEYLDBG")) printf("   [Weyl check: n %d ns %d nd %d lowrank %d dict %d cls %d]\n", n, B->ns, B->nd, B->lowrank, B->dict, B->cls);
+    if (!B->lowrank && !B->dict && !B->cls && B->nd == 0 && B->ns >= 2 * n && n >= 32 && (n & (n - 1)) == 0
+        && !(getenv("BRISK_WEYL") && atoi(getenv("BRISK_WEYL")) == 0)) {
+        int ok = 1;
+        int *wx = xmalloc(sizeof(int) * B->ns), *wz = xmalloc(sizeof(int) * B->ns); double *wk = xmalloc(sizeof(double) * B->ns);
+        double *vc = xmalloc(sizeof(double) * n); char *have = xmalloc(n);
+        for (int a = 0; a < B->ns && ok; a++) {
+            const SpSym *S = &B->A[B->slist[a]];
+            if (S->ef != n) { ok = 0; break; }
+            memset(have, 0, n);
+            const int x = S->fr[0] ^ S->fc[0];
+            for (int e = 0; e < S->ef; e++) {
+                if ((S->fr[e] ^ S->fc[e]) != x || have[S->fc[e]]) { ok = 0; break; }
+                have[S->fc[e]] = 1; vc[S->fc[e]] = S->fv[e];
+            }
+            if (!ok) break;
+            const double k = vc[0];
+            if (k == 0) { ok = 0; break; }
+            int z = 0;
+            for (int bit = 1; bit < n; bit <<= 1) if (vc[bit] != k) { if (vc[bit] == -k) z |= bit; else { ok = 0; break; } }
+            for (int c = 0; c < n && ok; c++) {
+                const double want = __builtin_popcount(z & c) & 1 ? -k : k;
+                if (vc[c] != want) ok = 0;
+            }
+            wx[a] = x; wz[a] = z; wk[a] = k;
+        }
+        free(vc); free(have);
+        if (getenv("BRISK_WEYLDBG")) printf("   [Weyl operators: block n %d, %d constraints: %s]\n", n, B->ns, ok ? "all" : "not all");
+        if (ok) { B->allweyl = 1; B->wx = wx; B->wz = wz; B->wk = wk; B->allmono = 1; for (int a = 0; a < B->ns; a++) B->route[B->slist[a]] = 5; }
+        else { free(wx); free(wz); free(wk); }
+    }
 
     /* 5.5: the live region of the row products. X A_a Zi is read only at the entries of the
      * constraints b >= a. An index whose last constraint is before a is dead for a: with the
@@ -849,7 +1100,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
      * with shares of 53-58 %, losses of 8 % at a share of 74 % (n = 135) and of 15 % on blocks of
      * 55-66 (small products run at a lower rate, the gather is not reduced). */
     B->live = 0; B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL;
-    B->lu_cp = B->lu_ca = B->lu_cr = B->lu_ch = NULL; B->lu_cv = NULL; B->symg = 0;
+    B->lu_cp = B->lu_ca = B->lu_cr = B->lu_ch = NULL; B->lu_cv = NULL; B->symg = 0; B->s2k = 0;
     {
         int n1 = 0;
         for (int a = 0; a < B->ns; a++) n1 += B->route[B->slist[a]] == 1;
@@ -921,7 +1172,34 @@ double analyze_sdp_block(Block *B, const Params *par) {
             if (ENV_ON("BRISK_ROUTEDBG")) printf("   [block n %d: live region of the row products: %.1f %% of nr n^2 (%s); gather %.3g entries, products %.3g flops, share %.2f]\n", n, 100.0 * area / fmax(full, 1.0), B->live ? "used" : "not used", gath, 2.0 * area, gshare);
             free(death); free(cnt);
             if (!B->live) { free(B->lv_perm); free(B->lv_rank); free(B->lv_u); free(B->lv_cp); free(B->lv_ca); free(B->lv_cr); free(B->lv_ch); free(B->lv_cv);
-                            B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL; }
+                            B->lv_perm = B->lv_rank = B->lv_u = B->lv_cp = B->lv_ca = B->lv_cr = B->lv_ch = NULL; B->lv_cv = NULL;
+              if (!ENV_ON("BRISK_NOS2K")) {
+                /* 18 October 2026: without the live region (its staircase saves nothing: random sparse data, every
+                 * index read to the last constraint), the upper entries of the block's constraints by column in the
+                 * original order, the diagonal halved, each column's entries by constraint: route 1 then forms
+                 * H = X A_a Zi + Zi A_a X by one dsyr2k (its upper triangle, the flops of the full X A_a Zi) and
+                 * reads it at the later constraints' upper entries column by column, half the entries of the full
+                 * gather and in the order of the memory (the owner's benchmark, random sparse SDPs: the gather was
+                 * half of the assembly). BRISK_NOS2K=1: the full product and gather as before */
+                size_t fu = 0;
+                for (size_t k = 0; k < fe; k++) fu += B->ffr[k] <= B->ffc[k];
+                B->lu_cp = xcalloc((size_t)n + 2, sizeof(int));
+                B->lu_ca = xmalloc(sizeof(int) * (fu + 1)); B->lu_cr = xmalloc(sizeof(int) * (fu + 1)); B->lu_cv = xmalloc(sizeof(double) * (fu + 1));
+                for (size_t k = 0; k < fe; k++) if (B->ffr[k] <= B->ffc[k]) B->lu_cp[B->ffc[k] + 1]++;
+                for (int q = 0; q < n; q++) B->lu_cp[q + 1] += B->lu_cp[q];
+                int *pos = xmalloc(sizeof(int) * (n + 1));
+                memcpy(pos, B->lu_cp, sizeof(int) * (n + 1));
+                for (int a = 0; a < ns; a++)
+                    for (int k = B->foff[a]; k < B->foff[a + 1]; k++) {
+                        if (B->ffr[k] > B->ffc[k]) continue;
+                        const int t = pos[B->ffc[k]]++;
+                        B->lu_ca[t] = a; B->lu_cr[t] = B->ffr[k];
+                        B->lu_cv[t] = B->ffr[k] == B->ffc[k] ? 0.5 * B->ffv[k] : B->ffv[k];
+                    }
+                free(pos);
+                B->s2k = 1;
+              }
+            }
             else if (!ENV_ON("BRISK_NOSYMG")) {
                 /* 5.12, the symmetric gather (solver.c): the upper triangle in the permuted order, in
                  * the same column-and-constraint order. BRISK_NOSYMG=1: the full entries as before.
@@ -1043,7 +1321,8 @@ void problem_prepare(Problem *P, const Params *par) {
             free(cnt);
             continue;
         }
-        analyze_sdp_block(B, par);
+        if (brisk_block_as_cone(par, B)) { Params pc = *par; pc.lowrank = 0; pc.dict = 0; analyze_sdp_block(B, &pc); }
+        else analyze_sdp_block(B, par);
     }
 }
 
@@ -1057,7 +1336,9 @@ void block_free_contents(Block *B) {
     free(B->A); free(B->con);
     spsym_free(&B->C);
     free(B->route); free(B->urows); free(B->ufr); free(B->ufc);
-    free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad);
+    free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad); free(B->Adl);
+    free(B->dfoff); free(B->dfW); free(B->dfS); B->dfoff = NULL; B->dfW = NULL; B->dfS = NULL; B->dfac = 0;
+    free(B->wx); free(B->wz); free(B->wk); B->wx = B->wz = NULL; B->wk = NULL; B->allweyl = 0;
     if (B->drk) { for (int a = 0; a < B->nd; a++) { free(B->drW[a]); free(B->drS[a]); } }
     free(B->drk); free(B->drW); free(B->drS);
     free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv); free(B->ffp);

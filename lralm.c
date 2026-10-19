@@ -47,6 +47,8 @@ typedef struct {
     double *xs, *ws, *wq;        /* per pattern entry: X (or a bilinear form), S = C - A*(w), A*(q) */
     int *sup, *supp;             /* constraint t: its distinct rows (the support) */
     SChol *F;                    /* preconditioner: 2 S + 4 sigma sum_t (A_t R)(A_t R)' + delta I */
+    size_t *ofS, *ofC, *ofCp, *ofD;   /* 5.19: F's value offsets in the assembly's order (S part, constraints, diagonal) */
+    size_t *tp; unsigned *tq; double *cv2; size_t ntp;   /* 5.19: per value entry its contributions q (ascending), and their values */
     double fshift, fabs_; int Fr;
     SChol *Fz;                   /* Z's own pattern (the bound test) */
     int ncon; const int *con;
@@ -113,7 +115,7 @@ static void ls_setup(LS *s, const Block *B, int k) {
         free(on);
     }
 }
-static void ls_free(LS *s) { free(s->sp); free(s->sj); free(s->dg); free(s->cp); free(s->ep); free(s->ev); free(s->cep); free(s->cev); free(s->xs); free(s->ws); free(s->wq); free(s->sup); free(s->supp); if (s->F) schol_free(s->F); if (s->Fz) schol_free(s->Fz); }
+static void ls_free(LS *s) { free(s->tp); free(s->tq); free(s->cv2); free(s->ofS); free(s->ofC); free(s->ofCp); free(s->ofD); free(s->sp); free(s->sj); free(s->dg); free(s->cp); free(s->ep); free(s->ev); free(s->cep); free(s->cev); free(s->xs); free(s->ws); free(s->wq); free(s->sup); free(s->supp); if (s->F) schol_free(s->F); if (s->Fz) schol_free(s->Fz); }
 
 /* xs[p] = (U V' + V U')_{ij} / (1 + same) on the pattern: sym = 0: (U U')_{ij}; 1: U_i.V_j + V_i.U_j */
 static void pat_form(const LS *s, const double *U, const double *V, int sym) {
@@ -211,10 +213,14 @@ static double dphi(const LR *L, double a, const double *t0, const double *t1, co
     }
     return d;
 }
-static double lsearch(const LR *L, const double *t0, const double *t1, const double *t2, const double *y, double c1, double c2, double d0, int *nev) {
-    double lo = 0, dlo = d0, hi = 1, dhi = dphi(L, hi, t0, t1, t2, y, c1, c2);
+static double lsearch(const LR *L, const double *t0, const double *t1, const double *t2, const double *y, double c1, double c2, double d0, int *nev, double amax) {
+    /* 5.19: amax, a trust radius (the step's length at most 10 (|z| + 1)): with the clipped rows flat and the
+     * objective's curvature negative along the direction the subproblem is unbounded on it, and 80 doublings
+     * gave a step of 2^80 (case19402: |grad| 3e22 in one subproblem) */
+    if (!(amax > 0)) amax = 1e300;
+    double lo = 0, dlo = d0, hi = fmin(1.0, amax), dhi = dphi(L, hi, t0, t1, t2, y, c1, c2);
     int k = 1;
-    while (dhi < 0 && k < 80) { lo = hi; dlo = dhi; hi *= 2; dhi = dphi(L, hi, t0, t1, t2, y, c1, c2); k++; }
+    while (dhi < 0 && k < 80 && hi < amax) { lo = hi; dlo = dhi; hi = fmin(2 * hi, amax); dhi = dphi(L, hi, t0, t1, t2, y, c1, c2); k++; }
     if (dhi < 0) { *nev += k; return hi; }
     /* Illinois on [lo, hi]; the point with the smallest |phi'| is returned */
     int side = 0; double best = fabs(dlo) < fabs(dhi) ? lo : hi, dbest = fmin(fabs(dlo), fabs(dhi));
@@ -308,6 +314,52 @@ static int z_posdef(LS *s) {
     return schol_factor(s->Fz, 0.0) == 0;
 }
 
+/* 5.19 (research, BRISK_LRXOUT=file): the rank-one point R / R_0 (one value per index of the block as read; R_0
+ * the row of the constant 1, the first index) when the method leaves rank 1, for a start of the factored
+ * interior-point method (-bm 2, BRISK_BM2START) */
+static void lr_xout(const LS *s, const double *R, const char *fn) {
+    const int r = s->r; if (r < 1) return;
+    const double r0 = R[0];
+    FILE *f = fopen(fn, "w"); if (!f) return;
+    for (int i = 0; i < s->n; i++) fprintf(f, "%.17g\n", r0 != 0 ? R[(size_t)i * r] / r0 : R[(size_t)i * r]);
+    fclose(f);
+}
+/* 5.19: the smallest eigenpair of Z = ws by shift and invert on its sparse Cholesky (the network pattern,
+ * analysed once in s->Fz): the smallest shift d of the ladder at which Z + d scale I factors, refined by
+ * bisection to within ~7%, then inverse iteration with that factor converges to the eigenvector of
+ * lambda_min(Z) at a ratio (lambda_1 + d) / (lambda_2 + d) <= ~0.07. Near the optimum Z is singular and
+ * its smallest eigenvalues cluster at 0, where 60 Lanczos steps do not resolve a small negative one
+ * (case1354: the ladder at -6.7e-3 relative, Lanczos above -tol, no escape). Returns lambda (scaled),
+ * 1 in *ok when found; v of length n. */
+static double zmin_si(LS *s, double *v, int *ok) {
+    const int n = s->n; *ok = 0;
+    if (!z_posdef(s) && s->Fz) {
+        double dmax = 0; for (int i = 0; i < n; i++) if (s->dg[i] >= 0) dmax = fmax(dmax, fabs(s->ws[s->dg[i]]));
+        if (dmax <= 0) dmax = 1;
+        #define ZFAC(SH) ({ schol_zero(s->Fz); for (int i_ = 0; i_ < n; i_++) for (int p_ = s->sp[i_]; p_ < s->sp[i_ + 1]; p_++) { const int j_ = s->sj[p_]; if (j_ <= i_) schol_add(s->Fz, i_, j_, s->ws[p_] + (i_ == j_ ? (SH) : 0.0)); } schol_factor(s->Fz, 0.0) == 0; })
+        double lo = 0, hi = -1;
+        for (int at = 0; at < 14; at++) { const double sh = dmax * pow(10.0, -13.0 + at); if (ZFAC(sh)) { hi = sh; break; } lo = sh; }
+        if (hi < 0) return 0;
+        for (int b = 0; b < 5; b++) { const double mid = sqrt(fmax(lo, hi * 1e-3) * hi); if (ZFAC(mid)) hi = mid; else lo = mid; }
+        if (!ZFAC(hi)) return 0;
+        #undef ZFAC
+        double *w = lx(sizeof(double) * (n + 1)), *wk = lx(sizeof(double) * (2 * (size_t)n + 2));
+        unsigned h = 12345u; for (int i = 0; i < n; i++) { h = h * 1103515245u + 12345u; v[i] = ((h >> 8) & 0xffff) / 65535.0 - 0.5; }
+        for (int it = 0; it < 30; it++) {
+            schol_solve(s->Fz, v, wk);
+            double nv = 0; for (int i = 0; i < n; i++) nv += v[i] * v[i]; nv = sqrt(nv);
+            if (!(nv > 0)) break;
+            for (int i = 0; i < n; i++) v[i] /= nv;
+        }
+        /* Rayleigh quotient with Z */
+        double vz = 0;
+        for (int i = 0; i < n; i++) { double a = 0; for (int p = s->sp[i]; p < s->sp[i + 1]; p++) a += s->ws[p] * v[s->sj[p]]; w[i] = a; vz += a * v[i]; }
+        free(w); free(wk);
+        *ok = 1;
+        return vz;
+    }
+    return 0;
+}
 static double nrm(const double *x, size_t n) { double s = 0; for (size_t i = 0; i < n; i++) s += x[i] * x[i]; return sqrt(s); }
 static double dotv(const double *x, const double *y, size_t n) { double s = 0; for (size_t i = 0; i < n; i++) s += x[i] * y[i]; return s; }
 
@@ -340,6 +392,7 @@ static void lr_scale(Problem *P) {
 
 typedef struct { double pinf, dinf, gap, compl, pobj, dobj, err[7]; double lmin; int lmin_ok; } LMeas;
 
+static int meas_finite(const LMeas *M) { return isfinite(M->pinf) && isfinite(M->dinf) && isfinite(M->gap) && isfinite(M->compl) && isfinite(M->pobj) && isfinite(M->dobj); }
 /* the measures on the problem as read: X = R R' (exactly PSD), slacks from the ALM's u,
  * Z = C - A*y; dinf from the ladder (when asked) or the Lanczos estimate */
 static void measure(LR *L, const double *z, const double *y, const double *t, int full, LMeas *M) {
@@ -430,12 +483,13 @@ static void hess_vec(LR *L, const double *z, const double *y, const double *t, c
  * (a per-column preconditioner needed ~100 CG steps a Newton step at rank 2-3 against 1-3 at
  * rank 1). The pattern is analysed again when the rank changes. */
 static int npat_built = 0;
+static int g_shs = -1, g_local = 0, g_lroff = 1, g_zsi = 1, g_amax = 1;   /* g_lroff: BRISK_LROFF=0, the assembly by schol_add */   /* g_local: the last measured residual is in the local regime */
 static int g_lrdbg = -1;
 static void nprec_build(LR *L, const double *z, const double *y, const double *t) {
     Problem *P = L->P; const double sg = L->sigma;
     for (int q = 0; q < L->ns; q++) {
         LS *s = &L->S[q]; const Block *B = &P->blk[s->k]; const int n = s->n, r = s->r; const double *R = z + s->off;
-        if (s->F && s->Fr != r) { schol_free(s->F); s->F = NULL; }
+        if (s->F && s->Fr != r) { schol_free(s->F); s->F = NULL; free(s->ofS); free(s->ofC); free(s->ofCp); free(s->ofD); s->ofS = s->ofC = s->ofCp = s->ofD = NULL; free(s->tp); free(s->tq); free(s->cv2); s->tp = NULL; s->tq = NULL; s->cv2 = NULL; }
         if (!s->F) {
             /* base pattern (i > j): S's and the supports' cliques */
             size_t cap = (size_t)s->np + 16, np2 = 0; int (*pr)[2] = lx(sizeof(int[2]) * cap);
@@ -469,18 +523,98 @@ static void nprec_build(LR *L, const double *z, const double *y, const double *t
             npat_built++;
             s->Fr = r;
             if (s->fshift <= 0) s->fshift = 1e-8;
+            /* 5.19: the value offsets of every addition below, in the order of the assembly: one search in a
+             * supernode per entry and pattern, not per entry and Newton step (case19402: the assembly by
+             * schol_add was 60% of the run) */
+            if (g_lroff) {
+                size_t nS = 0, nC = 0;
+                for (int i = 0; i < n; i++) for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] <= i) nS += r;
+                s->ofCp = lx(sizeof(size_t) * (s->ncon + 1));
+                for (int tt = 0; tt < s->ncon; tt++) { s->ofCp[tt] = nC; const size_t k2 = (size_t)(s->supp[tt + 1] - s->supp[tt]) * r; nC += k2 * (k2 + 1) / 2; }
+                s->ofCp[s->ncon] = nC;
+                s->ofS = lx(sizeof(size_t) * (nS + 1)); s->ofC = lx(sizeof(size_t) * (nC + 1)); s->ofD = lx(sizeof(size_t) * ((size_t)n * r + 1));
+                size_t q = 0;
+                for (int i = 0; i < n; i++) for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] <= i) { const int j = s->sj[p]; for (int a = 0; a < r; a++) s->ofS[q++] = schol_offset(s->F, (size_t)i * r + a, (size_t)j * r + a); }
+                for (int tt = 0; tt < s->ncon; tt++) {
+                    size_t qc = s->ofCp[tt]; const int a0 = s->supp[tt], a1 = s->supp[tt + 1];
+                    for (int c = a0; c < a1; c++) for (int d2 = a0; d2 < a1; d2++) for (int a = 0; a < r; a++) for (int b2 = 0; b2 < r; b2++) {
+                        const size_t I = (size_t)s->sup[c] * r + a, J = (size_t)s->sup[d2] * r + b2;
+                        if (I < J) continue;
+                        s->ofC[qc++] = schol_offset(s->F, I, J);
+                    }
+                }
+                for (size_t i = 0; i < (size_t)n * r; i++) s->ofD[i] = schol_offset(s->F, i, i);
+                /* the transpose: per value entry the contributions in ascending q, i.e. in the sequential order */
+                if (nC < 4000000000u) {
+                    const size_t np2 = schol_pansz(s->F); s->ntp = np2;
+                    s->tp = lz(sizeof(size_t) * (np2 + 2)); s->tq = lx(sizeof(unsigned) * (nC + 1)); s->cv2 = lx(sizeof(double) * (nC + 1));
+                    for (size_t q2 = 0; q2 < nC; q2++) if (s->ofC[q2] != SIZE_MAX) s->tp[s->ofC[q2] + 1]++;
+                    for (size_t o = 0; o < np2; o++) s->tp[o + 1] += s->tp[o];
+                    size_t *fl2 = lx(sizeof(size_t) * (np2 + 1)); memcpy(fl2, s->tp, sizeof(size_t) * (np2 + 1));
+                    for (size_t q2 = 0; q2 < nC; q2++) if (s->ofC[q2] != SIZE_MAX) s->tq[fl2[s->ofC[q2]]++] = (unsigned)q2;
+                    free(fl2);
+                }
+            }
         }
         double dmax = 0;
         double *av = lx(sizeof(double) * ((size_t)n * r + 1));   /* (A_t R)_i per support row */
         for (int at = 0; at < 30; at++) {
             schol_zero(s->F);
+            double *V = s->ofS ? schol_values(s->F) : NULL;
+            if (V) {
+                /* (the same additions in the same order through the offsets) */
+                size_t q = 0;
+                for (int i = 0; i < n; i++) for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] <= i) for (int a = 0; a < r; a++) { const size_t o = s->ofS[q++]; if (o != SIZE_MAX) V[o] += 2.0 * s->ws[p]; }
+            } else
             for (int i = 0; i < n; i++) for (int p = s->sp[i]; p < s->sp[i + 1]; p++) if (s->sj[p] <= i) { const int j = s->sj[p]; for (int a = 0; a < r; a++) schol_add(s->F, (size_t)i * r + a, (size_t)j * r + a, 2.0 * s->ws[p]); }
+            if (V && s->tp) {
+                /* on the threads: each constraint's contributions into its own segment, then each value entry sums
+                 * its own in ascending order (the sequential code's order: the same bits at any thread count) */
+                const double s4 = 4.0 * sg;
+                #pragma omp parallel
+                {
+                    double *avt = lz(sizeof(double) * ((size_t)n * r + 1));
+                    #pragma omp for schedule(static)
+                    for (int tt = 0; tt < s->ncon; tt++) {
+                        const int i0 = B->con[tt];
+                        size_t qc = s->ofCp[tt]; const size_t qe = s->ofCp[tt + 1];
+                        if (L->sa[i0] != 0 && clip_u(t[i0], y[i0], sg, L->sa[i0]) != t[i0]) { for (; qc < qe; qc++) s->cv2[qc] = 0.0; continue; }
+                        const SpSym *A = &B->A[tt]; const int a0 = s->supp[tt], a1 = s->supp[tt + 1];
+                        for (int c = a0; c < a1; c++) for (int l = 0; l < r; l++) avt[(size_t)s->sup[c] * r + l] = 0;
+                        for (int e = 0; e < A->ef; e++) { const int i = A->fr[e], j = A->fc[e]; for (int l = 0; l < r; l++) avt[(size_t)i * r + l] += A->fv[e] * R[(size_t)j * r + l]; }
+                        for (int c = a0; c < a1; c++) for (int d2 = a0; d2 < a1; d2++) {
+                            const int i = s->sup[c], j = s->sup[d2];
+                            for (int a = 0; a < r; a++) for (int b2 = 0; b2 < r; b2++) {
+                                const size_t I = (size_t)i * r + a, J = (size_t)j * r + b2;
+                                if (I < J) continue;
+                                s->cv2[qc++] = s4 * avt[(size_t)i * r + a] * avt[(size_t)j * r + b2];
+                            }
+                        }
+                    }
+                    free(avt);
+                    #pragma omp for schedule(static)
+                    for (size_t o = 0; o < s->ntp; o++) { double v = V[o]; for (size_t k = s->tp[o]; k < s->tp[o + 1]; k++) v += s->cv2[s->tq[k]]; V[o] = v; }
+                }
+            } else
             for (int tt = 0; tt < s->ncon; tt++) {
                 const int i0 = B->con[tt];
                 if (L->sa[i0] != 0 && clip_u(t[i0], y[i0], sg, L->sa[i0]) != t[i0]) continue;
                 const SpSym *A = &B->A[tt]; const int a0 = s->supp[tt], a1 = s->supp[tt + 1];
                 for (int c = a0; c < a1; c++) for (int l = 0; l < r; l++) av[(size_t)s->sup[c] * r + l] = 0;
                 for (int e = 0; e < A->ef; e++) { const int i = A->fr[e], j = A->fc[e]; for (int l = 0; l < r; l++) av[(size_t)i * r + l] += A->fv[e] * R[(size_t)j * r + l]; }
+                if (V) {
+                    size_t qc = s->ofCp[tt]; const double s4 = 4.0 * sg;
+                    for (int c = a0; c < a1; c++) for (int d2 = a0; d2 < a1; d2++) {
+                        const int i = s->sup[c], j = s->sup[d2];
+                        for (int a = 0; a < r; a++) for (int b2 = 0; b2 < r; b2++) {
+                            const size_t I = (size_t)i * r + a, J = (size_t)j * r + b2;
+                            if (I < J) continue;
+                            const size_t o = s->ofC[qc++];
+                            if (o != SIZE_MAX) V[o] += s4 * av[(size_t)i * r + a] * av[(size_t)j * r + b2];
+                        }
+                    }
+                    continue;
+                }
                 for (int c = a0; c < a1; c++) for (int d2 = a0; d2 < a1; d2++) {
                     const int i = s->sup[c], j = s->sup[d2];
                     for (int a = 0; a < r; a++) for (int b2 = 0; b2 < r; b2++) {
@@ -490,9 +624,28 @@ static void nprec_build(LR *L, const double *z, const double *y, const double *t
                     }
                 }
             }
-            if (at == 0) { dmax = 0; for (size_t i = 0; i < (size_t)n * r; i++) dmax = fmax(dmax, fabs(schol_get(s->F, i, i))); if (dmax == 0) dmax = 1; }
+            if (at == 0) {
+                dmax = 0;
+                if (V) { for (size_t i = 0; i < (size_t)n * r; i++) if (s->ofD[i] != SIZE_MAX) dmax = fmax(dmax, fabs(V[s->ofD[i]])); }
+                else for (size_t i = 0; i < (size_t)n * r; i++) dmax = fmax(dmax, fabs(schol_get(s->F, i, i)));
+                if (dmax == 0) dmax = 1;
+                if (g_shs == 1 || (g_shs == 2 && g_local)) {
+                    /* 5.19: in the local regime (the last residual at most 1e-3) the shift is on the scale of the
+                     * part that can be indefinite, 2 S(w) (the Gauss-Newton part is PSD): relative to the
+                     * penalty-dominated diagonal (1e7 against 2e2 on case300) it over-damps the flat directions of
+                     * the face, and the steps oscillate. In the global phase the large shift stays: with hundreds of
+                     * inequality rows changing side a step, it acts as a trust region, and the subproblems that it
+                     * solves are what raises sigma (case2869: the objective 56 -> 188 once sigma grows; with the
+                     * small shift throughout the iterate stays at 56). BRISK_LRSHS: 2 (default), 0 the diagonal's
+                     * scale throughout, 1 S(w)'s throughout */
+                    double smax = 0; for (int i = 0; i < n; i++) if (s->dg[i] >= 0) smax = fmax(smax, fabs(2.0 * s->ws[s->dg[i]]));
+                    if (g_lrdbg) printf("      [shift scales: diagonal %.3e, 2 S(w) %.3e]\n", dmax, smax);
+                    if (smax > 0) dmax = smax;
+                }
+            }
             const double sh = s->fshift * dmax;
-            for (size_t i = 0; i < (size_t)n * r; i++) schol_add(s->F, i, i, sh);
+            if (V) { for (size_t i = 0; i < (size_t)n * r; i++) if (s->ofD[i] != SIZE_MAX) V[s->ofD[i]] += sh; }
+            else for (size_t i = 0; i < (size_t)n * r; i++) schol_add(s->F, i, i, sh);
             if (schol_factor(s->F, 0.0) == 0) { s->fabs_ = sh; if (at == 0 && s->fshift > 1e-12) s->fshift *= 0.1; break; }
             s->fshift = fmin(s->fshift * 4.0, 1.0);
         }
@@ -548,6 +701,96 @@ static void precond(LR *L, const double *z, const double *y, const double *t, co
     const double fl = 1e-10 * (hmax > 0 ? hmax : 1.0);
     for (size_t i = 0; i < L->N; i++) h[i] = 1.0 / (h[i] > fl ? h[i] : fl);   /* h holds the inverse */
 }
+
+
+/* ---- 5.19: the second-order multiplier step ---------------------------------------------
+ * The step y <- w = y - sigma u of the method of multipliers is a gradient step on the dual
+ * function with step sigma; the Newton step on it (Bertsekas, Constrained Optimization and
+ * Lagrange Multiplier Methods, 2.3.2) solves, over the rows that are not clipped (the
+ * equalities and the active inequalities),
+ *     K dl = -t + J M^-1 (g + sigma J' t),   K = J M^-1 J',
+ * with M = H_L(w) + sigma J'J the Hessian of the augmented Lagrangian (the factor the Newton
+ * steps use), J D = A(R D' + D R') the constraint Jacobian and g the gradient left by the inner
+ * solve (zero for an exact one). The multipliers become w + dl (sign-clipped on the slack
+ * rows), and the primal point moves by dR = M^-1 (J' dl - g - sigma J' t) when asked. K is
+ * applied by one solve with M a CG step; K ~ I / sigma where the penalty dominates, so CG
+ * spends its steps on the directions the method of multipliers is slow in. K is singular where
+ * more rows are active than R has entries (rank 1 and violated inequalities), so the system is
+ * (K + I / tau) dl = rhs with tau = kappa sigma: the proximal Newton step, at most kappa + 1 times
+ * the step of the method of multipliers in any direction, and a CG condition number ~kappa.  */
+static void jt_apply(LR *L, const double *z, const double *q, double *out) {
+    /* out = J' q = 2 A*(q) R (LP v: 2 v_j sum_i a_ij q_i) */
+    for (int k = 0; k < L->ns; k++) {
+        LS *s = &L->S[k]; const int n = s->n, r = s->r; const double *R = z + s->off; double *O = out + s->off;
+        pat_adj(s, q);
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; i++) {
+            double *oi = O + (size_t)i * r;
+            for (int l = 0; l < r; l++) oi[l] = 0;
+            for (int p = s->sp[i]; p < s->sp[i + 1]; p++) { const double a = 2.0 * s->wq[p]; const double *rj = R + (size_t)s->sj[p] * r; for (int l = 0; l < r; l++) oi[l] += a * rj[l]; }
+        }
+    }
+    for (int k = 0; k < L->nv; k++) { const LV *v = &L->V[k]; double aq = 0; for (int e = 0; e < v->nc; e++) aq += v->cv[e] * q[v->ci[e]]; out[v->off] = 2.0 * z[v->off] * aq; }
+}
+typedef struct { int cg, capped; double rel, dlnorm, wnorm; } DnStat;
+static void dual_newton(LR *L, double *z, double *y, const double *t, const double *w, int cgmax, double cgtol, double kap, int primal, DnStat *st) {
+    const int m = L->m; const size_t N = L->N; const double sg = L->sigma, tau = kap * sg;
+    double *g = lz(sizeof(double) * (N + 1)), *a = lz(sizeof(double) * (N + 1)), *v = lz(sizeof(double) * (N + 1)), *wk = lx(sizeof(double) * (2 * N + 2));
+    double *q = lz(sizeof(double) * (m + 1)), *rhs = lz(sizeof(double) * (m + 1)), *dl = lz(sizeof(double) * (m + 1)), *rr = lx(sizeof(double) * (m + 1)), *pp = lx(sizeof(double) * (m + 1)), *kp = lx(sizeof(double) * (m + 1));
+    char *act = lz(m + 1);
+    for (int i = 0; i < m; i++) act[i] = L->sa[i] == 0 || clip_u(t[i], y[i], sg, L->sa[i]) == t[i];
+    grad(L, z, w, g);                      /* (S(w) into ws for the factor) */
+    nprec_build(L, z, y, t);
+    /* a = M^-1 (g + sigma J' t_act) */
+    for (int i = 0; i < m; i++) q[i] = act[i] ? sg * t[i] : 0.0;
+    jt_apply(L, z, q, v);
+    for (size_t i = 0; i < N; i++) v[i] += g[i];
+    nprec_apply(L, z, y, t, w, v, a, NULL, wk);
+    jac_dir(L, z, a, rhs);
+    for (int i = 0; i < m; i++) rhs[i] = act[i] ? rhs[i] - t[i] : 0.0;
+    /* CG on K dl = rhs (the active rows) */
+    memcpy(rr, rhs, sizeof(double) * m); memcpy(pp, rhs, sizeof(double) * m);
+    double rz = 0; for (int i = 0; i < m; i++) rz += rr[i] * rr[i];
+    const double r0 = sqrt(rz); int k;
+    for (k = 0; k < cgmax && sqrt(rz) > cgtol * r0; k++) {
+        jt_apply(L, z, pp, v);
+        nprec_apply(L, z, y, t, w, v, a + 0, NULL, wk);   /* (a reused: the first solve is done with) */
+        jac_dir(L, z, a, kp);
+        double pk = 0; for (int i = 0; i < m; i++) { kp[i] = act[i] ? kp[i] + pp[i] / tau : 0.0; pk += pp[i] * kp[i]; }
+        if (!(pk > 0)) break;
+        const double al = rz / pk; double rn = 0;
+        for (int i = 0; i < m; i++) { dl[i] += al * pp[i]; rr[i] -= al * kp[i]; rn += rr[i] * rr[i]; }
+        const double be = rn / rz; rz = rn;
+        for (int i = 0; i < m; i++) pp[i] = rr[i] + be * pp[i];
+    }
+    st->cg = k; st->rel = r0 > 0 ? sqrt(rz) / r0 : 0;
+    /* the step at most twice the multipliers' size (the steps that helped: up to 1.6; the one that did not, on
+     * case19402 with Z far from PSD, sent b'y to -1e16) */
+    double dq = 0, wq = 0; for (int i = 0; i < m; i++) { if (act[i]) dq += dl[i] * dl[i]; wq += w[i] * w[i]; }
+    const double fcap = (dq > 4.0 * wq && dq > 0) ? sqrt(4.0 * wq / dq) : 1.0;
+    st->capped = fcap < 1.0;
+    double dn2 = 0, wn2 = 0;
+    double *yo = primal ? lx(sizeof(double) * (m + 1)) : NULL;   /* (the multipliers M and act were built with) */
+    if (yo) memcpy(yo, y, sizeof(double) * m);
+    for (int i = 0; i < m; i++) {
+        double yi = w[i] + (act[i] ? fcap * dl[i] : 0.0);
+        if (L->sa[i] > 0 && yi > 0) yi = 0; else if (L->sa[i] < 0 && yi < 0) yi = 0;   /* the sign of a slack row's multiplier */
+        dn2 += (yi - w[i]) * (yi - w[i]); wn2 += w[i] * w[i];
+        y[i] = yi;
+    }
+    st->dlnorm = sqrt(dn2); st->wnorm = sqrt(wn2);
+    if (primal) {
+        /* dR = M^-1 (J' dl - g - sigma J' t) */
+        for (int i = 0; i < m; i++) q[i] = act[i] ? fcap * dl[i] - sg * t[i] : 0.0;
+        jt_apply(L, z, q, v);
+        for (size_t i = 0; i < N; i++) v[i] -= g[i];
+        nprec_apply(L, z, yo, t, w, v, a, NULL, wk);
+        for (size_t i = 0; i < N; i++) z[i] += a[i];
+    }
+    free(yo);
+    free(g); free(a); free(v); free(wk); free(q); free(rhs); free(dl); free(rr); free(pp); free(kp); free(act);
+}
+
 
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res) {
     const double t0 = wtime();
@@ -605,6 +848,11 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
     const double tol = par->lr_tol > 0 ? par->lr_tol : 1e-6;
     const int verbose = par->verbose; L->verbose = verbose;
     g_lrdbg = getenv("BRISK_LRDBG") != NULL;
+    g_lroff = getenv("BRISK_LROFF") ? atoi(getenv("BRISK_LROFF")) : 1;
+    g_zsi = getenv("BRISK_LRZSI") ? atoi(getenv("BRISK_LRZSI")) : 1;
+    g_amax = getenv("BRISK_LRAMAX") ? atoi(getenv("BRISK_LRAMAX")) : 1;
+    g_local = 0;   /* (per solve: a library caller runs several in one process) */
+    g_shs = getenv("BRISK_LRSHS") ? atoi(getenv("BRISK_LRSHS")) : 2;   /* 5.19: the shift on the scale of 2 S(w) in the local regime (0: always on the diagonal, 1: always on S(w)) */
     if (verbose >= 0) {
         long np = 0; for (int q = 0; q < L->ns; q++) np += L->S[q].np;
         int maxn = 0; for (int q = 0; q < L->ns; q++) if (L->S[q].n > maxn) maxn = L->S[q].n;
@@ -636,6 +884,13 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
     const int bal = getenv("BRISK_LRBAL") ? atoi(getenv("BRISK_LRBAL")) : 0, bal_newton = getenv("BRISK_LRBALN") ? atoi(getenv("BRISK_LRBALN")) : 10;
     const int sigesc = getenv("BRISK_LRSIGESC") ? atoi(getenv("BRISK_LRSIGESC")) : 0;
     const int guard_y = getenv("BRISK_LRGUARD") ? atoi(getenv("BRISK_LRGUARD")) : 0;
+    /* 5.19: the second-order multiplier step after a solved subproblem in the local regime (BRISK_LRDN: 1 the
+     * multipliers, the default; 2 also the primal step; 0 off; BRISK_LRDNRES the regime's residual, 1e-3;
+     * BRISK_LRDNK kappa, 100) */
+    const int dnm = getenv("BRISK_LRDN") ? atoi(getenv("BRISK_LRDN")) : 1, dn_cg = getenv("BRISK_LRDNCG") ? atoi(getenv("BRISK_LRDNCG")) : 100;
+    const double dn_tol = getenv("BRISK_LRDNTOL") ? atof(getenv("BRISK_LRDNTOL")) : 1e-2, dn_gate = getenv("BRISK_LRDNGATE") ? atof(getenv("BRISK_LRDNGATE")) : 1e-3, dn_kap = getenv("BRISK_LRDNK") ? atof(getenv("BRISK_LRDNK")) : 100.0, dn_res = getenv("BRISK_LRDNRES") ? atof(getenv("BRISK_LRDNRES")) : 1e-3; int dn_off = 0;
+    const int mom = getenv("BRISK_LRMOM") ? atoi(getenv("BRISK_LRMOM")) : 0; double *wprev = NULL, un_mom = 1e300, sig_mom = 0; int mk = 1;
+    int ndn = 0, ndn_bad = 0, dn_pend = 0, dn_pause = 5; long ndncg = 0; double tdn = 0, dn_un = 0, *dn_z = NULL, *dn_w = NULL;
     const int sched = getenv("BRISK_LRSCHED") ? atoi(getenv("BRISK_LRSCHED")) : 0; int nunsolved = 0, nsigstall = 0; double feas_tgt = -1, un_at_sig = 1e300;
     long ncg = 0; int nneg = 0, nrank_dn = 0; const double drop = getenv("BRISK_LRDROP") ? atof(getenv("BRISK_LRDROP")) : 0.0; const int lmshift = getenv("BRISK_LRLM") ? atoi(getenv("BRISK_LRLM")) : 1;
     double *rc = lz(sizeof(double) * (N + 1)), *zc = lz(sizeof(double) * (N + 1)), *pv = lz(sizeof(double) * (N + 1)), *Hp = lz(sizeof(double) * (N + 1)), *qb = lx(sizeof(double) * (m + 1));
@@ -664,13 +919,14 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
             /* rank reduction: columns (eigenvalues of X) below lr_drop of the largest are
              * dropped - an excess rank makes the minimizer degenerate (the vanishing
              * columns converge like Newton on x^4, linearly) */
+            if (info == 0 && g_lrdbg) { printf("      [eigenvalues of R'R in block %d:", s->k + 1); for (int a = r - 1; a >= 0; a--) printf(" %.3e", ev2[a]); printf("]\n"); }
             if (info == 0 && drop > 0) {
                 int keep = r; while (keep > 1 && ev2[r - keep] < drop * ev2[r - 1]) keep--;
                 if (keep < r) {
                     for (int i = 0; i < n; i++) for (int l = 0; l < keep; l++) R[(size_t)i * keep + l] = R[(size_t)i * r + l];
                     memset(R + (size_t)n * keep, 0, sizeof(double) * (size_t)n * (r - keep));
                     if (verbose > 0) printf("   (rank reduction in block %d: %d -> %d)\n", s->k + 1, r, keep);
-                    s->r = keep; nrank_dn++;
+                    s->r = keep; nrank_dn++; dn_pend = 0;   /* (a pending undo of the multiplier step holds the old layout) */
                 }
             }
         }
@@ -716,7 +972,7 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
                 if (!(gd < 0)) { nprec_apply(L, z, y, t, w, g, d, col, wk); for (size_t i = 0; i < N; i++) d[i] = -d[i]; gd = dotv(g, d, N); }
                 double c1, c2;
                 eval_dir(L, z, d, t1, t2, &c1, &c2);
-                const double a = lsearch(L, t, t1, t2, y, c1, c2, gd, &nev);
+                const double a = lsearch(L, t, t1, t2, y, c1, c2, gd, &nev, g_amax ? 10.0 * (nrm(z, N) + 1.0) / fmax(nrm(d, N), 1e-300) : 0.0);
                 for (size_t i = 0; i < N; i++) z[i] += a * d[i];
                 for (int i = 0; i < m; i++) t[i] += a * (t1[i] + a * t2[i]);
                 cobj += a * (c1 + a * c2);
@@ -749,7 +1005,7 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
             if (!(gd < 0)) { for (size_t i = 0; i < N; i++) d[i] = -g[i]; gd = -gnorm * gnorm; nm = 0; }
             double c1, c2;
             eval_dir(L, z, d, t1, t2, &c1, &c2);
-            const double a = lsearch(L, t, t1, t2, y, c1, c2, gd, &nev);
+            const double a = lsearch(L, t, t1, t2, y, c1, c2, gd, &nev, g_amax ? 10.0 * (nrm(z, N) + 1.0) / fmax(nrm(d, N), 1e-300) : 0.0);
             for (size_t i = 0; i < N; i++) z[i] += a * d[i];
             for (int i = 0; i < m; i++) t[i] += a * (t1[i] + a * t2[i]);
             cobj += a * (c1 + a * c2);
@@ -771,6 +1027,22 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
         cobj = eval_t(L, z, t);
         pen_sum(L, t, y, w);
         double un = 0; for (int i = 0; i < m; i++) { const double u = clip_u(t[i], y[i], L->sigma, L->sa[i]); un += u * u; } un = sqrt(un);
+        if (dn_pend) {
+            /* 5.19: the subproblem after a multiplier Newton step: a residual over 10 x the one at the step that
+             * also left the local regime (or not finite) restores the point and the plain update, and pauses the
+             * Newton step (5 outer iterations, doubled at each failure) */
+            dn_pend = 0;
+            double rp2 = 0; for (int i = 0; i < m; i++) { const double u = clip_u(t[i], y[i], L->sigma, L->sa[i]) * P->du[i]; rp2 += u * u; }
+            const double pinf2 = sqrt(rp2) / (1 + P->normb2);
+            if (!(un <= 10.0 * dn_un) && !(pinf2 <= dn_res)) {
+                memcpy(z, dn_z, sizeof(double) * N); memcpy(y, dn_w, sizeof(double) * m);
+                cobj = eval_t(L, z, t); pen_sum(L, t, y, w);
+                dn_off = dn_pause; dn_pause *= 2; ndn_bad++;
+                if (verbose > 0) printf("   (multiplier Newton step undone: residual %.1e against %.1e; paused for %d outer iterations)\n", un, dn_un, dn_off);
+                continue;
+            }
+        }
+        if (dn_off > 0) dn_off--;
         int sched_sig = 0; (void)sched_sig;
         if (sched) {
             /* 4.40 (LANCELOT-type): the multipliers move only after a solved subproblem whose
@@ -791,10 +1063,38 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
                     L->sigma = fmin(L->sigma * sigfac, 1e12); sched_sig = 1;
                 }
             }
-        } else if (!guard_y || gnorm <= eta || gnorm <= 1e-3 * gstart || un < unorm_prev)
+        } else if (dnm > 0 && (gnorm <= eta || gnorm <= dn_gate * gstart) && M.pinf > 0 && M.pinf <= dn_res && !dn_off) {
+            DnStat ds; const double td = wtime();
+            if (!dn_z) dn_z = lx(sizeof(double) * (N + 1)), dn_w = lx(sizeof(double) * (m + 1));
+            memcpy(dn_z, z, sizeof(double) * N); memcpy(dn_w, w, sizeof(double) * m); dn_un = un; dn_pend = 1;
+            dual_newton(L, z, y, t, w, dn_cg, dn_tol, dn_kap, dnm >= 2, &ds);
+            ndn++; ndncg += ds.cg; tdn += wtime() - td;
+            if (dnm >= 2) cobj = eval_t(L, z, t);
+            if (g_lrdbg || verbose > 1) printf("      [multiplier Newton step: %d CG, residual %.1e, |dl| %.2e of |w| %.2e, %.2fs]\n", ds.cg, ds.rel, ds.dlnorm, ds.wnorm, wtime() - td);
+        } else if (!guard_y || gnorm <= eta || gnorm <= 1e-3 * gstart || un < unorm_prev) {
             memcpy(y, w, sizeof(double) * m);   /* (guarded: not after a subproblem that is neither solved nor more feasible) */
+            if (mom && !g_local) {
+                /* 5.19 (research, BRISK_LRMOM=1): the accelerated proximal point method (Guler): the method of
+                 * multipliers is the proximal point method on the dual, and its iterates get Nesterov's momentum
+                 * y = w + beta_k (w - w_prev), beta_k = (k - 1) / (k + 2), restarted when the residual rises or the
+                 * penalty changes; sign-clipped on the slack rows */
+                if (!wprev) { wprev = lx(sizeof(double) * (m + 1)); memcpy(wprev, w, sizeof(double) * m); mk = 1; }
+                else if (un > un_mom || L->sigma != sig_mom) { mk = 1; memcpy(wprev, w, sizeof(double) * m); }
+                else {
+                    const double be = (mk - 1.0) / (mk + 2.0);
+                    for (int i = 0; i < m; i++) {
+                        double yi = w[i] + be * (w[i] - wprev[i]);
+                        if (L->sa[i] > 0 && yi > 0) yi = 0; else if (L->sa[i] < 0 && yi < 0) yi = 0;
+                        y[i] = yi;
+                    }
+                    memcpy(wprev, w, sizeof(double) * m); mk++;
+                }
+                un_mom = un; sig_mom = L->sigma;
+            }
+        }
         /* ---- measures (the ladder when the cheap ones are near the target) ---- */
         measure(L, z, y, t, 0, &M);
+        g_local = M.pinf > 0 && M.pinf <= dn_res;
         {   /* 4.40: the best certified lower bound: b'y with Z positive definite on every
              * block (sparse Cholesky) and the LP duals >= 0 (the slack duals by the clipping) */
             int ok = 1; double dl = 0;   /* lambda_min(Z) >= -dl (scaled) */
@@ -831,9 +1131,18 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
             for (int q = 0; q < L->ns; q++) {
                 LS *s = &L->S[q]; pat_slack(s, y);
                 double *v = lx(sizeof(double) * s->n);
-                const double th = lanczos_min(s, 60, v, (unsigned)outer);
+                double th = lanczos_min(s, 60, v, (unsigned)outer);
+                if (g_zsi && near_kkt && th > -tol) {
+                    /* (Lanczos sees no negative eigenvalue: the shift-invert pair, when Z does not factor) */
+                    double *v2 = lx(sizeof(double) * s->n); int ok = 0;
+                    const double th2 = zmin_si(s, v2, &ok);
+                    if (ok && th2 < th) { th = th2; memcpy(v, v2, sizeof(double) * s->n); }
+                    if (g_lrdbg) printf("      [shift-invert lambda_min(Z) %.3e (found %d), Lanczos's above]\n", th2, ok);
+                    free(v2);
+                }
                 if (th < lz_min) lz_min = th;
                 if ((near_kkt || (bal_esc && th < -fmax(tol, 0.1 * M.pinf))) && th < -tol && s->r < s->rmax && par->lr_escape != 0) {
+                    if (s->r == 1 && getenv("BRISK_LRXOUT")) lr_xout(s, z + s->off, getenv("BRISK_LRXOUT"));
                     /* grow the rank in place: X + alpha v v' with alpha from the exact line
                      * search (the residuals are linear in alpha), the new column sqrt(alpha) v */
                     const int r = s->r, n = s->n; double *R = z + s->off;
@@ -842,10 +1151,10 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
                     const double c1 = pat_apply(s, t1);
                     double d0 = c1; for (int i = 0; i < m; i++) { const double u = clip_u(t[i], y[i], L->sigma, L->sa[i]); d0 -= (y[i] - L->sigma * u) * t1[i]; }
                     double al = 0;
-                    if (d0 < 0) al = lsearch(L, t, t1, t2, y, c1, 0.0, d0, &nev);
+                    if (d0 < 0) al = lsearch(L, t, t1, t2, y, c1, 0.0, d0, &nev, 0.0);
                     const double be = al > 0 ? sqrt(al) : 1e-3;
                     for (int i = n - 1; i >= 0; i--) { for (int l = r - 1; l >= 0; l--) R[(size_t)i * (r + 1) + l] = R[(size_t)i * r + l]; R[(size_t)i * (r + 1) + r] = be * v[i]; }
-                    s->r = r + 1; nrank++; escaped = 1; nstall = 0; un_best = 1e300;
+                    s->r = r + 1; nrank++; escaped = 1; nstall = 0; un_best = 1e300; dn_pend = 0;   /* (a pending undo holds the old rank's layout) */
                     if (verbose > 0) printf("   (rank escape in block %d: lambda_min(Z) %.2e, step %.2e, rank %d)\n", s->k + 1, th, al, s->r);
                 }
                 free(v);
@@ -857,6 +1166,7 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
         if (verbose > 0) printf("LR%4d %16.9e %16.9e  pinf %8.1e gap %9.1e compl %9.1e dinf %8.1e%s  sigma %7.1e  inner %5d (cg %ld, neg %d, shift %.0e) |g| %7.1e  rank %d  %7.1fs  LB %s%.9e\n",
                                 outer, M.pobj, M.dobj, M.pinf, M.gap, M.compl, M.dinf, full ? "*" : (lz_min < 0 || outer % 10 == 0 || fmax(M.pinf, fabs(M.gap)) <= 10 * tol ? "~" : " "),
                                 L->sigma, inner, ncg - ncg0, nneg - nneg0, L->ns ? L->S[0].fshift : 0.0, gnorm, L->ns ? L->S[0].r : 0, wtime() - t0, bound_ok_now ? "+" : " ", have_best ? best_lb : 0.0), fflush(stdout);
+        if (!meas_finite(&M) || !isfinite(un)) { status = ST_NUMERIC; break; }
         if (full && fmax(fmax(M.pinf, M.dinf), fmax(fabs(M.gap), fabs(M.compl))) <= tol) { status = ST_OPTIMAL; break; }
         if (escaped && !bal) {
             /* a new face: the penalty that held the old one (often 1e8) would freeze the
@@ -894,13 +1204,17 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
     /* final measure with the ladder */
     cobj = eval_t(L, z, t);
     measure(L, z, y, t, 1, &M);
-    const double acc = fmax(fmax(M.pinf, M.dinf), fmax(fabs(M.gap), fabs(M.compl)));
-    int st = acc <= tol ? ST_OPTIMAL : (acc <= par->red_acc ? ST_REDUCED : (status == ST_TIME ? ST_TIME : ST_MAXIT));
+    /* 5.19: a measure that is not finite is numerical difficulties (fmax returns the other argument for a NaN,
+     * and a NaN run was reported OPTIMAL with error 0) */
+    const int fin = meas_finite(&M);
+    const double acc = fin ? fmax(fmax(M.pinf, M.dinf), fmax(fabs(M.gap), fabs(M.compl))) : NAN;
+    int st = !fin || status == ST_NUMERIC ? ST_NUMERIC : acc <= tol ? ST_OPTIMAL : (acc <= par->red_acc ? ST_REDUCED : (status == ST_TIME ? ST_TIME : ST_MAXIT));
     if (verbose >= 0) {
-        const char *sn = st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : "ITERATION LIMIT";
+        const char *sn = st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : st == ST_NUMERIC ? "NUMERICAL DIFFICULTIES" : "ITERATION LIMIT";
         printf("lralm: %d outer, %ld %s steps (%ld CG, %d negative curvature), %d line-search evaluations, %d rank increases, final rank", outer, ninner, newton ? "Newton" : "L-BFGS", ncg, nneg, nev, nrank);
         for (int q = 0; q < L->ns; q++) printf(" %d", L->S[q].r);
         printf("%s\n", M.lmin_ok ? "" : " (lambda_min(Z) not certified: the pattern did not factor)");
+        if (ndn) printf("lralm: %d multiplier Newton steps (%ld CG, %.1fs), %d undone\n", ndn, ndncg, tdn, ndn_bad);
         printf("status: %s (max rel error %.1e)   iterations: %d\n", sn, acc, outer);
         printf("optimal value (SDPA/SDPLIB convention, max <F0,Y>): %.10e\n", -M.pobj);
         printf("  primal obj <C,X> = %.10e   dual obj b'y = %.10e\n", M.pobj, M.dobj);
@@ -915,7 +1229,7 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
          * (X = R R' is not formed) */
         static const int ecode[7] = { 0, 11, 12, 13, 14, 10, 15 };
         res->status = st; res->exit_code = ecode[st];
-        snprintf(res->status_str, sizeof(res->status_str), "%s", st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : "ITERATION LIMIT");
+        snprintf(res->status_str, sizeof(res->status_str), "%s", st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : st == ST_NUMERIC ? "NUMERICAL DIFFICULTIES" : "ITERATION LIMIT");
         res->iters = outer; res->pobj = M.pobj; res->dobj = M.dobj;
         for (int e = 1; e <= 6; e++) res->err[e] = M.err[e];
         res->time = wtime() - t0; res->m = m; res->nblk = P->nblk;
@@ -927,6 +1241,11 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
         snprintf(res->cause, sizeof(res->cause), "%s", st == ST_OPTIMAL ? "" : "low-rank ALM (-lralm, experimental): the outer iteration did not reach the target");
     }
     free(bs0);
+    if (getenv("BRISK_LRDUMP")) {
+        /* (research) per row: the residual t, the ALM's u, y and the slack coefficient, scaled back to the problem as read */
+        FILE *f = fopen(getenv("BRISK_LRDUMP"), "w");
+        if (f) { for (int i = 0; i < m; i++) { const double u = clip_u(t[i], y[i], L->sigma, L->sa[i]); fprintf(f, "%d %.6e %.6e %.6e %g\n", i + 1, t[i] * P->du[i], u * P->du[i], P->cs * P->d[i] * y[i], L->sa[i]); } fclose(f); }
+    }
     if (yfile) {
         FILE *f = fopen(yfile, "w");
         if (f) { for (int i = 0; i < m; i++) fprintf(f, "%.17g\n", P->cs * P->d[i] * y[i]); fclose(f); }
@@ -934,7 +1253,8 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
     for (int q = 0; q < L->ns; q++) ls_free(&L->S[q]);
     for (int q = 0; q < L->nv; q++) { free(L->V[q].ci); free(L->V[q].cv); }
     free(L->S); free(L->V); free(L->sa); free(L->sk); free(L->sj2);
+    free(dn_z); free(dn_w); free(wprev);
     free(z); free(g); free(d); free(gn); free(y); free(w); free(t); free(t1); free(t2); free(Sm); free(Ym); free(hinv); free(ybest); free(rc); free(zc); free(pv); free(Hp); free(qb); free(col); free(wk);
     problem_free(P);
-    return st == ST_OPTIMAL ? 0 : st == ST_REDUCED ? 10 : st == ST_TIME ? 15 : 13;
+    return st == ST_OPTIMAL ? 0 : st == ST_REDUCED ? 10 : st == ST_TIME ? 15 : st == ST_NUMERIC ? 14 : 13;
 }

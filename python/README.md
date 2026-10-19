@@ -44,8 +44,8 @@ the default `-llapack -lblas` links OpenBLAS.
 interface. A virtual environment keeps things separate:
 
 ```sh
-unzip brisk-1.5.1.zip        # or: tar xzf brisk-1.5.1.tar.gz
-cd brisk-1.5.1
+unzip brisk-1.5.3.zip        # or: tar xzf brisk-1.5.3.tar.gz
+cd brisk-1.5.3
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -77,7 +77,7 @@ link time (`-Wl,--no-undefined`), not at import.
 ```sh
 python -c "import brisk; print(brisk.version(), brisk.library_path())"
 python python/examples/quickstart.py
-pip install "./python[test]" && python -m pytest python/tests     # 46 tests, about 5 s
+pip install "./python[test]" && python -m pytest python/tests     # 85 tests, about 10 s
 ```
 
 ## Installation on macOS
@@ -95,8 +95,8 @@ Homebrew packages are required.
 **2. Python.** Python 3.9 or later: from python.org, Homebrew (`brew install python`) or conda.
 
 ```sh
-unzip brisk-1.5.1.zip        # or: tar xzf brisk-1.5.1.tar.gz
-cd brisk-1.5.1
+unzip brisk-1.5.3.zip        # or: tar xzf brisk-1.5.3.tar.gz
+cd brisk-1.5.3
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip

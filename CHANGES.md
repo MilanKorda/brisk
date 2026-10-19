@@ -1,5 +1,53 @@
 # BRISK change log
 
+## Version 1.5.3 (October 2026)
+
+Semidefinite programs:
+- **Free variables eliminated by a cost model.** When a problem has free variables (equality-constrained
+  multipliers, polynomial coefficients), the solver now compares the cost of eliminating them with the cost
+  of the saddle-point system and takes the cheaper form. On polynomial optimization over the sphere with
+  free multiplier coefficients this gives the moment form and no saddle system at all: about 10 s → 1.1 s on
+  a problem with 16 variables. When the saddle system is kept, its symmetric indefinite factorization and
+  its solves run on all threads from order 512, with the same results at any thread count.
+- **Random sparse constraint matrices: the Schur complement by one symmetric product.** When every
+  constraint matrix is sparse and unstructured, the rows of the Schur complement are formed by one
+  symmetric rank-2k product with the constraints gathered by columns: 22-24 % faster on such problems.
+- **The matrix-free attempt only where it can pay.** It is tried only when each linear variable enters one
+  constraint; a random SDP with a linear block is solved twice as fast.
+- **The sparse Schur factor at half the memory.** Chained sum-of-squares relaxations: 1306 → 625 MB at
+  20 million entries of the factor, the same iterates and time. The limit on the factor's size was raised
+  accordingly, so larger sparse Schur complements stay on the sparse path (a chain of 100 such blocks: solved
+  in 98 s in 3 GB, where it took the dense path before).
+- **Faster sparse Cholesky.** The panels of the supernodal factorization are factored by
+  recursion on the matrix product with short loops at the leaves, instead of the BLAS library's triangular
+  solve and Cholesky (which run at a third of its product rate on narrow panels): the factorizations of
+  AC-OPF relaxations 20-35 % faster, of chained sum-of-squares relaxations 15-20 %. The triangular solves take four columns
+  per pass, the symbolic analysis sorts by radix and the nested dissection keeps its gains current (an
+  LP's ordering a third faster), all with the same results.
+- **The polishing's products over many small blocks on the threads**, in block order (the same results).
+
+Linear programs:
+- **The dual form when it is cheaper.** Regressions in the L1 norm, the maximum norm and quantile
+  regressions (many residuals, few coefficients) are solved through their dual: from minutes, killed runs
+  or out of memory to a few seconds (an L1 regression with 2,000 residuals: 32 s → 0.1 s).
+- **Dense columns, large factors.** The normal equations are formed by one symmetric product when dense;
+  dense columns that lose the accuracy of their low-rank correction go to the cone solver instead of a
+  dense factor; the factor's fill is capped by the memory and `-timelimit` is honoured before a
+  factorization; the large nodes of the factor run as a task graph; no nested dissection on a nearly dense
+  pattern, and a second ordering trial where the first is expensive (set covering 2-3x faster, a staircase
+  LP that ran out of memory solved in under a minute).
+
+Second-order cone programs:
+- **Free-variable substitution in time proportional to the rows it changes.** One large cone tied to a few
+  dense rows took time quadratic in the cone's dimension: 426 s → about 3 s for a cone of 50,000 entries.
+- **Fewer rows and iterations.** Free copies of cone entries in many rows are substituted by columns,
+  nonnegative variables that their cone keeps nonnegative are treated as free copies, the dual form is
+  taken when every cone is a slack of the rows and its factor is smaller, and rotated cones are balanced
+  during the iteration: total-variation denoising 1.3-4x faster, group lasso and portfolio problems
+  1.5-2x. Blocks in no row are fixed or proved unbounded in the presolve (100,000 small cones: 4.7 → 0.3 s).
+  More of the solver's passes run on the threads, with the same results at any thread count.
+- **`-vv` prints the cone solver's iteration log.**
+
 ## Version 1.5.1 (October 2026)
 
 - **Threads on small problems with second-order cones next to semidefinite blocks.** A problem

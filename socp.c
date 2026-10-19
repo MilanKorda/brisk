@@ -39,6 +39,11 @@
 #include <math.h>
 #include <time.h>
 #include "socp.h"
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static int omp_in_parallel(void) { return 0; }
+#endif
 extern double brisk_mem_scale(void);   /* (main.c) max(1, memory / 8 GB) */
 #include "amd/amd.h"
 
@@ -67,11 +72,12 @@ int    schol_ntiny(const SChol *S);
 int (*socp_printf)(const char *fmt, ...) = printf;
 void (*socp_note)(const char *fmt, ...) = NULL;    /* 5.8: a line for the caller's summary at the end of the run (brisk_note in main.c) */
 #define SNOTE(...) do { if (socp_note) socp_note(__VA_ARGS__); } while (0)
+static const char *g_stat_prefix = "";     /* (19 October 2026: "the dual: " while the dual form is solved) */
 static volatile int socp_never = 0;
 volatile int *socp_stop = &socp_never;
 static double sc_time(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
-static int dbg_on(void) { static int v = -1; if (v < 0) v = getenv("BRISK_CONEDBG") != NULL; return v; }
+static int dbg_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("BRISK_CONEDBG"); v = e ? (atoi(e) > 1 ? atoi(e) : 1) : 0; } return v; }     /* (2: also the dual residual by kind) */
 
 #define NE_MAXFREE 8
 #define SOCP_DENSE_MAX 4          /* cones up to this dimension: H as a dense block; larger: the sparse form */
@@ -272,7 +278,7 @@ typedef struct {
     int m, n;                      /* rows, variables (after the rotated cones became second-order cones) */
     int nf, nl, nq; int *q, *qs;   /* free, linear, cones: dimensions and first index */
     int *Ap, *Ai; double *Ax;      /* A scaled, by columns */
-    int *Rp, *Ri; double *Rx;      /* A scaled, by rows (column indices) */
+    int *Rp, *Ri; double *Rx, *R0x;      /* A scaled, by rows (column indices); A as given, by rows (the same pattern) */
     double *b, *c;                 /* scaled */
     double *Dr, *Ec, sb, scl;      /* row and column scales, the two scalars */
     /* iterate */
@@ -297,17 +303,36 @@ typedef struct {
     double *gs, *gV, *gZ, *gH, *gcs; int gm_max; double gm_tol;   /* GMRES on the KKT system */
     double rr_est; double t_mul; double cflops; double last_res; double t_setup, t_factor, t_solve; long nfact; long nback, slnz, nfallback; int sc_ok;
     /* the normal equations A H^-1 A' + delta I (no free variable, small cones, no dense column) */
-    SChol *ne; size_t *ne_off, *ne_doff; double *ne_G; int *ne_r, **ne_rows; int ne_ok, ne_fallback, ne_tiny, ne_left, free_last, dz_refine; double *wdz, *wdx, *wdy, *wdy2; long dz_count; double *ne_W, ne_T[NE_MAXFREE * NE_MAXFREE]; long ndyn_total; long ne_nfact, ne_lnz;
+    SChol *ne; size_t *ne_off, *ne_doff; double *ne_G; int *ne_r, **ne_rows; int ne_ok, ne_fallback, ne_tiny, ne_left, free_last, dz_refine; double *wdz, *wdx, *wdy, *wdy2; long dz_count; double *ne_W, ne_T[NE_MAXFREE * NE_MAXFREE]; long ndyn_total; long ne_nfact, ne_lnz; double *ne_C; int nr_rot; int **bpos; double *bth; int *Rq; long nboost; int anyrot;
     SChol *sc; size_t *soff; long knz; double *swork;   /* the supernodal factorization, when it is used */
     int refine_max, verbose;
     long refine_total, solves;
 } Socp;
 
-/* y += alpha A x ; y += alpha A' x */
+/* y += alpha A x ; y += alpha A' x.
+ * 18 October 2026 (LP/SOCP): on the threads the cone solver keeps for its large blocks (g_cone_nt), when A has 1e5
+ * entries or more: A'x by columns (each entry its own sum), A x as a gather by rows from a row copy whose entries
+ * are in ascending column order, each y_i starting from its value: the additions into y_i in the order of the
+ * scatter by columns, so the same bits at any thread count (BRISK_CONEAPAR=0: the sequential products). */
+static int g_cone_nt = 1;
+static int cone_apar(const Socp *S) {
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_CONEAPAR"); on = !(e && atoi(e) == 0); }
+    return on && g_cone_nt > 1 && S->Rp && !omp_in_parallel();
+}
 static void A_mul(const Socp *S, double al, const double *x, double *y) {
+    if (cone_apar(S)) {
+        #pragma omp parallel for schedule(static) num_threads(g_cone_nt)
+        for (int i = 0; i < S->m; i++) {
+            double v = y[i];
+            for (int q = S->Rp[i]; q < S->Rp[i + 1]; q++) { const double xj = al * x[S->Ri[q]]; if (xj != 0.0) v += S->Rx[q] * xj; }
+            y[i] = v;
+        }
+        return;
+    }
     for (int j = 0; j < S->n; j++) { const double xj = al * x[j]; if (xj != 0.0) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) y[S->Ai[p]] += S->Ax[p] * xj; }
 }
 static void At_mul(const Socp *S, double al, const double *x, double *y) {
+    #pragma omp parallel for schedule(static) num_threads(g_cone_nt) if (cone_apar(S))
     for (int j = 0; j < S->n; j++) { double s = 0.0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) s += S->Ax[p] * x[S->Ai[p]]; y[j] += al * s; }
 }
 static double dotv(int n, const double *a, const double *b) { double s = 0; for (int i = 0; i < n; i++) s += a[i] * b[i]; return s; }
@@ -444,7 +469,7 @@ static void Hinv_apply(const Socp *S, const double *in, double *out) {
 static void ne_free(Socp *S) {
     if (S->ne) schol_free(S->ne);
     S->ne = NULL;
-    free(S->ne_off); free(S->ne_doff); free(S->ne_G); free(S->ne_r);
+    free(S->ne_off); free(S->ne_doff); free(S->ne_G); free(S->ne_r); free(S->ne_C); S->ne_C = NULL;
     if (S->ne_rows) { free(S->ne_rows[0]); free(S->ne_rows); }
     S->ne_off = S->ne_doff = NULL; S->ne_G = NULL; S->ne_r = NULL; S->ne_rows = NULL;
     free(S->ne_W); S->ne_W = NULL;
@@ -453,8 +478,15 @@ static int cmp_ll(const void *a, const void *b) { const long long x = *(const lo
 /* returns 1 when the normal equations are set up (S->ne), 0 when they are not used */
 static int ne_setup(Socp *S) {
     const int n = S->n, m = S->m, nb = S->nl + S->nq;
-    if (S->nf > NE_MAXFREE || nb <= 0 || m < 64 || getenv("BRISK_CONENONE")) return 0;
-    for (int k = 0; k < S->nq; k++) if (S->q[k] > NE_MAXCONE) return 0;
+    if (S->nf > NE_MAXFREE || nb <= 0 || getenv("BRISK_CONENONE")) return 0;     /* (18 October 2026: m < 64 no longer excluded, the cost decides: one cone of 50,001 in 50 rows) */
+    /* (18 October 2026, LP/SOCP: a cone of more than NE_MAXCONE entries enters by its low-rank form,
+     * A_k H_k^-1 A_k' = eta^-2 (2 v v' - A_k J A_k') with v = A_k u: A_k J A_k' (C_k) once, v every iteration. One
+     * cone of 50,001 entries in 50 dense rows, after the free variables' substitution: the full system had 50,053
+     * unknowns and nnz(L) 2.6e6, the normal equations are 50 x 50.) */
+    double cpre = 0;                  /* the work of the C_k: the products of the entries of each column */
+    for (int k = 0; k < S->nq; k++) if (S->q[k] > NE_MAXCONE)
+        for (int t = 0; t < S->q[k]; t++) { const double l = S->Ap[S->qs[k] + t + 1] - S->Ap[S->qs[k] + t]; cpre += l * l; }
+    if (cpre > 0 && !getenv("BRISK_CONENE") && cpre > 1.5 * S->cflops + 1e6) return 0;
     /* the rows of every block; the number of pairs */
     int *r = (int *)malloc(sizeof(int) * (size_t)nb), *mark = (int *)malloc(sizeof(int) * (size_t)m);
     for (int i = 0; i < m; i++) mark[i] = -1;
@@ -504,7 +536,7 @@ static int ne_setup(Socp *S) {
     size_t o = 0; int bad = 0; long gsz = 0;
     for (int k = 0; k < nb; k++) {
         for (int a = 0; a < r[k]; a++) for (int b_ = 0; b_ <= a; b_++) { const size_t f = schol_offset(sc, (size_t)rows[k][a], (size_t)rows[k][b_]); if (f == (size_t)-1) bad = 1; S->ne_off[o++] = f; }
-        if (k >= S->nl) gsz += (long)r[k] * S->q[k - S->nl];
+        if (k >= S->nl && S->q[k - S->nl] <= NE_MAXCONE) gsz += (long)r[k] * S->q[k - S->nl];
     }
     for (int i = 0; i < m; i++) { S->ne_doff[i] = schol_offset(sc, (size_t)i, (size_t)i); if (S->ne_doff[i] == (size_t)-1) bad = 1; }
     if (bad) { ne_free(S); return 0; }
@@ -512,9 +544,25 @@ static int ne_setup(Socp *S) {
     S->ne_G = (double *)calloc((size_t)gsz + 1, sizeof(double));
     int *posr = (int *)malloc(sizeof(int) * (size_t)m);
     long g = 0;
+    long csz = 0;
+    for (int k = S->nl; k < nb; k++) if (S->q[k - S->nl] > NE_MAXCONE) csz += (long)r[k] * (r[k] + 1) / 2;
+    if (csz) S->ne_C = (double *)calloc((size_t)csz, sizeof(double));
+    long cpos = 0;
     for (int k = S->nl; k < nb; k++) {
         const int d = S->q[k - S->nl], c0 = S->qs[k - S->nl];
         for (int a = 0; a < r[k]; a++) posr[rows[k][a]] = a;
+        if (d > NE_MAXCONE) {          /* C_k = sum_t J_tt a_t a_t', packed as the pairs (a >= b) */
+            double *C = S->ne_C + cpos;
+            for (int t = 0; t < d; t++) {
+                const double jt = t == 0 ? 1.0 : -1.0;
+                for (int p = S->Ap[c0 + t]; p < S->Ap[c0 + t + 1]; p++) {
+                    const long ra = posr[S->Ai[p]]; const double xa = jt * S->Ax[p];
+                    for (int p2 = S->Ap[c0 + t]; p2 < S->Ap[c0 + t + 1]; p2++) { const int rb = posr[S->Ai[p2]]; if (rb <= ra) C[ra * (ra + 1) / 2 + rb] += xa * S->Ax[p2]; }
+                }
+            }
+            cpos += (long)r[k] * (r[k] + 1) / 2;
+            continue;
+        }
         for (int t = 0; t < d; t++) for (int p = S->Ap[c0 + t]; p < S->Ap[c0 + t + 1]; p++) S->ne_G[g + (long)posr[S->Ai[p]] * d + t] += S->Ax[p];
         g += (long)r[k] * d;
     }
@@ -536,9 +584,21 @@ static int ne_factor(Socp *S) {
     }
     const double *G = S->ne_G;
     double Hi[NE_MAXCONE * NE_MAXCONE], T[NE_MAXCONE];
+    const double *Cb = S->ne_C;
+    double *vb = NULL; int *posb = NULL;
     for (int k = S->nl; k < nb; k++) {
         const int kc = k - S->nl, d = S->q[kc], s = S->qs[kc], rk = S->ne_r[k];
         const double *w = S->wbar + s; const double ie2 = 1.0 / (S->eta[kc] * S->eta[kc]);
+        if (d > NE_MAXCONE) {          /* eta^-2 (2 v v' - C_k), v = A_k u, u = (w0, -w1) */
+            if (!vb) { vb = (double *)malloc(sizeof(double) * (size_t)m); posb = (int *)malloc(sizeof(int) * (size_t)m); }
+            for (int a = 0; a < rk; a++) { posb[S->ne_rows[k][a]] = a; vb[a] = 0.0; }
+            for (int t = 0; t < d; t++) {
+                const double ut = t == 0 ? w[0] : -w[t];
+                for (int p = S->Ap[s + t]; p < S->Ap[s + t + 1]; p++) vb[posb[S->Ai[p]]] += ut * S->Ax[p];
+            }
+            for (int a = 0; a < rk; a++) { const double va = 2.0 * vb[a]; for (int b_ = 0; b_ <= a; b_++) pm[*off++] += ie2 * (va * vb[b_] - *Cb++); }
+            continue;
+        }
         for (int i = 0; i < d; i++) for (int j = 0; j < d; j++) {
             const double ui = i == 0 ? w[0] : -w[i], uj = j == 0 ? w[0] : -w[j];
             Hi[i * d + j] = ie2 * (2.0 * ui * uj - (i == j ? (i == 0 ? 1.0 : -1.0) : 0.0));
@@ -550,6 +610,7 @@ static int ne_factor(Socp *S) {
         }
         G += (size_t)rk * d;
     }
+    free(vb); free(posb);
     for (int i = 0; i < m; i++) pm[S->ne_doff[i]] += S->sreg0;
     schol_set_tinypiv(S->ne, 1e-14);
     const int bad = schol_factor(S->ne, 0.0);
@@ -617,7 +678,8 @@ static int kkt_factor(Socp *S) {
         return f;
     }
     double *pm = schol_values(S->sc);
-    for (long q = 0; q < S->knz; q++) pm[S->soff[q]] = F->Ax[q];
+    #pragma omp parallel for schedule(static) num_threads(g_cone_nt) if (S->knz >= 1000000 && g_cone_nt > 1 && !omp_in_parallel())
+    for (long q = 0; q < S->knz; q++) pm[S->soff[q]] = F->Ax[q];       /* (distinct positions: the same at any thread count) */
     const int dyn = getenv("BRISK_CONENODYN") == NULL;
     if (dyn) schol_set_dynpiv(S->sc, 1e-7);            /* (a pivot of the wrong sign is replaced, as in the column code) */
     S->sc_ok = schol_factor(S->sc, 0.0) == 0;
@@ -649,7 +711,8 @@ static void kkt_back(Socp *S, double *t) {
         const int nk = S->nk; const Ldl *F = &S->F;
         double *u = S->swork + nk;
         for (int i = 0; i < nk; i++) u[i] = t[F->iperm[i]];
-        schol_set_solve_seq(1); schol_solve(S->sc, u, S->swork); schol_set_solve_seq(0);     /* (the sequential solve: the tree-parallel one is slower here) */
+        schol_set_solve_seq(1); schol_solve(S->sc, u, S->swork); schol_set_solve_seq(0);     /* (the sequential solve: the tree-parallel one is slower here;
+                                     * 18 October 2026 at four threads: socp_svm's 432 solves 8.7 -> 18.0 s, socp_fir's 2.2 -> 3.5 s) */
         for (int i = 0; i < nk; i++) t[F->iperm[i]] = u[i];
     } else if (S->F.dd) ldl_solve_perm_dd(&S->F, t);
     else ldl_solve_perm(&S->F, t);
@@ -699,6 +762,19 @@ static void kkt_prec(Socp *S, const double *r, double *v) {
     if (S->ne && S->ne_ok) { ne_prec(S, r, v); return; }
     const Ldl *F = &S->F;
     double *t = S->rk;
+    if (S->sc && S->sc_ok && !S->anyrot) {
+        /* (18 October 2026, LP/SOCP: the supernodal factor takes the unknowns in their own order (it applies its
+         * permutation itself): the round trip through the column factorization's order, four scattered passes over the
+         * nk unknowns, is left out; the same arithmetic. TV denoising 300: 10 of 70 samples were those passes) */
+        const int naux = S->naux; double *u = S->swork + nk;
+        memcpy(u, r, sizeof(double) * (size_t)n);
+        for (int i = 0; i < naux; i++) u[n + i] = 0.0;
+        memcpy(u + n + naux, r + n, sizeof(double) * (size_t)m);
+        { const double ts = sc_time(); schol_set_solve_seq(1); schol_solve(S->sc, u, S->swork); schol_set_solve_seq(0); S->t_solve += sc_time() - ts; S->nback++; }
+        memcpy(v, u, sizeof(double) * (size_t)n);
+        memcpy(v + n, u + n + naux, sizeof(double) * (size_t)m);
+        return;
+    }
     for (int i = 0; i < nk; i++) t[i] = 0.0;
     for (int i = 0; i < n; i++) t[F->iperm[i]] = r[i];
     for (int i = 0; i < m; i++) t[F->iperm[n + S->naux + i]] = r[n + i];
@@ -898,6 +974,33 @@ static int nt_update(Socp *S) {
 static void *xcalloc(size_t n, size_t s) { void *p = calloc(n ? n : 1, s); return p; }
 
 /* builds the pattern of the factored matrix, orders it and maps the entries */
+/* (18 October 2026, LP/SOCP) the boost of rotated cone k by theta: with (a, b) the rotated pair, a -> a e^-theta,
+ * b -> b e^theta, an automorphism of the cone; on the second-order form's first two entries x' = B x,
+ * B = [ch -sh; -sh ch], z' = B^-T z, the columns A B^-1, the costs B^-T c. The pattern is the same (both columns on
+ * the same rows); the factored matrix's entries, the row copy and the cumulative angle are updated. */
+static void cone_boost(Socp *S, int k, double th) {
+    const int j = S->qs[k], len = S->Ap[j + 1] - S->Ap[j];
+    const double ch = cosh(th), sh = sinh(th);
+    double *x = S->x + j, *z = S->z + j;
+    { const double a = ch * x[0] - sh * x[1], b = -sh * x[0] + ch * x[1]; x[0] = a; x[1] = b; }
+    { const double a = ch * z[0] + sh * z[1], b = sh * z[0] + ch * z[1]; z[0] = a; z[1] = b; }
+    { const double a = ch * S->c[j] + sh * S->c[j + 1], b = sh * S->c[j] + ch * S->c[j + 1]; S->c[j] = a; S->c[j + 1] = b; }
+    double *A0 = S->Ax + S->Ap[j], *A1 = S->Ax + S->Ap[j + 1];
+    for (int t = 0; t < len; t++) { const double a = ch * A0[t] + sh * A1[t], b = sh * A0[t] + ch * A1[t]; A0[t] = a; A1[t] = b; }
+    for (int t = 0; t < 2 * len; t++) S->F.Ax[S->bpos[k][t]] = S->Ax[S->Ap[j] + t];
+    if (S->Rq) for (int t = 0; t < 2 * len; t++) S->Rx[S->Rq[S->Ap[j] + t]] = S->Ax[S->Ap[j] + t];
+    S->bth[k] += th; S->nboost++;
+}
+/* a point of the boosted problem back to the unboosted one: x = B^-1 x', z = B' z' on each boosted pair */
+static void cone_unboost(const Socp *S, double *x, double *z) {
+    if (!S->bth) return;
+    for (int k = S->nq - S->nr_rot; k < S->nq; k++) {
+        const double th = S->bth[k]; if (!(th != 0.0) || th != th) continue;
+        const int j = S->qs[k]; const double ch = cosh(th), sh = sinh(th);
+        if (x) { const double a = ch * x[j] + sh * x[j + 1], b = sh * x[j] + ch * x[j + 1]; x[j] = a; x[j + 1] = b; }
+        if (z) { const double a = ch * z[j] - sh * z[j + 1], b = -sh * z[j] + ch * z[j + 1]; z[j] = a; z[j + 1] = b; }
+    }
+}
 static int kkt_setup(Socp *S) {
     const double flop_ratio = 110.0;
     double nd0 = 0;                   /* dense rows found by the first AMD pass */
@@ -930,7 +1033,7 @@ static int kkt_setup(Socp *S) {
             if (S->auxu[k] >= 0 || d < 2) continue;
             int cnt_ = 0;
             for (int j = 0; j < d; j++) for (int p = S->Ap[s + j]; p < S->Ap[s + j + 1]; p++) if (mark[S->Ai[p]] != k) { mark[S->Ai[p]] = k; cnt_++; }
-            S->rot[k] = 1; S->rnr[k] = cnt_;
+            S->rot[k] = 1; S->anyrot = 1; S->rnr[k] = cnt_;
             S->rrows[k] = (int *)malloc(sizeof(int) * (size_t)(cnt_ + 1));
             int c = 0;
             for (int j = 0; j < d; j++) for (int p = S->Ap[s + j]; p < S->Ap[s + j + 1]; p++) if (mark[S->Ai[p]] != -2 - k) { mark[S->Ai[p]] = -2 - k; S->rrows[k][c++] = S->Ai[p]; }
@@ -1060,6 +1163,18 @@ static int kkt_setup(Socp *S) {
              * second pass then (AMD at the higher threshold orders the rows between the two thresholds, at
              * a cost that can be large: 27 s on a lasso problem with 4,000 such rows, for the same order) */
             if (t == 1 && var_gain && !getenv("BRISK_CONEAMD2")) break;
+            /* nor when no unknown has a degree between the two thresholds, in AMD's graph (AMD: dense above
+             * max(16, a sqrt(n)), the degree without the diagonal) and in the variant's: the same dense rows,
+             * the same order and the same variant (group lasso, 4,502 dense rows at both: 0.3 s of AMD and
+             * two symbolic counts for the same factor) */
+            if (t == 1 && !getenv("BRISK_CONEAMD2")) {
+                const double ra = fmin((double)nred, fmax(16.0, dn[0] * sqrt((double)nred))), rb = fmin((double)nred, fmax(16.0, dn[1] * sqrt((double)nred)));
+                const double va = fmax(16.0, dn[0] * sqrt((double)nk)), vb = fmax(16.0, dn[1] * sqrt((double)nk));
+                long between = 0;
+                for (int i = 0; i < nred && !between; i++) { const double d_ = (double)(cntr[i + 1] - cntr[i] - 1); if (d_ > ra && d_ <= rb) between++; }
+                for (int i = 0; i < nk && !between; i++) { const double d_ = (double)(cnt[i + 1] - cnt[i] - 1); if (d_ > va && d_ <= vb) between++; }
+                if (!between) { if (dbg_on()) socp_printf("  [AMD (dense %g): no degree between the thresholds, the same order]\n", dn[1]); break; }
+            }
             double ctl[AMD_CONTROL], info[AMD_INFO], fl_;
             amd_defaults(ctl);
             ctl[AMD_DENSE] = dn[t];
@@ -1143,7 +1258,9 @@ static int kkt_setup(Socp *S) {
             free(pos); free(after); free(cmin);
         }
         memcpy(F->perm, bestp, sizeof(int) * (size_t)nk);
+        { const double tk_ = sc_time();
         KKT_COUNT();
+        if (dbg_on()) socp_printf("  [the final count %.3fs]\n", sc_time() - tk_); }
         S->cflops = fl_;
     }
 #undef KKT_COUNT
@@ -1153,7 +1270,11 @@ static int kkt_setup(Socp *S) {
     {
         const char *e = getenv("BRISK_CONEBACKEND");
         /* (dense rows: the supernodal update batches the data rows into one product per tile, svm_5000 1.0 -> 0.65 s) */
-        const int want = e ? atoi(e) : (F->lnz > 40000 && (F->lnz > 40L * nk || S->cflops > flop_ratio * (double)F->lnz || (nd0 >= 32 && S->Ap[n] >= 20L * m)));
+        /* (19 October 2026, LP/SOCP: also when both are moderately high, columns of L longer than 15 on average and more
+         * than 60 flops per entry: an LP with 20 dense columns handed over by the LP method, 26 and 87, factorizations
+         * 3.8 -> 1.8 s; DIMACS nql60old 0.61 -> 0.45 s; TV denoising and truss design, columns of 6, stay by columns,
+         * where the supernodal code was slower) */
+        const int want = e ? atoi(e) : (F->lnz > 40000 && (F->lnz > 40L * nk || S->cflops > flop_ratio * (double)F->lnz || (F->lnz > 15L * nk && S->cflops > 60.0 * (double)F->lnz) || (nd0 >= 32 && S->Ap[n] >= 20L * m)));
         if (want && nk >= 64) {
             int *deg = (int *)xcalloc((size_t)nk + 1, sizeof(int)), **nbr = (int **)malloc(sizeof(int *) * ((size_t)nk + 1));
             for (long q = nk; q < nz; q++) { deg[ti[q]]++; deg[tj[q]]++; }
@@ -1162,7 +1283,9 @@ static int kkt_setup(Socp *S) {
             for (long q = nk; q < nz; q++) { nbr[ti[q]][deg[ti[q]]++] = tj[q]; nbr[tj[q]][deg[tj[q]]++] = ti[q]; }
             const int om = schol_set_amd(2);
             schol_set_perm(bestp);
+            const double tsa_ = sc_time();
             S->sc = schol_analyze_adj(nk, deg, nbr, (size_t)1 << 31);
+            if (dbg_on()) socp_printf("  [supernodal analysis %.3fs]\n", sc_time() - tsa_);
             schol_set_perm(NULL);
             schol_set_amd(om);
             free(deg); free(nbr); free(pool);
@@ -1176,8 +1299,11 @@ static int kkt_setup(Socp *S) {
         schol_set_signs(S->sc, sg); schol_set_tinypiv(S->sc, 0.0);
         free(sg);
         S->soff = (size_t *)malloc(sizeof(size_t) * (size_t)(nz + 1)); S->knz = nz;
-        int bad = 0;
+        int bad = 0; const double tso_ = sc_time();
+        /* (19 October 2026, LP/SOCP: on the threads, each lookup independent; a group lasso's 4.5e6 entries 0.27 -> 0.08 s) */
+        #pragma omp parallel for schedule(static) num_threads(g_cone_nt) reduction(|:bad) if (nz >= 1000000 && g_cone_nt > 1 && !omp_in_parallel())
         for (long q = 0; q < nz; q++) { S->soff[pos[q]] = schol_offset(S->sc, (size_t)ti[q], (size_t)tj[q]); if (S->soff[pos[q]] == (size_t)-1) bad = 1; }
+        if (dbg_on()) socp_printf("  [offsets %.3fs]\n", sc_time() - tso_);
         if (bad) { schol_free(S->sc); S->sc = NULL; free(S->soff); S->soff = NULL; }
         else S->swork = (double *)xcalloc(2 * (size_t)nk + 2, sizeof(double));
     }
@@ -1208,6 +1334,11 @@ static int kkt_setup(Socp *S) {
                 if (j == S->qs[k]) { const long np_ = (long)S->q[k] * S->rnr[k]; S->rapos[k] = (int *)malloc(sizeof(int) * (size_t)(np_ + 1)); for (long q_ = 0; q_ < np_; q_++) S->rapos[k][q_] = pos[e++]; }
                 continue;
             }
+            if (S->bpos && k < S->nq && k >= S->nq - S->nr_rot && (j == S->qs[k] || j == S->qs[k] + 1)) {   /* (the boost of a rotated cone rewrites these) */
+                const int off = j == S->qs[k] ? 0 : S->Ap[S->qs[k] + 1] - S->Ap[S->qs[k]];
+                if (!S->bpos[k]) S->bpos[k] = (int *)malloc(sizeof(int) * (size_t)(S->Ap[S->qs[k] + 2] - S->Ap[S->qs[k]] + 1));
+                for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) S->bpos[k][off + p - S->Ap[j]] = pos[e + p - S->Ap[j]];
+            }
             for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) F->Ax[pos[e++]] = S->Ax[p];
         }
     }
@@ -1226,13 +1357,13 @@ static void socp_free(Socp *S) {
     for (int k = 0; k < S->nq; k++) { if (S->rrows) free(S->rrows[k]); if (S->rG) free(S->rG[k]); if (S->rapos) free(S->rapos[k]); }
     free(S->rot); free(S->rrows); free(S->rnr); free(S->rG); free(S->rpos0); free(S->Qr); free(S->rapos);
     free(S->kblk); free(S->ku); free(S->kv); free(S->kdiag); free(S->auxu); free(S->auxv);
-    free(S->q); free(S->qs); free(S->Ap); free(S->Ai); free(S->Ax); free(S->Rp); free(S->Ri); free(S->Rx); free(S->b); free(S->c);
+    free(S->q); free(S->qs); free(S->Ap); free(S->Ai); free(S->Ax); free(S->Rp); free(S->Ri); free(S->Rx); free(S->R0x); free(S->b); free(S->c);
     free(S->Dr); free(S->Ec); free(S->x); free(S->y); free(S->z); free(S->h); free(S->eta); free(S->wbar); free(S->lam);
     free(S->w1); free(S->w2); free(S->w3); free(S->w4); free(S->rk); free(S->sk); ne_free(S); free(S->swork2);
     free(S->lastx); free(S->gs); free(S->gV); free(S->gZ); free(S->gH); free(S->gcs);
 }
 
-void socp_default_opts(SocpOpts *o) { o->tol = 1e-8; o->maxit = 200; o->timelimit = 0; o->verbose = 1; o->equil = 1; o->step = 0; o->attempt = 0; }
+void socp_default_opts(SocpOpts *o) { o->tol = 1e-8; o->maxit = 200; o->timelimit = 0; o->verbose = 1; o->equil = getenv("BRISK_CONEEQ") ? atoi(getenv("BRISK_CONEEQ")) : 1; o->step = 0; o->attempt = 0; }
 const char *socp_status_str(int s) {
     return s == SOCP_OPTIMAL ? "OPTIMAL" : s == SOCP_PINF ? "PRIMAL INFEASIBLE" : s == SOCP_DINF ? "DUAL INFEASIBLE" : s == SOCP_MAXIT ? "ITERATION LIMIT"
          : s == SOCP_TIME ? "TIME LIMIT" : s == SOCP_REDUCED ? "SOLVED TO REDUCED ACCURACY" : s == SOCP_NUMERR ? "NUMERICAL DIFFICULTIES" : "INPUT ERROR";
@@ -1355,6 +1486,7 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     if (nn != n || m < 0 || n < 1) { R->status = SOCP_INPUT; return SOCP_INPUT; }
     S->m = m; S->n = n; S->nf = P->nf; S->nl = P->nl; S->nq = P->nq + P->nr;
     S->verbose = opt->verbose; S->refine_max = 10;
+    S->nr_rot = P->nr;
     S->q = (int *)xcalloc((size_t)S->nq, sizeof(int)); S->qs = (int *)xcalloc((size_t)S->nq + 1, sizeof(int));
     { int s = S->nf + S->nl; for (int k = 0; k < S->nq; k++) { S->q[k] = k < P->nq ? P->q[k] : P->r[k - P->nq]; S->qs[k] = s; s += S->q[k]; } S->qs[S->nq] = s; }
     /* cones of dimension 1 are half-lines: kept as cones (x0 >= 0), the algebra is the same */
@@ -1397,6 +1529,20 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     for (int j = 0; j < n; j++) S->Ec[j] = 1.0;
     if (opt->equil) {
         double *rn = (double *)malloc(sizeof(double) * ((size_t)m + 1)), *cn = (double *)malloc(sizeof(double) * (size_t)n);
+        if (opt->equil == 2) {     /* (test: geometric-mean scaling passes first: each row and column scaled by 1/sqrt(max min)) */
+            double *rl = (double *)malloc(sizeof(double) * ((size_t)m + 1)), *cl = (double *)malloc(sizeof(double) * (size_t)n);
+            for (int pass = 0; pass < 8; pass++) {
+                for (int i = 0; i < m; i++) { rn[i] = 0.0; rl[i] = 1e300; }
+                for (int j = 0; j < n; j++) { double s = 0, l = 1e300; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double v = fabs(S->Ax[p]); if (v == 0) continue; if (v > s) s = v; if (v < l) l = v; if (v > rn[S->Ai[p]]) rn[S->Ai[p]] = v; if (v < rl[S->Ai[p]]) rl[S->Ai[p]] = v; } cn[j] = s; cl[j] = l; }
+                for (int k = 0; k < S->nq; k++) { double s = 0, l = 1e300; for (int i = S->qs[k]; i < S->qs[k + 1]; i++) { if (cn[i] > s) s = cn[i]; if (cl[i] < l) l = cl[i]; } for (int i = S->qs[k]; i < S->qs[k + 1]; i++) { cn[i] = s; cl[i] = l; } }
+                for (int i = 0; i < m; i++) rn[i] = rn[i] > 0 ? 1.0 / sqrt(sqrt(rn[i] * rl[i])) : 1.0;
+                for (int j = 0; j < n; j++) cn[j] = cn[j] > 0 ? 1.0 / sqrt(sqrt(cn[j] * cl[j])) : 1.0;
+                for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) S->Ax[p] *= rn[S->Ai[p]] * cn[j];
+                for (int i = 0; i < m; i++) S->Dr[i] *= rn[i];
+                for (int j = 0; j < n; j++) S->Ec[j] *= cn[j];
+            }
+            free(rl); free(cl);
+        }
         for (int pass = 0; pass < 10; pass++) {
             for (int i = 0; i < m; i++) rn[i] = 0.0;
             for (int j = 0; j < n; j++) { double s = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double v = fabs(S->Ax[p]); if (v > s) s = v; if (v > rn[S->Ai[p]]) rn[S->Ai[p]] = v; } cn[j] = s; }
@@ -1413,14 +1559,38 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     }
     for (int i = 0; i < m; i++) S->b[i] *= S->Dr[i];
     for (int j = 0; j < n; j++) S->c[j] *= S->Ec[j];
+    if (S->Ap[n] >= 100000 && g_cone_nt > 1) {     /* the row copy of the scaled A, for A x on the threads */
+        const int nz = S->Ap[n];
+        S->Rp = (int *)xcalloc((size_t)m + 2, sizeof(int)); S->Ri = (int *)malloc(sizeof(int) * ((size_t)nz + 1)); S->Rx = (double *)malloc(sizeof(double) * ((size_t)nz + 1));
+        for (int p = 0; p < nz; p++) S->Rp[S->Ai[p] + 2]++;
+        for (int i = 0; i < m; i++) S->Rp[i + 2] += S->Rp[i + 1];
+        S->Rq = (int *)malloc(sizeof(int) * ((size_t)nz + 1));
+        for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const int q = S->Rp[S->Ai[p] + 1]++; S->Ri[q] = j; S->Rx[q] = S->Ax[p]; S->Rq[p] = q; }
+        S->R0x = (double *)malloc(sizeof(double) * ((size_t)nz + 1));
+        for (int p = 0; p < nz; p++) S->R0x[S->Rq[p]] = A0x[p];
+    }
     S->sb = fmax(1.0, nrmi(m, S->b)); S->scl = fmax(1.0, nrmi(n, S->c));
     if (!opt->equil) { S->sb = 1.0; S->scl = 1.0; }
+    if (getenv("BRISK_CONESBF")) S->sb *= atof(getenv("BRISK_CONESBF"));      /* (test) */
+    if (getenv("BRISK_CONESCF")) S->scl *= atof(getenv("BRISK_CONESCF"));
     for (int i = 0; i < m; i++) S->b[i] /= S->sb;
     for (int j = 0; j < n; j++) S->c[j] /= S->scl;
     /* ---- workspace, pattern, ordering */
     S->x = (double *)xcalloc((size_t)n, sizeof(double)); S->y = (double *)xcalloc((size_t)m, sizeof(double)); S->z = (double *)xcalloc((size_t)n, sizeof(double));
     S->h = (double *)xcalloc((size_t)S->nl, sizeof(double)); S->eta = (double *)xcalloc((size_t)S->nq, sizeof(double));
     S->wbar = (double *)xcalloc((size_t)n, sizeof(double)); S->lam = (double *)xcalloc((size_t)n, sizeof(double));
+    {   /* (18 October 2026, LP/SOCP: the rotated cones that can be balanced by a boost, their two columns on the same rows) */
+        static int bal = -1; if (bal < 0) { const char *e_ = getenv("BRISK_CONEBAL"); bal = e_ ? atoi(e_) : 1; }   /* (0: off) */
+        if (bal && S->nr_rot > 0) {
+            S->bpos = (int **)xcalloc((size_t)S->nq + 1, sizeof(int *)); S->bth = (double *)xcalloc((size_t)S->nq + 1, sizeof(double));
+            for (int k = S->nq - S->nr_rot; k < S->nq; k++) {
+                const int j = S->qs[k], l0 = S->Ap[j + 1] - S->Ap[j], l1 = S->Ap[j + 2] - S->Ap[j + 1];
+                int same = l0 == l1;
+                for (int t = 0; same && t < l0; t++) if (S->Ai[S->Ap[j] + t] != S->Ai[S->Ap[j + 1] + t]) same = 0;
+                if (!same) S->bth[k] = NAN;      /* (not boosted) */
+            }
+        }
+    }
     { const double ts = sc_time(); const int rc_ = kkt_setup(S); S->t_setup = sc_time() - ts;
       if (rc_) { socp_free(S); free(A0x); free(b0); free(c0); R->status = SOCP_INPUT; return SOCP_INPUT; } }
     const size_t wn = (size_t)S->nk + 8;
@@ -1428,7 +1598,7 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     S->w4 = (double *)xcalloc(wn, sizeof(double)); S->rk = (double *)xcalloc(wn, sizeof(double)); S->sk = (double *)xcalloc(wn, sizeof(double));
     S->lastx = (double *)xcalloc(2 * wn, sizeof(double)); S->lasty = S->lastx + wn;
     S->swork2 = (double *)xcalloc((size_t)m + 8, sizeof(double));
-    { const double ts = sc_time(); ne_setup(S); S->t_setup += sc_time() - ts; }
+    { const double ts = sc_time(); ne_setup(S); S->t_setup += sc_time() - ts; if (dbg_on()) socp_printf("  [kkt setup %.3fs, normal equations setup %.3fs]\n", S->t_setup - (sc_time() - ts), sc_time() - ts); }
     S->gm_max = 10; S->gm_tol = 1e-12;
     S->gs = (double *)xcalloc(wn, sizeof(double));
     S->gV = (double *)xcalloc((size_t)(S->gm_max + 1) * wn, sizeof(double)); S->gZ = (double *)xcalloc((size_t)S->gm_max * wn, sizeof(double));
@@ -1473,20 +1643,58 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
             for (int i = 1; i < d; i++) { a += px[j + i] * px[j + i]; b_ += qx[j + i] * qx[j + i]; }
             sx = fmin(sx, px[j] - sqrt(a)); sz = fmin(sz, -qx[j] - sqrt(b_));
         }
+        if (dbg_on()) for (int k = S->nq - 1; k >= 0 && k >= S->nq - 3; k--) {     /* (the rotated cones' least-squares entries: a, b, |r|) */
+            const int j = S->qs[k], d = S->q[k]; if (k < S->nq - (S->nr_rot)) break;
+            const double a = sqrt(0.5) * (px[j] + px[j + 1]) * S->Ec[j], b_ = sqrt(0.5) * (px[j] - px[j + 1]) * S->Ec[j]; double r2 = 0; for (int i = 2; i < d; i++) r2 += px[j + i] * px[j + i] * S->Ec[j + i] * S->Ec[j + i];
+            socp_printf("  [rotated cone %d (dimension %d), least squares: a %.3e b %.3e |r| %.3e; |r| / (sqrt2 max(a, b)) %.3e]\n", k, d, a, b_, sqrt(r2), sqrt(r2) / (sqrt(2.0) * fmax(fabs(a), fabs(b_))));
+        }
         int ok = 1;
         for (int j = 0; j < n; j++) if (!(fabs(px[j]) < 1e8) || !(fabs(qx[j]) < 1e8)) ok = 0;      /* (the scaled data are at most 1) */
         for (int i = 0; i < m; i++) if (!(fabs(qy[i]) < 1e8)) ok = 0;
+        /* 19 October 2026 (LP/SOCP), a test, off (BRISK_CONEROTSHIFT=1): the shared shift along the identity from the
+         * linear part and the second-order cones only; each rotated cone moved into itself by its own shift, to the margin
+         * 1. The tail of a rotated cone that holds a quadratic (s >= |r|^2 / 2, r of the size of the data) has a
+         * least-squares norm that grows with its dimension; as the minimum of the shared rule it shifts every small cone by
+         * the same amount: TV denoising, a rotated cone of dimension 22502, shift 14.6 for all 22500 cones of dimension 3,
+         * tau 1 -> 11 and the first three steps 0.20, 0.26, 0.90. Measured on the 79 SOCP files (ISSUES 207): all status
+         * lines kept, iterations 1,305 -> 1,299; TV 15/18/18/19 -> 14/16/17/18, the SVMs 40/30/44 -> 38/27/41, but MPC
+         * 17 -> 21 and branch flow 20 -> 23 (they gain from the larger shared shift: Mehrotra's rule per rotated cone
+         * gives 21 and 30). A shift per cone for all cones de-centres the small cones against each other (TV 17-18). */
+        static int rotsh = -1; if (rotsh < 0) { const char *e_ = getenv("BRISK_CONEROTSHIFT"); rotsh = e_ ? atoi(e_) : 0; }
+        const int nrs = rotsh ? S->nr_rot : 0;
         if (ok) {
+            if (nrs > 0) {
+                sx = 1e300; sz = 1e300;
+                for (int i = S->nf; i < S->nf + S->nl; i++) { sx = fmin(sx, px[i]); sz = fmin(sz, -qx[i]); }
+                for (int k = 0; k < S->nq - nrs; k++) {
+                    const int j = S->qs[k], d = S->q[k]; double a = 0, b_ = 0;
+                    for (int i = 1; i < d; i++) { a += px[j + i] * px[j + i]; b_ += qx[j + i] * qx[j + i]; }
+                    sx = fmin(sx, px[j] - sqrt(a)); sz = fmin(sz, -qx[j] - sqrt(b_));
+                }
+                if (sx > 1e299) { sx = 0; sz = 0; }
+            }
             const double ax = sx < 1e-8 ? 1.0 - sx : 0.0, az = sz < 1e-8 ? 1.0 - sz : 0.0;
             for (int j = 0; j < S->nf; j++) { S->x[j] = px[j]; S->z[j] = 0.0; }
             for (int i = S->nf; i < S->nf + S->nl; i++) { S->x[i] = px[i] + ax; S->z[i] = -qx[i] + az; }
             for (int k = 0; k < S->nq; k++) {
                 const int j = S->qs[k], d = S->q[k];
-                S->x[j] = px[j] + ax; S->z[j] = -qx[j] + az;
+                double axk = ax, azk = az;
+                if (k >= S->nq - nrs) {      /* a rotated cone: its own shift, to the margin 1 */
+                    double a = 0, b_ = 0;
+                    for (int i = 1; i < d; i++) { a += px[j + i] * px[j + i]; b_ += qx[j + i] * qx[j + i]; }
+                    const double mx = px[j] - sqrt(a), mz = -qx[j] - sqrt(b_);
+                    axk = mx < 1.0 ? 1.0 - mx : 0.0; azk = mz < 1.0 ? 1.0 - mz : 0.0;
+                }
+                S->x[j] = px[j] + axk; S->z[j] = -qx[j] + azk;
                 for (int i = 1; i < d; i++) { S->x[j + i] = px[j + i]; S->z[j + i] = -qx[j + i]; }
             }
             for (int i = 0; i < m; i++) S->y[i] = qy[i];
         }
+    }
+    if (getenv("BRISK_CONEKAP0")) {     /* (test: kappa0 so that tau kappa is the mean product of x and z) */
+        double xz0 = 0; for (int j = S->nf; j < n; j++) xz0 += S->x[j] * S->z[j];
+        const double mx = xz0 / fmax(1.0, (double)(S->nl + S->nq));
+        if (mx > 0 && isfinite(mx)) S->kap = mx / S->tau;
     }
     const double nu = (double)(S->nl + S->nq + 1);
     int status = SOCP_MAXIT, it;
@@ -1494,15 +1702,26 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
         socp_printf("BRISK second-order cone solver: m = %d, n = %d (free %d, linear %d, cones %d", m, n, S->nf, S->nl, S->nq);
         if (S->nq) { int mx = 0; for (int k = 0; k < S->nq; k++) if (S->q[k] > mx) mx = S->q[k]; socp_printf(", largest %d", mx); }
         socp_printf("), nnz(A) = %d, factor: %d unknowns, nnz(L) = %ld\n", S->Ap[n], S->nk, S->F.lnz);
-        socp_printf("Number of threads: 1\n");   /* (this solver is sequential) */
+        {   extern int schol_panel_threads(void); const int pt = schol_panel_threads();   /* (17 October 2026: the large blocks of the factorization) */
+            if (pt > 1) socp_printf("Number of threads: %d (the large blocks of the factorization; the rest is sequential)\n", pt);
+            else socp_printf("Number of threads: 1\n"); }
     }
     if (S->verbose > 1) socp_printf("  it      pobj             dobj         pinf     dinf     gap      mu       tau    step  sigma  ref\n");
     double pobj = 0, dobj = 0, e_p = 1, e_d = 1, e_g = 1, e_c = 1;
     const double ne_k = 3.0;
-    double gm_switch = 1e-4, gm_tol_early = 1e-9, gm_tol_late = 1e-12;
+    /* (18 October 2026, LP/SOCP: an early tolerance of 1e-7 or 1e-8 instead of 1e-9 was measured and not kept: a third
+     * fewer solves and the DIMACS sched files better, but the end phase of TV denoising and of the clustering problem
+     * is on a knife edge (replaced pivots, one large cone far from the central path), and any change of the path flips
+     * one of them into the second attempt: socp_tv_200 19 -> 52 iterations at 1e-7, socp_sonclust 20 -> 49 at 1e-8;
+     * ISSUES 207) */
+    /* (18 October 2026, the night: 1e-8 now that the rotated cones are balanced, which removed the knife edge: 79 SOCP
+     * files 3.3 % faster in the geometric mean, the DIMACS sched files better (one REDUCED -> OPTIMAL, one NUMERICAL
+     * DIFFICULTIES -> REDUCED, sched_50_50_orig 50 -> 23 iterations), socp_sonclust 19 iterations either way; 1e-7 took
+     * the powered descent from 35 to 82 iterations) */
+    double gm_switch = 1e-4, gm_tol_early = 1e-8, gm_tol_late = 1e-12;
     { const char *e = getenv("BRISK_CONEGMTOL"); if (e) { sscanf(e, "%lf,%lf,%lf", &gm_tol_early, &gm_tol_late, &gm_switch); } }
     const int mcc_ref = 10, mcc_max = getenv("BRISK_CONEMCC") ? atoi(getenv("BRISK_CONEMCC")) : 3;
-    const double mcc_da = 0.2, mcc_bmin = 0.1, mcc_bmax = 10.0, mcc_acc = 0.1, step_frac = opt->step > 0 && opt->step < 1 ? opt->step : 0.99;
+    const double mcc_da = getenv("BRISK_CONEMCCDA") ? atof(getenv("BRISK_CONEMCCDA")) : 0.2, mcc_bmin = getenv("BRISK_CONEMCCB") ? atof(getenv("BRISK_CONEMCCB")) : 0.1, mcc_bmax = 1.0 / mcc_bmin, mcc_acc = getenv("BRISK_CONEMCCACC") ? atof(getenv("BRISK_CONEMCCACC")) : 0.1, step_frac = opt->step > 0 && opt->step < 1 ? opt->step : 0.99;
     double *dxa = (double *)xcalloc((size_t)n, sizeof(double)), *dya = (double *)xcalloc((size_t)m + 1, sizeof(double)), *dza = (double *)xcalloc((size_t)n, sizeof(double));
     double *ctv = (double *)xcalloc((size_t)n, sizeof(double)), *dxs = (double *)xcalloc((size_t)n, sizeof(double)), *dzs = (double *)xcalloc((size_t)n, sizeof(double));
     double mu0 = 1.0;
@@ -1515,7 +1734,7 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
         S->rr_est = tf / tsv;
     }
     int ddbump = 0;
-    int nfeas = 0, feas_pending = 0, nsmall = 0; const int feas_on = getenv("BRISK_CONENOFEAS") == NULL;
+    int nfeas = 0, feas_pending = 0, nsmall = 0, nf_retry = 0, nf_restore = 0; double nf_sv[4] = { 0, 0, 0, 1 }; const int feas_on = getenv("BRISK_CONENOFEAS") == NULL;
     double feas_prev = 0;
     double *sv_x = (double *)xcalloc((size_t)n, sizeof(double)), *sv_z = (double *)xcalloc((size_t)n, sizeof(double)), *sv_y = (double *)xcalloc((size_t)m + 1, sizeof(double));
     for (it = 0; ; it++) {
@@ -1532,13 +1751,27 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
         {
             const double f = 1.0 / S->tau;
             for (int j = 0; j < n; j++) { xo[j] = S->Ec[j] * S->x[j] * f * S->sb; zo[j] = S->z[j] * f * S->scl / S->Ec[j]; }
+            cone_unboost(S, xo, zo);
             for (int i = 0; i < m; i++) yo[i] = S->Dr[i] * S->y[i] * f * S->scl;
             double *ra = S->w1, *rb = S->w2;
-            for (int i = 0; i < m; i++) ra[i] = -b0[i];
-            for (int j = 0; j < n; j++) { const double xj = xo[j]; if (xj != 0.0) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) ra[S->Ai[p]] += A0x[p] * xj; }
+            /* (19 October 2026, LP/SOCP: on the threads with the row copy, each row's sum in the order of the columns
+             * as by columns, so the same bits) */
+            if (S->R0x && cone_apar(S)) {
+                #pragma omp parallel for schedule(static) num_threads(g_cone_nt)
+                for (int i = 0; i < m; i++) { double v = -b0[i]; for (int q = S->Rp[i]; q < S->Rp[i + 1]; q++) { const double xj = xo[S->Ri[q]]; if (xj != 0.0) v += S->R0x[q] * xj; } ra[i] = v; }
+            } else {
+                for (int i = 0; i < m; i++) ra[i] = -b0[i];
+                for (int j = 0; j < n; j++) { const double xj = xo[j]; if (xj != 0.0) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) ra[S->Ai[p]] += A0x[p] * xj; }
+            }
+            #pragma omp parallel for schedule(static) num_threads(g_cone_nt) if (S->R0x && cone_apar(S))
             for (int j = 0; j < n; j++) { double s = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) s += A0x[p] * yo[S->Ai[p]]; rb[j] = c0[j] - s - zo[j]; }
             pobj = dotv(n, c0, xo); dobj = dotv(m, b0, yo);
             e_p = nrm2(m, ra) / (1.0 + nb0); e_d = nrm2(n, rb) / (1.0 + nc0);
+            if (dbg_on() > 1) {          /* (18 October 2026: the dual residual by kind of column, its largest entry) */
+                double sf = 0, sl = 0, sq = 0, mx = 0; int jm = -1;
+                for (int j = 0; j < n; j++) { const double r2 = rb[j] * rb[j]; if (j < S->nf) sf += r2; else if (j < S->nf + S->nl) sl += r2; else sq += r2; if (fabs(rb[j]) > mx) { mx = fabs(rb[j]); jm = j; } }
+                socp_printf("      [dual residual: free %.1e linear %.1e cones %.1e; largest %.1e at column %d (%s), |y| %.1e, x %.1e z %.1e]\n", sqrt(sf) / (1.0 + nc0), sqrt(sl) / (1.0 + nc0), sqrt(sq) / (1.0 + nc0), mx, jm, jm < S->nf ? "free" : jm < S->nf + S->nl ? "linear" : "cone", nrm2(m, yo), jm >= 0 ? xo[jm] : 0.0, jm >= 0 ? zo[jm] : 0.0);
+            }
             e_g = (pobj - dobj) / (1.0 + fabs(pobj) + fabs(dobj));
             double xzo = 0; for (int j = S->nf; j < n; j++) xzo += xo[j] * zo[j];
             e_c = xzo / (1.0 + fabs(pobj) + fabs(dobj));
@@ -1580,6 +1813,18 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
         S->gm_tol = err > gm_switch && mu > 1e-5 * mu0 && S->tau > 1e-3 * fmax(1.0, S->kap) ? gm_tol_early : gm_tol_late;      /* (also full accuracy on the way to an infeasibility certificate) */
         /* ---- scaling and factorization */
         S->it_maxres = 0.0;
+        if (S->bth && !S->ne && !S->use_dd) for (int k = S->nq - S->nr_rot; k < S->nq; k++) {      /* the rotated cones balanced */
+            if (S->bth[k] != S->bth[k] || !S->bpos[k]) continue;
+            const double *x = S->x + S->qs[k], a = sqrt(0.5) * (x[0] + x[1]), b = sqrt(0.5) * (x[0] - x[1]);
+            if (!(a > 0 && b > 0)) continue;
+            const double r = a / b;
+            /* (any boost is exact; it is applied only to a pair out of balance by more than 100, where the second-order form's
+             * scaling cancels: on TV denoising the replaced pivots of the end phase came from that cone, 30 -> 19 iterations) */
+            if (r > 100.0 || r < 0.01) {
+                if (dbg_on()) socp_printf("      [rotated cone %d: a %.2e b %.2e, boosted by %.3g]\n", k, a, b, sqrt(r));
+                cone_boost(S, k, 0.5 * log(r));
+            }
+        }
         if (nt_update(S)) { status = SOCP_NUMERR; break; }
         { static double mureg_c = -1; if (mureg_c < 0) { const char *e_ = getenv("BRISK_CONEMUREG"); mureg_c = e_ ? atof(e_) : 0; }   /* (test: the regularization follows mu) */
           if (mureg_c > 0 && !S->use_dd && S->bump == 1.0) { const double r_ = fmin(1e-6, fmax(1e-10, mureg_c * mu / fmax(mu0, 1e-300))); S->sreg = r_; S->sregx = r_; S->sregf = fmax(r_, 1e-8); } }
@@ -1735,6 +1980,46 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
             if (dkap < 0) a2 = fmin(a2, -S->kap / dkap);
             alpha = fmin(alpha, fmin(1.0, step_frac * a2));
         }
+        if (dbg_on()) {      /* (diagnostics: the step to the boundary of each part) */
+            double axl = 1e300, azl = 1e300, axq = 1e300, azq = 1e300; int ixl = -1, izl = -1;
+            for (int i = S->nf; i < S->nf + S->nl; i++) { if (dx[i] < 0 && -S->x[i] / dx[i] < axl) { axl = -S->x[i] / dx[i]; ixl = i; } if (dz[i] < 0 && -S->z[i] / dz[i] < azl) { azl = -S->z[i] / dz[i]; izl = i; } }
+            int kxb = -1, kzb = -1;
+            for (int k = 0; k < S->nq; k++) { const double a1 = soc_step(S->q[k], S->x + S->qs[k], dx + S->qs[k], axq), a2 = soc_step(S->q[k], S->z + S->qs[k], dz + S->qs[k], azq); if (a1 < axq) { axq = a1; kxb = k; } if (a2 < azq) { azq = a2; kzb = k; } }
+            if (kxb >= 0 || kzb >= 0) socp_printf("      [cones blocking: x cone %d (dimension %d), z cone %d (dimension %d)]\n", kxb, kxb >= 0 ? S->q[kxb] : 0, kzb, kzb >= 0 ? S->q[kzb] : 0);
+            const double at = dtau < 0 ? -S->tau / dtau : 1e300, ak = dkap < 0 ? -S->kap / dkap : 1e300;
+            int nsmall = 0; double pmin = 1e300, pmax = 0, lmin = 1e300, lmax = 0;
+            for (int i = S->nf; i < S->nf + S->nl; i++) { const double p = S->x[i] * S->z[i]; if (p < 1e-2 * mu) nsmall++; pmin = fmin(pmin, p); pmax = fmax(pmax, p); }
+            int kmax = -1, kmin = -1;
+            for (int k = 0; k < S->nq; k++) { const double *l = S->lam + S->qs[k]; double ln = 0; for (int i = 1; i < S->q[k]; i++) ln += l[i] * l[i]; ln = sqrt(ln);
+                if ((l[0] - ln) * (l[0] - ln) < lmin) { lmin = (l[0] - ln) * (l[0] - ln); kmin = k; } if ((l[0] + ln) * (l[0] + ln) > lmax) { lmax = (l[0] + ln) * (l[0] + ln); kmax = k; } }
+            if (kmax >= 0) socp_printf("      [cones: the largest eigenvalue in cone %d (dimension %d%s), the smallest in cone %d (dimension %d)]\n", kmax, S->q[kmax], S->rot && S->rot[kmax] ? ", rotated" : "", kmin, S->q[kmin]);
+            socp_printf("      [products / mu: linear %.1e .. %.1e, cones (lambda eigenvalues squared) %.1e .. %.1e, tau kap %.1e; sigma %.2f]\n", pmin / mu, pmax / mu, lmin / mu, lmax / mu, S->tau * S->kap / mu, sigma);
+            socp_printf("      [steps to the boundary: lin x %.3f (%d: x %.1e z %.1e) lin z %.3f (%d) cone x %.3f cone z %.3f tau %.3f kap %.3f; %d linear products below mu/100]\n",
+                        axl, ixl, ixl >= 0 ? S->x[ixl] : 0, ixl >= 0 ? S->z[ixl] : 0, azl, izl, axq, azq, at, ak, nsmall);
+        }
+        {   /* (18 October 2026, LP/SOCP: a direction that is not finite is not taken: the point stays, the iteration
+             * ends as a numerical failure; a branch-flow relaxation's last double-double step had tau = NaN, and the
+             * attempt then ended on an earlier point) */
+            int fin = isfinite(alpha) && isfinite(dtau) && isfinite(dkap);
+            for (int j = 0; j < n && fin; j++) if (!isfinite(dx[j]) || !isfinite(dz[j])) fin = 0;
+            for (int i = 0; i < m && fin; i++) if (!isfinite(dy[i])) fin = 0;
+            if (!fin) {
+                /* the factored matrix's regularization raised, as for a pivot of the wrong sign (GMRES solves the system
+                 * without it), and the iteration done again from the same point; at most twice in a solve (a cap per step: the iterate drifted,
+                 * the raised level spoils the preconditioner, 70-100 GMRES steps) */
+                const int retry = nf_retry < 2 && S->bump_on && S->bump < 1e4;
+                if (dbg_on()) socp_printf("      [the direction is not finite (alpha %g, dtau %g, dkap %g, denom %g): not taken%s]\n", alpha, dtau, dkap, denom0, retry ? "; the regularization raised" : "");
+                if (retry) {
+                    if (!nf_restore) { nf_sv[0] = S->sreg; nf_sv[1] = S->sregx; nf_sv[2] = S->sregf; nf_sv[3] = S->bump; }
+                    nf_restore = 1;
+                    nf_retry++; S->bump *= 100.0; S->nbump++;
+                    S->sreg = S->sreg0 * S->bump; S->sregx = S->sreg0 * S->bump; S->sregf = fmax(1e-6, 1e-8 * S->bump);
+                    continue;
+                }
+                status = SOCP_NUMERR; break;
+            }
+        }
+        if (nf_restore) { S->sreg = nf_sv[0]; S->sregx = nf_sv[1]; S->sregf = nf_sv[2]; S->bump = nf_sv[3]; nf_restore = 0; }   /* (the raise for that iteration only) */
         for (int j = 0; j < n; j++) { S->x[j] += alpha * dx[j]; S->z[j] += alpha * dz[j]; }
         for (int i = 0; i < m; i++) S->y[i] += alpha * dy[i];
         S->tau += alpha * dtau; S->kap += alpha * dkap;
@@ -1773,6 +2058,7 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     if (status == SOCP_PINF || status == SOCP_DINF) {
         /* the certificate, normalised: b'y = 1 (primal infeasible) or c'x = -1 (dual infeasible) */
         for (int j = 0; j < n; j++) { R->x[j] = S->Ec[j] * S->x[j] * S->sb; R->z[j] = S->z[j] * S->scl / S->Ec[j]; }
+        cone_unboost(S, R->x, R->z);
         for (int i = 0; i < m; i++) R->y[i] = S->Dr[i] * S->y[i] * S->scl;
         const double v = status == SOCP_PINF ? dotv(m, b0, R->y) : -dotv(n, c0, R->x);
         if (v > 0) { for (int j = 0; j < n; j++) { R->x[j] = status == SOCP_DINF ? R->x[j] / v : 0.0; R->z[j] = status == SOCP_PINF ? R->z[j] / v : 0.0; } for (int i = 0; i < m; i++) R->y[i] = status == SOCP_PINF ? R->y[i] / v : 0.0; }
@@ -1794,11 +2080,12 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     if (S->verbose > 0) {
         if (att_line || !by_elim) {
             if (att_line) socp_printf("attempt %d%s: %s", att, att == 2 ? " (shorter steps)" : "", socp_status_str(status));
-            else socp_printf("status: %s", socp_status_str(status));
+            else socp_printf("%sstatus: %s", g_stat_prefix, socp_status_str(status));
             if (status != SOCP_PINF && status != SOCP_DINF) socp_printf(" (max rel error %.1e)", best);
             socp_printf("   iterations: %d   time: %.3fs\n", it, R->time);
         }
         if (S->verbose > 1) socp_printf("  time: setup %.3f, factorizations %.3f, %ld solves %.3f + products %.3f (%s factorization, nnz(L) = %ld%s; %.2e flops by columns)\n", S->t_setup, S->t_factor, S->nback, S->t_solve, S->t_mul, S->sc ? "supernodal" : "column", S->sc ? S->slnz : S->F.lnz, S->nfallback ? "; some by columns" : "", S->cflops);
+        { extern void schol_ftime_print(void); if (getenv("BRISK_FTIME")) schol_ftime_print(); }   /* (the sparse factorization's split, as in the SDP solver) */
         if (dbg_on()) socp_printf("  [factorization / solve: estimated %.1f, measured %.1f]\n", S->rr_est, (S->t_factor / fmax(S->nfact, 1)) / fmax((S->t_solve + S->t_mul) / fmax(S->nback, 1), 1e-12));
         if (S->verbose > 1 && S->ncor_total) socp_printf("  %ld centrality correctors\n", S->ncor_total);
         if (S->verbose > 1 && S->ne_nfact) socp_printf("  %ld factorizations of the normal equations (nnz(L) = %ld, %d tiny pivots)\n", S->ne_nfact, S->ne_lnz, S->ne_tiny);
@@ -1838,18 +2125,67 @@ typedef struct {
     double *b, *c;
     long nnz;
     int ne, ecap; int *eu, *ei, *elen, *emn; int **ecol; double **eval; double *epiv, *ebi, *ecu; int **emk; double **emv;
+    unsigned long long *hk; int *hp; size_t hmask, hcnt;    /* the index (row, column) -> position in the row */
+    unsigned char *rh;                                      /* the row is in the index (else: as read, sorted) */
 } Elim;
+/* 18 October 2026 (LP/SOCP): a row that a substitution updates enters an open-addressing index (linear probing,
+ * deletion by backward shift) that gives the position of an entry, and is updated in place (unsorted from then on),
+ * so that a substitution costs O(len(pivot row)) per row it updates, after the row's first update. Rows never
+ * updated stay as read (sorted; binary search). Before, each update merged the pivot row into the whole sorted row: with long rows holding many free
+ * variables (one cone of dimension 50,001 tied to its free copy, with 50 dense rows) every substitution rewrote
+ * 50 rows of length n, O(n^2) in all (426 s). The entries, their values and the reduced problem are the same. */
+#define EH_EMPTY (~0ULL)
+static inline size_t eh_slot(const Elim *E, unsigned long long key) { return (size_t)((key * 0x9E3779B97F4A7C15ULL) >> 20) & E->hmask; }
+static inline unsigned long long eh_key(int i, int col) { return ((unsigned long long)(unsigned)i << 32) | (unsigned)col; }
 static int row_find(const Elim *E, int i, int col) {
-    int lo = 0, hi = E->rlen[i] - 1; const int *rc = E->rcol[i];
-    while (lo <= hi) { const int mid = (lo + hi) >> 1; if (rc[mid] == col) return mid; if (rc[mid] < col) lo = mid + 1; else hi = mid - 1; }
-    return -1;
+    if (!E->rh[i]) {
+        int lo = 0, hi = E->rlen[i] - 1; const int *rc = E->rcol[i];
+        while (lo <= hi) { const int mid = (lo + hi) >> 1; if (rc[mid] == col) return mid; if (rc[mid] < col) lo = mid + 1; else hi = mid - 1; }
+        return -1;
+    }
+    const unsigned long long key = eh_key(i, col);
+    for (size_t h = eh_slot(E, key); ; h = (h + 1) & E->hmask) { if (E->hk[h] == key) return E->hp[h]; if (E->hk[h] == EH_EMPTY) return -1; }
+}
+static void eh_grow(Elim *E);
+static void eh_set(Elim *E, int i, int col, int pos) {          /* insert or update */
+    if (2 * (E->hcnt + 1) > E->hmask + 1) eh_grow(E);
+    const unsigned long long key = eh_key(i, col);
+    size_t h = eh_slot(E, key);
+    while (E->hk[h] != EH_EMPTY && E->hk[h] != key) h = (h + 1) & E->hmask;
+    if (E->hk[h] == EH_EMPTY) { E->hk[h] = key; E->hcnt++; }
+    E->hp[h] = pos;
+}
+static void eh_grow(Elim *E) {
+    const size_t oc = E->hmask + 1; unsigned long long *ok = E->hk; int *op = E->hp;
+    size_t c = 1024; while (c < 4 * (E->hcnt + 1)) c <<= 1;
+    E->hk = (unsigned long long *)malloc(sizeof(unsigned long long) * c); E->hp = (int *)malloc(sizeof(int) * c);
+    for (size_t h = 0; h < c; h++) E->hk[h] = EH_EMPTY;
+    E->hmask = c - 1; E->hcnt = 0;
+    for (size_t h = 0; h < oc && ok; h++) if (ok[h] != EH_EMPTY) eh_set(E, (int)(ok[h] >> 32), (int)(unsigned)(ok[h] & 0xffffffffULL), op[h]);
+    free(ok); free(op);
+}
+static void eh_del(Elim *E, int i, int col) {
+    const unsigned long long key = eh_key(i, col);
+    size_t h = eh_slot(E, key);
+    while (E->hk[h] != key) { if (E->hk[h] == EH_EMPTY) return; h = (h + 1) & E->hmask; }
+    for (size_t g = (h + 1) & E->hmask; E->hk[g] != EH_EMPTY; g = (g + 1) & E->hmask) {   /* backward shift */
+        const size_t want = eh_slot(E, E->hk[g]);
+        if (((g - want) & E->hmask) >= ((g - h) & E->hmask)) { E->hk[h] = E->hk[g]; E->hp[h] = E->hp[g]; h = g; }
+    }
+    E->hk[h] = EH_EMPTY; E->hcnt--;
+}
+/* remove the entry at position t of row k: the last entry takes its place */
+static void row_del(Elim *E, int k, int t) {
+    const int last = --E->rlen[k];
+    eh_del(E, k, E->rcol[k][t]);
+    if (t != last) { E->rcol[k][t] = E->rcol[k][last]; E->rval[k][t] = E->rval[k][last]; eh_set(E, k, E->rcol[k][t], t); }
 }
 static void flist_add(Elim *E, int u, int row) {
     if (E->flen[u] == E->fcap[u]) { E->fcap[u] = 2 * E->fcap[u] + 4; E->flist[u] = (int *)realloc(E->flist[u], sizeof(int) * (size_t)E->fcap[u]); }
     E->flist[u][E->flen[u]++] = row;
 }
 static int elim_run(Elim *E, const SocpProb *P) {
-    const int m = P->m, n = P->n, nf = P->nf;
+    const int m = P->m, n = P->n, nf = P->nf, nl = P->nl;
     E->m = m; E->n = n; E->nf = nf;
     E->rlen = (int *)calloc((size_t)m + 1, sizeof(int)); E->rcap = (int *)calloc((size_t)m + 1, sizeof(int));
     E->rcol = (int **)calloc((size_t)m + 1, sizeof(int *)); E->rval = (double **)calloc((size_t)m + 1, sizeof(double *));
@@ -1858,14 +2194,99 @@ static int elim_run(Elim *E, const SocpProb *P) {
     E->b = (double *)malloc(sizeof(double) * ((size_t)m + 1)); memcpy(E->b, P->b, sizeof(double) * (size_t)m);
     E->c = (double *)malloc(sizeof(double) * ((size_t)n + 1)); memcpy(E->c, P->c, sizeof(double) * (size_t)n);
     for (int p = 0; p < P->Ap[n]; p++) E->rlen[P->Ai[p]]++;
+    /* (19 October 2026, LP/SOCP) the long free copies first, by columns: a free u in more than 64 rows (which the
+     * substitution by rows below skips) with a row i = {u, v}, v not free and in no other row (a cone's entry tied to a
+     * free variable), is substituted by moving its column onto v (no fill), in O(nnz(column)), before the rows are
+     * built; by rows it would cost a hash access per entry, 1.3 s for a group lasso's 3,000 coefficients in 1,500 dense
+     * rows. Recorded as the row route records an elimination, so the postsolve is the same. The shorter columns stay
+     * with the row route and its order: done by columns too, the order changed and a powered-descent SOCP (36 -> 78
+     * iterations) and an MPC problem (17 -> 22) became harder. */
+    int *uof = (int *)malloc(sizeof(int) * ((size_t)n + 1));
+    for (int j = 0; j < n; j++) uof[j] = -1;
+    int *cpiv = (int *)malloc(sizeof(int) * ((size_t)n + 1));     /* the position of the pivot in column u */
+    /* (19 October 2026, LP/SOCP) the entries a cone keeps nonnegative: the first of a second-order cone, the first two of a
+     * rotated one. A nonnegative variable u tied to one of them by u = alpha v, alpha > 0 (a row a_iu u + a_iv v = 0,
+     * a_iu a_iv < 0), has its bound implied by the cone: it is substituted as a free copy, its slack z_u = 0 (the bound
+     * is not active in a solution of the problem without it, which has the same solutions). TV denoising ties each
+     * cone's t to a nonnegative t: 22,500 rows of 67,502. */
+    unsigned char *impl = (unsigned char *)calloc((size_t)n + 1, 1);
+    { int s_ = nf + nl; for (int k = 0; k < P->nq; k++) { impl[s_] = 1; s_ += P->q[k]; } for (int k = 0; k < P->nr; k++) { impl[s_] = 1; impl[s_ + 1] = 1; s_ += P->r[k]; } }
+    static int implon = -1; if (implon < 0) implon = getenv("BRISK_CONENOIMPL") == NULL;
+    {
+        int *rfirst = (int *)malloc(sizeof(int) * ((size_t)m + 1)), *rother = (int *)malloc(sizeof(int) * ((size_t)m + 1));     /* a row of two: its columns */
+        for (int i = 0; i < m; i++) rfirst[i] = rother[i] = -1;
+        for (int j = 0; j < n; j++) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) { const int i = P->Ai[p]; if (E->rlen[i] == 2) { if (rfirst[i] < 0) rfirst[i] = j; else rother[i] = j; } }
+        static int fcmin = -1; if (fcmin < 0) { const char *e_ = getenv("BRISK_CONEFCOPY"); fcmin = e_ ? atoi(e_) : 64; }
+        for (int u = 0; u < nf + (implon ? nl : 0); u++) {
+            cpiv[u] = -1;
+            /* (the shorter columns by rows, as before, unless the substitution is a mere renaming: a row u - v = 0 up to
+             * scaling, |a_iu| = |a_iv| and b_i = 0, moves u's entries to v with the same values, so the substitutions
+             * by rows decide as they would have; a cone of 50,001 entries tied to its free copies in 50 dense rows) */
+            const int shortcol = P->Ap[u + 1] - P->Ap[u] <= fcmin;
+            double amax = 0; for (int p = P->Ap[u]; p < P->Ap[u + 1]; p++) amax = fmax(amax, fabs(P->Ax[p]));
+            int best = -1;
+            for (int p = P->Ap[u]; p < P->Ap[u + 1]; p++) {
+                const int i = P->Ai[p];
+                if (E->rlen[i] != 2 || !E->ralive[i]) continue;
+                const int v = rfirst[i] == u ? rother[i] : rfirst[i];
+                if (v < nf || v == u || P->Ap[v + 1] - P->Ap[v] != 1 || uof[v] >= 0) continue;
+                const double av = P->Ax[P->Ap[v]], au = P->Ax[p];
+                if (u >= nf && !(impl[v] && au * av < 0 && P->b[i] == 0.0)) continue;     /* (a nonnegative u: implied by the cone) */
+                if (shortcol && !(fabs(av) == fabs(au) && P->b[i] == 0.0)) continue;
+                if (fabs(au) < 0.5 * fmax(fabs(au), fabs(av)) || fabs(au) < 0.1 * amax) continue;
+                if (best < 0 || fabs(au) > fabs(P->Ax[best])) best = p;
+            }
+            if (best < 0) continue;
+            const int i = P->Ai[best], v = rfirst[i] == u ? rother[i] : rfirst[i];
+            uof[v] = u; cpiv[u] = best; E->ralive[i] = 0; E->cgone[u] = 1;
+        }
+        free(rfirst); free(rother);
+    }
+    for (int i = 0; i < m; i++) if (!E->ralive[i]) E->rlen[i] = 0;
+    for (int v = 0; v < n; v++) if (uof[v] >= 0) {      /* the row lengths after the moves */
+        const int u = uof[v];
+        for (int p = P->Ap[u]; p < P->Ap[u + 1]; p++) if (p != cpiv[u]) E->rlen[P->Ai[p]]++;
+    }
+    for (int j = 0; j < n; j++) if (E->cgone[j]) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) if (E->ralive[P->Ai[p]]) E->rlen[P->Ai[p]]--;
     for (int i = 0; i < m; i++) { E->rcap[i] = E->rlen[i] + 4; E->rcol[i] = (int *)malloc(sizeof(int) * (size_t)E->rcap[i]); E->rval[i] = (double *)malloc(sizeof(double) * (size_t)E->rcap[i]); E->rlen[i] = 0; }
-    for (int j = 0; j < n; j++) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) { const int i = P->Ai[p]; E->rcol[i][E->rlen[i]] = j; E->rval[i][E->rlen[i]++] = P->Ax[p]; }
-    E->nnz = P->Ap[n];
+    E->nnz = 0;
+    for (int t = 0; t < n; t++) {       /* the rows in column order */
+        if (E->cgone[t]) continue;
+        if (uof[t] >= 0) {
+            const int u = uof[t], pp = cpiv[u], i = P->Ai[pp]; const double au = P->Ax[pp], av = P->Ax[P->Ap[t]];
+            const int nr = P->Ap[u + 1] - P->Ap[u];
+            if (E->ne == E->ecap) {
+                E->ecap = 2 * E->ecap + 256;
+                E->eu = (int *)realloc(E->eu, sizeof(int) * (size_t)E->ecap); E->ei = (int *)realloc(E->ei, sizeof(int) * (size_t)E->ecap);
+                E->elen = (int *)realloc(E->elen, sizeof(int) * (size_t)E->ecap); E->emn = (int *)realloc(E->emn, sizeof(int) * (size_t)E->ecap);
+                E->ecol = (int **)realloc(E->ecol, sizeof(int *) * (size_t)E->ecap); E->eval = (double **)realloc(E->eval, sizeof(double *) * (size_t)E->ecap);
+                E->epiv = (double *)realloc(E->epiv, sizeof(double) * (size_t)E->ecap); E->ebi = (double *)realloc(E->ebi, sizeof(double) * (size_t)E->ecap); E->ecu = (double *)realloc(E->ecu, sizeof(double) * (size_t)E->ecap);
+                E->emk = (int **)realloc(E->emk, sizeof(int *) * (size_t)E->ecap); E->emv = (double **)realloc(E->emv, sizeof(double *) * (size_t)E->ecap);
+            }
+            const int e = E->ne++;
+            E->eu[e] = u; E->ei[e] = i; E->elen[e] = 2; E->epiv[e] = au; E->ebi[e] = P->b[i]; E->ecu[e] = P->c[u];
+            E->ecol[e] = (int *)malloc(sizeof(int) * 2); E->eval[e] = (double *)malloc(sizeof(double) * 2);
+            E->ecol[e][0] = u < t ? u : t; E->eval[e][0] = u < t ? au : av; E->ecol[e][1] = u < t ? t : u; E->eval[e][1] = u < t ? av : au;
+            E->emn[e] = nr - 1; E->emk[e] = (int *)malloc(sizeof(int) * (size_t)nr); E->emv[e] = (double *)malloc(sizeof(double) * (size_t)nr);
+            E->c[t] -= P->c[u] / au * av;
+            int mq = 0;
+            for (int p = P->Ap[u]; p < P->Ap[u + 1]; p++) {
+                if (p == pp) continue;
+                const int k = P->Ai[p]; const double mk = P->Ax[p] / au;
+                E->emk[e][mq] = k; E->emv[e][mq++] = mk;
+                E->b[k] -= mk * P->b[i];
+                if (!E->ralive[k]) continue;
+                E->rcol[k][E->rlen[k]] = t; E->rval[k][E->rlen[k]++] = -mk * av; E->nnz++;
+            }
+        } else for (int p = P->Ap[t]; p < P->Ap[t + 1]; p++) { const int i = P->Ai[p]; if (!E->ralive[i]) continue; E->rcol[i][E->rlen[i]] = t; E->rval[i][E->rlen[i]++] = P->Ax[p]; E->nnz++; }
+    }
+    free(uof); free(cpiv); free(impl);
+    E->rh = (unsigned char *)calloc((size_t)m + 1, 1); E->hcnt = 0; E->hmask = 0; E->hk = NULL; E->hp = NULL; eh_grow(E);
     E->fcnt = (int *)calloc((size_t)nf + 1, sizeof(int)); E->flen = (int *)calloc((size_t)nf + 1, sizeof(int)); E->fcap = (int *)calloc((size_t)nf + 1, sizeof(int));
     E->flist = (int **)calloc((size_t)nf + 1, sizeof(int *));
-    for (int u = 0; u < nf; u++) for (int p = P->Ap[u]; p < P->Ap[u + 1]; p++) { flist_add(E, u, P->Ai[p]); E->fcnt[u]++; }
-    int wcap = 64; int *wc = (int *)malloc(sizeof(int) * (size_t)wcap); double *wv = (double *)malloc(sizeof(double) * (size_t)wcap);
+    for (int u = 0; u < nf; u++) if (!E->cgone[u]) for (int p = P->Ap[u]; p < P->Ap[u + 1]; p++) if (E->ralive[P->Ai[p]]) { flist_add(E, u, P->Ai[p]); E->fcnt[u]++; }
     int *rows = NULL; double *avals = NULL; int rwcap = 0;
+    int *rmark = (int *)calloc((size_t)m + 1, sizeof(int)), stamp = 0;     /* (the rows of a column, each once) */
     int el_rowmax = ELIM_ROWMAX, el_pass = 3; double el_fill = 1.0;
     { const char *e_ = getenv("BRISK_CONEELIM"); if (e_) sscanf(e_, "%d,%lf,%d", &el_rowmax, &el_fill, &el_pass); }   /* (test: row length, fill factor, passes) */
     for (int pass = 0; pass < el_pass; pass++) {
@@ -1874,13 +2295,13 @@ static int elim_run(Elim *E, const SocpProb *P) {
             if (E->cgone[u] || E->fcnt[u] == 0) continue;
             if (E->flen[u] > rwcap) { rwcap = 2 * E->flen[u] + 8; rows = (int *)realloc(rows, sizeof(int) * (size_t)rwcap); avals = (double *)realloc(avals, sizeof(double) * (size_t)rwcap); }
             int nr = 0; double amax = 0;
+            if (++stamp == 0x7fffffff) { memset(rmark, 0, sizeof(int) * (size_t)m); stamp = 1; }     /* (the duplicates by a mark) */
             for (int t = 0; t < E->flen[u]; t++) {
                 const int i = E->flist[u][t];
-                if (!E->ralive[i]) continue;
-                int dup = 0; for (int q = 0; q < nr; q++) if (rows[q] == i) { dup = 1; break; }
-                if (dup) continue;
+                if (!E->ralive[i] || rmark[i] == stamp) continue;
                 const int pos = row_find(E, i, u);
                 if (pos < 0) continue;
+                rmark[i] = stamp;
                 rows[nr] = i; avals[nr] = E->rval[i][pos]; if (fabs(avals[nr]) > amax) amax = fabs(avals[nr]); nr++;
                 if (nr > 64) break;
             }
@@ -1909,6 +2330,12 @@ static int elim_run(Elim *E, const SocpProb *P) {
             const int e = E->ne++;
             E->eu[e] = u; E->ei[e] = pi; E->elen[e] = li; E->ecol[e] = E->rcol[pi]; E->eval[e] = E->rval[pi]; E->epiv[e] = piv; E->ebi[e] = E->b[pi]; E->ecu[e] = E->c[u];
             E->emn[e] = nr - 1; E->emk[e] = (int *)malloc(sizeof(int) * (size_t)nr); E->emv[e] = (double *)malloc(sizeof(double) * (size_t)nr);
+            if (E->rh[pi]) for (int t = 0; t < li; t++) eh_del(E, pi, E->rcol[pi][t]);
+            for (int t = 1; t < li; t++) {      /* (in column order: the postsolve sums the row as before) */
+                const int cc = E->rcol[pi][t]; const double vv = E->rval[pi][t]; int q = t - 1;
+                while (q >= 0 && E->rcol[pi][q] > cc) { E->rcol[pi][q + 1] = E->rcol[pi][q]; E->rval[pi][q + 1] = E->rval[pi][q]; q--; }
+                E->rcol[pi][q + 1] = cc; E->rval[pi][q + 1] = vv;
+            }
             const int *ic = E->rcol[pi]; const double *iv = E->rval[pi];
             const double cu = E->c[u] / piv;
             if (cu != 0) for (int t = 0; t < li; t++) if (ic[t] != u) E->c[ic[t]] -= cu * iv[t];
@@ -1918,25 +2345,22 @@ static int elim_run(Elim *E, const SocpProb *P) {
                 const int k = rows[q]; const double mk = avals[q] / piv;
                 E->emk[e][mq] = k; E->emv[e][mq++] = mk;
                 const int lk = E->rlen[k];
-                if (lk + li > wcap) { wcap = 2 * (lk + li) + 16; wc = (int *)realloc(wc, sizeof(int) * (size_t)wcap); wv = (double *)realloc(wv, sizeof(double) * (size_t)wcap); }
-                const int *kc = E->rcol[k]; const double *kv = E->rval[k];
-                int a = 0, b_ = 0, w = 0;
-                while (a < lk || b_ < li) {
-                    if (b_ >= li || (a < lk && kc[a] < ic[b_])) { wc[w] = kc[a]; wv[w++] = kv[a]; a++; }
-                    else if (a >= lk || ic[b_] < kc[a]) {
-                        const int col = ic[b_];
-                        wc[w] = col; wv[w++] = -mk * iv[b_]; b_++;
+                if (!E->rh[k]) { E->rh[k] = 1; for (int t = 0; t < lk; t++) eh_set(E, k, E->rcol[k][t], t); }
+                if (lk + li > E->rcap[k]) { E->rcap[k] = lk + li + (lk + li) / 2 + 4; E->rcol[k] = (int *)realloc(E->rcol[k], sizeof(int) * (size_t)E->rcap[k]); E->rval[k] = (double *)realloc(E->rval[k], sizeof(double) * (size_t)E->rcap[k]); }
+                for (int t = 0; t < li; t++) {
+                    const int col = ic[t], pos = row_find(E, k, col);
+                    if (col == u) { if (pos >= 0) row_del(E, k, pos); continue; }
+                    if (pos < 0) {
+                        const int w = E->rlen[k]++;
+                        E->rcol[k][w] = col; E->rval[k][w] = -mk * iv[t]; eh_set(E, k, col, w);
                         if (col < nf) { E->fcnt[col]++; flist_add(E, col, k); }
                     } else {
-                        const int col = kc[a]; const double v = kv[a] - mk * iv[b_]; a++; b_++;
-                        if (col == u) continue;
-                        if (v != 0) { wc[w] = col; wv[w++] = v; }
-                        else if (col < nf) E->fcnt[col]--;
+                        const double v = E->rval[k][pos] - mk * iv[t];
+                        if (v != 0) E->rval[k][pos] = v;
+                        else { row_del(E, k, pos); if (col < nf) E->fcnt[col]--; }
                     }
                 }
-                if (w > E->rcap[k]) { E->rcap[k] = w + w / 2 + 4; E->rcol[k] = (int *)realloc(E->rcol[k], sizeof(int) * (size_t)E->rcap[k]); E->rval[k] = (double *)realloc(E->rval[k], sizeof(double) * (size_t)E->rcap[k]); }
-                memcpy(E->rcol[k], wc, sizeof(int) * (size_t)w); memcpy(E->rval[k], wv, sizeof(double) * (size_t)w);
-                E->nnz += w - lk; E->rlen[k] = w;
+                E->nnz += E->rlen[k] - lk;
                 E->b[k] -= mk * E->b[pi];
             }
             for (int t = 0; t < li; t++) if (ic[t] < nf) E->fcnt[ic[t]]--;
@@ -1946,7 +2370,7 @@ static int elim_run(Elim *E, const SocpProb *P) {
         }
         if (!done) break;
     }
-    free(wc); free(wv); free(rows); free(avals);
+    free(rows); free(avals); free(rmark);
     return E->ne;
 }
 static void elim_free(Elim *E) {
@@ -1955,6 +2379,7 @@ static void elim_free(Elim *E) {
     for (int e = 0; e < E->ne; e++) { free(E->ecol[e]); free(E->eval[e]); free(E->emk[e]); free(E->emv[e]); }
     free(E->rlen); free(E->rcap); free(E->rcol); free(E->rval); free(E->ralive); free(E->fcnt); free(E->flen); free(E->fcap); free(E->flist); free(E->cgone); free(E->b); free(E->c);
     free(E->eu); free(E->ei); free(E->elen); free(E->emn); free(E->ecol); free(E->eval); free(E->epiv); free(E->ebi); free(E->ecu); free(E->emk); free(E->emv);
+    free(E->hk); free(E->hp); free(E->rh);
 }
 /* 5.8 (test, BRISK_CONESPLIT=1): the free variables left after the substitution written as
  * differences of two nonnegative ones (columns a, -a with costs c, -c) and solved by the core
@@ -1991,6 +2416,7 @@ static int core_split(const SocpProb *Q, const SocpOpts *o, SocpRes *R) {
     free(Ap); free(Ai); free(Ax); free(c2);
     return st;
 }
+static int socp_drop_empty(const SocpProb *P, const SocpOpts *opt, SocpRes *R, int (*inner)(const SocpProb *, const SocpOpts *, SocpRes *));
 static int socp_solve_elim(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     if (P->nf == 0 || getenv("BRISK_CONENOELIM")) return socp_solve_core(P, opt, R);
     const double t0 = sc_time();
@@ -2012,8 +2438,9 @@ static int socp_solve_elim(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     for (int i = 0; i < m; i++) if (rmap[i] >= 0) b2[rmap[i]] = E->b[i];
     for (int j = 0; j < n; j++) if (cmap[j] >= 0) c2[cmap[j]] = E->c[j];
     SocpProb Q = *P;
+    { int nlg = 0; for (int j = nf; j < nf + P->nl; j++) if (E->cgone[j]) nlg++; Q.nl = P->nl - nlg; }      /* (nonnegative copies implied by their cones) */
     Q.m = m2; Q.n = n2; Q.Ap = Ap; Q.Ai = Ai; Q.Ax = Ax; Q.b = b2; Q.c = c2; Q.nf = nf2;
-    if (opt && opt->verbose > 0) socp_printf("presolve: %d free variables eliminated by substitution (rows %d -> %d, nonzeros %d -> %d)\n", E->ne, m, m2, P->Ap[n], Ap[n2]);
+    if (opt && opt->verbose > 0) socp_printf("presolve: %d free variables eliminated by substitution (rows %d -> %d, nonzeros %d -> %d; %.2f s)\n", E->ne, m, m2, P->Ap[n], Ap[n2], sc_time() - t0);
     SNOTE("presolve: %d free variables eliminated by substitution (rows %d -> %d)", E->ne, m, m2);
     SocpOpts o2; if (opt) o2 = *opt; else socp_default_opts(&o2);
     const int vb = o2.verbose, att = o2.attempt;
@@ -2025,7 +2452,7 @@ static int socp_solve_elim(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
         memset(R, 0, sizeof(*R));
         R->x = (double *)xcalloc(1, sizeof(double)); R->y = (double *)xcalloc((size_t)m2 + 1, sizeof(double)); R->z = (double *)xcalloc(1, sizeof(double));
         st = SOCP_OPTIMAL; R->status = st; R->iters = 0;
-    } else st = core_split(&Q, &o2, R);
+    } else st = socp_drop_empty(&Q, &o2, R, core_split);      /* (cones tied to free copies are empty only now) */
     if (R->x && R->y && R->z) {
         const int cert = st == SOCP_PINF || st == SOCP_DINF;
         double *x = (double *)calloc((size_t)n + 1, sizeof(double)), *y = (double *)calloc((size_t)m + 1, sizeof(double)), *z = (double *)calloc((size_t)n + 1, sizeof(double));
@@ -2068,7 +2495,7 @@ static int socp_solve_elim(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     R->status = st2;
     const int deferred = att == 2 || (att == 1 && (st2 == SOCP_REDUCED || st2 == SOCP_NUMERR));
     if (vb > 0 && !deferred) {
-        socp_printf("status: %s", socp_status_str(st2));
+        socp_printf("%sstatus: %s", g_stat_prefix, socp_status_str(st2));
         if (st2 != SOCP_PINF && st2 != SOCP_DINF) socp_printf(" (max rel error %.1e)", R->maxerr);
         socp_printf("   iterations: %d   time: %.3fs\n", R->iters, R->time);
         if (st2 != SOCP_PINF && st2 != SOCP_DINF) socp_printf("  primal obj c'x = %+.12e   dual obj b'y = %+.12e\n  errors: pinf %.1e  dinf %.1e  gap %.1e  x'z %.1e\n", R->pobj, R->dobj, R->err[0], R->err[1], R->err[2], R->err[3]);
@@ -2168,7 +2595,308 @@ static int socp_solve_pre(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
  * with steps to 0.8 of the way to the boundary: better centred iterates reach the tolerance on badly
  * scaled problems where the default 0.99 does not (at 10-15 % more iterations, which is why it is not
  * the default). The better of the two results is returned. */
+static int socp_solve_seq(const SocpProb *P, const SocpOpts *opt, SocpRes *R);
+/* 17 October 2026: the cone solver is sequential, and runs on one thread: its sparse factorization would take the
+ * OpenMP threads (the tree code of sparsechol.c), which made it slower (the SOCP applications 8.4 -> 10.8 s at
+ * four threads, robustlp_400 0.82 -> 1.50 s) and its results depend on the thread count */
+/* (17 October 2026: ... but the large nodes of that factorization take the threads, by fixed tiles, so the results
+ * are the same at any thread count: schol_set_panel_threads; BRISK_CONEPANEL=0 off) */
+void schol_set_panel_threads(int nt);
+/* ---- presolve: blocks in no row (18 October 2026, LP/SOCP) ----
+ * A variable or a whole cone whose columns of A are empty is decoupled from the rest: min c_k'x_k over its cone alone.
+ * If c_k is in the dual cone the minimum is x_k = 0 (z_k = c_k) and the block goes; otherwise a ray d in the cone
+ * with c_k'd < 0 and A d = 0 proves the dual infeasible at once (a free variable with c_j != 0, a nonnegative one
+ * with c_j < 0, a cone (c0, c1) with |c1| > c0: d = (1, -c1/|c1|), a rotated cone through its map to a second-order
+ * cone). 100,000 cones of dimension 4 of which about 30 % meet no row: the certificate in 17 iterations before,
+ * from the presolve now; and the bounded variant loses those cones. */
+static int socp_drop_empty(const SocpProb *P, const SocpOpts *opt, SocpRes *R, int (*inner)(const SocpProb *, const SocpOpts *, SocpRes *)) {
+    if (getenv("BRISK_CONENOEMPTY") || P->n < 1) return inner(P, opt, R);
+    const int n = P->n, nf = P->nf, nl = P->nl, nb = nf + nl + P->nq + P->nr;
+    /* the blocks: free and linear variables one each, then the cones */
+    int *bs = (int *)malloc(sizeof(int) * ((size_t)nb + 1)); int *bk = (int *)malloc(sizeof(int) * ((size_t)nb + 1));   /* start, kind (0 free, 1 linear, 2 cone, 3 rotated) */
+    { int k = 0, s = 0;
+      for (int j = 0; j < nf; j++) { bs[k] = s++; bk[k++] = 0; }
+      for (int j = 0; j < nl; j++) { bs[k] = s++; bk[k++] = 1; }
+      for (int q = 0; q < P->nq; q++) { bs[k] = s; s += P->q[q]; bk[k++] = 2; }
+      for (int q = 0; q < P->nr; q++) { bs[k] = s; s += P->r[q]; bk[k++] = 3; }
+      bs[nb] = s;
+      if (s != n) { free(bs); free(bk); return inner(P, opt, R); } }
+    char *gone = (char *)calloc((size_t)nb + 1, 1); int ngone = 0, ray = -1; double raybest = 0;
+    for (int k = 0; k < nb; k++) {
+        const int j0 = bs[k], j1 = bs[k + 1];
+        if (P->Ap[j1] != P->Ap[j0]) continue;           /* (some column of the block has entries) */
+        const double *c = P->c + j0; const int d = j1 - j0;
+        double viol;     /* > 0: c_k is outside the dual cone (by that much, relative) */
+        if (bk[k] == 0) viol = fabs(c[0]);
+        else if (bk[k] == 1) viol = -c[0];
+        else {
+            double c0 = c[0], s2 = 0; int i1 = 1;
+            if (bk[k] == 3) { c0 = (c[0] + c[1]) * sqrt(0.5); const double c1 = (c[0] - c[1]) * sqrt(0.5); s2 = c1 * c1; i1 = 2; }
+            for (int i = i1; i < d; i++) s2 += c[i] * c[i];
+            viol = sqrt(s2) - c0;
+        }
+        if (viol > 0) { if (viol > raybest) { raybest = viol; ray = k; } }
+        else { gone[k] = 1; ngone++; }
+    }
+    if (ray >= 0) {
+        /* the certificate: d in the cone of block `ray`, normalised to c'd = -1 */
+        const int j0 = bs[ray], d = bs[ray + 1] - j0; const double *c = P->c + j0;
+        memset(R, 0, sizeof(*R));
+        R->x = (double *)xcalloc((size_t)n, sizeof(double)); R->y = (double *)xcalloc((size_t)P->m + 1, sizeof(double)); R->z = (double *)xcalloc((size_t)n, sizeof(double));
+        double *x = R->x + j0;
+        if (bk[ray] == 0) x[0] = c[0] > 0 ? -1.0 : 1.0;
+        else if (bk[ray] == 1) x[0] = 1.0;
+        else if (bk[ray] == 2) { double nr = 0; for (int i = 1; i < d; i++) nr += c[i] * c[i]; nr = sqrt(nr); x[0] = 1.0; for (int i = 1; i < d; i++) x[i] = -c[i] / nr; }
+        else {
+            const double rs = sqrt(0.5), t0 = (c[0] + c[1]) * rs, t1 = (c[0] - c[1]) * rs;
+            double nr = t1 * t1; for (int i = 2; i < d; i++) nr += c[i] * c[i]; nr = sqrt(nr);
+            const double u0 = 1.0, u1 = -t1 / nr; (void)t0;
+            x[0] = (u0 + u1) * rs; x[1] = (u0 - u1) * rs; for (int i = 2; i < d; i++) x[i] = -c[i] / nr;
+        }
+        double cd = 0; for (int i = 0; i < d; i++) cd += c[i] * x[i];
+        if (cd < 0) for (int i = 0; i < d; i++) x[i] /= -cd;
+        R->status = SOCP_DINF; R->pobj = -1.0; R->dobj = 0.0; R->iters = 0;
+        if (opt && opt->verbose > 0) {          /* (inside the substitution presolve, attempt >= 10, it prints the status) */
+            socp_printf("presolve: a %s in no row of A with its cost outside the dual cone: dual infeasible (an improving ray)\n", bk[ray] == 0 ? "free variable" : bk[ray] == 1 ? "nonnegative variable" : "cone");
+            if (opt->attempt < 10) socp_printf("status: %s   iterations: 0   time: 0.000s\n", socp_status_str(SOCP_DINF));
+        }
+        SNOTE("presolve: a block in no row of A has its cost outside the dual cone: dual infeasible, the certificate is that ray");
+        free(bs); free(bk); free(gone);
+        return SOCP_DINF;
+    }
+    if (ngone == 0 || ngone == nb) { free(bs); free(bk); free(gone); return inner(P, opt, R); }
+    /* the reduced problem without the blocks at x = 0 */
+    int *map = (int *)malloc(sizeof(int) * ((size_t)n + 1)); int n2 = 0, nf2 = 0, nl2 = 0, nq2 = 0, nr2 = 0;
+    int *q2 = (int *)malloc(sizeof(int) * ((size_t)P->nq + 1)), *r2 = (int *)malloc(sizeof(int) * ((size_t)P->nr + 1));
+    for (int k = 0; k < nb; k++) {
+        for (int j = bs[k]; j < bs[k + 1]; j++) map[j] = gone[k] ? -1 : n2++;
+        if (gone[k]) continue;
+        if (bk[k] == 0) nf2++; else if (bk[k] == 1) nl2++;
+        else if (bk[k] == 2) q2[nq2++] = bs[k + 1] - bs[k]; else r2[nr2++] = bs[k + 1] - bs[k];
+    }
+    int *Ap = (int *)malloc(sizeof(int) * ((size_t)n2 + 1)); double *c2 = (double *)malloc(sizeof(double) * ((size_t)n2 + 1));
+    for (int j = 0; j < n; j++) if (map[j] >= 0) { Ap[map[j]] = P->Ap[j]; c2[map[j]] = P->c[j]; }
+    Ap[n2] = P->Ap[n];          /* (the removed columns are empty: the others keep their positions in Ai, Ax) */
+    SocpProb Q = *P; Q.n = n2; Q.nf = nf2; Q.nl = nl2; Q.nq = nq2; Q.q = q2; Q.nr = nr2; Q.r = r2; Q.Ap = Ap; Q.c = c2;
+    if (opt && opt->verbose > 0) socp_printf("presolve: %d of %d blocks (variables and cones) in no row of A are at 0 (columns %d -> %d)\n", ngone, nb, n, n2);
+    SNOTE("presolve: %d variables and cones in no row of A set to 0 (columns %d -> %d)", ngone, n, n2);
+    const int st = inner(&Q, opt, R);
+    if (R->x && R->z) {
+        double *x = (double *)xcalloc((size_t)n, sizeof(double)), *z = (double *)xcalloc((size_t)n, sizeof(double));
+        const int cert = st == SOCP_PINF || st == SOCP_DINF;
+        for (int j = 0; j < n; j++) { if (map[j] >= 0) { x[j] = R->x[map[j]]; z[j] = R->z[map[j]]; } else z[j] = cert ? 0.0 : P->c[j]; }
+        free(R->x); free(R->z); R->x = x; R->z = z;
+    }
+    free(map); free(q2); free(r2); free(Ap); free(c2); free(bs); free(bk); free(gone);
+    return st;
+}
+static int socp_solve_seq_empty(const SocpProb *P, const SocpOpts *opt, SocpRes *R) { return socp_drop_empty(P, opt, R, socp_solve_seq); }
+/* (19 October 2026, LP/SOCP) the shape of the dual: a block (a nonnegative variable or a cone) all of whose columns are
+ * singletons, each in a row of its own, is a slack of those rows; the dual then needs a row only for each free column
+ * and each column of the other blocks. Returns that number of rows; sl[block] = 1 for the slack blocks. */
+static int dual_shape(const SocpProb *P, unsigned char *slk, int *n_ro) {
+    const int m = P->m, nf = P->nf, nl = P->nl, nbk = nl + P->nq + P->nr;
+    int *bs = (int *)malloc(sizeof(int) * ((size_t)nbk + 1)), *rowc = (int *)calloc((size_t)m + 1, sizeof(int));
+    { int s_ = nf, b_ = 0; for (int j = 0; j < nl; j++) bs[b_++] = s_++; for (int k = 0; k < P->nq; k++) { bs[b_++] = s_; s_ += P->q[k]; } for (int k = 0; k < P->nr; k++) { bs[b_++] = s_; s_ += P->r[k]; } bs[nbk] = s_; }
+    for (int b_ = 0; b_ < nbk; b_++) {
+        int ok = 1;
+        for (int j = bs[b_]; j < bs[b_ + 1] && ok; j++) if (P->Ap[j + 1] - P->Ap[j] != 1 || P->Ax[P->Ap[j]] == 0.0) ok = 0;
+        slk[b_] = (unsigned char)ok;
+        if (ok) for (int j = bs[b_]; j < bs[b_ + 1]; j++) rowc[P->Ai[P->Ap[j]]]++;
+    }
+    int mrows = nf, nro = m;
+    for (int b_ = 0; b_ < nbk; b_++) {
+        if (slk[b_]) for (int j = bs[b_]; j < bs[b_ + 1]; j++) if (rowc[P->Ai[P->Ap[j]]] != 1) { slk[b_] = 0; break; }
+        if (slk[b_]) nro -= bs[b_ + 1] - bs[b_]; else mrows += bs[b_ + 1] - bs[b_];
+    }
+    free(bs); free(rowc);
+    *n_ro = nro;
+    return mrows;
+}
+/* (19 October 2026, LP/SOCP) the dual form. min c'x, A x = b, x in K with the slack blocks s (dual_shape) is solved
+ * through its dual, written as a problem of the same form: for a slack s of row i (coefficient a_s) the dual's y_i =
+ * (c_s - w_s) / a_s with w_s in K* = K; the rows without a slack keep a free y_i; the dual's equations are one for each
+ * free column and each column of the other blocks j (with z_j in K):
+ *     sum_{i slack} -(a_ij / a_s) w_s + sum_{i free} a_ij y_i (+ z_j) = c_j - sum_{i slack} a_ij c_s / a_s,
+ * minimizing sum_{i slack} (b_i / a_s) w_s - sum_{i free} b_i y_i. Its multipliers give x: x_j = -y''_j for the free
+ * and other columns, x_s = z''_s (the slack of w_s); an infeasibility certificate of one is a certificate of the other.
+ * A cone on an affine expression of a few variables (a CBF file's affine conic constraints, a modelling layer's
+ * epigraphs) has many rows and few free columns: the smallest enclosing ball of 20,000 points in 20 dimensions has
+ * 420,001 rows and its dual 22. Used when the dual has fewer rows, at most NE_MAXFREE free variables, and its factor,
+ * estimated from the union of the rows of each block, is not larger than the primal's by more than 20 %;
+ * BRISK_CONEDUAL=0 never, 1 whenever it has fewer rows. */
+static int socp_solve_dualform(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
+    const int m = P->m, n = P->n, nf = P->nf, nl = P->nl, nbk = nl + P->nq + P->nr;
+    const char *e = getenv("BRISK_CONEDUAL"); const int mode = e ? atoi(e) : 2;
+    if (mode == 0 || m < 1 || n - nf < 1) return socp_solve_seq_empty(P, opt, R);
+    unsigned char *slk = (unsigned char *)malloc((size_t)nbk + 1); int nro = 0;
+    const int md = dual_shape(P, slk, &nro);
+    /* (the dual's free variables are the rows without a slack: free variables are the cone solver's weak point, and a
+     * dual with many of them was much harder: a branch-flow relaxation 22 -> 47 iterations with 60,001, an AC-OPF
+     * relaxation 29 -> 70, a powered-descent problem reduced accuracy after 400. At most NE_MAXFREE, as for the normal
+     * equations) */
+    const int use = md >= 1 && md < m && (mode == 1 || (m >= 1000 && nro <= NE_MAXFREE));
+    if (!use) { free(slk); return socp_solve_seq_empty(P, opt, R); }
+    const double t0 = sc_time();
+    const int nz = P->Ap[n];
+    /* the role of each column: srow[j] the row of a slack column (else -1); prow[j] the dual's row of a free or other
+     * column (else -1); the slack column of each row (else -1) and the dual's free column of each row without one */
+    int *srow = (int *)malloc(sizeof(int) * ((size_t)n + 1)), *prow = (int *)malloc(sizeof(int) * ((size_t)n + 1));
+    int *rs_ = (int *)malloc(sizeof(int) * ((size_t)m + 1)), *rfree = (int *)malloc(sizeof(int) * ((size_t)m + 1));
+    for (int i = 0; i < m; i++) { rs_[i] = -1; rfree[i] = -1; }
+    int nrow2 = 0;
+    for (int j = 0; j < nf; j++) { srow[j] = -1; prow[j] = nrow2++; }
+    {
+        int s_ = nf;
+        for (int b_ = 0; b_ < nbk; b_++) {
+            const int d = b_ < nl ? 1 : b_ < nl + P->nq ? P->q[b_ - nl] : P->r[b_ - nl - P->nq];
+            for (int j = s_; j < s_ + d; j++) {
+                if (slk[b_]) { srow[j] = P->Ai[P->Ap[j]]; rs_[srow[j]] = j; prow[j] = -1; }
+                else { srow[j] = -1; prow[j] = nrow2++; }
+            }
+            s_ += d;
+        }
+    }
+    int nfr2 = 0;
+    for (int i = 0; i < m; i++) if (rs_[i] < 0) rfree[i] = nfr2++;
+    const int n2 = nfr2 + (n - nf);
+    /* the rows of A (entries of free and other columns only) */
+    int *rp = (int *)calloc((size_t)m + 2, sizeof(int)), *rc = (int *)malloc(sizeof(int) * ((size_t)nz + 1)); double *rv = (double *)malloc(sizeof(double) * ((size_t)nz + 1));
+    for (int j = 0; j < n; j++) if (prow[j] >= 0) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) rp[P->Ai[p] + 2]++;
+    for (int i = 0; i < m; i++) rp[i + 2] += rp[i + 1];
+    for (int j = 0; j < n; j++) if (prow[j] >= 0) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) { const int q = rp[P->Ai[p] + 1]++; rc[q] = j; rv[q] = P->Ax[p]; }
+    /* the dual: columns [free y of the rows without a slack | w or z of the blocks, in their order] */
+    int *Ap2 = (int *)calloc((size_t)n2 + 2, sizeof(int));
+    for (int i = 0; i < m; i++) if (rfree[i] >= 0) Ap2[rfree[i] + 1] = rp[i + 1] - rp[i];
+    for (int j = nf; j < n; j++) Ap2[nfr2 + (j - nf) + 1] = srow[j] >= 0 ? rp[srow[j] + 1] - rp[srow[j]] : 1;
+    for (int j = 0; j < n2; j++) Ap2[j + 1] += Ap2[j];
+    int *Ai2 = (int *)malloc(sizeof(int) * ((size_t)Ap2[n2] + 1)); double *Ax2 = (double *)malloc(sizeof(double) * ((size_t)Ap2[n2] + 1));
+    double *b2 = (double *)malloc(sizeof(double) * ((size_t)nrow2 + 1)), *c2 = (double *)malloc(sizeof(double) * ((size_t)n2 + 1));
+    for (int j = 0; j < n; j++) if (prow[j] >= 0) b2[prow[j]] = P->c[j];
+    for (int i = 0; i < m; i++) {
+        if (rfree[i] >= 0) {
+            int w = Ap2[rfree[i]];
+            for (int q = rp[i]; q < rp[i + 1]; q++) { Ai2[w] = prow[rc[q]]; Ax2[w++] = rv[q]; }
+            c2[rfree[i]] = -P->b[i];
+        } else {
+            const int s = rs_[i]; const double as = P->Ax[P->Ap[s]], cs = P->c[s];
+            int w = Ap2[nfr2 + (s - nf)];
+            for (int q = rp[i]; q < rp[i + 1]; q++) { Ai2[w] = prow[rc[q]]; Ax2[w++] = -rv[q] / as; b2[prow[rc[q]]] -= rv[q] * cs / as; }
+            c2[nfr2 + (s - nf)] = P->b[i] / as;
+        }
+    }
+    for (int j = nf; j < n; j++) if (prow[j] >= 0) { const int w = Ap2[nfr2 + (j - nf)]; Ai2[w] = prow[j]; Ax2[w] = 1.0; c2[nfr2 + (j - nf)] = 0.0; }
+    /* each column's rows ascending (the rows of a slack follow the order of its row's columns, which ascends) */
+    double est_d = 0, est_p = 0;     /* the factors' sizes, estimated: a block of dimension <= SOCP_DENSE_MAX fills its d columns to the union of their rows */
+    {
+        int *mk = (int *)malloc(sizeof(int) * ((size_t)(nrow2 > m ? nrow2 : m) + 1));
+        for (int pass = 0; pass < 2; pass++) {
+            const int *Ap_ = pass ? Ap2 : P->Ap, *Ai_ = pass ? Ai2 : P->Ai; const int off = pass ? nfr2 : nf, mm = pass ? nrow2 : m;
+            for (int i = 0; i < mm; i++) mk[i] = -1;
+            double est = 0; int s_ = off;
+            for (int b_ = 0; b_ < nbk; b_++) {
+                const int d = b_ < nl ? 1 : b_ < nl + P->nq ? P->q[b_ - nl] : P->r[b_ - nl - P->nq];
+                int u = 0; long nzb = 0;
+                for (int j = s_; j < s_ + d; j++) { nzb += Ap_[j + 1] - Ap_[j]; for (int p = Ap_[j]; p < Ap_[j + 1]; p++) if (mk[Ai_[p]] != b_) { mk[Ai_[p]] = b_; u++; } }
+                est += d <= SOCP_DENSE_MAX ? (double)d * u : (double)nzb + 2.0 * u;
+                s_ += d;
+            }
+            for (int j = 0; j < off; j++) est += Ap_[j + 1] - Ap_[j];
+            if (pass) est_d = est; else est_p = est;
+        }
+        free(mk);
+    }
+    if (getenv("BRISK_CONEDBG")) socp_printf("  [the dual form: factor estimated %.3g against the primal's %.3g; nnz %d against %d; rows %d against %d, free %d against %d]\n", est_d, est_p, Ap2[n2], nz, nrow2, m, nfr2, nf);
+    /* (the factor's size decides beyond the rows: FIR filter design has 152 rows in the dual against 42,301, but its
+     * cones of three each meet most of them, and the dual's factor had 6.4e6 entries against 4.5e6: 6.1 -> 7.4 s) */
+    if (mode == 2 && est_d > 1.2 * est_p) {
+        free(slk); free(srow); free(prow); free(rs_); free(rfree); free(rp); free(rc); free(rv); free(Ap2); free(Ai2); free(Ax2); free(b2); free(c2);
+        return socp_solve_seq_empty(P, opt, R);
+    }
+    SocpProb Q = *P;
+    Q.m = nrow2; Q.n = n2; Q.Ap = Ap2; Q.Ai = Ai2; Q.Ax = Ax2; Q.b = b2; Q.c = c2; Q.nf = nfr2;
+    SocpOpts o2; if (opt) o2 = *opt; else socp_default_opts(&o2);
+    if (o2.verbose > 0) socp_printf("the dual solved: %d rows instead of %d (%d slack blocks; %d free variables)\n", nrow2, m, (int)(n - nf - (nrow2 - nf)), nfr2);
+    SNOTE("the dual solved by the cone solver: %d rows instead of %d", nrow2, m);
+    const char *pfx = g_stat_prefix; g_stat_prefix = "the dual: ";
+    SocpRes R2; memset(&R2, 0, sizeof R2);
+    const int st2 = socp_solve_seq_empty(&Q, &o2, &R2);
+    g_stat_prefix = pfx;
+    int st = st2 == SOCP_PINF ? SOCP_DINF : st2 == SOCP_DINF ? SOCP_PINF : st2;
+    memset(R, 0, sizeof *R);
+    R->x = (double *)calloc((size_t)n + 1, sizeof(double)); R->y = (double *)calloc((size_t)m + 1, sizeof(double)); R->z = (double *)calloc((size_t)n + 1, sizeof(double));
+    R->iters = R2.iters; R->lnz = R2.lnz;
+    if (R2.x && R2.y && R2.z) {
+        const int cert = st2 == SOCP_PINF || st2 == SOCP_DINF;
+        if (st2 != SOCP_DINF) {         /* x from the dual's multipliers (a ray when the dual is infeasible) */
+            for (int j = 0; j < n; j++) R->x[j] = prow[j] >= 0 ? -R2.y[prow[j]] : R2.z[nfr2 + (j - nf)];
+        }
+        if (st2 != SOCP_PINF) {         /* y and z from the dual's point (a certificate when it is a ray) */
+            for (int i = 0; i < m; i++) {
+                if (rfree[i] >= 0) R->y[i] = R2.x[rfree[i]];
+                else { const int s = rs_[i]; R->y[i] = ((cert ? 0.0 : P->c[s]) - R2.x[nfr2 + (s - nf)]) / P->Ax[P->Ap[s]]; }
+            }
+            for (int j = nf; j < n; j++) R->z[j] = R2.x[nfr2 + (j - nf)];
+        }
+        if (!cert) {          /* the errors of the problem as given */
+            double po = 0, dobj = 0, nb = 0, nc = 0, rpn = 0, rd = 0, xz = 0;
+            double *ra = (double *)malloc(sizeof(double) * ((size_t)m + 1));
+            for (int i = 0; i < m; i++) { ra[i] = -P->b[i]; dobj += P->b[i] * R->y[i]; nb += P->b[i] * P->b[i]; }
+            for (int j = 0; j < n; j++) {
+                double s = 0; for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) { ra[P->Ai[p]] += P->Ax[p] * R->x[j]; s += P->Ax[p] * R->y[P->Ai[p]]; }
+                const double r = P->c[j] - s - R->z[j];
+                rd += r * r; po += P->c[j] * R->x[j]; nc += P->c[j] * P->c[j]; xz += R->x[j] * R->z[j];
+            }
+            for (int i = 0; i < m; i++) rpn += ra[i] * ra[i];
+            free(ra);
+            R->pobj = po; R->dobj = dobj;
+            R->err[0] = sqrt(rpn) / (1.0 + sqrt(nb)); R->err[1] = sqrt(rd) / (1.0 + sqrt(nc));
+            R->err[2] = (po - dobj) / (1.0 + fabs(po) + fabs(dobj)); R->err[3] = xz / (1.0 + fabs(po) + fabs(dobj));
+            R->maxerr = fmax(fmax(R->err[0], R->err[1]), fmax(fabs(R->err[2]), R->err[3]));
+            if (st == SOCP_OPTIMAL && R->maxerr > 10.0 * o2.tol) st = SOCP_REDUCED;
+        }
+    }
+    if (getenv("BRISK_CONEDBG") && (st == SOCP_PINF || st == SOCP_DINF)) {     /* (the certificate checked on the problem as given) */
+        double *t_ = (double *)calloc((size_t)(m > n ? m : n) + 1, sizeof(double)); double nr = 0, nv = 0, ob = 0;
+        if (st == SOCP_DINF) { for (int j = 0; j < n; j++) { nv += R->x[j] * R->x[j]; ob += P->c[j] * R->x[j]; for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) t_[P->Ai[p]] += P->Ax[p] * R->x[j]; } for (int i = 0; i < m; i++) nr += t_[i] * t_[i]; }
+        else { for (int i = 0; i < m; i++) { nv += R->y[i] * R->y[i]; ob += P->b[i] * R->y[i]; } for (int j = 0; j < n; j++) { double v = R->z[j]; for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) v += P->Ax[p] * R->y[P->Ai[p]]; nr += v * v; } }
+        socp_printf("  [the certificate on the problem as given: |%s| %.2e, residual %.2e, %s %.3e]\n", st == SOCP_DINF ? "x" : "y", sqrt(nv), sqrt(nr), st == SOCP_DINF ? "c'x" : "b'y", ob);
+        free(t_);
+    }
+    socp_result_free(&R2);
+    R->status = st; R->time = sc_time() - t0;
+    if (o2.verbose > 0) {
+        const int cert = st == SOCP_PINF || st == SOCP_DINF;
+        socp_printf("%sstatus: %s", g_stat_prefix, socp_status_str(st));
+        if (!cert) socp_printf(" (max rel error %.1e)", R->maxerr);
+        socp_printf("   iterations: %d   time: %.3fs\n", R->iters, R->time);
+        if (!cert) socp_printf("  primal obj c'x = %+.12e   dual obj b'y = %+.12e\n  errors: pinf %.1e  dinf %.1e  gap %.1e  x'z %.1e\n", R->pobj, R->dobj, R->err[0], R->err[1], R->err[2], R->err[3]);
+    }
+    free(slk); free(srow); free(prow); free(rs_); free(rfree); free(rp); free(rc); free(rv); free(Ap2); free(Ai2); free(Ax2); free(b2); free(c2);
+    return st;
+}
+int brisk_threads_busy(int verbose);
 int socp_solve(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
+#ifdef _OPENMP
+    /* (18 October 2026, LP/SOCP: the busy-machine rule of the other engines, solver.c: only the free cores. With one
+     * core taken by another process, the truss design problem's products with A, parallel regions of 0.1 ms, took
+     * 2.55 s instead of 0.05 s: every region waits for the thread without a core) */
+    const int ntb = omp_in_parallel() ? -1 : brisk_threads_busy(0);
+    const int nt = omp_get_max_threads();
+    if (nt > 1) omp_set_num_threads(1);
+    { const char *e = getenv("BRISK_CONEPANEL"); if (!(e && atoi(e) == 0) && !omp_in_parallel()) schol_set_panel_threads(nt); }
+    g_cone_nt = nt;
+    const int st = socp_solve_dualform(P, opt, R);
+    g_cone_nt = 1;
+    schol_set_panel_threads(0);
+    if (nt > 1) omp_set_num_threads(nt);
+    if (ntb > 0) omp_set_num_threads(ntb);
+    return st;
+#else
+    return socp_solve_dualform(P, opt, R);
+#endif
+}
+static int socp_solve_seq(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     const double t0 = sc_time();
     SocpOpts o1; if (opt) o1 = *opt; else socp_default_opts(&o1);
     const int retry = !(o1.step > 0) && !getenv("BRISK_CONENORETRY");
@@ -2190,7 +2918,7 @@ int socp_solve(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     R->time = sc_time() - t0;
     if (o1.verbose > 0) {
         const int cert = st == SOCP_PINF || st == SOCP_DINF;
-        socp_printf("status: %s", socp_status_str(st));
+        socp_printf("%sstatus: %s", g_stat_prefix, socp_status_str(st));
         if (!cert) socp_printf(" (max rel error %.1e)", R->maxerr);
         socp_printf("   iterations: %d   time: %.3fs%s\n", R->iters, R->time, second ? "   (second attempt)" : "");
         if (!cert) socp_printf("  primal obj c'x = %+.12e   dual obj b'y = %+.12e\n  errors: pinf %.1e  dinf %.1e  gap %.1e  x'z %.1e\n", R->pobj, R->dobj, R->err[0], R->err[1], R->err[2], R->err[3]);

@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.5.1"
+#define BRISK_VERSION "1.5.3"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -134,6 +134,7 @@ typedef struct {
     int *rows;
 } SpSym;
 
+#define ADL_MAXN 32   /* (Block.Adl: the largest order with packed dense constraints) */
 typedef struct Block {
     int type, n;
     int ncon;            /* constraints with a nonzero in this block */
@@ -141,12 +142,20 @@ typedef struct Block {
     SpSym *A;            /* matrices, parallel to con */
     SpSym C;
     unsigned char *route;/* Schur route per constraint: 0 sparse-sparse, 1 row-product, 2 dense BLAS3, 3 row-product on the union pattern, 5 monomial (allmono) */
+    int allweyl;         /* 5.18 (ISSUES 96a): every constraint a symmetric Weyl operator of Z_2^p (n = 2^p), A[c ^ wx, c] =
+                            wk (-1)^(wz . c): the pairs by Walsh-Hadamard transforms of the XOR diagonals of X A_a Zi */
+    int *wx, *wz; double *wk;   /* per sparse constraint (slist order) */
     int allmono;         /* 16 October 2026 (ISSUES 96a): every constraint of the block a monomial matrix (one entry per row and column): the products X A_a Zi batched into one BLAS-3 call per chunk, the pairs by gathers */
     double asm_cost;     /* estimated work of the block's Schur assembly by the chosen routes, in BLAS-3 flops (0 for the low-rank route) */
     int nd, ns;          /* number of dense / sparse constraints */
     int *dlist, *slist;  /* positions (into con/A) of dense and sparse constraints */
     int *dpos;           /* dense index of position t, or -1 */
     double *Ad;          /* dense copies: nd columns of length n*n */
+    double *Adl;         /* 17 October 2026: ... and their lower triangles packed by columns (n <= ADL_MAXN), for Aop and ATy */
+    int dfac;            /* 5.18: the dense constraints through their factors in the operators (no Ad): dense index a has the
+                            columns dfoff[a] .. dfoff[a+1] of dfW (n x Rd) with the signs dfS; set with the low-rank dictionary */
+    int *dfoff; double *dfW, *dfS;
+    int dlr;             /* 5.18: the dictionary is the low-rank one (lrdict_build) */
     int *drk; double **drW, **drS;   /* 15 October 2026 (ISSUES 96): a dense constraint of low rank r <= 8 at dense index a: drk[a] = r, A = sum_k drS[a][k] w_k w_k' with w_k the columns of drW[a] (n x r); 0 = not low-rank */
     int *foff;           /* flattened full entries of sparse constraints (ns+1 offsets) */
     int *ffr, *ffc;
@@ -169,6 +178,8 @@ typedef struct Block {
     int *lu_cp, *lu_ca, *lu_cr, *lu_ch; double *lu_cv;
     int symg;            /* 5.12: the symmetric gather in double precision too (by the gather's share; single-precision
                           * row products always take it when lu_cp is there) */
+    int s2k;             /* 18 October 2026: lu_* in the original order on a block without the live region: the
+                          * row products of route 1 by one dsyr2k each and the gather over the upper entries */
     int prod_route;      /* Zi*(A'y)*R: 0 row-subset, 1 sparse-left, 2 dense */
     /* low-rank Schur route (whole block): A_t = W_t diag(sig_t) W_t' */
     int lowrank;
@@ -210,6 +221,7 @@ typedef struct {
     int *orig;           /* orig[i] = file index of constraint i */
     int fr_removed;      /* constraints removed by facial reduction */
     int fr_depth;        /* longest chain of dependent reductions (4.20) */
+    int fr_coupled;      /* 5.17: removed constraints whose index is coupled to a kept one by the data (ISSUES 93) */
     double tbR;          /* 4.30: rhs of the trace-bound row (excluded from the rhs norms and scaling), 0 = none */
     double obj_off;      /* 4.30: objective constant dropped by the free elimination (file objective = this problem's + obj_off);
                             the relative gap and complementarity are measured against the file's objective magnitude */
@@ -292,7 +304,7 @@ typedef struct {
     int hsd_first_on;    /* internal: this run is the embedding-first attempt */
     int crossover;       /* 0 off, 1 on, -1 auto (when cheap) */
     double fr_gain;      /* facial reduction of depth >= 2 kept only if it cuts the cost per iteration this much (4) */
-    double fr_fallback;  /* removed duals not rebuilt: the re-solve without facial reduction may take this multiple of the solve's time (4; 0 = none) */
+    double fr_fallback;  /* removed duals not rebuilt: the re-solve without facial reduction may take this multiple of the solve's time (0 = none, the default: the user is told) */
     double sym_fallback; /* a solve after an automorphism reduction that ends worse than reduced accuracy is repeated without it within this multiple of the solve's time (4; 0 = never) */
     int std_slow;        /* standard method: stop on slow progress when a retry follows (iterations, 0 off) */
     double sigma_min;    /* floor for the centering parameter (a zero sigma makes the corrector affine) */
@@ -344,7 +356,7 @@ typedef struct {
     int fom_ssn_warm;    /* 4.32: phase II CG warm start along the previous Newton direction (1) */
     double fom_ssn_sig0; /* 4.31: phase II starts with the splitting's penalty times this (10) */
     int fom_ssn_outer, fom_ssn_newton, fom_ssn_cg;   /* 4.31: phase II limits: outer (200), Newton per outer (30), CG per Newton (200) */
-    double fom_aasafe;   /* 4.31: ... safeguard: reject when the residual grows by more than this factor (1) */
+    double fom_aasafe;   /* 4.31: ... safeguard: reject when the residual grows by more than this factor (2) */
     int fom_sigint;      /* 4.31: penalty checked every this many iterations (20) */
     int fom_sigrule;     /* 4.31: penalty rule: 0 dead zone (ratio > 5), 1 continuous sqrt balancing */
     double fom_sigmax;   /* 4.31: largest factor of one penalty change (2) */
@@ -482,6 +494,18 @@ int  brisk_threads_busy(int verbose);   /* 4.42 (solver.c): the busy-machine thr
 typedef struct SChol SChol;
 int chol_tiny_blocked(int nr, int w, double *P, int ld, const double *d0, int d0stride, double tinypiv);
 int schol_clique_offsets(const SChol *S, int nl, const int *con, size_t *pos, size_t *soff, int *sidx);
+/* 18 October 2026: the panel offsets of a clique as a table (sparsechol.c): offset(a, b) = cb[c] + rp[sl[c] * nl + r]
+ * with c the one of a, b of smaller position in the factor's order (pl) and r the other */
+typedef struct { int pl, sl; size_t cb; } CliqueEnt;   /* position in the factor's order, slot, column base */
+typedef struct { int nl, nslot; CliqueEnt *e; int *rp; } CliqueTab;
+CliqueTab *schol_clique_table(const SChol *S, int nl, const int *con);
+void clique_tab_free(CliqueTab *T);
+static inline size_t clique_off(const CliqueTab *T, int a, int b) {
+    const CliqueEnt *ea = T->e + a, *eb = T->e + b;
+    const int lo = ea->pl < eb->pl;
+    const CliqueEnt *ec = lo ? ea : eb;
+    return ec->cb + (size_t)T->rp[(size_t)ec->sl * T->nl + (lo ? b : a)];
+}
 long schol_uid(const SChol *S);
 void schol_set_tinypiv(SChol *S, double t);
 void schol_set_dynpiv(SChol *S, double p);       /* signed factorization: wrong-sign pivots replaced by sign * p */
@@ -489,6 +513,10 @@ int schol_ndyn(const SChol *S);
 int schol_ntiny(const SChol *S);
 typedef struct SAdj SAdj;
 SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap);
+SChol *schol_analyze_sym(int m, int *deg, int **nbr, size_t fillcap);     /* ordering and symbolic factorization only */
+void   schol_attach_pattern(SChol *S, int *deg, int **nbr);                  /* ... then the pattern of M and its offsets */
+int    schol_analysis_fits(const SChol *S, size_t fillcap, double flopcap);
+uint64_t schol_adj_key(int m, const int *deg, int *const *nbr);
 void   schol_free(SChol *S);
 void   schol_zero(SChol *S);
 void   schol_gather_dense(SChol *S, const double *M);
@@ -498,6 +526,9 @@ size_t schol_offset(const SChol *S, size_t r, size_t c);
 double *schol_values(SChol *S);
 void   schol_set_signs(SChol *S, const signed char *sgn_orig);
 void   schol_mv(const SChol *S, const double *x, double *y);
+int    schol_set_peo(int on);
+int    schol_peo_used(void);
+void   schol_mv2(const SChol *S, const double *x1, const double *x2, double *y1, double *y2);
 void   schol_mv_abs(const SChol *S, const double *x, double *y, double *ya);
 int    schol_factor(SChol *S, double shift);
 void   schol_release_factor(SChol *S);
@@ -519,6 +550,7 @@ size_t schol_nnz(const SChol *S);
 int    schol_nsuper(const SChol *S);
 size_t schol_mpat_nnz(const SChol *S);
 SChol *chordal_take_analysis(int m, size_t patnnz);
+SChol *chordal_take_estimate(int m, int *deg, int **nbr, size_t fillcap, double flopcap);
 /* internal (problem.c / dictroute.c) */
 void   spsym_finish(SpSym *S, int n, int is_lp);
 double analyze_sdp_block(Block *B, const Params *par);
@@ -568,6 +600,7 @@ enum { PS_RANK1 = 0, PS_DIAG = 1, PS_LP = 2, PS_FACE = 3 };
 typedef struct {
     int con;                /* index of the removed constraint in the file */
     double sgn;             /* sgn * A_con is positive semidefinite */
+    int coupled;            /* 5.17: the data couple the removed directions to the face (the dual is rebuilt only if the reduced slack allows) */
     int np;
     PSPart *parts;
 } PSRecord;
@@ -619,6 +652,7 @@ typedef struct {
     int np, *pb, *pp, *pm;  /* all detected pairs (eliminated or kept) */
     double offset;          /* objective constant of the reduced problem */
     int cheap;              /* 4.30: only fill-free eliminations were made (outside the SOS class): no trace bound, no fallback */
+    int bycost;             /* 18 October 2026: the full elimination outside the SOS class, accepted by the cost model: no trace bound */
     int nblk, *lpoff, *lpmap;   /* 4.30: LP slots dropped from the reduced problem: file slot lpoff[k] + l -> reduced slot or -1 (lpmap NULL: none dropped) */
 } PSFreeElim;
 typedef struct Postsolve {
@@ -777,6 +811,7 @@ typedef struct {
     int have_x;             /* X could be mapped back (no chordal conversion) */
     int recovered;          /* removed constraints whose y was recovered */
     int unrecovered;        /* ... and those where recovery was not possible */
+    int fr_corrected;       /* the lift of the reduced dual was corrected through complementarity with the primal (ISSUES 93) */
     double t;               /* seconds */
 } PSResult;
 int  ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res);   /* 4.30: errors of (Xo, yo) on O */
@@ -848,6 +883,8 @@ void   BL(spotrs_)(const char *, const int *, const int *, const float *, const 
                    float *, const int *, int *);
 void   BL(dsyrk_)(const char *, const char *, const int *, const int *, const double *,
                   const double *, const int *, const double *, double *, const int *);
+void   BL(dsyr2k_)(const char *, const char *, const int *, const int *, const double *, const double *, const int *,
+                   const double *, const int *, const double *, double *, const int *);
 void   BL(dgesdd_)(const char *, const int *, const int *, double *, const int *, double *,
                    double *, const int *, double *, const int *, double *, const int *, int *, int *);
 void   BL(dsyevr_)(const char *, const char *, const char *, const int *, double *, const int *,
@@ -888,6 +925,9 @@ void pdtrsm(const char *side, const char *uplo, const char *ta, const char *diag
 void pdtrmm(const char *side, const char *uplo, const char *ta, const char *diag, const int *m, const int *n,
             const double *alpha, const double *A, const int *lda, double *B, const int *ldb);
 int brisk_spotrf(int n, float *A, int lda);
+int brisk_dsytrf(int n, double *A, int lda, int *ipiv);   /* dsytrf (lower) with its trailing updates on the threads, the same bits at any thread count */
+void brisk_dsyconv(int n, double *A, int lda, const int *ipiv, double *e);       /* dsyconv (lower, "C") */
+void brisk_dsytrs1(int n, const double *A, int lda, const int *ipiv, const double *e, double *x);   /* one solve with the converted factor, threaded */
 void brisk_dpotrs1(int n, const double *L, int lda, double *x);
 void brisk_dtrsv1(int trans, int n, const double *L, int lda, double *x);
 int brisk_dpotri_full(int n, double *A, int lda);

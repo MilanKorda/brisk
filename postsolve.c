@@ -37,6 +37,9 @@ static void *pcalloc(size_t n, size_t s) {
     return p;
 }
 int g_ps_need_x = 0;      /* set by main: the caller needs X itself (files, crossover) */
+int g_ps_fr_correct = 0;  /* set by main (5.17, ISSUES 93): correct the lift of the reduced dual through complementarity when the
+                           * certificate passes fail; opt-in since the owner's policy of 16 October 2026 (main.c sets it from BRISK_FRFIX=1),
+                           * so that the message that the recovery failed is unambiguous and the default path pays nothing */
 static double ps_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1024,6 +1027,17 @@ static double part_t_sdp(const PSOrig *O, const ConIndex *CI, const PSRecord *r,
             double lz = ps_lammin(nn, Zn, wk), dm = 0;
             for (int i = 0; i < nn; i++) dm = fmax(dm, fabs(Zn[i + (size_t)i * nn]));
             printf("   [ps part blk %d kind %d: lambda_min(Zn) %.3e (max diag %.2e), H %.3e]\n", pp->blk, pp->kind, lz, dm, H[0]);
+            if (nn <= 40 && kw == 1 && getenv("BRISK_PSDEBUG2")) {   /* the spectrum of Zn and the components of g on its eigenvectors */
+                double *Zc = pmalloc(sizeof(double) * ((size_t)nn * nn + 1)), *ev = pmalloc(sizeof(double) * (nn + 1)), *w2 = pmalloc(sizeof(double) * (8 * nn + 64));
+                memcpy(Zc, Zn, sizeof(double) * (size_t)nn * nn);
+                int lw = 8 * nn + 64, info = 0;
+                BL(dsyev_)("V", "L", &nn, Zc, &nn, ev, w2, &lw, &info);
+                printf("   [   eig(Zn) / |g'v|:");
+                for (int i = 0; i < nn; i++) { double gv = 0; for (int q = 0; q < nn; q++) gv += G[q] * Zc[q + (size_t)i * nn]; printf(" %.1e/%.1e", ev[i], fabs(gv)); }
+                printf("]\n");
+
+                free(Zc); free(ev); free(w2);
+            }
         }
         const int sp = sparse_gtag(nn, Zn, G, kw, S);
         if (sp == 2) { *fail = 1; free(wk); goto out; }
@@ -1130,7 +1144,7 @@ static int recover_pass(const Postsolve *ps, const PSOrig *O, const ConIndex *CI
             double *Zp = pmalloc(sizeof(double) * (size_t)np * np), *ZT = pmalloc(sizeof(double) * ((size_t)no * np + 1));
             double *wk = pmalloc(sizeof(double) * (size_t)np * np);
             congruence(&pp->T, Zo[o], Zp, ZT);
-            printf("   [ps after rec %d: lambda_min(prev-space Z) %.3e, t used %.3e]\n", ri, ps_lammin(np, Zp, wk), tu);
+            printf("   [ps after rec %d%s: lambda_min(prev-space Z) %.3e, t used %.3e]\n", ri, r->coupled ? " (coupled)" : "", ps_lammin(np, Zp, wk), tu);
             free(Zp); free(ZT); free(wk);
         }
     }
@@ -1344,6 +1358,275 @@ projected:
                r0, rn, it, direct ? "direct passes" : "CG", dn, yr, ok ? "applied" : "rejected");
 #undef KMV
     free(eid); free(qs); free(eq); free(cw); free(tw); free(xe); free(r); free(u); free(p); free(z); free(Kp); free(dg); free(de); free(res);
+}
+
+/* The removed duals through complementarity with the primal (ISSUES 93). The reduced solve
+ * lifts to a primal optimum X of the problem as read; any dual optimum satisfies Z X = 0, so Z
+ * vanishes on the range of X: with N a basis of that range (per block, from the eigenvalues of
+ * X; for an LP block the slots where x > 0), Z(y) N = 0 is a linear system in y, and the lift
+ * of the reduced dual nearly solves it: the kept rows are at the solve's accuracy, only the rows
+ * of the removed indices (g' N, with g the coupling of a removed index to the kept ones) are
+ * off, and that is the condition the recovery through the certificates needs (g in the range
+ * of the reduced slack, the complement of N). The least-norm correction dy with
+ * Z(y + dy) N = 0 moves the dual within the reduced dual optimal face (every point of which has
+ * the same N, by complementarity with the same X) to the face that lifts.
+ * Two kinds of rows: (Z N)_ik in the standard basis, consistent only to first order in the
+ * error e of N (Z* N = Z* e), and the projected rows N' Z N, consistent to second order
+ * (N*' Z* = 0 as well). lambda_min(Z) and the gap <Z, X> = tr(N' Z N Lambda) depend on the
+ * projected rows, which get the weight 1; the others only keep the coupling of N to its
+ * complement small and get the weight omega. One more row pins b'y = <C, X>.
+ * The removed constraints' duals are unknowns like the others (a removed constraint's matrix
+ * may couple its index to a kept one in the data as read: it is diagonal only on the face of
+ * an earlier reduction). Their values are set by the passes through the certificates; those add
+ * t_k A_k and so move the couplings again, which is why the correction is applied repeatedly
+ * from the passes' result (the fixed point has Z N = 0 and the certificate margins).
+ * The system is dense in the smaller of its dimensions (rows, m), factored once (the matrix
+ * does not change between applications), with a few refinement passes against the exact
+ * operator.                                                                             */
+typedef struct {
+    int mo, R, Rz, Rstd;      /* columns, rows with the objective row, without, standard rows */
+    int *cptr, *rind; double *aval; size_t na;   /* A by columns */
+    double *K; int dimK; int gram;   /* the Cholesky factor of A A' (gram 0, R x R) or A' A (gram 1, m x m) */
+    double *crow;             /* the right-hand side of the rows for y = 0 (C N, N' C N, the objective) */
+    double *cscale;           /* column scales (dy = cscale dz) */
+    double omega;
+} PSFix;
+
+static void ps_fix_free(PSFix *F) {
+    free(F->cptr); free(F->rind); free(F->aval); free(F->K); free(F->crow); free(F->cscale);
+    memset(F, 0, sizeof(*F));
+}
+
+/* builds the system; returns 0 on success, 1 when not applicable (too large, no range) */
+static int ps_fix_setup(PSFix *F, const PSOrig *O, double **Xo, const Postsolve *ps, int verbose) {
+    const int mo = O->m, nbo = O->nblk;
+    /* the removed constraints' duals are set by the passes; the correction prefers to compensate
+     * their couplings through the kept duals, so their columns are scaled down (a change of
+     * variables dy_k = s dz_k, least norm in z) */
+    const double srem = getenv("BRISK_PSSREM") ? atof(getenv("BRISK_PSSREM")) : 1e-3;
+    char *isrem = pcalloc(mo + 1, 1);
+    if (ps) for (int ri = 0; ri < ps->nrec; ri++) if (ps->rec[ri].con >= 0 && ps->rec[ri].con < mo) isrem[ps->rec[ri].con] = 1;
+    const double tau = getenv("BRISK_PSRANKTOL") ? atof(getenv("BRISK_PSRANKTOL")) : 1e-6;
+    const double omega = getenv("BRISK_PSEW") ? atof(getenv("BRISK_PSEW")) : 1.0;
+    const double gapmax = getenv("BRISK_PSGAP") ? atof(getenv("BRISK_PSGAP")) : 1e-3;
+    const double t0 = ps_now();
+    const int dbg = verbose >= 2 || getenv("BRISK_PSDEBUG") != NULL;
+    memset(F, 0, sizeof(*F));
+    F->mo = mo; F->omega = omega;
+    double ecost = 0;
+    for (int o = 0; o < nbo; o++) if (O->bs[o] > 0) ecost += pow((double)O->bs[o], 3.0);
+    if (ecost > 4e10) { if (dbg) printf("postsolve: dual correction skipped (eigendecompositions %.1e)\n", ecost); return 1; }
+    double **N = pcalloc(nbo + 1, sizeof(double *)), *lmax = pcalloc(nbo + 1, sizeof(double));
+    double **W = pcalloc(nbo + 1, sizeof(double *));
+    int *rk = pcalloc(nbo + 1, sizeof(int)), *rowoff = pcalloc(nbo + 2, sizeof(int)), *soff = pcalloc(nbo + 2, sizeof(int));
+    int **pidx = pcalloc(nbo + 1, sizeof(int *));
+    double **wc = pcalloc(nbo + 1, sizeof(double *));   /* row weights of the standard rows */
+    int ret = 1;
+    double gmax = 0;
+    for (int o = 0; o < nbo; o++) {
+        const int n = abs(O->bs[o]);
+        if (O->bs[o] < 0) { for (int i = 0; i < n; i++) lmax[o] = fmax(lmax[o], Xo[o][i]); gmax = fmax(gmax, lmax[o]); continue; }
+        N[o] = pmalloc(sizeof(double) * ((size_t)n * n + 1));
+        W[o] = pmalloc(sizeof(double) * (n + 1));
+        memcpy(N[o], Xo[o], sizeof(double) * (size_t)n * n);
+        int lwork = -1, info = 0; double wq = 0;
+        BL(dsyev_)("V", "L", &n, N[o], &n, W[o], &wq, &lwork, &info);
+        lwork = (int)wq + 1;
+        double *wk = pmalloc(sizeof(double) * (lwork + 1));
+        BL(dsyev_)("V", "L", &n, N[o], &n, W[o], wk, &lwork, &info);
+        free(wk);
+        if (info != 0) { if (dbg) printf("postsolve: dual correction skipped (eigensolver failed on block %d)\n", o + 1); goto out; }
+        lmax[o] = W[o][n - 1];
+        gmax = fmax(gmax, lmax[o]);
+    }
+    if (!(gmax > 0)) goto out;
+    int R = 0;
+    for (int o = 0; o < nbo; o++) {
+        const int n = abs(O->bs[o]);
+        const double thr = tau * fmax(lmax[o], 1e-3 * gmax);
+        rowoff[o] = R;
+        if (O->bs[o] < 0) {
+            pidx[o] = pmalloc(sizeof(int) * (n + 1));
+            wc[o] = pmalloc(sizeof(double) * (n + 1));
+            int np = 0;
+            for (int i = 0; i < n; i++) { if (Xo[o][i] > thr) { wc[o][np] = 1.0; pidx[o][i] = np++; } else pidx[o][i] = -1; }
+            rk[o] = np; R += np;
+        } else {
+            int r = 0;
+            for (int i = n - 1; i >= 0 && W[o][i] > thr; i--) r++;
+            /* the range must be separated: the largest eigenvalue left out well below the
+             * smallest kept (taha1b: eigenvalues decaying continuously from 0.8 to 1e-7, no face
+             * to speak of; the rows would be inconsistent and the correction useless) */
+            if (r > 0 && r < n && W[o][n - r - 1] > gapmax * W[o][n - r]) {
+                if (dbg) printf("postsolve: dual correction skipped (the range of X is not separated in block %d: eigenvalues %.1e / %.1e)\n", o + 1, W[o][n - r], W[o][n - r - 1]);
+                goto out;
+            }
+            if (r > 0 && r < n) memmove(N[o], N[o] + (size_t)(n - r) * n, sizeof(double) * (size_t)n * r);   /* the range to the front */
+            wc[o] = pmalloc(sizeof(double) * (r + 1));
+            for (int c = 0; c < r; c++) wc[o][c] = omega * sqrt(W[o][n - r + c] / gmax);
+            rk[o] = r; R += n * r;
+            if (getenv("BRISK_PSDEBUG2")) {
+                printf("   [range blk %d n %d: rank %d, eigenvalues", o + 1, n, r);
+                for (int i = n - 1; i >= 0 && i >= n - r - 2; i--) printf(" %.2e", W[o][i]);
+                printf("]\n");
+            }
+        }
+    }
+    rowoff[nbo] = R;
+    if (R == 0) { if (dbg) printf("postsolve: dual correction skipped (the primal has no range)\n"); goto out; }
+    const int Rstd = R;
+    for (int o = 0; o < nbo; o++) { soff[o] = R; if (O->bs[o] > 0) R += rk[o] * (rk[o] + 1) / 2; }
+    soff[nbo] = R;
+    const int Rz = R;
+    R++;                                            /* the objective row */
+    double pobj = 0, bn = 0;
+    for (size_t q = 0; q < O->nnz; q++) {
+        if (O->con[q] >= 0) continue;
+        const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+        pobj += O->bs[o] < 0 ? O->v[q] * Xo[o][i] : (i == j ? 1.0 : 2.0) * O->v[q] * Xo[o][i + (size_t)j * no];
+    }
+    for (int j = 0; j < mo; j++) bn += O->b[j] * O->b[j];
+    const double wb = 10.0 / fmax(sqrt(bn), 1e-300);
+    const int small = R < mo ? R : mo;
+    if (small > 10000) { if (dbg) printf("postsolve: dual correction skipped (system %d x %d)\n", R, mo); goto out; }
+    F->R = R; F->Rz = Rz; F->Rstd = Rstd;
+    F->cscale = pmalloc(sizeof(double) * (mo + 1));
+    for (int j = 0; j < mo; j++) F->cscale[j] = isrem[j] ? srem : 1.0;
+    /* A by columns (constraints), and the rows' values at y = 0 */
+    {
+        ConIndex CI;
+        conindex_build(O, &CI);
+        size_t cap = O->nnz * 4 + 16, na = 0;
+        int *cptr = pmalloc(sizeof(int) * (mo + 2)), *rind = pmalloc(sizeof(int) * cap);
+        double *aval = pmalloc(sizeof(double) * cap);
+        double *acc = pcalloc(R + 1, sizeof(double));
+        int *touched = pmalloc(sizeof(int) * (R + 1)), nt = 0;
+        double *crow = pcalloc(R + 1, sizeof(double));
+#define ACC_ENTRY(q, v) do { \
+        const int o_ = O->blk[q], i_ = O->ii[q], l_ = O->jj[q], n_ = abs(O->bs[o_]); \
+        if (O->bs[o_] < 0) { const int p_ = pidx[o_][i_]; if (p_ >= 0) { const int rr = rowoff[o_] + p_; if (acc[rr] == 0) { touched[nt++] = rr; } acc[rr] += (v) * wc[o_][p_]; } } \
+        else { for (int c_ = 0; c_ < rk[o_]; c_++) { \
+            const double *nc = N[o_] + (size_t)c_ * n_; const double w_ = wc[o_][c_]; \
+            int rr = rowoff[o_] + c_ * n_ + i_; \
+            if (acc[rr] == 0) { touched[nt++] = rr; } acc[rr] += (v) * nc[l_] * w_; \
+            if (i_ != l_) { rr = rowoff[o_] + c_ * n_ + l_; if (acc[rr] == 0) { touched[nt++] = rr; } acc[rr] += (v) * nc[i_] * w_; } \
+            for (int d_ = 0; d_ <= c_; d_++) { \
+                const double *nd = N[o_] + (size_t)d_ * n_; \
+                const double s_ = i_ == l_ ? (v) * nc[i_] * nd[i_] : (v) * (nc[i_] * nd[l_] + nc[l_] * nd[i_]); \
+                rr = soff[o_] + c_ * (c_ + 1) / 2 + d_; \
+                if (acc[rr] == 0) { touched[nt++] = rr; } acc[rr] += s_; \
+            } } } } while (0)
+        for (int j = -1; j < mo; j++) {
+            nt = 0;
+            for (size_t e = CI.ptr[j + 1]; e < CI.ptr[j + 2]; e++) { const size_t q = CI.ord[e]; ACC_ENTRY(q, O->v[q]); }
+            if (j < 0) { for (int t = 0; t < nt; t++) { crow[touched[t]] = acc[touched[t]]; acc[touched[t]] = 0; } crow[Rz] = wb * pobj; continue; }
+            if (O->b[j] != 0) { if (acc[Rz] == 0) { touched[nt++] = Rz; } acc[Rz] += wb * O->b[j]; }
+            cptr[j] = (int)na;
+            if (na + nt > cap) { cap = 2 * (na + nt) + 16; rind = realloc(rind, sizeof(int) * cap); aval = realloc(aval, sizeof(double) * cap); }
+            const double cs = isrem[j] ? srem : 1.0;
+            for (int t = 0; t < nt; t++) {
+                const int rr = touched[t];
+                if (acc[rr] != 0) { rind[na] = rr; aval[na] = cs * acc[rr]; na++; }
+                acc[rr] = 0;
+            }
+        }
+        cptr[mo] = (int)na;
+#undef ACC_ENTRY
+        free(CI.ptr); free(CI.ord); free(acc); free(touched);
+        F->cptr = cptr; F->rind = rind; F->aval = aval; F->na = na; F->crow = crow;
+        /* the cost of the Gram matrix: the squares of the column (or row) counts */
+        double gcost = 0;
+        if (R <= mo) for (int j = 0; j < mo; j++) { const double c = cptr[j + 1] - cptr[j]; gcost += c * c; }
+        else { int *rc = pcalloc(R + 1, sizeof(int)); for (size_t a = 0; a < na; a++) rc[rind[a]]++; for (int i = 0; i < R; i++) gcost += (double)rc[i] * rc[i]; free(rc); }
+        gcost += pow((double)small, 3.0) / 3.0;
+        if (gcost > 4e10) { if (dbg) printf("postsolve: dual correction skipped (system %d x %d, %.1e flops)\n", R, mo, gcost); goto out; }
+    }
+    /* the factor */
+    if (R <= mo) {
+        double *K = pcalloc((size_t)R * R + 1, sizeof(double)), *wk = pmalloc(sizeof(double) * ((size_t)R * R + 1));
+        for (int j = 0; j < mo; j++)
+            for (int a = F->cptr[j]; a < F->cptr[j + 1]; a++) {
+                const int ra = F->rind[a]; const double va = F->aval[a];
+                for (int b = F->cptr[j]; b < F->cptr[j + 1]; b++) if (F->rind[b] <= ra) K[ra + (size_t)F->rind[b] * R] += va * F->aval[b];
+            }
+        const int ok = chol_reg(R, K, wk) == 0;
+        free(wk);
+        if (!ok) { free(K); if (dbg) printf("postsolve: dual correction skipped (A A' could not be factored)\n"); goto out; }
+        F->K = K; F->dimK = R; F->gram = 0;
+    } else {
+        int *rptr = pcalloc(R + 2, sizeof(int)), *cind = pmalloc(sizeof(int) * (F->na + 1));
+        double *rval = pmalloc(sizeof(double) * (F->na + 1));
+        for (size_t a = 0; a < F->na; a++) rptr[F->rind[a] + 2]++;
+        for (int i = 0; i < R; i++) rptr[i + 2] += rptr[i + 1];
+        for (int j = 0; j < mo; j++) for (int a = F->cptr[j]; a < F->cptr[j + 1]; a++) { const int w = rptr[F->rind[a] + 1]++; cind[w] = j; rval[w] = F->aval[a]; }
+        double *G = pcalloc((size_t)mo * mo + 1, sizeof(double)), *wk = pmalloc(sizeof(double) * ((size_t)mo * mo + 1));
+        for (int i = 0; i < R; i++)
+            for (int a = rptr[i]; a < rptr[i + 1]; a++) {
+                const int ja = cind[a]; const double va = rval[a];
+                for (int b = rptr[i]; b < rptr[i + 1]; b++) if (cind[b] <= ja) G[ja + (size_t)cind[b] * mo] += va * rval[b];
+            }
+        free(rptr); free(cind); free(rval);
+        const int ok = chol_reg(mo, G, wk) == 0;
+        free(wk);
+        if (!ok) { free(G); if (dbg) printf("postsolve: dual correction skipped (A' A could not be factored)\n"); goto out; }
+        F->K = G; F->dimK = mo; F->gram = 1;
+    }
+    ret = 0;
+    if (dbg) printf("postsolve: dual correction through complementarity: %d + %d rows (Z N, N'Z N) + the objective, %d columns, %zu nonzeros, omega %g, set up in %.2fs\n",
+                    Rstd, Rz - Rstd, mo, F->na, omega, ps_now() - t0);
+out:
+    for (int o = 0; o < nbo; o++) { free(N[o]); free(W[o]); free(pidx[o]); free(wc[o]); }
+    free(N); free(W); free(lmax); free(rk); free(rowoff); free(soff); free(pidx); free(wc); free(isrem);
+    if (ret) ps_fix_free(F);
+    return ret;
+}
+
+/* yout = yin + dy, dy the least-norm solution of A dy = (rows at yin); stats: |rows| before and
+ * after, |dy|. Returns the residual after. */
+static double ps_fix_apply(const PSFix *F, const double *yin, double *yout, int verbose, double *dnorm) {
+    const int mo = F->mo, R = F->R;
+    const int dbg = verbose >= 2 || getenv("BRISK_PSDEBUG") != NULL;
+    double *rhs = pmalloc(sizeof(double) * (R + 1)), *res = pmalloc(sizeof(double) * (R + 1)), *dy = pcalloc(mo + 1, sizeof(double));
+    memcpy(rhs, F->crow, sizeof(double) * R);
+    for (int j = 0; j < mo; j++) { const double yz = yin[j] / F->cscale[j]; for (int a = F->cptr[j]; a < F->cptr[j + 1]; a++) rhs[F->rind[a]] -= yz * F->aval[a]; }
+    double r0 = 0;
+    for (int i = 0; i < R; i++) r0 += rhs[i] * rhs[i];
+    r0 = sqrt(r0);
+    double rn = r0;
+    int passes = 0;
+    double *u = pmalloc(sizeof(double) * (F->dimK + 1));
+    memcpy(res, rhs, sizeof(double) * R);
+    for (int pass = 0; pass < 4; pass++) {
+        int one = 1, info = 0;
+        if (!F->gram) {
+            memcpy(u, res, sizeof(double) * R);
+            BL(dpotrs_)("L", &R, &one, F->K, &R, u, &R, &info);
+            for (int j = 0; j < mo; j++) { double s = 0; for (int a = F->cptr[j]; a < F->cptr[j + 1]; a++) s += F->aval[a] * u[F->rind[a]]; dy[j] += s; }
+        } else {
+            for (int j = 0; j < mo; j++) { double s = 0; for (int a = F->cptr[j]; a < F->cptr[j + 1]; a++) s += F->aval[a] * res[F->rind[a]]; u[j] = s; }
+            BL(dpotrs_)("L", &mo, &one, F->K, &mo, u, &mo, &info);
+            for (int j = 0; j < mo; j++) dy[j] += u[j];
+        }
+        memcpy(res, rhs, sizeof(double) * R);
+        for (int j = 0; j < mo; j++) for (int a = F->cptr[j]; a < F->cptr[j + 1]; a++) res[F->rind[a]] -= F->aval[a] * dy[j];
+        double rn2 = 0; for (int i = 0; i < R; i++) rn2 += res[i] * res[i];
+        rn2 = sqrt(rn2); passes++;
+        if (!(rn2 < 0.5 * rn)) { rn = fmin(rn, rn2); break; }
+        rn = rn2;
+    }
+    double dn = 0;
+    for (int j = 0; j < mo; j++) { dy[j] *= F->cscale[j]; yout[j] = yin[j] + dy[j]; dn += dy[j] * dy[j]; }
+    dn = sqrt(dn);
+    if (dnorm) *dnorm = dn;
+    if (dbg) {
+        double re = 0, rs = 0;
+        for (int i = 0; i < F->Rstd; i++) re += res[i] * res[i];
+        for (int i = F->Rstd; i < F->Rz; i++) rs += res[i] * res[i];
+        printf("postsolve: dual correction: |rows| %.2e -> %.2e (%.1e coupling / omega, %.1e projected, %.1e objective) in %d passes, |dy| %.2e\n",
+               r0, rn, sqrt(re), sqrt(rs), fabs(res[F->Rz]), passes, dn);
+    }
+    free(rhs); free(res); free(dy); free(u);
+    return rn;
 }
 
 /* ------------------------------------------------------------------ main entry */
@@ -1748,7 +2031,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             }
             best = best == best ? -best : INFINITY;
             if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: lambda_min with the removed duals at zero]\n", ps_now() - t0);
-            const double best0 = best;
+            double best0 = best;
             memcpy(ybest, yo, sizeof(double) * mo);
             int brec = 0, bunrec = 0;
             if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: removed duals at zero: lambda_min(Z) %.2e (1 + nC1 = %.2e)\n", -best, 1.0 + O->nC1);
@@ -1756,14 +2039,51 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
              * few dense factorizations of the original blocks each: 3.3 s on the 1781 x
              * 1781 AC-OPF block for a violation of 2e-10) */
             double prevlz = -1;
+            /* round 0: the passes from the lift of the reduced dual. Later rounds (ISSUES 93): when
+             * they leave a violation, the base is corrected through complementarity with the primal
+             * (ps_fix_apply, from the previous round's best point with its certificate duals) and the
+             * passes run again from the corrected base, until the correction is small or no round
+             * improves */
+            PSFix fix; int have_fix = 0, bround = 0;
+            double *ybr = pmalloc(sizeof(double) * (mo + 1));   /* the best point of the round */
+            double bestr = best;
+            memcpy(ybr, y0, sizeof(double) * mo);
+            const int maxround = getenv("BRISK_PSROUNDS") ? atoi(getenv("BRISK_PSROUNDS")) : 2;
+            for (int round = 0; round < maxround; round++) {
+            if (round >= 1) {
+                if (!(best > 1e-9 * (1.0 + O->nC1)) || !Xo || !g_ps_fr_correct) break;
+                if (round == 1) { if (ps_fix_setup(&fix, O, Xo, ps, verbose)) break; have_fix = 1; }
+                double dn = 0;
+                ps_fix_apply(&fix, ybr, y0, verbose, &dn);
+                if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: dual correction round %d]\n", ps_now() - t0, round);
+                for (int o = 0; o < nbo; o++) memset(Z0[o], 0, sizeof(double) * bsize(O->bs[o]));
+                for (size_t q = 0; q < O->nnz; q++) {
+                    const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+                    const double coef = O->con[q] < 0 ? O->v[q] : -y0[O->con[q]] * O->v[q];
+                    if (coef == 0) continue;
+                    if (O->bs[o] < 0) Z0[o][i] += coef;
+                    else { Z0[o][i + (size_t)j * no] += coef; if (i != j) Z0[o][j + (size_t)i * no] += coef; }
+                }
+                double lb = 0;
+                for (int o = 0; o < nbo; o++) {
+                    const int no = abs(O->bs[o]);
+                    if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lb = fmin(lb, Z0[o][i]); }
+                    else lb = fmin(lb, ps_lammin_tol(no, Z0[o], wk, 1e-12 * (1.0 + O->nC1)));
+                }
+                best0 = lb == lb ? -lb : INFINITY;
+                if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: corrected base (round %d): lambda_min(Z) %.2e, |dy| %.2e\n", round, -best0, dn);
+                if (best0 < best) { best = best0; brec = 0; bunrec = 0; bround = round; memcpy(ybest, y0, sizeof(double) * mo); }
+                prevlz = -1;
+            }
+            bestr = INFINITY;   /* the round's best pass result; a diverging chain leaves its partial lift as the next base */
             for (int k = 0; k < nm && best > 1e-9 * (1.0 + O->nC1); k++) {
-                if (k > 0) {
+                if (k > 0 || round > 0) {
                     memcpy(yo, y0, sizeof(double) * mo);
                     for (int o = 0; o < nbo; o++) memcpy(Zo[o], Z0[o], sizeof(double) * bsize(O->bs[o]));
                 }
                 int rc = 0, un = 0;
                 double lz = 0;
-                if (recover_pass(ps, O, &CI, yo, Zo, me ? atof(me) : margins[k], &rc, &un, NULL)) lz = -INFINITY;
+                if (recover_pass(ps, O, &CI, yo, Zo, me ? atof(me) : margins[k], &rc, &un, NULL)) { lz = -INFINITY; if (round >= 1 && bestr == INFINITY) memcpy(ybr, yo, sizeof(double) * mo); }
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: recovery pass]\n", ps_now() - t0);
                 if (lz == 0) for (int o = 0; o < nbo; o++) {   /* (4.22: was skipped under BRISK_PSTIME) */
                     const int no = abs(O->bs[o]);
@@ -1781,12 +2101,18 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                  * 10 s per pass) ends the search */
                 if (k > 0 && fabs(-lz - prevlz) <= 1e-3 * fmax(prevlz, 1e-300)) { if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: margin does not change lambda_min, stopped\n"); break; }
                 prevlz = -lz;
+                if (-lz < bestr) { bestr = -lz; memcpy(ybr, yo, sizeof(double) * mo); }
                 if (-lz < best) {
-                    best = -lz; brec = rc; bunrec = un;
+                    best = -lz; brec = rc; bunrec = un; bround = round;
                     memcpy(ybest, yo, sizeof(double) * mo);
                 }
                 if (best <= 1e-10 * (1.0 + O->nC1)) break;
             }
+            }   /* rounds */
+            if (have_fix) ps_fix_free(&fix);
+            free(ybr);
+            res->fr_corrected = bround >= 1;
+            if (bround >= 1 && (verbose >= 2 || getenv("BRISK_PSTIME"))) printf("postsolve: the corrected lift is kept (round %d): lambda_min(Z) %.2e\n", bround, -best);
             memcpy(yo, ybest, sizeof(double) * mo);
             /* rebuild Z from the kept y */
             for (int o = 0; o < nbo; o++) memset(Zo[o], 0, sizeof(double) * bsize(O->bs[o]));
