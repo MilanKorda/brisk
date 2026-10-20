@@ -1,5 +1,43 @@
 # BRISK change log
 
+## Version 1.5.4 (October 2026)
+
+Semidefinite programs:
+- **The self-dual embedding's end of run.** When a run misses the tolerance, the iterate with the best objective is
+  returned rather than an early one with a slightly smaller residual, and a primal breakdown at the accuracy floor
+  stops the run instead of continuing for several useless iterations. An optional rule, `BRISK_DRIFT=1` (off by
+  default), holds the tolerance stops back while the objective still changes by more than the tolerance: on problems
+  with a thin optimal face it avoids OPTIMAL answers whose value is wrong in the fifth or sixth digit, at the cost of
+  a few more iterations and the high-precision endgame. Contributed by a user.
+- **Guaranteed bounds beside the solution.** `-bound p|d|pd` now reports rigorous bounds on the optimal value next to
+  the returned solution instead of replacing one side of it, and `-bound pd` gives both sides in one run, each built
+  in high precision. A-priori bounds on y need no margin (`-boundprior`), and the smallest-eigenvalue checks are
+  repeated beyond double precision when only rounding fails them (`-boundprec`): more problems get a certificate
+  (relaxations of structural design: 10 -> 12 upper bounds of 24) in half the time. Contributed by a user.
+- **Block scaling by the size of the data, `-blkscale 2`** (off by default): each index of a semidefinite block is
+  scaled by the reciprocal of its largest coefficient, in powers of two. It helps problems whose data differ in
+  scale by orders of magnitude between indices (a region-of-attraction LMI: the value from 2e-3 off to 1e-6). After
+  a solve in scaled coordinates that misses the tolerance, the better of the scaled and the unscaled answers is
+  returned.
+- The first-order engine tried before the interior-point method is off by default (`-fomrace 0.2` restores it).
+- The memory cap of the best-iterate copies scales with the available memory.
+
+Second-order cone programs:
+- **Small problems at high accuracy.** On the normal-equations route the cone solver's dual regularization is now
+  below the target accuracy; at `acc = "high"` two-row problems with the optimum on the cone's boundary ended
+  ALMOST_OPTIMAL (two of MathOptInterface's tests), now OPTIMAL in 6 iterations.
+- A large cone's product for the normal equations by matrix-matrix kernels on dense panels when a cost model says
+  so (a CBLIB filter design problem: setup 417 -> 27 s, solve 516 -> 166 s, the same iterations).
+
+Interfaces and library:
+- **MATLAB on Linux:** the MEX build against MATLAB's 64-bit-integer MKL links again (four routines of the dense
+  LDL' factorization were missing from the integer-widening layer in 1.5.3). Contributed by a user. `make
+  blas64test` checks this layer against an ILP64 OpenBLAS without MATLAB, also in CI.
+- **Julia:** MathOptInterface's full test suite passes (`BRISK_TEST_MOI=1 Pkg.test("Brisk")`), also in CI.
+- **Two memory leaks fixed:** in every solve with a second-order cone and in the Schur assembly; a process solving
+  many problems through the library no longer grows.
+- `tools/release_check.sh` runs every interface and every regression guard on a source tree.
+
 ## Version 1.5.3 (October 2026)
 
 Semidefinite programs:

@@ -104,12 +104,21 @@ nfail = nfail + check('bound d: rigorous lower bound <= 41.9', Ib.bound.rigorous
 [ob, xb, Xb, Yb, Ib] = brisk_sdpa(ex1, struct('bound', 'p', 'certify', true));
 nfail = nfail + check('bound p: rigorous upper bound >= 41.9', strcmp(Ib.bound.side, 'p') && Ib.bound.certified == 1 && Ib.bound.rigorous >= 41.9 - 1e-9 && Ib.bound.rigorous < 41.9 + 1e-5);
 [ob, xb, Xb, Yb, Ib] = brisk_sdpa(ex1, struct('bound', 'p'));
-nfail = nfail + check('certify is off by default', Ib.bound.certified == 0 && isnan(Ib.bound.rigorous));
+nfail = nfail + check('a bound is always checked rigorously', Ib.bound.certified == 1 && isfinite(Ib.bound.rigorous));
+[ob, xb, Xb, Yb, Ib] = brisk_sdpa(ex1, struct('bound', 'pd'));
+nfail = nfail + check('bound pd: both sides certified, bracketing 41.9, certificates returned', ...
+    isfield(Ib.bounds, 'p') && isfield(Ib.bounds, 'd') && Ib.bounds.p.certified == 1 && Ib.bounds.d.certified == 1 && ...
+    Ib.bounds.d.rigorous <= 41.9 + 1e-9 && Ib.bounds.p.rigorous >= 41.9 - 1e-9 && iscell(Ib.bounds.p.X) && ~isempty(Ib.bounds.d.y));
+[ob0, xb0, Xb0, Yb0, Ib0] = brisk_sdpa(ex1, struct());
+nfail = nfail + check('without opts.bound: no side evaluated; with it the solution is the solve''s own', ...
+    isempty(fieldnames(Ib0.bounds)) && norm(xb - xb0) <= 1e-6 * (1 + norm(xb0)));
 nfail = nfail + check('info.resolves and info.cause present', isfield(Ib, 'resolves') && isfield(Ib, 'cause') && Ib.resolves.n >= 0);
 [m2, bs2, c2, F2] = read_sdpa_cells(ex2);
 [A2, b2, cs2, K2] = sdpa2sedumi(m2, bs2, c2, F2);
 [xs2, ys2, is2] = brisk_sedumi(A2, b2, cs2, K2, struct('bound', 'sos'));
 nfail = nfail + check('brisk_sedumi accepts opts.bound = ''sos''', is2.numerr <= 1);
+nfail = nfail + check('brisk_sedumi: the certificate x of bound p (c''x is its value)', isfield(is2.brisk.bounds, 'p') && ...
+    numel(is2.brisk.bounds.p.x) == numel(cs2) && abs(cs2' * is2.brisk.bounds.p.x - is2.brisk.bounds.p.value) <= 1e-8 * (1 + abs(is2.brisk.bounds.p.value)));
 
 % ---- every command-line option through opts ----------------------------------------
 a = brisk_opts2args(struct('chordal', 0, 'nohsd', true, 'nofr', false, 'certify', true, 'dir', 'nt', 'fomstart_x', 'x.txt'));
@@ -123,7 +132,7 @@ out = evalc('brisk_sdpa(ex1, struct(''verbose'', 1));');
 has = @(t) ~isempty(strfind(out, t));
 nfail = nfail + check('log: the advice in MATLAB syntax (accuracy, precision, bound)', ...
     has('in the options of brisk_sdpa(..., opts)') && has('opts.acc = ''high''') && has('opts.prec = ''dd''') && ...
-    has('opts.bound = ''d''') && has('opts.certify = true'));
+    has('opts.bound = ''d''') && ~has('opts.certify = true'));   % (a bound is always checked rigorously)
 [x1, y1, i1] = brisk_sedumi(sparse([1 0 0 1]), 1, [2; 0; 0; 2], struct('s', 2));
 nfail = nfail + check('brisk_sedumi: one constraint (min 2 tr X, tr X = 1)', i1.numerr <= 1 && abs([2 0 0 2] * x1 - 2) < 1e-6 && abs(y1 - 2) < 1e-6);
 % a max-cut-type SDP on a path (tridiagonal, chordal pattern): chordal decomposition auto / off / forced

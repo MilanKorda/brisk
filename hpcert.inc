@@ -515,9 +515,11 @@ static void hpc_combine(const HPJob *J, int side, uint64_t **DX, uint64_t *dy, u
  * returned point, the anchors anc[0..na-1] (older first; earlier, more central iterates of the
  * solve mapped to the problem as read) and, after a face reduction, the direction that the
  * multiplier of the reduction's certificate adds (DirX on side p, diry on side d). On success
- * the certificate replaces J->X (p) or J->y (d) and 1 is returned. */
+ * the certificate is written to Xc (p, blocks of J) or yc (d) and 1 is returned; the returned
+ * point J->X, J->y is not changed (the candidates are copies or the anchors: side p changes
+ * only their X, side d only their y, so the two sides can share them). */
 static int hp_bound(HPJob *J, const PSOrig *O, int exact, int side, int na, HPPoint *anc, uint64_t **DirX, const uint64_t *diry,
-                    int verbose, HPCertOut *out, char *src, size_t srclen) {
+                    int verbose, HPCertOut *out, char *src, size_t srclen, uint64_t **Xc, uint64_t *yc) {
     const size_t Wm = (size_t)mpx_W;
     const int nb = J->nblk, m = J->m;
     HPPairs Q;
@@ -642,8 +644,8 @@ static int hp_bound(HPJob *J, const PSOrig *O, int exact, int side, int na, HPPo
     }
     if (found && tdir != 0) { const size_t l = strlen(src); snprintf(src + l, srclen - l, "; multiplier %.0e on the face reduction's certificate", tdir); }
     if (found) {
-        if (side == 1) for (int k = 0; k < nb; k++) { const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k]; memcpy(J->X[k], TX[k], len * Wm * sizeof(uint64_t)); }
-        else memcpy(J->y, ty, (size_t)m * Wm * sizeof(uint64_t));
+        if (side == 1) for (int k = 0; k < nb; k++) { const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k]; memcpy(Xc[k], TX[k], len * Wm * sizeof(uint64_t)); }
+        else memcpy(yc, ty, (size_t)m * Wm * sizeof(uint64_t));
     }
     if (side == 1) { hpc_free_blocks(C[0].X, nb); hpc_free_blocks(C[isyn].X, nb); } else { free(C[0].y); free(C[isyn].y); }
     hpc_free_blocks(TX, nb); free(ty); free(C);

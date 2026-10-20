@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.5.3"
+    assert brisk.version() == "1.5.4"
     assert os.path.exists(brisk.library_path())
 
 
@@ -72,10 +72,11 @@ def test_advice_in_the_callers_syntax(capsys):
     out = capsys.readouterr().out
     assert "For higher accuracy, in brisk.solve_sdpa(..., options={...}):" in out
     assert '"acc": "high"' in out and '"prec": "dd"' in out
-    assert "For a guaranteed bound on the optimal value" in out and '"bound": "d"' in out and '"certify": True' in out
+    assert "For a guaranteed bound on the optimal value" in out and '"bound": "d"' in out
+    assert '"certify": True' not in out                                            # (a bound is always checked rigorously)
     brisk.solve_sdpa(**EX1, options={"acc": "high", "bound": "d"}, verbose=True)   # what was asked for is not advised
     out = capsys.readouterr().out
-    assert '"acc": "high"' not in out and "For a guaranteed bound" not in out and "For a rigorous check of the bound" in out
+    assert '"acc": "high"' not in out and "For a guaranteed bound" not in out and "For a rigorous check of the bound" not in out
     brisk.solve_sdpa(**EX1, options={"prec": "dd"}, verbose=True)                  # high precision: the bound only
     out = capsys.readouterr().out
     assert "For higher accuracy" not in out and '"bound": "d"' in out and "in brisk.solve_sdpa(" in out
@@ -92,7 +93,7 @@ def test_advice_cvxpy(capsys):
     prob.solve(solver=brisk.BRISK(), verbose=True)
     out = capsys.readouterr().out
     assert "For higher accuracy, in prob.solve(solver=brisk.BRISK(), ...):" in out
-    assert 'acc="high"' in out and 'prec="dd"' in out and 'bound="dual"' in out and "certify=True" in out
+    assert 'acc="high"' in out and 'prec="dd"' in out and 'bound="dual"' in out and "certify=True" not in out
     x = cp.Variable(3)                                                             # a second-order cone program
     cp.Problem(cp.Minimize(cp.norm(x, 2)), [cp.sum(x) == 1]).solve(solver=brisk.BRISK(), verbose=True)
     out = capsys.readouterr().out
@@ -417,32 +418,44 @@ def _read_sdpa_exact(path):
 
 
 def test_bound_mode_low_level(tmp_path):
-    """-bound p / d on the max-cut SDPA problem: valid certificates, rigorously certified in
-    libbrisk (-certify, and brisk.certify on the returned arrays), bracketing the optimum."""
+    """-bound p / d / pd on the max-cut SDPA problem: certificates returned beside the solution
+    (never in its place), rigorously certified in libbrisk (always, and by brisk.certify on the
+    returned certificates), bracketing the optimum."""
     data = maxcut_sdpa(30, seed=3)
     f = tmp_path / "mc.dat-s"
     brisk.write_sdpa(f, **data)
     r0 = brisk.solve_file(str(f), {"acc": "high"}, verbose=False)
     opt = r0.pobj
-    rp = brisk.solve_file(str(f), {"bound": "p", "certify": True}, verbose=False)
+    rp = brisk.solve_file(str(f), {"bound": "p"}, verbose=False)
     assert rp.bound["side"] == "p" and rp.bound["valid"] >= 1 and rp.bound["certified"]
-    assert rp.bound["rigorous"] >= opt - 1e-7 * (1 + abs(opt))
-    cp_ = brisk.certify(str(f), "p", X=rp.X)
-    assert cp_["certified"] and abs(cp_["bound"] - rp.bound["rigorous"]) <= 1e-12 * (1 + abs(opt))
-    rd = brisk.solve_file(str(f), {"bound": "d", "certify": True}, verbose=False)
-    assert rd.bound["side"] == "d" and rd.bound["certified"]
-    cd = brisk.certify(str(f), "d", y=rd.y)
+    assert set(rp.bounds) == {"p"}
+    bp = rp.bounds["p"]
+    assert bp["certified"] and bp["rigorous"] == rp.bound["rigorous"] and bp["X"] is not None
+    assert bp["rigorous"] >= opt - 1e-7 * (1 + abs(opt))
+    cp_ = brisk.certify(str(f), "p", X=bp["X"])
+    assert cp_["certified"] and abs(cp_["bound"] - bp["rigorous"]) <= 1e-12 * (1 + abs(opt))
+    assert np.max(np.abs(rp.dimacs)) < 1e-6                 # the returned pair is the solve's own point
+    rd = brisk.solve_file(str(f), {"bound": "d"}, verbose=False)
+    assert rd.bound["side"] == "d" and rd.bound["certified"] and set(rd.bounds) == {"d"}
+    cd = brisk.certify(str(f), "d", y=rd.bounds["d"]["y"])
     assert cd["certified"] and cd["bound"] <= opt + 1e-7 * (1 + abs(opt))
     assert cd["bound"] <= cp_["bound"] and abs(cp_["bound"] - cd["bound"]) < 1e-5 * (1 + abs(opt))
     # in memory (exact data) as well
-    cm = brisk.certify(data, "d", y=rd.y)
+    cm = brisk.certify(data, "d", y=rd.bounds["d"]["y"])
     assert cm["certified"]
-    # the default: no certification
-    rn = brisk.solve_file(str(f), {"bound": "d"}, verbose=False)
-    assert not rn.bound["certified"] and not np.isfinite(rn.bound["rigorous"])
-    # a certificate that is not one
-    bad = brisk.certify(str(f), "d", y=rd.y * 1.1 + 1.0)
+    # both sides in one solve
+    rb = brisk.solve_file(str(f), {"bound": "pd"}, verbose=False)
+    assert set(rb.bounds) == {"p", "d"} and rb.bounds["p"]["certified"] and rb.bounds["d"]["certified"]
+    assert rb.bounds["d"]["rigorous"] <= opt + 1e-7 * (1 + abs(opt)) and rb.bounds["p"]["rigorous"] >= opt - 1e-7 * (1 + abs(opt))
+    # without -bound: no bound evaluated
+    rn = brisk.solve_file(str(f), {}, verbose=False)
+    assert rn.bound is None and rn.bounds is None
+    # a certificate that is not one: refused by the margin check; with the a-priori bound
+    # tr X <= n (diag(X) = 1) any y gives a valid, weaker, lower bound
+    bad = brisk.certify(str(f), "d", y=rd.bounds["d"]["y"] * 1.1 + 1.0, prior=False)
     assert not bad["certified"] and bad["reason"]
+    badp = brisk.certify(str(f), "d", y=rd.bounds["d"]["y"] * 1.1 + 1.0)
+    assert badp["certified"] and badp["bound"] <= opt + 1e-7 * (1 + abs(opt)) and badp["bound"] < cd["bound"]
 
 
 def test_certify_against_exact_rationals(tmp_path):
@@ -452,10 +465,10 @@ def test_certify_against_exact_rationals(tmp_path):
     from fractions import Fraction
     f = tmp_path / "ex1.dat-s"
     brisk.write_sdpa(f, **EX1)
-    rd = brisk.solve_file(str(f), {"bound": "d", "certify": True}, verbose=False)
+    rd = brisk.solve_file(str(f), {"bound": "d"}, verbose=False)
     assert rd.bound["certified"]
     m, bs, c, ent = _read_sdpa_exact(str(f))
-    yq = [Fraction(float(v)) for v in rd.y]
+    yq = [Fraction(float(v)) for v in rd.bounds["d"]["y"]]
     n = bs[0]
     Z = [[Fraction(0)] * n for _ in range(n)]
     for t, k, i, j, v in ent:
@@ -488,8 +501,14 @@ def test_bound_cvxpy():
                 assert b["value"] >= -ref - 1e-6
             else:
                 assert b["value"] <= -ref + 1e-6
+    # both sides in one solve: a certified upper and lower bound around the value
+    for form in ("image", "kernel"):
+        prob.solve(solver=brisk.BRISK(), bound="both", form=form)
+        bb = prob.solver_stats.extra_stats["bounds"]
+        assert set(bb) == {"upper", "lower"} and bb["upper"]["certified"] and bb["lower"]["certified"]
+        assert bb["lower"]["rigorous"] <= -ref + 1e-6 <= bb["upper"]["rigorous"] + 2e-6
     with pytest.raises(ValueError):
-        prob.solve(solver=brisk.BRISK(), bound="both")
+        prob.solve(solver=brisk.BRISK(), bound="sideways")
 
 
 def test_resolve_note_and_cause_fields():
@@ -664,10 +683,12 @@ def test_high_precision_certificates(tmp_path):
     assert rd.status == 0 and rd.bound["side"] == "d" and rd.bound["certified"]
     hd = brisk.hp_solution()
     L = hd["bound"]
-    assert isinstance(L, Decimal) and hd["digits"] >= 90
+    assert isinstance(L, Decimal) and hd["digits"] >= 30 and set(hd["bounds"]) == {"d"} and hd["bounds"]["d"]["bound"] == L
+    yc = hd["bounds"]["d"]["y"]                                # the certificate, with all the digits of its check
+    assert max(len(v.as_tuple().digits) for v in yc) >= 60
     # exact oracle: Z(y) is positive definite and the bound is below b'y
     m, bs, c, ent = _read_sdpa_exact(str(f))
-    yq = [Fraction(v) for v in hd["y"]]
+    yq = [Fraction(v) for v in yc]
     n = bs[0]
     Z = [[Fraction(0)] * n for _ in range(n)]
     for t, k, i, j, v in ent:
@@ -684,7 +705,7 @@ def test_high_precision_certificates(tmp_path):
                 A[i][j] -= f_ * A[p][j]
     by = sum(bi * yi for bi, yi in zip(c, yq))
     assert Fraction(L) <= by and by - Fraction(L) < Fraction(1, 10 ** 25) * (1 + abs(by))
-    cd = brisk.certify(str(f), "d", y=hd["y"], prec="dd")
+    cd = brisk.certify(str(f), "d", y=yc, prec="dd")
     assert cd["certified"] and abs(cd["bound"] - L) <= Decimal("1e-28") * (1 + abs(L))
     rp = brisk.solve_file(str(f), {"prec": "dd", "bound": "p"}, verbose=False)
     assert rp.bound["side"] == "p" and rp.bound["certified"]
@@ -692,14 +713,20 @@ def test_high_precision_certificates(tmp_path):
     U = hp_["bound"]
     assert L <= U and U - L < Decimal("1e-20") * (1 + abs(L))
     assert rd.bound["rigorous"] <= float(L) and float(U) <= rp.bound["rigorous"]
-    cp_ = brisk.certify(str(f), "p", X=hp_["X"], prec="dd")
+    cp_ = brisk.certify(str(f), "p", X=hp_["bounds"]["p"]["X"], prec="dd")
     assert cp_["certified"] and cp_["bound"] >= L
+    # both sides in one solve: the same bounds; the solution is the solve's own
+    rb = brisk.solve_file(str(f), {"prec": "dd", "bound": "pd"}, verbose=False)
+    hb = brisk.hp_solution()
+    assert rb.status == 0 and set(hb["bounds"]) == {"p", "d"}
+    assert hb["bounds"]["d"]["bound"] == L and hb["bounds"]["p"]["bound"] == U
+    assert rb.bounds["p"]["certified"] and rb.bounds["d"]["certified"] and rb.bounds["p"]["X"] is not None
     # a wrong certificate is not certified
-    bad = brisk.certify(str(f), "d", y=[v * 2 + 1 for v in hd["y"]], prec="dd")
+    bad = brisk.certify(str(f), "d", y=[v * 2 + 1 for v in yc], prec="dd")
     assert not bad["certified"]
     # without a bound option there is no bound
     brisk.solve_file(str(f), {"prec": "dd"}, verbose=False)
-    assert brisk.hp_solution()["bound"] is None
+    assert brisk.hp_solution()["bound"] is None and brisk.hp_solution()["bounds"] == {}
 
 
 # ---- problems in SeDuMi format, second-order cones ----------------------------------------------
@@ -882,3 +909,28 @@ def test_cvxpy_cone_solver():
     assert p3.status == "unbounded"
     p4 = cp.Problem(cp.Minimize(cp.sum(x)), [x >= 1, x[:3] <= 4])       # a linear program
     assert abs(p4.solve(solver=brisk.BRISK()) - 30) < 1e-6 and p4.solver_stats.extra_stats["form"] == "cone"
+
+
+def test_a_priori_bounds_without_a_margin(tmp_path):
+    """(D) without an interior: Z(y) = [1 y; y 0] >= 0 forces y = 0 (d* = 0), and the optimal X of
+    (P) (min X11 s.t. X12 = -1/2) is not attained. A certificate X without a margin cannot be
+    checked the usual way; the a-priori bound |y| <= 0 that Z(y) >= 0 implies (its 2 x 2 minor)
+    gives a rigorous upper bound anyway (-boundprior, on by default). The d side of max-cut: a y
+    pushed outside the feasible set, rescued by diag(X) = 1 (tr X <= n)."""
+    f = tmp_path / "nointerior.dat-s"
+    f.write_text("1\n1\n2\n1.0\n0 1 1 1 -1.0\n1 1 1 2 -1.0\n")
+    X = [np.array([[1e-6, -0.5], [-0.5, 250000.0]])]          # singular: no margin at all
+    c = brisk.certify(str(f), "p", X=X)
+    assert c["certified"] and 0.0 <= c["bound"] <= 1e-6 * (1 + 1e-9)
+    c0 = brisk.certify(str(f), "p", X=X, prior=False)          # the margin check alone fails
+    assert not c0["certified"] and c0["bound"] is not None and not np.isfinite(c0["bound"])
+    Xbad = [np.array([[1e-6, -0.5], [-0.5, 240000.0]])]       # not even positive semidefinite: a valid, weaker bound
+    cb = brisk.certify(str(f), "p", X=Xbad)
+    assert cb["certified"] and cb["bound"] >= 0.0
+    # max-cut: y + 1e-4 makes Z indefinite; the bound stays below the optimum
+    data = maxcut_sdpa(30, seed=3)
+    g = tmp_path / "mc.dat-s"
+    brisk.write_sdpa(g, **data)
+    r = brisk.solve_file(str(g), {"acc": "high"}, verbose=False)
+    cd = brisk.certify(str(g), "d", y=r.y + 1e-4)
+    assert cd["certified"] and cd["bound"] <= r.pobj + 1e-7 * (1 + abs(r.pobj))

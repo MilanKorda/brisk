@@ -34,6 +34,12 @@ function [x, y, info, z] = brisk_sedumi(A, b, c, K, opts)
 %   iter, cpusec, pobj = c'x, dobj = b'y, dimacs (1x6, DIMACS errors on the data as given),
 %   status (BRISK's status string), statuscode, brisk (the raw BRISK info)
 %
+% opts.bound = 'p' | 'd' | 'pd' (or 'sos' = 'p'): guaranteed bounds beside the solution, in
+% info.brisk.bounds.p (an upper bound on min c'x from a feasible x: fields value, certified,
+% rigorous, src, x the certificate) and info.brisk.bounds.d (a lower bound b'y: y the
+% certificate). A bound is always checked rigorously; only a certified one (certified = 1,
+% then rigorous is it) is guaranteed. x, y above stay the solve's own point.
+%
 % See also BRISK_SDPA, BRISK_OPTS2ARGS.
 
 if nargin < 4, error('brisk:input', 'usage: brisk_sedumi(A, b, c, K [, opts])'); end
@@ -134,22 +140,13 @@ clear r cc v r0 v0
 
 [yb, Xb, ~, bi] = brisk_mex(m, bsizes, b, T, brisk_opts2args(opts, 'brisk_sedumi'));
 
-% ---- back to SeDuMi's x
+% ---- back to SeDuMi's x (the solution, and the certificate of opts.bound = 'p' / 'pd')
 x = zeros(N, 1);
+if isfield(bi, 'bounds') && isfield(bi.bounds, 'p') && iscell(bi.bounds.p.X) && ~isempty(bi.bounds.p.X)
+    bi.bounds.p.x = blocks_to_x(bi.bounds.p.X, N, nf, nl, nlp, lpb, sdpcols);
+end
 if bi.have_x
-    if nlp > 0
-        xl = Xb{lpb};
-        x(1:nf) = xl(1:nf) - xl(nf + (1:nf));
-        x(nf + (1:nl)) = xl(2 * nf + (1:nl));
-    end
-    for t = 1:numel(ns)
-        S = sdpcols{t};
-        if S.n == 1
-            x(S.cols) = Xb{lpb}(S.slot);
-        else
-            x(S.cols) = Xb{S.blk}(:);
-        end
-    end
+    x = blocks_to_x(Xb, N, nf, nl, nlp, lpb, sdpcols);
 else
     warning('brisk:nox', ['BRISK returned no primal solution (the point was verified on the cliques of the chordal decomposition); ' ...
         'x is zero. Set opts.returnx = 1 to force it, or opts.chordal = 0.']);
@@ -157,6 +154,24 @@ end
 y = yb;
 info = sedumi_info(bi, c, x, b, y);
 if nargout > 3, z = c - A' * y; end
+end
+
+function x = blocks_to_x(Xb, N, nf, nl, nlp, lpb, sdpcols)
+% the SDPA form's blocks back to SeDuMi's x
+x = zeros(N, 1);
+if nlp > 0
+    xl = Xb{lpb};
+    x(1:nf) = xl(1:nf) - xl(nf + (1:nf));
+    x(nf + (1:nl)) = xl(2 * nf + (1:nl));
+end
+for t = 1:numel(sdpcols)
+    S = sdpcols{t};
+    if S.n == 1
+        x(S.cols) = Xb{lpb}(S.slot);
+    else
+        x(S.cols) = Xb{S.blk}(:);
+    end
+end
 end
 
 function info = sedumi_info(bi, c, x, b, y)

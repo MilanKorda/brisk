@@ -252,9 +252,13 @@ static double max_step(MB *b, double *Mt) {
     if (b->type == BLK_LP) { lmin = 0; for (int i = 0; i < n; i++) { const double r = Mt[i] / b->dv[i]; if (r < lmin) lmin = r; } }
     else {
         for (int j = 0; j < n; j++) for (int i = 0; i < n; i++) Mt[i + (size_t)j * n] /= sqrt(b->dv[i] * b->dv[j]);
-        int il = 1, iu = 1, mf = 0, info = 0, lw = b->lwork, liw = b->liwork; const double at = 0; double w1[2];
+        /* W of dsyevr has length n even for one eigenvalue (LAPACK uses all of it; a w1[2] here overflowed the stack on
+         * a block of order 192, 19 October 2026: a delay-independent stability LMI, the -mftry attempt) */
+        int il = 1, iu = 1, mf = 0, info = 0, lw = b->lwork, liw = b->liwork; const double at = 0;
+        double *w1 = malloc(sizeof(double) * (size_t)n);
         BL(dsyevr_)("N", "I", "L", &n, Mt, &n, &DZERO, &DZERO, &il, &iu, &at, &mf, w1, NULL, &n, b->iwork + b->liwork, b->work, &lw, b->iwork, &liw, &info);
         lmin = info ? -1e300 : w1[0];
+        free(w1);
     }
     return lmin < 0 ? -1.0 / lmin : 1e300;
 }

@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.5.3"
+#define BRISK_VERSION "1.5.4"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -81,6 +81,18 @@ typedef struct {
     int bound_side, bound_valid, bound_certified;
     double bound_value, bound_resid, bound_lammin;
     double bound_rigorous;  /* 4.39 -certify: the rigorous bound (NaN when not run) */
+    /* bound mode, per side: [0] p (an upper bound <C,X> from the certificate X), [1] d (a lower
+     * bound b'y from the certificate y). Only the sides asked for (-bound p|d|pd) are evaluated;
+     * the returned point above is the solve's own, never the certificate. The legacy bound_*
+     * fields above are those of the first side asked for. */
+    struct {
+        int asked, have, valid, certified;   /* certified: the rigorous check passed; only then is rigorous a bound */
+        double value, resid, lammin, rigorous;
+        char src[200];                       /* where the certificate came from */
+        double **X;                          /* p: the certificate, per block as X (NULL otherwise) */
+        double *y;                           /* d: the certificate (m) */
+        double *sx;                          /* a problem in SeDuMi format, p: the certificate as its x (sn) */
+    } bnd[2];
     int n_resolves;         /* 4.37: re-solves run (method retry, fallbacks) and their time */
     double t_resolves;
     char cause[320];        /* 4.37: the likely cause when the tolerance is missed ("" otherwise) */
@@ -364,7 +376,7 @@ typedef struct {
     int symnodes;        /* 4.32: ... node cap (500) */
     const char *symfile; /* 4.32: -sym: "auto" (default, 4.33), NULL (none) or a file of generators (symred.c) */
     int symsign;         /* 4.33: sign symmetries first (1) */
-    double fom_race, fom_race_budget;   /* 4.42: the first-order engine first at tol >= 1e-6 on few large dense blocks: share of the expected IPM time (0.2; 0 off); the budget in seconds (set by run_pipeline) */
+    double fom_race, fom_race_budget;   /* 4.42: the first-order engine first at tol >= 1e-6 on few large dense blocks: share of the expected IPM time (0 off, the default since 19 October 2026; 0.2 before); the budget in seconds (set by run_pipeline) */
     int returnx;         /* 4.42 (library): X of a chordal-decomposed block: -1 returned unless its dense form exceeds 30% of the memory, 0 never (measured on the cliques, fastest), 1 always */
     int symalg;          /* 4.41: *-algebra block diagonalisation (symalg.c): -1 auto (blocks up to symalgmax), 0 off, 1 every block */
     int bm;              /* 5.14: the Burer-Monteiro solver (bm.c): 0 off, 1 on */
@@ -406,11 +418,15 @@ typedef struct {
     int dualize;         /* 4.30: solve the dual form: -1 auto (smaller Schur complement), 0 off, 1 force */
     double warm_lam;     /* re-solve warm start: blend weight of the first attempt's point (0 = off) */
     double **warm_X, **warm_Z, *warm_y;   /* internal: that point (solver scaling), NULL if none */
-    /* 4.37 bound mode (-bound p|d, bound.c): the side of the problem as read (0 off, 1 p, 2 d),
-     * the certificate tolerance and margin; the tracker of the problem being solved */
+    /* 4.37 bound mode (-bound p|d|pd, bound.c): the sides of the problem as read, a bit mask (0 off,
+     * 1 p, 2 d, 3 both), the certificate tolerance and margin; the trackers of the problem being
+     * solved (btrack2: the second side with -bound pd) */
     int bound_side;
     double bound_tol, bound_margin, bound_track_tol;
-    struct BoundTrack *btrack;
+    struct BoundTrack *btrack, *btrack2;
+    const char *bound_xfile, *bound_yfile;   /* -boundx / -boundy (the high-precision path writes them itself) */
+    int bound_prec;          /* -boundprec: the precision of the lambda_min checks of the bound mode beyond double (-1 auto, 0 off, > 0 bits) */
+    int bound_prior;         /* -boundprior: when the margin check fails, a bound from a-priori bounds of the other side (1, default; 0 off) */
     int soc;                 /* 5.16: semidefinite blocks with arrow data as second-order cones in the embedding: 1 on (default), 0 off */
     int soc_minn;            /* ... blocks of at least this order (3) */
 } Params;
@@ -435,12 +451,17 @@ typedef struct BoundTrack {
 /* a certificate on the problem as read (bound.c) */
 typedef struct {
     int side;                /* 1 p (X, upper bound <C,X>), 2 d (y, lower bound b'y) */
-    int have, valid;         /* valid: 2 PSD with the margin, 1 PSD, 0 not */
+    int have, valid;         /* valid: 2 PSD with the margin, 1 PSD, 0 not (BRISK's floating-point check: not a guarantee) */
+    int certified;           /* the rigorous check on the problem as read passed (main.c) */
+    double rigorous;         /* ... and the bound it proves (NaN otherwise) */
     double value, resid, lammin, theta;
     int attempt;
     char src[48];
     int nblk, m;
     double **X; double *y;
+    /* the candidate before its margin was restored (NULL when nothing moved it), and its value:
+     * the a-priori route can certify it when the restoration gave away part of the objective */
+    double **X0; double *y0; double value0, resid0, lammin0;
 } BoundCert;
 
 #define ST_OPTIMAL 0
@@ -704,6 +725,7 @@ typedef struct {
     int *prow;
 } PSDual;
 PSDual *dualize_apply(Problem *P, int automatic, int verbose);   /* NULL: not applied */
+int dualize_has_objective(const Problem *P);   /* b != 0: the automatic dual form needs an objective (19 October 2026) */
 void dualize_unmap(const PSDual *D, double **Xp, const double *yp, double ***Xo, double *yo);
 void dualize_free(PSDual *D);
 typedef struct MomAff MomAff;      /* momaff.c: a moment relaxation over an ellipsoid in the coordinates of the unit ball */
@@ -719,6 +741,7 @@ void blkscale_free(BlkScale *S);
 double blkscale_spread(const BlkScale *S);
 extern int g_blkscale_off;
 extern double g_blkscale_min;
+extern double g_blkscale_cap;   /* -blkscale 2: each factor within [1/cap, cap] */
 void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose);   /* 4.30 */
 void free_elim_free(PSFreeElim *F);
 void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile);
@@ -749,6 +772,14 @@ int bound_find_pairs(const PSOrig *O, int **P1, int **P2, int **PK);
 /* 4.39 (boundcert.c): rigorous certification on the problem as read; side 1 X, 2 y; exact: the
  * data are exact doubles (in memory) rather than decimals read from a file. Returns 1 when
  * certified; *bound is the rigorous upper (p) / lower (d) bound (also when not certified) */
+/* a-priori bounds (boundcert.c): side 1 an upper bound on the optimal value of (D) from X1 or X2,
+ * side 2 a lower bound on that of (P) from y1 or y2, with bounds of the other side found from the
+ * problem; returns 1 with the better finite bound (and the candidate, 1 or 2) */
+int brisk_prior_bound(const PSOrig *O, int side, double **X1, double **X2, const double *y1, const double *y2, int exact,
+                      int verbose, double *bound, int *which, char *reason, size_t rlen);
+/* hpsolve.c: lambda_min(M) >= need proved in mpx arithmetic of `bits` bits (1), not (0), no memory (-1) */
+int brisk_lammin_ge_mp(int n, const double *M, double need, int bits);
+void brisk_bound_prec_set(int bits, int verbose);   /* boundcert.c: -boundprec (-1 auto: 192, then 384 bits; 0 double; > 0 bits) */
 int brisk_certify_orig(const PSOrig *O, int side, double **X, const double *y, int exact,
                        double *bound, char *reason, size_t rlen);
 double brisk_gram_lammin_lower(const PSOrig *O, int exact);                                   /* 5.2: for hpsolve.c */

@@ -24,6 +24,8 @@ jobs:
         run: make hpredtest bindtest restoretest advicetest frtest
       - name: C library
         run: make libbrisk capitest
+      - name: MATLAB's 64-bit-integer BLAS layer (blas64.c) against an ILP64 OpenBLAS
+        run: sudo apt-get install -y libopenblas64-dev && make blas64test
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -41,9 +43,9 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: "1.11"
-      - name: Julia tests (without MathOptInterface's own suite)
+      - name: Julia tests with MathOptInterface's full suite (RELEASE_CHECKS R7)
         env:
-          BRISK_TEST_MOI: "0"
+          BRISK_TEST_MOI: "1"
         run: cd julia/Brisk && julia --project=. -e 'import Pkg; Pkg.test("Brisk")'
 
   octave:

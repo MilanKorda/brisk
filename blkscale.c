@@ -24,7 +24,8 @@
 #include <stdio.h>
 
 double g_blkscale_min = 4.0;   /* auto (-blkscale -1): applied when some block's factors spread by at least this */
-int g_blkscale_off = 0;          /* set by the driver for the re-solve of the problem as given */
+int g_blkscale_off = 0;
+double g_blkscale_cap = 1048576.0;   /* mode 2: each factor within [1/cap, cap] (BRISK_BLKSCALECAP; 2^20) */          /* set by the driver for the re-solve of the problem as given */
 
 struct BlkScale {
     int nblk, m, *bs;
@@ -47,7 +48,26 @@ BlkScale *blkscale_apply(Problem *P, int mode, int verbose) {
     }
     double *r = malloc(sizeof(double) * m), *rho = malloc(sizeof(double) * m);
     for (int i = 0; i < m; i++) r[i] = 1.0;
-    for (int it = 0; it < 10; it++) {
+    /* 19 October 2026, mode 2: D from the size of the data at each index, d_p = 1 / max over the constraints i of the
+     * entries |A_i(p, q)| of row p (the solution then has entries of order 1 where the data's are small: an index whose
+     * coefficients are 1e-4 carries an X* of order 1e8 - a user's thin-face problem, the region-of-attraction LMIs;
+     * ISSUES 120); no row factors, no iteration, a bounded spread (below) */
+    const int simple = mode == 2 || mode == -2;
+    if (simple) for (int k = 0; k < nb; k++) {
+        if (!d[k]) continue;
+        const Block *B = &P->blk[k]; const int n = B->n;
+        memset(acc[k], 0, sizeof(double) * n);
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *A = &B->A[t];
+            for (int q = 0; q < A->nnz; q++) {
+                const double v = fabs(A->val[q]);
+                if (v > acc[k][A->row[q]]) acc[k][A->row[q]] = v;
+                if (v > acc[k][A->col[q]]) acc[k][A->col[q]] = v;
+            }
+        }
+        for (int p = 0; p < n; p++) d[k][p] = acc[k][p] > 0 ? 1.0 / acc[k][p] : 1.0;
+    }
+    for (int it = 0; it < (simple ? 0 : 10); it++) {
         memset(rho, 0, sizeof(double) * m);
         for (int k = 0; k < nb; k++) {
             const Block *B = &P->blk[k];
@@ -81,10 +101,13 @@ BlkScale *blkscale_apply(Problem *P, int mode, int verbose) {
         if (!d[k]) continue;
         const int n = P->blk[k].n; double lg = 0;
         for (int p = 0; p < n; p++) lg += log(d[k][p]);
-        const double g = exp(lg / n);
+        const double g = simple ? 1.0 : exp(lg / n);   /* mode 2: each block keeps its own scale (the relative scale of the blocks is
+                                                        * what the region-of-attraction LMIs need: sat_roa_n8 1.3e-6 from the optimum
+                                                        * with it, 9e-4 with the blocks normalized) */
         double lo = 1e300, hi = 0;
-        for (int p = 0; p < n; p++) { d[k][p] = p2(d[k][p] / g); lo = fmin(lo, d[k][p]); hi = fmax(hi, d[k][p]); }
-        if (hi / lo < 2.0) { free(d[k]); d[k] = NULL; continue; }   /* (within a factor 2: left alone) */
+        const double cap = simple ? g_blkscale_cap : INFINITY;     /* mode 2: each factor within [1/cap, cap] */
+        for (int p = 0; p < n; p++) { d[k][p] = p2(fmin(cap, fmax(1.0 / cap, d[k][p] / g))); lo = fmin(lo, d[k][p]); hi = fmax(hi, d[k][p]); }
+        if (hi / lo < 2.0 && !(simple && (lo != 1.0 || hi != 1.0))) { free(d[k]); d[k] = NULL; continue; }   /* (within a factor 2: left alone; mode 2 keeps a uniform scale other than 1) */
         spread = fmax(spread, hi / lo);
     }
     free(r); free(rho);

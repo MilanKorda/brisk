@@ -140,6 +140,14 @@ capitest: $(LIBBRISK) tools/capi_test.c
 	$(CC) -O1 -std=gnu11 -Wall -I. -o tools/capi_test tools/capi_test.c -L. -lbrisk -Wl,-rpath,$(CURDIR) -lm
 	./tools/capi_test
 
+# the library under AddressSanitizer: the C API test and the bound-mode handle test (memory errors and leaks)
+asantest:
+	tools/asan_test.sh
+
+# the MATLAB build's integer-widening BLAS layer (blas64.c) against an ILP64 OpenBLAS (libopenblas64-dev)
+blas64test: brisk
+	tools/blas64_test.sh
+
 # bound OpenMP threads on the command line (Linux): one processor per thread
 bindtest: brisk
 	tools/bind_test.sh ./brisk

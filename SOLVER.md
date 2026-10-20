@@ -1,4 +1,4 @@
-# BRISK 1.5.3: the solver in detail
+# BRISK 1.5.4: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -155,7 +155,7 @@ Every automatic choice below can be overridden from the command line.
     map the constraints onto each other, unless they are permutations (the item above).
     `-symalg 0` turns it off, `-symalg 1` checks every block;
   - elimination of split free variables;
-  - the dual form, when it has at most half the rows;
+  - the dual form, when it has at most half the rows and the problem has an objective;
   - a moment relaxation (order ≥ 3) over an ellipsoid is solved in coordinates in which the
     ellipsoid is the unit ball, and its solution mapped back and measured on the problem as
     given;
@@ -170,7 +170,7 @@ Every automatic choice below can be overridden from the command line.
   At a tolerance of 1e-6 or looser (`-acc low`) the engine also runs *first* on such
   few-large-dense-block problems when their Gram matrix A A' is sparse (theta-type problems)
   and the interior-point solve is estimated at 20 s or more:
-  it gets 20% of that time (`-fomrace 0.2`; 0 turns it off), and the interior-point method
+  with `-fomrace 0.2` it gets 20% of that time (off by default), and the interior-point method
   follows if it has not reached the tolerance.
 
 - **The matrix-free method first.** On problems with one to four dense blocks of order 100 or
@@ -237,15 +237,17 @@ Every automatic choice below can be overridden from the command line.
   mid-size problems; see `./brisk` for its options.
 - **`-dual`:** a sparse dual-scaling method. It keeps Z sparse and never forms X, and is fast on
   sparse relaxations such as max-cut and box-QP.
-- **`-bound p|d`:** returns the best *guaranteed* bound on one side instead of the best-balanced
-  primal-dual pair.
+- **`-bound p|d|pd`:** returns *guaranteed* bounds on the optimal value beside the solution (the
+  returned point and its status stay the solve's own; `-boundx` / `-boundy` write the certificates).
   - `p`: the feasible X with the smallest <C,X>, an upper bound on the optimum even when the
     solve does not converge.
   - `d`: the feasible y with the largest b'y (Z ⪰ 0 verified), a lower bound.
+  - `pd`: both, in one solve.
   - For SOS programs from GloptiPoly or SeDuMi, use `-bound p` (`opts.bound = 'sos'` in
     MATLAB; `bound="sos"` in CVXPY and Julia).
-  - `-certify` makes the bound rigorous: the file's decimals in intervals, directed rounding, a
-    verified λmin.
+  - Every certificate is checked rigorously (the file's decimals in intervals, directed rounding, a
+    verified λmin); only a certified one is a bound. When the other side has no interior, a-priori
+    bounds found from the problem certify a certificate without a margin (`-boundprior`).
   - `brisk problem.dat-s -certify-x X.txt` (or `-certify-y y.txt`) checks a given certificate,
     from BRISK or any solver, without solving.
   - With `-prec` the certificate is built and checked in high precision: the rigorous bound

@@ -534,27 +534,37 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
         for (int i = 0; i < 6; i++) R->err[i] = B.err[i + 1];
         R->x = (double *)calloc((size_t)n + 1, sizeof(double)); R->y = (double *)calloc((size_t)m + 1, sizeof(double)); R->z = (double *)calloc((size_t)n + 1, sizeof(double));
         memcpy(R->y, B.y, sizeof(double) * (size_t)m);
-        if (B.have_x && B.X) {
-            int col = 0;
-            const double *xl = nlp > 0 ? B.X[0] : NULL;
-            for (int j = 0; j < P->nf; j++, col++) R->x[col] = xl[j] - xl[P->nf + j];
-            for (int j = 0; j < P->nl; j++, col++) R->x[col] = xl[2 * P->nf + j];
-            for (int k = 0; k < ncone; k++) {
-                const int d = bs[blk_cone0 - 1 + k]; const double *X = B.X[blk_cone0 - 1 + k];
-                double tr = 0; for (int i = 0; i < d; i++) tr += X[(size_t)i * d + i];
-                R->x[col] = tr;
-                for (int t = 1; t < d; t++) R->x[col + t] = 2.0 * X[(size_t)t * d];
-                if (k >= P->nq) { const double a = R->x[col], b2 = R->x[col + 1]; R->x[col] = rs * (a + b2); R->x[col + 1] = rs * (a - b2); }
-                col += d;
-            }
-            int slot = 2 * P->nf + P->nl, kb2 = blk_sdp0 - 1;
-            for (int k = 0; k < P->ns; k++) {
-                const int d = P->s[k];
-                if (d == 1) { R->x[col++] = xl[slot++]; continue; }
-                memcpy(R->x + col, B.X[kb2], sizeof(double) * (size_t)d * d);
-                col += d * d; kb2++;
-            }
+        /* the SDPA form's X back to SeDuMi's x (the solution, and the certificate of -bound p) */
+#define SD_MAP_X(XB, xo) do { \
+            int col = 0; \
+            const double *xl = nlp > 0 ? (XB)[0] : NULL; \
+            for (int j = 0; j < P->nf; j++, col++) (xo)[col] = xl[j] - xl[P->nf + j]; \
+            for (int j = 0; j < P->nl; j++, col++) (xo)[col] = xl[2 * P->nf + j]; \
+            for (int k = 0; k < ncone; k++) { \
+                const int d = bs[blk_cone0 - 1 + k]; const double *X = (XB)[blk_cone0 - 1 + k]; \
+                double tr = 0; for (int i = 0; i < d; i++) tr += X[(size_t)i * d + i]; \
+                (xo)[col] = tr; \
+                for (int t = 1; t < d; t++) (xo)[col + t] = 2.0 * X[(size_t)t * d]; \
+                if (k >= P->nq) { const double a = (xo)[col], b2 = (xo)[col + 1]; (xo)[col] = rs * (a + b2); (xo)[col + 1] = rs * (a - b2); } \
+                col += d; \
+            } \
+            int slot = 2 * P->nf + P->nl, kb2 = blk_sdp0 - 1; \
+            for (int k = 0; k < P->ns; k++) { \
+                const int d = P->s[k]; \
+                if (d == 1) { (xo)[col++] = xl[slot++]; continue; } \
+                memcpy((xo) + col, (XB)[kb2], sizeof(double) * (size_t)d * d); \
+                col += d * d; kb2++; \
+            } \
+        } while (0)
+        if (B.have_x && B.X) SD_MAP_X(B.X, R->x);
+        for (int s = 0; s < 2; s++) {
+            R->bnd[s].asked = B.bnd[s].asked; R->bnd[s].have = B.bnd[s].have; R->bnd[s].valid = B.bnd[s].valid; R->bnd[s].certified = B.bnd[s].certified;
+            R->bnd[s].value = B.bnd[s].value; R->bnd[s].resid = B.bnd[s].resid; R->bnd[s].lammin = B.bnd[s].lammin; R->bnd[s].rigorous = B.bnd[s].rigorous;
+            memcpy(R->bnd[s].src, B.bnd[s].src, sizeof(R->bnd[s].src));
         }
+        if (B.bnd[0].X) { R->bnd[0].x = (double *)calloc((size_t)n + 1, sizeof(double)); SD_MAP_X(B.bnd[0].X, R->bnd[0].x); }
+        if (B.bnd[1].y) { R->bnd[1].y = (double *)malloc(sizeof(double) * ((size_t)m + 1)); memcpy(R->bnd[1].y, B.bnd[1].y, sizeof(double) * (size_t)m); }
+#undef SD_MAP_X
         /* z = c - A'y */
         for (int j = 0; j < n; j++) { double s = 0; for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) s += P->Ax[p] * R->y[P->Ai[p]]; R->z[j] = P->c[j] - s; }
         R->pobj = 0; for (int j = 0; j < n; j++) R->pobj += P->c[j] * R->x[j];
@@ -565,4 +575,4 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
     free(bs); free(tm); free(tb); free(ti); free(tj); free(tv);
     return rc;
 }
-void sedumi_result_free(SedumiRes *R) { free(R->x); free(R->y); free(R->z); memset(R, 0, sizeof(*R)); R->status = -1; }
+void sedumi_result_free(SedumiRes *R) { free(R->x); free(R->y); free(R->z); for (int s = 0; s < 2; s++) { free(R->bnd[s].x); free(R->bnd[s].y); } memset(R, 0, sizeof(*R)); R->status = -1; }

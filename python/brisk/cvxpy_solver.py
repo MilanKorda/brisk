@@ -428,7 +428,7 @@ class BRISK(ConicSolver):
         soc = opts.pop("soc", "auto")
         amax = opts.pop("soc_arrow_max", None)
         bound = opts.pop("bound", None)
-        do_cert = bool(opts.pop("certify", False))
+        opts.pop("certify", None)          # accepted; a bound is always checked rigorously
         opts.pop("use_quad_obj", None)
         dims = data[ConicSolver.DIMS]
         cone = opts.pop("conesolver", 1)
@@ -458,11 +458,14 @@ class BRISK(ConicSolver):
             # SOS Gram matrices); "dual": a feasible dual. In the image form CVXPY's primal
             # is BRISK's (D), in the kernel form BRISK's (P).
             b0 = str(bound).lower()
-            if b0 not in ("primal", "dual", "sos", "p", "d"):
-                raise ValueError('bound must be "primal", "dual" or "sos"')
-            prim = b0 in ("primal", "sos", "p")
-            side = ("d" if prim else "p") if info["form"] == "image" else ("p" if prim else "d")
-            argv += ["-bound", side] + (["-certify"] if do_cert else [])
+            if b0 not in ("primal", "dual", "sos", "p", "d", "both", "pd"):
+                raise ValueError('bound must be "primal", "dual", "sos" or "both"')
+            if b0 in ("both", "pd"):
+                side = "pd"
+            else:
+                prim = b0 in ("primal", "sos", "p")
+                side = ("d" if prim else "p") if info["form"] == "image" else ("p" if prim else "d")
+            argv += ["-bound", side]       # (always checked rigorously; "certify" is accepted and implied)
         info["bound_side"] = side
         try:
             res = _core.solve_sdpa(*sd, options=argv, verbose=verbose, _caller="cvxpy")
@@ -479,22 +482,26 @@ class BRISK(ConicSolver):
                 s.EXTRA_STATS: {"status": res.status_str, "dimacs": res.dimacs,
                                 "exit_code": res.exit_code, "form": info["form"],
                                 "blocksizes": res.blocksizes, "interrupted": res.interrupted}}
-        if res.bound:
+        def conic_bound(b, side):
             # the bound on the conic problem  min c'x + offset  that CVXPY solves (for a
-            # Maximize model CVXPY minimizes -f: the kind and the sign then flip)
-            v = res.bound["value"]
+            # Maximize model CVXPY minimizes -f: the kind and the sign then flip); a guaranteed
+            # bound only when certified (then "rigorous" is it)
+            v = b["value"]
             img = info["form"] == "image"
             conic = (-v if img else v) + inverse_data[s.OFFSET]
-            kind = res.bound["kind"]
+            kind = b["kind"]
             if img:
                 kind = "lower" if kind == "upper" else "upper"
-            rig = res.bound.get("rigorous")
+            rig = b.get("rigorous")
             if rig is not None and np.isfinite(rig):
                 rig = (-rig if img else rig) + inverse_data[s.OFFSET]
-            attr[s.EXTRA_STATS]["bound"] = dict(value=conic, kind=kind, brisk_side=res.bound["side"],
-                                                resid=res.bound["resid"], lammin=res.bound["lammin"],
-                                                valid=res.bound["valid"], certified=res.bound["certified"],
-                                                rigorous=rig)
+            return dict(value=conic, kind=kind, brisk_side=side, resid=b["resid"], lammin=b["lammin"],
+                        valid=b["valid"], certified=b["certified"], rigorous=rig)
+        if res.bound:
+            attr[s.EXTRA_STATS]["bound"] = conic_bound(res.bound, res.bound["side"])
+        if res.bounds:
+            attr[s.EXTRA_STATS]["bounds"] = {cb["kind"]: cb for cb in
+                                             (conic_bound(b, sd) for sd, b in res.bounds.items() if b.get("have"))}
         attr[s.EXTRA_STATS]["n_resolves"] = res.n_resolves
         attr[s.EXTRA_STATS]["cause"] = res.cause
         smap = self.STATUS_IMAGE if info["form"] == "image" else self.STATUS_KERNEL

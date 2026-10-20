@@ -84,6 +84,12 @@ def load_library(path=None):
     L.brisk_solve_file.argtypes = [ctypes.c_char_p, I, ppc, P]
     L.brisk_solve_file.restype = I
     L.brisk_result_bound.argtypes, L.brisk_result_bound.restype = [P, pd], I
+    if hasattr(L, "brisk_result_bound_of"):  # per side (-bound p|d|pd) with the certificates
+        L.brisk_result_bound_of.argtypes, L.brisk_result_bound_of.restype = [P, I, pd], I
+        L.brisk_result_bound_src.argtypes, L.brisk_result_bound_src.restype = [P, I], ctypes.c_char_p
+        L.brisk_result_bound_X.argtypes, L.brisk_result_bound_X.restype = [P, I], pd
+        L.brisk_result_bound_y.argtypes, L.brisk_result_bound_y.restype = [P], pd
+        L.brisk_result_bound_sx.argtypes, L.brisk_result_bound_sx.restype = [P], pd
     L.brisk_result_resolves.argtypes, L.brisk_result_resolves.restype = [P, pd], I
     L.brisk_result_cause.argtypes, L.brisk_result_cause.restype = [P], ctypes.c_char_p
     if hasattr(L, "brisk_hp_text"):          # high precision: all the digits as text
@@ -92,6 +98,8 @@ def load_library(path=None):
         L.brisk_hp_blocksize.argtypes, L.brisk_hp_blocksize.restype = [I], I
         L.brisk_hp_count.argtypes, L.brisk_hp_count.restype = [I, I], ctypes.c_longlong
         L.brisk_hp_text.argtypes, L.brisk_hp_text.restype = [I, I, ctypes.c_char_p, ctypes.c_longlong], ctypes.c_longlong
+        if hasattr(L, "brisk_hp_cert_digits"):
+            L.brisk_hp_cert_digits.argtypes, L.brisk_hp_cert_digits.restype = [], I
     if hasattr(L, "brisk_solve_sedumi"):     # problems in SeDuMi format
         L.brisk_solve_sedumi.argtypes = [I, I, pi, pi, pd, pd, pd, I, I, I, pi, I, pi, I, pi, I, ppc, P]
         L.brisk_solve_sedumi.restype = I
@@ -131,7 +139,9 @@ class Result:
     X: Optional[List[np.ndarray]] = None
     Z: Optional[List[np.ndarray]] = None
     interrupted: bool = False        # stopped by Ctrl-C / brisk.interrupt() (status 6)
-    bound: Optional[dict] = None     # -bound p|d: side, value, resid, lammin, valid, certified
+    bound: Optional[dict] = None     # -bound p|d: side, value, resid, lammin, valid, certified (the first side asked for)
+    bounds: Optional[dict] = None    # per side asked for ("p", "d"): kind, value, resid, lammin, valid, certified,
+                                     # rigorous (a bound only when certified), src, and the certificate X (p) or y (d)
     n_resolves: int = 0              # re-solves run (method retry, fallbacks) and their time
     t_resolves: float = 0.0
     cause: str = ""                  # likely cause when the tolerance is missed
@@ -295,6 +305,35 @@ def _run(call, options, verbose, collect=None, caller=None):
         cleanup()
 
 
+def _bounds(L, r, blocks=None, n=0, m=0):
+    """The bound of each side asked for (-bound p|d|pd), with its certificate: X (a list of
+    blocks; x for a problem in SeDuMi format) for p, y for d. A value is a guaranteed bound
+    only when "certified" is True (then "rigorous" is that bound)."""
+    if not hasattr(L, "brisk_result_bound_of"):
+        return None
+    out = {}
+    bo = (ctypes.c_double * 6)()
+    for side, name in ((1, "p"), (2, "d")):
+        st = L.brisk_result_bound_of(r, side, bo)
+        if st == 0:
+            continue
+        d = dict(kind="upper" if side == 1 else "lower", have=st == 2, value=bo[0], resid=bo[1], lammin=bo[2],
+                 valid=int(bo[3]), certified=bool(bo[4]), rigorous=bo[5],
+                 src=(L.brisk_result_bound_src(r, side) or b"").decode())
+        if side == 1:
+            if blocks is not None:
+                d["X"] = blocks(L.brisk_result_bound_X)
+            ps = L.brisk_result_bound_sx(r)
+            if ps and n > 0:
+                d["x"] = np.ctypeslib.as_array(ps, shape=(n,)).copy()
+        else:
+            py = L.brisk_result_bound_y(r)
+            if py and m > 0:
+                d["y"] = np.ctypeslib.as_array(py, shape=(m,)).copy()
+        out[name] = d
+    return out or None
+
+
 def _collect(L, r, rc):
     err = (ctypes.c_double * 6)()
     L.brisk_result_dimacs(r, err)
@@ -334,6 +373,7 @@ def _collect(L, r, rc):
     if L.brisk_result_have_x(r):
         res.X = blocks(L.brisk_result_X)
     res.Z = blocks(L.brisk_result_Z)
+    res.bounds = _bounds(L, r, blocks=blocks, m=m)
     if rc < 0 or rc in (1, 2) or (status == -1 and rc not in (0, 20)):
         raise RuntimeError(f"BRISK did not solve the problem (exit code {rc}: "
                            + {1: "bad options", 2: "invalid problem data"}.get(rc, "aborted") + ")")
@@ -357,6 +397,7 @@ class ConeResult:
     y: Optional[np.ndarray] = None
     z: Optional[np.ndarray] = None
     interrupted: bool = False
+    bounds: Optional[dict] = None    # per side asked for (-bound p|d|pd), as Result.bounds; certificate x (p) or y (d)
 
     def __repr__(self):
         return (f"brisk.ConeResult({self.status_str}, pobj={self.pobj:.10g}, dobj={self.dobj:.10g}, "
@@ -377,6 +418,7 @@ def _collect_sedumi(L, r, rc):
     for name, ptr, k in (("x", L.brisk_result_sx(r), n), ("y", L.brisk_result_y(r), m), ("z", L.brisk_result_sz(r), n)):
         if ptr and k > 0:
             setattr(res, name, np.ctypeslib.as_array(ptr, shape=(k,)).copy())
+    res.bounds = _bounds(L, r, n=n, m=m)
     return res
 
 
@@ -462,7 +504,7 @@ def solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True, _ca
         P(arrs[2], pi), P(arrs[3], pi), P(v, pd), n, a, r), options, verbose, caller=_caller)
 
 
-def certify(problem, side, X=None, y=None, verbose=False, prec=None):
+def certify(problem, side, X=None, y=None, verbose=False, prec=None, prior=True):
     """Rigorous check of a certificate (in libbrisk: -certify-x / -certify-y): side "p"
     with X (a list of blocks, n x n or LP vectors) proves the upper bound <C,X> on the optimal
     value of BRISK's (P), side "d" with y the lower bound b'y. problem: an SDPA file name or a
@@ -470,6 +512,9 @@ def certify(problem, side, X=None, y=None, verbose=False, prec=None):
     prec ("dd", "qd" or a number of digits): the check runs in that precision (plus guard
     digits); X or y may then hold decimal.Decimal, mpmath.mpf or strings (as hp_solution
     returns them), and `bound` is a decimal.Decimal with all the digits.
+    prior: a certificate without a margin (the other side without an interior) is certified by
+    a-priori bounds of the other side found from the problem (-boundprior; the bound then holds
+    for the optimal value of that other side), unless prior=False.
     Returns dict(certified, bound, reason)."""
     import os
     import tempfile
@@ -504,6 +549,8 @@ def certify(problem, side, X=None, y=None, verbose=False, prec=None):
         opt = ["-certify-x" if side == "p" else "-certify-y", tmp]
         if prec is not None:
             opt += ["-prec", str(prec)]
+        if not prior:
+            opt += ["-boundprior", "0"]
         if isinstance(problem, dict):
             r = solve_sdpa(**problem, options=opt, verbose=verbose)
         else:
@@ -536,10 +583,11 @@ def hp_solution(convert=None):
     digits). The Result of that solve holds the solution rounded to doubles; this returns a
     dict with digits, blocksizes, pobj (<C,X>), dobj (b'y), y, X and Z (one array per block,
     n x n or n), each value converted from its decimal text by `convert` (default
-    decimal.Decimal; e.g. mpmath.mpf, fractions.Fraction or str). With the option
-    bound = "p" or "d" and a certificate, `bound` is the rigorous bound on the optimal value
-    of (P) (an upper bound for p, a lower bound for d; rounded outward) and the certificate
-    is the X or the y returned, with all the digits of its check; otherwise `bound` is None.
+    decimal.Decimal; e.g. mpmath.mpf, fractions.Fraction or str). The solution is the solve's
+    own point. With the option bound = "p", "d" or "pd", `bounds` maps each certified side
+    ("p", "d") to its rigorous bound on the optimal value of (P) (an upper bound for p, a lower
+    bound for d; rounded outward) and its certificate (X for p, y for d) with all the digits of
+    its check; `bound` is that of the first side (None without one).
     None when the last solve was not a high-precision one."""
     L = load_library()
     if not hasattr(L, "brisk_hp_text") or L.brisk_hp_digits() <= 0:
@@ -558,9 +606,19 @@ def hp_solution(convert=None):
     bs = [L.brisk_hp_blocksize(k) for k in range(L.brisk_hp_nblk())]
     first = lambda v: v[0] if v else None
     out = dict(digits=L.brisk_hp_digits(), blocksizes=bs, pobj=first(get(0)), dobj=first(get(1)),
-               y=np.array(get(2), dtype=object), X=[], Z=[], bound=first(get(5)))
+               y=np.array(get(2), dtype=object), X=[], Z=[], bound=first(get(5)), bounds={})
     for k, n in enumerate(bs):
         for what, key in ((3, "X"), (4, "Z")):
             v = np.array(get(what, k), dtype=object)
             out[key].append(v if n < 0 else v.reshape((n, n)))
+    if hasattr(L, "brisk_hp_cert_digits"):
+        bp, bd = first(get(6)), first(get(7))
+        if bp is not None:
+            Xc = []
+            for k, n in enumerate(bs):
+                v = np.array(get(8, k), dtype=object)
+                Xc.append(v if n < 0 else v.reshape((n, n)))
+            out["bounds"]["p"] = dict(bound=bp, X=Xc)
+        if bd is not None:
+            out["bounds"]["d"] = dict(bound=bd, y=np.array(get(9), dtype=object))
     return out

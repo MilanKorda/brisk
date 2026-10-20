@@ -109,14 +109,18 @@ static void usage(void) {
         "  -tol <t>         relative gap / infeasibility tolerance (1e-8)\n"
         "  -maxit <k>       iteration limit (100)\n"
         "  -timelimit <s>   wall-clock limit in seconds (0 = none)\n"
-        "  -bound p|d       return the best GUARANTEED bound instead of the best-balanced pair:\n"
+        "  -bound p|d|pd    also return GUARANTEED bounds on the optimal value, on the sides asked for:\n"
         "                   p: a feasible X of (P) (A(X) = b to -boundtol, X > 0 with a margin), <C,X> an\n"
         "                   upper bound on the optimal value even when the solve does not converge; d: a\n"
-        "                   feasible y (Z = C - A'y > 0 verified), b'y a lower bound. (P) is the SDPA dual\n"
-        "                   (min <C,X>, C = -F0): SOS certificates from SeDuMi/GloptiPoly are -bound p;\n"
-        "                   relaxations of minimisation problems take the lower bound from -bound d.\n"
-        "                   The certificate replaces its side of the returned pair (-x / -y write it);\n"
-        "                   -certify makes the bound rigorous. See README (bound mode).\n"
+        "                   feasible y (Z = C - A'y > 0 verified), b'y a lower bound; pd: both, in one\n"
+        "                   solve. (P) is the SDPA dual (min <C,X>, C = -F0): SOS certificates from\n"
+        "                   SeDuMi/GloptiPoly are -bound p; relaxations of minimisation problems take the\n"
+        "                   lower bound from -bound d. Each certificate is checked rigorously on the\n"
+        "                   problem as read; only a certified one is a bound. The returned point, its\n"
+        "                   status and -x / -y stay the solve's own (-boundx / -boundy write the\n"
+        "                   certificates). Only the sides asked for are evaluated. See README (bound mode).\n"
+        "  -boundx <f>      with -bound p or pd: write the certificate X (the -x format)\n"
+        "  -boundy <f>      with -bound d or pd: write the certificate y (the -y format)\n"
         "  -boundanchor <f> with -bound d: a y (the -y format, as read) whose Z = C - A'y is positive\n"
         "                   definite, e.g. from a solve of the problem with the largest margin; a\n"
         "                   candidate whose Z is not positive semidefinite is blended with it\n"
@@ -124,9 +128,16 @@ static void usage(void) {
         "  -boundmargin <e> eigenvalue margin of the certificate, relative to 1 + max diagonal; at least\n"
         "                   8 n^2 u per block of order n, what a rigorous check needs (1e-13)\n"
         "  -boundtrack <t>  residual below which iterates are tracked as candidates (100 x -boundtol)\n"
-        "  -certify         with -bound, check the certificate rigorously on the\n"
-        "                   problem as read (the file's decimals enclosed in intervals, directed rounding,\n"
-        "                   a verified lambda_min) and print the rigorous bound\n"
+        "  -boundprec <k>   the lambda_min checks of the bound mode beyond double, when only their rounding\n"
+        "                   allowance fails them (about n^2 u on a unit diagonal): -1 automatic (192 bits,\n"
+        "                   then 384), 0 double only, > 0 that many bits (mpx arithmetic, a-priori error bounds)\n"
+        "  -boundprior <k>  when a certificate has no margin (the other side without an interior): a rigorous\n"
+        "                   bound from a-priori bounds of the other side found from the problem (1, the\n"
+        "                   default; 0 off): y bounded through Z(y) >= 0 (moment relaxations with a ball or\n"
+        "                   box constraint), the diagonal of X through equations of positive diagonal entries\n"
+        "  -certify         (implied by -bound) the rigorous check of a certificate on the problem as\n"
+        "                   read: the file's decimals enclosed in intervals, directed rounding, a\n"
+        "                   verified lambda_min; the rigorous bound is printed\n"
         "  -certify-x <f>   no solve: rigorously check the X in f (-x format: block i j value) as a\n"
         "  -certify-y <f>   ... p certificate, or the y in f (-y format) as a d certificate; exit code 0\n"
         "                   when certified, 20 when not (certificates of any solver in these formats)\n"
@@ -150,11 +161,12 @@ static void usage(void) {
         "                   Newton method runs in high precision instead, with -lralm 1 the low-rank\n"
         "                   (X = R R') augmented Lagrangian method. -x/-y/-z write all the digits.\n"
         "                   Status PRECISION LIMIT: the accuracy the precision reaches on the problem\n"
-        "                   With -bound p|d the certificate of that side is built in high precision on the\n"
-        "                   problem as read and checked rigorously (in the precision of -prec plus guard\n"
+        "                   With -bound p|d|pd the certificate of each side is built in high precision on\n"
+        "                   the problem as read and checked rigorously (in the precision of -prec plus guard\n"
         "                   limbs, with a-priori error bounds of the arithmetic); the rigorous bound is\n"
-        "                   printed with all digits, and -x / -y write the certificate with all the digits\n"
-        "                   of its check. -certify-x / -certify-y with -prec check a given certificate\n"
+        "                   printed with all digits, and -boundx / -boundy write the certificates with all\n"
+        "                   the digits of their check (-x / -y: the solution, with the digits of -prec).\n"
+        "                   -certify-x / -certify-y with -prec check a given certificate\n"
         "                   the same way (p needs an interior of (P), d one of (D))\n"
         "  -hpext <k>       interior-point method: when the precision is exhausted short of the tolerance\n"
         "                   (problems without an interior that the presolve does not reduce reach about\n"
@@ -200,7 +212,8 @@ static void usage(void) {
         "  -tracebound <R>  with the elimination: the row sum tr(X) + s = R that keeps the Gram side\n"
         "                   bounded (-1 auto: 1e7 (1 + max|b|), 0 off)\n"
         "  -dualize <k>     solve the dual form (Z + sum y_i A_i = C entrywise, y eliminated) when its\n"
-        "                   Schur complement is at most half the size: -1 auto, 0 off, 1 force\n"
+        "                   Schur complement is at most half the size and the problem has an objective\n"
+        "                   (not for a feasibility problem): -1 auto, 0 off, 1 force\n"
         "  -mfipm <k>       matrix-free interior-point method: NT Mehrotra steps, Newton systems\n"
         "                   by preconditioned CG, no Schur complement (1 on, 0 off); for problems with\n"
         "                   a low-rank optimal side (moment-SOS with few atoms). 2: the hybrid - the\n"
@@ -259,7 +272,8 @@ static void usage(void) {
         "                   and a sparse Gram matrix A A' (theta-type problems)\n"
         "                   that the presolve leaves as they are (no chordal conversion, no dual form)\n"
         "                   and whose interior-point solve is expected to take 20 s or more, the\n"
-        "                   first-order engine runs first for the fraction f of that time (0.2; 0 off);\n"
+        "                   first-order engine runs first for the fraction f of that time (default 0: off;\n"
+        "                   it lost wherever it ran on the sets, e.g. 0.2);\n"
         "                   the interior-point method follows if it has not reached the tolerance\n"
         "  -fomstart-x <f>  start the first-order engine from the X in f (the -x format) ...\n"
         "  -fomstart-y <f>  ... and the y in f (the -y format): continuing a long run (needs -nosym\n"
@@ -302,8 +316,10 @@ static void usage(void) {
         "                   eigendecomposition and two n x n products per block: 0.2 s at n = 1000,\n"
         "                   1.3 s at n = 1860)\n"
         "  -blkscale <k>    diagonal congruence scaling of the semidefinite blocks, X = D X' D with D from the\n"
-        "                   data (Ruiz iterations, powers of two): 1 on, -1 when a block's factors spread by 4\n"
-        "                   or more, 0 off (the default)\n"        "  -chordal <k>     chordal decomposition: -1 auto, 0 off, 1 force\n"
+        "                   data in powers of two: 2 by the size of the data at each index (D = 1 / the largest\n"
+        "                   |coefficient| there, within 2^-20..2^20), 1 by Ruiz iterations; -2, -1 the same when\n"
+        "                   a block's factors spread by 4 or more; 0 off (the default). When the scaled solve\n"
+        "                   misses the tolerance the problem is solved as given and the better answer kept\n"        "  -chordal <k>     chordal decomposition: -1 auto, 0 off, 1 force\n"
         "  -chordalmin <n>  only blocks at least this large (100)\n"
         "  -returnx <k>     library calls (MATLAB, Python, Julia): X of a chordal-decomposed block is\n"
         "                   -1 returned as a dense matrix unless that needs more than 30%% of the memory\n"
@@ -498,7 +514,7 @@ typedef struct {
     double *y, **X, **Xo, *yo;
     int status, measured, fr_removed;
     double acc, tread, tpre;
-    BoundCert cert;         /* 4.37 bound mode: the best certificate of this run, on the problem as read */
+    BoundCert cert[2];      /* 4.37 bound mode: the best certificate of this run per side ([0] p, [1] d), on the problem as read */
     int fom_check;          /* 4.39: the first-order decision deferred until after the dual form and free elimination */
     int fom_chordal;        /* 4.40: ... until after the chordal conversion (a very sparse large block) */
     double fr_cost;      /* per-iteration cost of the problem as read over that of the reduced problem (the model of the fr_gain rule) */
@@ -525,7 +541,7 @@ static void run_free(Run *u) {
     if (u->Oalg) ps_orig_free(u->Oalg);
     alg_free(u->alg);
     free_elim_free(u->fe);
-    bound_cert_free(&u->cert);
+    bound_cert_free(&u->cert[0]); bound_cert_free(&u->cert[1]);
     problem_free(&u->P);
     memset(u, 0, sizeof(*u));
 }
@@ -784,6 +800,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         const char *e = getenv("BRISK_BLKSCALE");
         const int mode = e ? atoi(e) : par->blkscale;
         if (getenv("BRISK_BLKSCALEMIN")) g_blkscale_min = atof(getenv("BRISK_BLKSCALEMIN"));
+        if (getenv("BRISK_BLKSCALECAP")) g_blkscale_cap = atof(getenv("BRISK_BLKSCALECAP"));
         PSOrig *Of = mode ? ps_orig_build(P) : NULL;
         u->aff = mode ? blkscale_apply(P, mode, par->verbose) : NULL;
         if (u->aff) u->Oaff = Of; else if (Of) ps_orig_free(Of);
@@ -861,7 +878,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
             long N = 0; int nlp = 0;
             for (int k = 0; k < P->nblk; k++) { if (P->blk[k].type == BLK_SDP) N += (long)P->blk[k].n * (P->blk[k].n + 1) / 2; else nlp += P->blk[k].n; }
             const long mK = P->m - np, mD = N + (nlp - 2L * np) + np - P->m;
-            if (par->dualize < 0 && par->free_elim != 0 && mD >= 1 && mD <= mK / 2 && mK >= 20) mf_want = 0;
+            if (par->dualize < 0 && par->free_elim != 0 && mD >= 1 && mD <= mK / 2 && mK >= 20 && dualize_has_objective(P)) mf_want = 0;
             for (int k = 0; k < P->nblk && mf_want; k++) {
                 const Block *B = &P->blk[k];
                 if (B->type != BLK_SDP || B->n < 200 || par->chordal == 0) continue;
@@ -994,7 +1011,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
             long N = 0; int nlp = 0;
             for (int k = 0; k < P->nblk; k++) { if (P->blk[k].type == BLK_SDP) N += (long)P->blk[k].n * (P->blk[k].n + 1) / 2; else nlp += P->blk[k].n; }
             const long mK = P->m - np, mD = N + (nlp - 2L * np) + np - P->m;
-            const int dual_rule = par->dualize > 0 || (par->dualize < 0 && par->free_elim != 0 && mD >= 1 && mD <= mK / 2 && mK >= 20);
+            const int dual_rule = par->dualize > 0 || (par->dualize < 0 && par->free_elim != 0 && mD >= 1 && mD <= mK / 2 && mK >= 20 && dualize_has_objective(P));
             const double mp = dual_rule ? (double)mD : (par->free_elim != 0 ? (double)mK : (double)P->m);
             if (8.0 * mp * mp <= 0.5 * ram) {
                 use = 0; u->fom_check = 1;
@@ -1226,21 +1243,29 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     }
     int st_ = -1;
     double tdual = 0;
-    /* 4.37 bound mode: the tracker of the side asked for, on this problem (the dual form
-     * exchanges the sides); one X and one y per slot, best and anchor */
-    BoundTrack bt;
-    memset(&bt, 0, sizeof(bt));
+    /* 4.37 bound mode: a tracker per side asked for, on this problem (the dual form exchanges
+     * the sides); one X and one y per slot, best and anchor */
+    BoundTrack bt[2];
+    memset(bt, 0, sizeof(bt));
+    par->btrack = par->btrack2 = NULL;
     if (par->bound_side) {
-        bt.side = u->dual ? 3 - par->bound_side : par->bound_side;
-        bt.tol = par->bound_track_tol > 0 ? par->bound_track_tol : 100.0 * par->bound_tol;
-        bt.tol_a = fmax(bt.tol, 1e-2);     /* anchors: the barrier-metric step of bound.c makes them feasible */
-        bt.m = P->m; bt.nblk = P->nblk;
-        double bytes = 8.0 * (BOUND_NANCHOR + 1) * (P->m + 1);
-        for (int k = 0; k < P->nblk; k++) bytes += 8.0 * (BOUND_NANCHOR + 1) * (double)(P->blk[k].type == BLK_SDP ? (size_t)P->blk[k].n * P->blk[k].n : (size_t)P->blk[k].n);
-        if (bytes > fmin(1024.0 * 1048576.0 * brisk_mem_scale(), 0.15 * brisk_mem_limit())) {
-            bt.disabled = 1;
-            if (par->verbose >= 0) printf("bound: the candidates (%.0f MB) do not fit; only the returned points are certified\n", bytes / 1048576.0);
-        } else {
+        const int nside = (par->bound_side & 1) + ((par->bound_side >> 1) & 1);
+        for (int sd = 1; sd <= 2; sd++) {
+            if (!(par->bound_side & sd)) continue;
+            BoundTrack *T = &bt[sd - 1];
+            T->side = u->dual ? 3 - sd : sd;
+            /* (1e-7 at the default bound_tol: the certificate projects X onto A(X) = b anyway, and a
+             * late iterate at 2e-8 can be several units better than every one at 1e-8) */
+            T->tol = par->bound_track_tol > 0 ? par->bound_track_tol : 1000.0 * par->bound_tol;
+            T->tol_a = fmax(T->tol, 1e-2);     /* anchors: the barrier-metric step of bound.c makes them feasible */
+            T->m = P->m; T->nblk = P->nblk;
+            double bytes = 8.0 * (BOUND_NANCHOR + 1) * (P->m + 1);
+            for (int k = 0; k < P->nblk; k++) bytes += 8.0 * (BOUND_NANCHOR + 1) * (double)(P->blk[k].type == BLK_SDP ? (size_t)P->blk[k].n * P->blk[k].n : (size_t)P->blk[k].n);
+            if (nside * bytes > fmin(1024.0 * 1048576.0 * brisk_mem_scale(), 0.15 * brisk_mem_limit())) {
+                T->disabled = 1;
+                if (par->verbose >= 0) printf("bound: the candidates (%.0f MB) do not fit; only the returned points are certified\n", nside * bytes / 1048576.0);
+                continue;
+            }
             for (int s = 0; s <= BOUND_NANCHOR; s++) {
                 double **X = calloc(P->nblk + 1, sizeof(double *));
                 for (int k = 0; k < P->nblk; k++) {
@@ -1248,9 +1273,9 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
                     X[k] = calloc(len + 1, sizeof(double));
                 }
                 double *yv = calloc(P->m + 1, sizeof(double));
-                if (s == 0) { bt.X = X; bt.y = yv; } else { bt.Xa[s - 1] = X; bt.ya[s - 1] = yv; }
+                if (s == 0) { T->X = X; T->y = yv; } else { T->Xa[s - 1] = X; T->ya[s - 1] = yv; }
             }
-            par->btrack = &bt;
+            if (!par->btrack) par->btrack = T; else par->btrack2 = T;
         }
     }
     if (P->m > 0 && !par->fom && !par->mfipm && !par->lralm && !par->dual && par->sparse_schur != 0 && !par->mf_trial
@@ -1388,7 +1413,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         }
     }
     if (st_ < 0) { brisk_solve(P, par, R, u->y, u->X); R->t_total += tdual; }
-    par->btrack = NULL;
+    par->btrack = par->btrack2 = NULL;
     if (u->aff_par) { par->tol = u->aff_tol0; u->aff_par = NULL; }   /* (the tolerance asked for, on the problem as read) */
     /* ---- postsolve: the solution of the problem as read, and its errors */
     u->yo = calloc(u->O->m + 1, sizeof(double));
@@ -1415,24 +1440,26 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     u->nXo = u->O->nblk;
     u->Ofin = u->O;
     run_finish(u, par);
-    if (par->bound_side) {
+    for (int sd = 1; sd <= 2; sd++) {
+        if (!(par->bound_side & sd)) continue;
         /* 4.37: certificates from the tracked candidate (with its anchor) and from the
-         * returned point, on the problem as read; the better one is the run's */
+         * returned point, on the problem as read; the better one is the run's (per side) */
+        BoundTrack *T = &bt[sd - 1];
         const double tb0 = wtime();
         double **Xt = NULL, *yt = NULL, **XA[BOUND_NANCHOR], *YA[BOUND_NANCHOR];
         int nXt = 0, nXA[BOUND_NANCHOR], na = 0;
-        for (int s = -1; s < bt.na; s++) {
-            if (s < 0 && !bt.have) continue;
+        for (int s = -1; s < T->na; s++) {
+            if (s < 0 && !T->have) continue;
             double **Xm = NULL, *ym = calloc(u->O->m + 1, sizeof(double));
             PSResult prc;
-            postsolve(P, u->O, s < 0 ? bt.X : bt.Xa[s], s < 0 ? bt.y : bt.ya[s], &Xm, ym, &prc, 0);
+            postsolve(P, u->O, s < 0 ? T->X : T->Xa[s], s < 0 ? T->y : T->ya[s], &Xm, ym, &prc, 0);
             int nX = u->O->nblk;
             map_back(u, par, &Xm, &ym, &nX, 0);
             if (s < 0) { Xt = Xm; yt = ym; nXt = nX; }
             else { XA[na] = Xm; YA[na] = ym; nXA[na] = nX; na++; }
         }
         PSOrig *Of = u->Ofin ? u->Ofin : u->O;
-        if (par->bound_anchor && par->bound_side == 2 && na < BOUND_NANCHOR) {
+        if (par->bound_anchor && sd == 2 && na < BOUND_NANCHOR) {
             /* a y given by the user as the anchor of the dual side (the problem as read) */
             FILE *fa = fopen(par->bound_anchor, "r");
             if (!fa) fprintf(stderr, "brisk: cannot read %s\n", par->bound_anchor);
@@ -1447,26 +1474,41 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         BoundCert c1, c2;
         memset(&c1, 0, sizeof(c1)); memset(&c2, 0, sizeof(c2));
         char src[48];
-        snprintf(src, sizeof(src), "iteration %d", bt.it);
+        snprintf(src, sizeof(src), "iteration %d", T->it);
         { extern double g_bound_deadline; g_bound_deadline = par->timelimit > 0 ? par->t_start + par->timelimit : 0; }
-        if (bt.have) bound_certify(Of, par->bound_side, Xt, yt, na, XA, YA, par->bound_margin, par->bound_tol, src, par->verbose, &c1);
-        bound_certify(Of, par->bound_side, u->Xo, u->yo, na, XA, YA, par->bound_margin, par->bound_tol, "the returned point", par->verbose, &c2);
-        if (bound_better(&c1, &c2)) { u->cert = c1; bound_cert_free(&c2); } else { u->cert = c2; bound_cert_free(&c1); }
-        u->cert.attempt = g_run_no;
-        if (par->verbose > 0 && u->cert.have)
+        if (T->have) bound_certify(Of, sd, Xt, yt, na, XA, YA, par->bound_margin, par->bound_tol, src, par->verbose, &c1);
+        bound_certify(Of, sd, u->Xo, u->yo, na, XA, YA, par->bound_margin, par->bound_tol, "the returned point", par->verbose, &c2);
+        BoundCert *uc = &u->cert[sd - 1];
+        {
+            /* the candidate before its margin was restored goes with the kept certificate when it
+             * is the better of the two: the a-priori route (main.c) may certify it */
+            BoundCert *win = bound_better(&c1, &c2) ? &c1 : &c2, *lose = win == &c1 ? &c2 : &c1;
+            const int lhas = sd == 1 ? lose->X0 != NULL : lose->y0 != NULL, whas = sd == 1 ? win->X0 != NULL : win->y0 != NULL;
+            const double wv = whas ? win->value0 : win->value;
+            if (lhas && win->have && (sd == 1 ? lose->value0 < wv : lose->value0 > wv)) {
+                bound_free_blocks(win->X0, win->nblk); free(win->y0);
+                win->X0 = lose->X0; win->y0 = lose->y0; win->value0 = lose->value0;
+                lose->X0 = NULL; lose->y0 = NULL;
+            }
+            *uc = *win; bound_cert_free(lose);
+        }
+        uc->attempt = g_run_no;
+        if (par->verbose > 0 && uc->have)
             printf("   bound: %s from %s: %.10e (residual %.1e, lambda_min %.1e rel; %d candidates offered, %d anchors, %.2fs)\n",
-                   par->bound_side == 1 ? "upper" : "lower", u->cert.src, u->cert.value, u->cert.resid, u->cert.lammin, bt.offers, na, wtime() - tb0);
+                   sd == 1 ? "upper" : "lower", uc->src, uc->value, uc->resid, uc->lammin, T->offers, na, wtime() - tb0);
         bound_free_blocks(Xt, nXt); free(yt);
-        for (int a = 0; a < na; a++) { bound_free_blocks(XA[a], nXA[a]); free(YA[a]); }
+        for (int a2 = 0; a2 < na; a2++) { bound_free_blocks(XA[a2], nXA[a2]); free(YA[a2]); }
     }
-    if (bt.X) {
-        bound_free_blocks(bt.X, bt.nblk); free(bt.y);
-        for (int s = 0; s < BOUND_NANCHOR; s++) { bound_free_blocks(bt.Xa[s], bt.nblk); free(bt.ya[s]); }
+    for (int sd = 0; sd < 2; sd++) {
+        BoundTrack *T = &bt[sd];
+        if (!T->X) continue;
+        bound_free_blocks(T->X, T->nblk); free(T->y);
+        for (int s = 0; s < BOUND_NANCHOR; s++) { bound_free_blocks(T->Xa[s], T->nblk); free(T->ya[s]); }
     }
     return 0;
 }
 
-static const Params *g_rank_par = NULL;     /* 4.37: bound mode ranks runs by their certificates */
+static const Params *g_rank_par = NULL;     /* 4.37: bound mode: the certificates follow the run that is kept */
 /* ranking of a finished run: lower is better */
 static double run_rank(const Run *u) {
     switch (u->status) {
@@ -1625,11 +1667,7 @@ static void bound_hint(int hp) {
     const int model = k == CK_CVXPY || k == CK_JUMP;      /* the modelling layers name the sides of the model */
     const char *kc = syn_kv("certify", NULL, 0);
     const char *head = hp ? syn_head() : "";              /* (after the lines on accuracy the place has just been named) */
-    if (g_has_bound && (g_has_certify || hp)) return;
-    if (g_has_bound) {
-        printf("For a rigorous check of the bound%s:\n  %s   the certificate is checked on the problem as read, with directed rounding\n", head, kc);
-        return;
-    }
+    if (g_has_bound) return;          /* (the bound is checked rigorously whenever it is asked for) */
     const char *kb = syn_kv("bound", model ? "dual" : "d", 1);
     int w = (int)strlen(kb);
     if (!hp && (int)strlen(kc) > w) w = (int)strlen(kc);
@@ -1638,8 +1676,8 @@ static void bound_hint(int hp) {
     else printf("  %-*s   a lower bound b'y from a feasible y (%s: an upper bound %s)", w, kb, syn_val("p"),
                 strstr(cmd, "sedumi") ? "c'x from a feasible x" : "<C,X> from a feasible X");
     if (hp) printf(";\n  %-*s   the certificate is built and checked rigorously in the precision of the solve\n", w, "");
-    else printf(";\n  %-*s   with the high-precision solver the certificate is built and checked in its precision\n"
-                "  %-*s   with a bound: the certificate is checked rigorously on the problem as read\n", w, "", w, kc);
+    else printf(";\n  %-*s   the certificate is checked rigorously on the problem as read (with the\n"
+                "  %-*s   high-precision solver it is built and checked in its precision)\n", w, "", w, "");
 }
 static void accuracy_hint(int lp) {
     if (lp) { printf("For higher accuracy%s:\n  %s   the tolerance (default 1e-8)\n", syn_head(), syn_kv("tol", "<t>", 0)); return; }
@@ -1660,14 +1698,27 @@ static int g_natt = 0, g_first_internal = 0;
 static double g_first_t = 0, g_first_acc = 0;
 static void att_log(const char *name, double t, const void *run);
 
-/* 4.37: the second run replaces the first; in bound mode by the better certificate */
-static int run_better(const Run *a, const Run *b) {
-    /* only a valid certificate decides; otherwise the usual ranking */
-    if (g_rank_par && g_rank_par->bound_side && ((a->cert.have && a->cert.valid) || (b->cert.have && b->cert.valid))) {
-        if (bound_better(&a->cert, &b->cert)) return 1;
-        if (bound_better(&b->cert, &a->cert)) return 0;
+/* the same problem as read: a certificate of one run is one of the other */
+static int ps_same(const PSOrig *a, const PSOrig *b) {
+    if (a == b) return 1;
+    if (!a || !b || a->m != b->m || a->nblk != b->nblk || a->nnz != b->nnz || a->tbR != b->tbR) return 0;
+    if (memcmp(a->bs, b->bs, sizeof(int) * a->nblk) || memcmp(a->b, b->b, sizeof(double) * a->m)) return 0;
+    return !memcmp(a->con, b->con, sizeof(int) * a->nnz) && !memcmp(a->blk, b->blk, sizeof(int) * a->nnz)
+        && !memcmp(a->ii, b->ii, sizeof(int) * a->nnz) && !memcmp(a->jj, b->jj, sizeof(int) * a->nnz)
+        && !memcmp(a->v, b->v, sizeof(double) * a->nnz);
+}
+/* 4.37: does the second run replace the first? By the returned solution (the usual ranking).
+ * Bound mode: the better certificate of each side moves to the run that is kept, when both
+ * runs refer to the same problem as read (the returned point is never a certificate) */
+static int run_better(Run *a, Run *b) {
+    const int r = run_rank(a) < run_rank(b);
+    if (g_rank_par && g_rank_par->bound_side) {
+        Run *w = r ? a : b, *l = r ? b : a;
+        if (ps_same(w->Ofin ? w->Ofin : w->O, l->Ofin ? l->Ofin : l->O))
+            for (int s = 0; s < 2; s++)
+                if (bound_better(&l->cert[s], &w->cert[s])) { const BoundCert t = w->cert[s]; w->cert[s] = l->cert[s]; l->cert[s] = t; }
     }
-    return run_rank(a) < run_rank(b);
+    return r;
 }
 
 static void att_log(const char *name, double t, const void *run) {
@@ -1790,8 +1841,10 @@ static void print_summary(const Run *u, const Params *par, const PSOrig *O, int 
     if (extra && extra[0]) printf("                     %s\n", extra);
     if (status == ST_TIME) printf("                     stopped by the time limit%s\n", brisk_stop_flag ? " (interrupted)" : "");
     else if (status == ST_MAXIT) printf("                     stopped at the iteration limit\n");
-    if (par->bound_side && u->cert.have)
-        printf("                     %s bound on the optimal value: %s (%s)\n", par->bound_side == 1 ? "primal (upper)" : "dual (lower)", u->cert.valid ? "certificate valid" : "approximate", u->cert.src);
+    for (int sd = 1; sd <= 2; sd++)
+        if ((par->bound_side & sd) && u->cert[sd - 1].have)
+            printf("                     %s bound on the optimal value: %s (%s)\n", sd == 1 ? "primal (upper)" : "dual (lower)",
+                   u->cert[sd - 1].certified ? "certified" : u->cert[sd - 1].valid ? "not certified (approximate)" : "approximate", u->cert[sd - 1].src);
     printf("  Time:              %.2f s (presolve %.2f, solve and re-solves %.2f; reading the file %.2f s more)\n", t_all, tpre, fmax(0.0, t_all - tpre), tread);
     { const int nt = brisk_threads_logged(); const char *ts = brisk_threads_summary();
       if (ts) printf("  Threads:           %s\n", ts); else if (nt > 0) printf("  Threads:           %d\n", nt); }
@@ -1812,6 +1865,7 @@ BriskResult *g_brisk_result = NULL;   /* 4.30: set by brisk_run */
 static void diagnose_cause(const Run *u, const Params *par, const PSOrig *O, double **Xo, const double *yo,
                            const PSResult *pr, double acc, char *out, size_t len);
 static int certify_given(const char *fname, const char *cx, const char *cy);
+static int g_certify_prior = 1, g_certify_verbose = 1;     /* -boundprior and -v for -certify-x / -certify-y */
 
 #ifndef BRISK_LIBRARY
 /* 4.39: Ctrl-C (SIGINT) on the command line stops the solve as its time limit would: the current
@@ -2039,11 +2093,15 @@ static int brisk_main_sedumi(int argc, char **argv, int ifile) {
     if (sedumi_read_mat(argv[ifile], &P, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
     char **av = malloc(sizeof(char *) * ((size_t)argc + 1));
     int ac = 0, quiet = 0;
-    const char *xf = NULL, *yf = NULL, *zf = NULL;
+    const char *xf = NULL, *yf = NULL, *zf = NULL, *bxf = NULL, *byf = NULL;
     for (int i = 1; i < argc; i++) {
         if (i == ifile) continue;
         if (i + 1 < argc && (!strcmp(argv[i], "-x") || !strcmp(argv[i], "-y") || !strcmp(argv[i], "-z"))) {
             if (argv[i][1] == 'x') xf = argv[i + 1]; else if (argv[i][1] == 'y') yf = argv[i + 1]; else zf = argv[i + 1];
+            i++; continue;
+        }
+        if (i + 1 < argc && (!strcmp(argv[i], "-boundx") || !strcmp(argv[i], "-boundy"))) {    /* in SeDuMi's layout, below */
+            if (argv[i][6] == 'x') bxf = argv[i + 1]; else byf = argv[i + 1];
             i++; continue;
         }
         if (!strcmp(argv[i], "-q")) quiet = 1;
@@ -2065,6 +2123,8 @@ static int brisk_main_sedumi(int argc, char **argv, int ifile) {
         if (xf && R.x && (P.ns == 0 || R.have_x)) sedumi_write_vec(xf, R.x, P.n);
         if (yf && R.y) sedumi_write_vec(yf, R.y, P.m);
         if (zf && R.z) sedumi_write_vec(zf, R.z, P.n);
+        if (bxf) { if (R.bnd[0].x) sedumi_write_vec(bxf, R.bnd[0].x, P.n); else fprintf(stderr, "brisk: -boundx: no certificate x to write (it needs -bound p or pd and an admissible candidate)\n"); }
+        if (byf) { if (R.bnd[1].y) sedumi_write_vec(byf, R.bnd[1].y, P.m); else fprintf(stderr, "brisk: -boundy: no certificate y to write (it needs -bound d or pd and an admissible candidate)\n"); }
         if (g_brisk_result) {       /* a library call on the file: status, values and y */
             BriskResult *res = g_brisk_result;
             res->status = R.status; snprintf(res->status_str, sizeof res->status_str, "%s", R.status_str);
@@ -2072,6 +2132,18 @@ static int brisk_main_sedumi(int argc, char **argv, int ifile) {
             for (int i = 0; i < 6; i++) res->err[i + 1] = R.err[i];
             res->y = R.y; R.y = NULL;
             res->sn = P.n; res->have_x = P.ns == 0 || R.have_x; res->sx = R.x; R.x = NULL; res->sz = R.z; R.z = NULL;
+            for (int s = 0; s < 2; s++) {        /* the bounds: the certificate x (SeDuMi's layout) and y */
+                res->bnd[s].asked = R.bnd[s].asked; res->bnd[s].have = R.bnd[s].have; res->bnd[s].valid = R.bnd[s].valid; res->bnd[s].certified = R.bnd[s].certified;
+                res->bnd[s].value = R.bnd[s].value; res->bnd[s].resid = R.bnd[s].resid; res->bnd[s].lammin = R.bnd[s].lammin; res->bnd[s].rigorous = R.bnd[s].rigorous;
+                memcpy(res->bnd[s].src, R.bnd[s].src, sizeof(res->bnd[s].src));
+                res->bnd[s].sx = R.bnd[s].x; R.bnd[s].x = NULL; res->bnd[s].y = R.bnd[s].y; R.bnd[s].y = NULL;
+            }
+            {
+                const int s0 = R.bnd[0].asked ? 0 : 1;
+                res->bound_side = R.bnd[s0].asked && R.bnd[s0].have ? s0 + 1 : 0;
+                res->bound_value = R.bnd[s0].value; res->bound_resid = R.bnd[s0].resid; res->bound_lammin = R.bnd[s0].lammin;
+                res->bound_valid = R.bnd[s0].valid; res->bound_certified = R.bnd[s0].certified; res->bound_rigorous = R.bnd[s0].rigorous;
+            }
         }
     }
     sedumi_result_free(&R); sedumi_free(&P); free(av);
@@ -2249,7 +2321,7 @@ int brisk_main(int argc, char **argv) {
     }
     Params par;
     params_default(&par);
-    const char *fname = NULL, *yfile = NULL, *xfile = NULL, *zfile = NULL;
+    const char *fname = NULL, *yfile = NULL, *xfile = NULL, *zfile = NULL, *boundxfile = NULL, *boundyfile = NULL;
     const char *cert_x = NULL, *cert_y = NULL;   /* 4.39: certify a given certificate, no solve */
     int do_certify = 0;                          /* 4.39: -certify (off by default) */
     int force_route = -1, do_fr = 1, fr_retry = 1, acc_set = -1;
@@ -2334,6 +2406,8 @@ int brisk_main(int argc, char **argv) {
         OPT_D("-hptol", hp_tol)
         OPT_I("-hpext", hp_ext)
         else if (!strcmp(a, "-y")) { i = need(i, argc, a); yfile = argv[i]; }
+        else if (!strcmp(a, "-boundx")) { i = need(i, argc, a); boundxfile = argv[i]; }
+        else if (!strcmp(a, "-boundy")) { i = need(i, argc, a); boundyfile = argv[i]; }
         else if (!strcmp(a, "-x")) { i = need(i, argc, a); xfile = argv[i]; }
         else if (!strcmp(a, "-z")) { i = need(i, argc, a); zfile = argv[i]; }
         else if (!strcmp(a, "-sym")) { i = need(i, argc, a); par.symfile = (!strcmp(argv[i], "none") || !strcmp(argv[i], "0")) ? NULL : argv[i]; }
@@ -2346,10 +2420,11 @@ int brisk_main(int argc, char **argv) {
             const char *s = argv[i];
             if (!strcmp(s, "p") || !strcmp(s, "P") || !strcmp(s, "primal") || !strcmp(s, "upper")) par.bound_side = 1;
             else if (!strcmp(s, "d") || !strcmp(s, "D") || !strcmp(s, "dual") || !strcmp(s, "lower")) par.bound_side = 2;
+            else if (!strcmp(s, "pd") || !strcmp(s, "dp") || !strcmp(s, "PD") || !strcmp(s, "both")) par.bound_side = 3;
             else if (!strcmp(s, "0") || !strcmp(s, "off") || !strcmp(s, "none")) par.bound_side = 0;
-            else { fprintf(stderr, "brisk: -bound must be p or d\n"); return 1; }
+            else { fprintf(stderr, "brisk: -bound must be p, d or pd\n"); return 1; }
         }
-        OPT_D("-boundtol", bound_tol) OPT_D("-boundmargin", bound_margin) OPT_D("-boundtrack", bound_track_tol)
+        OPT_I("-boundprior", bound_prior) OPT_I("-boundprec", bound_prec) OPT_D("-boundtol", bound_tol) OPT_D("-boundmargin", bound_margin) OPT_D("-boundtrack", bound_track_tol)
         OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-blkscale", blkscale) OPT_I("-bm", bm) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle) OPT_D("-mfhand", mf_hand) OPT_I("-mfhandcg", mf_handcg) OPT_I("-mfproj", mf_proj) OPT_D("-mfeta", mf_eta) OPT_I("-mftry", mf_try)
         else if (!strcmp(a, "-threads")) { i = need(i, argc, a); const int nt = (int)num(argv[i], a); if (nt >= 1) { omp_set_num_threads(nt); g_threads_user = 1; } }   /* 4.32: BRISK's OpenMP threads (default OMP_NUM_THREADS / all cores) */
         else if (!strcmp(a, "-route")) { i = need(i, argc, a); force_route = (int)num(argv[i], a); }
@@ -2361,8 +2436,11 @@ int brisk_main(int argc, char **argv) {
 #undef OPT_I
     }
     if (!fname) { usage(); return 1; }
+    par.bound_xfile = boundxfile; par.bound_yfile = boundyfile;
+    brisk_bound_prec_set(par.bound_prec, par.verbose);
     if ((cert_x || cert_y) && par.hp_kind > 0)      /* 5.2: in the master precision of -prec (hpsolve.c) */
         return brisk_hp_certify_given(fname, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result, cert_x, cert_y, par.hp_kind, par.hp_digits, par.verbose);
+    g_certify_prior = par.bound_prior; g_certify_verbose = par.verbose;
     if (cert_x || cert_y) return certify_given(fname, cert_x, cert_y);
     { extern int g_ps_fr_correct; const char *ef = getenv("BRISK_FRFIX"); g_ps_fr_correct = ef ? atoi(ef) != 0 : 0; }   /* 5.17: opt-in (BRISK_FRFIX=1): the default path pays nothing and says plainly that the recovery failed */
     { extern int g_ps_need_x; g_ps_need_x = (xfile != NULL || getenv("BRISK_XOUT") != NULL || par.crossover != 0 || par.bound_side != 0 || (g_brisk_result != NULL && par.returnx > 0)) ? 1
@@ -2404,7 +2482,7 @@ int brisk_main(int argc, char **argv) {
             for (int i = 0; i < argc; i++) {
                 const char *a = argv[i];
                 if (i > 0 && (!strcmp(a, "-prec") || !strcmp(a, "-hptol") || !strcmp(a, "-hpext") || !strcmp(a, "-fom") || !strcmp(a, "-lralm") || !strcmp(a, "-x") || !strcmp(a, "-y") || !strcmp(a, "-z")
-                              || !strcmp(a, "-maxit") || !strcmp(a, "-tol") || !strcmp(a, "-bound"))) { i++; continue; }
+                              || !strcmp(a, "-maxit") || !strcmp(a, "-tol") || !strcmp(a, "-bound") || !strcmp(a, "-boundx") || !strcmp(a, "-boundy"))) { i++; continue; }
                 if (i > 0 && !strcmp(a, "-certify")) continue;     /* (the certificate is built in high precision: hpcert.inc) */
                 av[ac++] = argv[i];
             }
@@ -2525,17 +2603,33 @@ int brisk_main(int argc, char **argv) {
         }
         if (rc != 0) return 2;
         /* 5.14: a solve in scaled coordinates whose solution, mapped back, misses the tolerance on the problem as
-         * read: the problem is solved again as given (blkscale.c) */
+         * read: the problem is solved again as given (blkscale.c); 5.20: the better of the two answers is kept
+         * (both are measured on the problem as read; the scaled one is often the better, static21compl, sat_roa) */
         if ((u->aff || u->maff) && u->measured && u->status != ST_OPTIMAL && !brisk_stop_flag && (par.timelimit <= 0 || wtime() - par.t_start < 0.5 * par.timelimit)) {
             const double ta = wtime() - t_pipe0;
             if (par.verbose >= 0) printf("%s: %.1e on the problem as read; solving the problem as given\n", u->maff ? "ellipsoid coordinates" : "scaled blocks", u->acc);
-            att_log(u->maff ? "the relaxation in the coordinates of the unit ball" : "the solve with scaled blocks", ta, u); textra += ta;
-            run_free(u);
+            Run second;
+            const double tb0 = wtime();
             g_blkscale_off = 1; g_momaff_off = 1;
-            rc = run_pipeline(fname, &par, do_fr, force_route, u);
-            if (rc == 3) { run_free(u); do_fr = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }
+            int rc2 = run_pipeline(fname, &par, do_fr, force_route, &second);
+            if (rc2 == 3) { run_free(&second); do_fr = 0; rc2 = run_pipeline(fname, &par, do_fr, force_route, &second); }
             g_blkscale_off = 0; g_momaff_off = 0;
-            if (rc != 0) return 2;
+            if (rc2 == 5) run_free(&second);
+            if (rc2 == 0) {
+                if (run_better(&second, u)) {
+                    att_log(u->maff ? "the relaxation in the coordinates of the unit ball" : "the solve with scaled blocks", ta, u);
+                    second.R.iters += u->R.iters;
+                    run_free(u);
+                    run = second;
+                    textra += ta;
+                } else {
+                    if (par.verbose >= 0) printf("  the problem as given ended at %.1e; the solve in scaled coordinates is kept\n", second.acc);
+                    att_log("the problem as given", wtime() - tb0, &second);
+                    u->R.iters += second.R.iters;
+                    run_free(&second);
+                    textra += wtime() - tb0;
+                }
+            }
         }
         /* 4.37 (B1): the first attempt, and the in-solver method retry as a re-solve */
         g_first_t = u->R.t_total - (u->R.nretry ? u->R.t_retry : 0) + u->tpre + u->pr.t + u->tread;
@@ -2982,43 +3076,85 @@ int brisk_main(int argc, char **argv) {
         }
         textra += wtime() - tx0;
     }
-    BoundCert *bc = &u->cert;
-    /* 4.39: -certify: the rigorous check of the certificate on the problem as read; a
-     * certified one counts as valid whatever BRISK's own tolerances say */
-    int certified = 0;
-    double rigorous = NAN, t_cert = 0;
-    char cert_why[160] = "";
-    if (do_certify && par.bound_side && bc->have && u->status != ST_PINFEAS && u->status != ST_DINFEAS) {
+    /* Bound mode: each side asked for has its certificate checked rigorously on the problem as
+     * read (4.39 -certify, now always): only a certified certificate is a bound. The returned pair
+     * stays the solve's own point. Up to 1.5.1 the certificate replaced its side of the pair, which
+     * was then measured again; it can come from an earlier iterate than the returned point, or be
+     * the returned point moved to a margin, and the pair was then unbalanced (ni35 order 2: X of
+     * iteration 48 with the final y, gap 8.6e-7 for a pair at 9.7e-10; arch0 -bound p: OPTIMAL
+     * 9.7e-9 became REDUCED ACCURACY 7.2e-7). */
+    int certified[2] = { 0, 0 };
+    double rigorous[2] = { NAN, NAN }, t_cert[2] = { 0, 0 };
+    char cert_why[2][320] = { "", "" };
+    int prior[2] = { 0, 0 };                     /* certified by a-priori bounds: from the certificate (1) or the returned point (2) */
+    for (int sd = 1; sd <= 2; sd++) {
+        BoundCert *bc = &u->cert[sd - 1];
+        bc->certified = 0; bc->rigorous = NAN;
+        if (!(par.bound_side & sd) || !bc->have || u->status == ST_PINFEAS || u->status == ST_DINFEAS) continue;
         const double tc0 = wtime();
-        certified = brisk_certify_orig(u->Ofin ? u->Ofin : u->O, par.bound_side, bc->X, bc->y, g_brisk_data != NULL, &rigorous, cert_why, sizeof(cert_why));
-        t_cert = wtime() - tc0;
-        if (certified && !bc->valid) bc->valid = 1;
-    }
-    /* 4.37 bound mode: a certificate replaces its side of the returned pair, which is then
-     * measured again on the problem as read */
-    if (par.bound_side && bc->have && bc->valid && u->status != ST_PINFEAS && u->status != ST_DINFEAS) {
-        PSOrig *Ob = u->Ofin ? u->Ofin : u->O;
-        int replaced = 0;
-        if (par.bound_side == 1 && u->Xo && bc->X) {
-            for (int k = 0; k < Ob->nblk; k++) memcpy(u->Xo[k], bc->X[k], sizeof(double) * (Ob->bs[k] < 0 ? (size_t)-Ob->bs[k] : (size_t)Ob->bs[k] * Ob->bs[k]));
-            replaced = 1;
-        } else if (par.bound_side == 2 && bc->y) { memcpy(u->yo, bc->y, sizeof(double) * Ob->m); replaced = 1; }
-        if (replaced && (u->Xo || par.bound_side == 2)) {
-            PSResult pb;
-            ps_measure(Ob, u->Xo, u->yo, &pb);
-            pb.recovered = u->pr.recovered; pb.unrecovered = u->pr.unrecovered; pb.fr_corrected = u->pr.fr_corrected; pb.t += u->pr.t;
-            if (pb.have_x || !u->measured) {
-                u->pr = pb;
-                if (pb.have_x) {
-                    u->acc = fmax(fmax(pb.err[1], pb.err[2]), fmax(pb.err[4], fmax(fabs(pb.err[5]), fabs(pb.err[6]))));
-                    if (u->status == ST_OPTIMAL || u->status == ST_REDUCED || u->status == ST_NUMERIC) {
-                        if (u->acc <= par.tol) u->status = ST_OPTIMAL;
-                        else if (u->acc <= par.red_acc) u->status = ST_REDUCED;
-                        else u->status = ST_NUMERIC;
-                    }
+        certified[sd - 1] = brisk_certify_orig(u->Ofin ? u->Ofin : u->O, sd, bc->X, bc->y, g_brisk_data != NULL, &rigorous[sd - 1], cert_why[sd - 1], sizeof(cert_why[0]));
+        t_cert[sd - 1] = wtime() - tc0;
+        if (!certified[sd - 1]) rigorous[sd - 1] = NAN;      /* (computed before the check failed: not a bound) */
+        /* the candidate before its margin was restored, when the restoration moved it: blending
+         * with an anchor can give away most of the objective (ni35 order 2 with the objective cut:
+         * the anchor blend 1.0 certified 1941.608 for a point at 1940.571). The a-priori route
+         * certifies points without a margin, so it is tried on that candidate too, and the better
+         * rigorous bound is kept. */
+        const int has0 = sd == 1 ? bc->X0 != NULL : bc->y0 != NULL;
+        const int loss0 = certified[sd - 1] && has0 &&
+            (sd == 1 ? rigorous[sd - 1] - bc->value0 : bc->value0 - rigorous[sd - 1]) > 1e-7 * (1 + fabs(rigorous[sd - 1]));
+        if ((!certified[sd - 1] || loss0) && par.bound_prior) {
+            /* no margin (or a margin that cost objective): a bound from a-priori bounds of the other
+             * side (boundcert.c), for the certificate (before its margin was restored, when it was
+             * moved) or the returned point, whichever gives the better one */
+            double B; int which = 0; char w2[160];
+            const double tp0 = wtime();
+            const double margin_bound = rigorous[sd - 1];
+            if (brisk_prior_bound(u->Ofin ? u->Ofin : u->O, sd, sd == 1 ? (bc->X0 ? bc->X0 : bc->X) : NULL, sd == 1 ? u->Xo : NULL,
+                                  sd == 2 ? (bc->y0 ? bc->y0 : bc->y) : NULL, sd == 2 ? u->yo : NULL,
+                                  g_brisk_data != NULL, par.verbose, &B, &which, w2, sizeof(w2))
+                && (!certified[sd - 1] || (sd == 1 ? B < margin_bound : B > margin_bound))) {
+                if (certified[sd - 1])
+                    snprintf(cert_why[sd - 1], sizeof(cert_why[0]), "better than %.17g from the certificate with the margin restored (%s)", margin_bound, bc->src);
+                certified[sd - 1] = 1; rigorous[sd - 1] = B; prior[sd - 1] = which;
+                if (which == 1 && has0) {
+                    /* the certificate is the candidate as it was before the restoration */
+                    if (sd == 1) { bound_free_blocks(bc->X, bc->nblk); bc->X = bc->X0; bc->X0 = NULL; }
+                    else { free(bc->y); bc->y = bc->y0; bc->y0 = NULL; }
+                    bc->value = bc->value0; bc->resid = bc->resid0; bc->lammin = bc->lammin0; bc->theta = 0;
                 }
+                else if (which == 2) {
+                    /* (19 October 2026, the review S6) the returned point is what was certified: the certificate written by
+                     * -boundx / -boundy and returned by the library is that point, with its value and measures on the data
+                     * as read (before, the margin candidate stayed beside a bound it had not given) */
+                    const PSOrig *Oc = u->Ofin ? u->Ofin : u->O;
+                    if (sd == 1 && u->Xo) {
+                        double **Xc = bound_alloc_blocks(Oc);
+                        for (int k = 0; k < Oc->nblk; k++) {
+                            const size_t len = Oc->bs[k] < 0 ? (size_t)-Oc->bs[k] : (size_t)Oc->bs[k] * Oc->bs[k];
+                            memcpy(Xc[k], u->Xo[k], sizeof(double) * len);
+                        }
+                        if (bc->X) bound_free_blocks(bc->X, bc->nblk);
+                        bc->X = Xc; bc->nblk = Oc->nblk;
+                        bc->value = u->pr.pobj; bc->resid = u->pr.err[1]; bc->lammin = -u->pr.err[2];
+                    } else if (sd == 2 && u->yo) {
+                        double *yc = malloc(sizeof(double) * (Oc->m + 1));
+                        if (yc) {
+                            memcpy(yc, u->yo, sizeof(double) * Oc->m);
+                            free(bc->y); bc->y = yc;
+                            bc->value = u->pr.dobj; bc->resid = 0; bc->lammin = -u->pr.err[4];
+                        }
+                    }
+                    bc->theta = 0;
+                }
+            } else if (!certified[sd - 1]) {
+                const size_t l = strlen(cert_why[sd - 1]);
+                snprintf(cert_why[sd - 1] + l, sizeof(cert_why[0]) - l, "; a-priori bounds: %s", w2);
             }
+            t_cert[sd - 1] += wtime() - tp0;
         }
+        bc->certified = certified[sd - 1]; bc->rigorous = rigorous[sd - 1];
+        if (certified[sd - 1] && !bc->valid) bc->valid = 1;
     }
     Problem *PP = &u->P;
     PSOrig *O = u->Ofin ? u->Ofin : u->O;
@@ -3081,30 +3217,32 @@ int brisk_main(int argc, char **argv) {
     const double t_all = R.t_total + tpre + pr.t + textra;
     printf("time: total %.3fs (read %.3f, presolve+analysis %.3f) | schur %.3f  chol/solve %.3f  dense %.3f  step %.3f  postsolve %.3f\n",
            t_all, tread, tpre, R.t_schur, R.t_chol, R.t_dense, R.t_step, pr.t);
-    /* 4.37 (A1): the bound */
-    if (par.bound_side && par.verbose != 0) {
-        if (!bc->have) printf("BOUND (%s): no certificate (no admissible candidate)\n", par.bound_side == 1 ? "P" : "D");
-        else {
-            printf("BOUND (%s): %s bound %s = %.10e  (certificate: %s %.1e rel, lambda_min(%s) %.1e rel; from attempt %d, %s%s)\n",
-                   par.bound_side == 1 ? "P" : "D", par.bound_side == 1 ? "upper" : "lower", par.bound_side == 1 ? "<C,X>" : "b'y", bc->value,
-                   par.bound_side == 1 ? "|A(X)-b|" : "|C-A'y-Z|", bc->resid, par.bound_side == 1 ? "X" : "Z", bc->lammin, bc->attempt, bc->src,
-                   bc->theta > 0 ? ", margin restored" : "");
-            printf("           (SDPA convention, max <F0,Y>: %s bound %.10e)\n", par.bound_side == 1 ? "a lower" : "an upper", -bc->value);
-            if (!bc->valid && !certified)
-                printf("           certificate %s: the bound holds only approximately\n",
-                       bc->lammin < 0 ? "not positive semidefinite" : "residual above -boundtol");
-            else if (bc->valid == 1)
-                printf("           (positive semidefinite, but below the -boundmargin margin: rounding may break it)\n");
-        }
-    }
-    if (do_certify && par.verbose != 0) {
-        if (!par.bound_side) printf("(-certify needs -bound p or -bound d)\n");
-        else if (certified)
+    /* 4.37 (A1): the bound of each side asked for; only a certified one is a bound */
+    for (int sd = 1; sd <= 2 && par.verbose != 0; sd++) {
+        if (!(par.bound_side & sd)) continue;
+        const BoundCert *bc = &u->cert[sd - 1];
+        const char *SD = sd == 1 ? "P" : "D", *ul = sd == 1 ? "upper" : "lower";
+        if (!bc->have) { printf("BOUND (%s): no certificate (no admissible candidate): no %s bound\n", SD, ul); continue; }
+        printf("BOUND (%s): %s bound %s = %.10e  (certificate: %s %.1e rel, lambda_min(%s) %.1e rel; from attempt %d, %s%s)\n",
+               SD, ul, sd == 1 ? "<C,X>" : "b'y", bc->value,
+               sd == 1 ? "|A(X)-b|" : "|C-A'y-Z|", bc->resid, sd == 1 ? "X" : "Z", bc->lammin, bc->attempt, bc->src,
+               bc->theta > 0 ? ", margin restored" : "");
+        printf("           (SDPA convention, max <F0,Y>: %s bound %.10e)\n", sd == 1 ? "a lower" : "an upper", -bc->value);
+        if (certified[sd - 1] && prior[sd - 1])
+            printf("CERTIFIED (%s): rigorous %s bound %.17g on the optimal value of %s (SDPA convention: %s bound %.17g; %.2fs)\n"
+                   "           by a-priori bounds of %s found from the problem (%s%s); from %s\n",
+                   SD, ul, rigorous[sd - 1], sd == 1 ? "(D)" : "(P)", sd == 1 ? "a lower" : "an upper", -rigorous[sd - 1], t_cert[sd - 1],
+                   sd == 1 ? "y" : "the diagonal of X", strncmp(cert_why[sd - 1], "better than", 11) ? "the margin check failed: " : "", cert_why[sd - 1],
+                   prior[sd - 1] == 1 ? "the certificate" : "the returned point");
+        else if (certified[sd - 1])
             printf("CERTIFIED (%s): rigorous %s bound %.17g on the optimal value (SDPA convention: %s bound %.17g; %.2fs)\n",
-                   par.bound_side == 1 ? "P" : "D", par.bound_side == 1 ? "upper" : "lower", rigorous,
-                   par.bound_side == 1 ? "a lower" : "an upper", -rigorous, t_cert);
-        else if (bc->have) printf("NOT CERTIFIED (%s): %s\n", par.bound_side == 1 ? "P" : "D", cert_why);
+                   SD, ul, rigorous[sd - 1], sd == 1 ? "a lower" : "an upper", -rigorous[sd - 1], t_cert[sd - 1]);
+        else if (u->status == ST_PINFEAS || u->status == ST_DINFEAS)
+            printf("NOT CERTIFIED (%s): the problem was found infeasible: no %s bound\n", SD, ul);
+        else
+            printf("NOT CERTIFIED (%s): %s: no guaranteed %s bound (the value above holds only approximately)\n", SD, cert_why[sd - 1], ul);
     }
+    if (do_certify && !par.bound_side && par.verbose != 0) printf("(-certify needs -bound p, d or pd)\n");
     /* 4.37 (B1): re-solves */
     if (g_natt > 0 && par.verbose != 0) {
         double tre = 0;
@@ -3141,6 +3279,19 @@ int brisk_main(int argc, char **argv) {
         } else fprintf(stderr, "brisk: cannot write %s\n", yfile);
     }
     if (Xo && xfile) write_matrix_file(xfile, O, Xo);
+    /* the certificates of the bound mode, in the formats of -x and -y */
+    if (boundxfile) {
+        if (!(par.bound_side & 1) || !u->cert[0].have || !u->cert[0].X) fprintf(stderr, "brisk: -boundx: no certificate X to write (it needs -bound p or pd and an admissible candidate)\n");
+        else write_matrix_file(boundxfile, O, u->cert[0].X);
+    }
+    if (boundyfile) {
+        if (!(par.bound_side & 2) || !u->cert[1].have || !u->cert[1].y) fprintf(stderr, "brisk: -boundy: no certificate y to write (it needs -bound d or pd and an admissible candidate)\n");
+        else {
+            FILE *f = fopen(boundyfile, "w");
+            if (f) { for (int i = 0; i < O->m; i++) fprintf(f, "%.17g\n", u->cert[1].y[i]); fclose(f); }
+            else fprintf(stderr, "brisk: cannot write %s\n", boundyfile);
+        }
+    }
     if (zfile || g_brisk_result) {
         /* Z = C - A'y on the original data */
         double **Zo = malloc(sizeof(double *) * (O->nblk + 1));
@@ -3171,11 +3322,37 @@ int brisk_main(int argc, char **argv) {
             res->status = status; res->exit_code = exit_code[status];
             snprintf(res->status_str, sizeof(res->status_str), "%s", status_str[status]);
             res->iters = R.iters; res->pobj = pobj; res->dobj = dobj;
-            res->bound_side = par.bound_side && bc->have ? par.bound_side : 0;
-            res->bound_rigorous = NAN;
-            res->bound_value = bc->value; res->bound_resid = bc->resid; res->bound_lammin = bc->lammin;
-            res->bound_valid = bc->valid; res->bound_certified = certified;
-            res->bound_rigorous = rigorous;
+            /* the bound of each side asked for, with its certificate (a copy); the legacy fields
+             * are those of the first side asked for */
+            for (int sd = 1; sd <= 2; sd++) {
+                const BoundCert *bc = &u->cert[sd - 1];
+                memset(&res->bnd[sd - 1], 0, sizeof(res->bnd[0]));
+                res->bnd[sd - 1].rigorous = NAN; res->bnd[sd - 1].value = NAN;
+                if (!(par.bound_side & sd)) continue;
+                res->bnd[sd - 1].asked = 1;
+                if (!bc->have) continue;
+                res->bnd[sd - 1].have = 1; res->bnd[sd - 1].valid = bc->valid; res->bnd[sd - 1].certified = certified[sd - 1];
+                res->bnd[sd - 1].value = bc->value; res->bnd[sd - 1].resid = bc->resid; res->bnd[sd - 1].lammin = bc->lammin;
+                res->bnd[sd - 1].rigorous = rigorous[sd - 1];
+                snprintf(res->bnd[sd - 1].src, sizeof(res->bnd[0].src), "%s%s", prior[sd - 1] ? "a-priori bounds; " : "", prior[sd - 1] == 2 ? "the returned point" : bc->src);
+                if (sd == 1 && bc->X) {      /* (allocations checked: a copy that does not fit is left out, the bound kept) */
+                    res->bnd[0].X = calloc(O->nblk + 1, sizeof(double *));
+                    for (int k = 0; res->bnd[0].X && k < O->nblk; k++) {
+                        const size_t len = O->bs[k] < 0 ? (size_t)-O->bs[k] : (size_t)O->bs[k] * O->bs[k];
+                        res->bnd[0].X[k] = malloc(sizeof(double) * (len + 1));
+                        if (!res->bnd[0].X[k]) { for (int q = 0; q < k; q++) free(res->bnd[0].X[q]); free(res->bnd[0].X); res->bnd[0].X = NULL; break; }
+                        memcpy(res->bnd[0].X[k], bc->X[k], sizeof(double) * len);
+                    }
+                }
+                if (sd == 2 && bc->y && (res->bnd[1].y = malloc(sizeof(double) * (O->m + 1)))) memcpy(res->bnd[1].y, bc->y, sizeof(double) * O->m);
+            }
+            {
+                const int s0 = (par.bound_side & 1) ? 0 : 1;
+                res->bound_side = par.bound_side && res->bnd[s0].have ? s0 + 1 : 0;
+                res->bound_value = res->bnd[s0].value; res->bound_resid = res->bnd[s0].resid; res->bound_lammin = res->bnd[s0].lammin;
+                res->bound_valid = res->bnd[s0].valid; res->bound_certified = res->bnd[s0].certified;
+                res->bound_rigorous = res->bnd[s0].rigorous;
+            }
             res->n_resolves = g_natt;
             res->t_resolves = 0;
             for (int a = 0; a < g_natt; a++) res->t_resolves += g_att[a].t;
@@ -3250,10 +3427,17 @@ static int certify_given(const char *fname, const char *cx, const char *cy) {
     fclose(f);
     const double t0 = wtime();
     double B = NAN;
-    char why[160];
-    const int ok = brisk_certify_orig(O, side, X, y, g_brisk_data != NULL, &B, why, sizeof(why));
-    if (ok) printf("CERTIFIED (%s): rigorous %s bound %.17g on the optimal value of (P) (SDPA convention: %s bound %.17g; %.2fs)\n",
-                   side == 1 ? "P" : "D", side == 1 ? "upper" : "lower", B, side == 1 ? "a lower" : "an upper", -B, wtime() - t0);
+    char why[400];
+    int ok = brisk_certify_orig(O, side, X, y, g_brisk_data != NULL, &B, why, sizeof(why)), prior = 0;
+    if (!ok) {
+        /* no margin: a-priori bounds of the other side (boundcert.c) */
+        double B2; char w2[160];
+        if (g_certify_prior && brisk_prior_bound(O, side, X, NULL, y, NULL, g_brisk_data != NULL, g_certify_verbose, &B2, NULL, w2, sizeof(w2))) { ok = prior = 1; B = B2; }
+        else { B = NAN; if (g_certify_prior) { const size_t l = strlen(why); snprintf(why + l, sizeof(why) - l, "; a-priori bounds: %s", w2); } }
+    }
+    if (ok) printf("CERTIFIED (%s): rigorous %s bound %.17g on the optimal value of %s (SDPA convention: %s bound %.17g; %.2fs)%s\n",
+                   side == 1 ? "P" : "D", side == 1 ? "upper" : "lower", B, prior ? (side == 1 ? "(D)" : "(P)") : "(P)", side == 1 ? "a lower" : "an upper", -B, wtime() - t0,
+                   prior ? (side == 1 ? "\n           by a-priori bounds of y found from the problem (the certificate has no margin)" : "\n           by a-priori bounds of the diagonal of X found from the problem (the certificate has no margin)") : "");
     else printf("NOT CERTIFIED (%s): %s\n", side == 1 ? "P" : "D", why);
     if (g_brisk_result) {
         BriskResult *res = g_brisk_result;
@@ -3340,6 +3524,8 @@ void brisk_result_free(BriskResult *res) {
     if (!res) return;
     if (res->X) { for (int k = 0; k < res->nblk; k++) free(res->X[k]); free(res->X); }
     if (res->Z) { for (int k = 0; k < res->nblk; k++) free(res->Z[k]); free(res->Z); }
+    if (res->bnd[0].X) { for (int k = 0; k < res->nblk; k++) free(res->bnd[0].X[k]); free(res->bnd[0].X); }
+    for (int sd = 0; sd < 2; sd++) { free(res->bnd[sd].y); free(res->bnd[sd].sx); }
     free(res->y); free(res->bs); free(res->sx); free(res->sz);
     memset(res, 0, sizeof(*res));
     res->status = -1;

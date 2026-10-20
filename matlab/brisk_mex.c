@@ -117,6 +117,31 @@ static mxArray *block_cell(const BriskResult *r, double **B) {
     return c;
 }
 
+/* bound mode: the sides asked for, info.bounds.p / .d, each with its certificate (X: a cell of
+ * blocks, or x for a problem in SeDuMi format; y); an empty struct when no side was asked for */
+static mxArray *bound_side_struct(int side, int have, double value, double resid, double lammin, int valid, int certified,
+                                  double rigorous, const char *src, mxArray *cert) {
+    const char *f[] = { "kind", "have", "value", "resid", "lammin", "valid", "certified", "rigorous", "src", side == 1 ? "X" : "y" };
+    mxArray *b = mxCreateStructMatrix(1, 1, 10, f);
+    mxSetField(b, 0, "kind", mxCreateString(side == 1 ? "upper" : "lower"));
+    mxSetField(b, 0, "have", mxCreateDoubleScalar(have));
+    mxSetField(b, 0, "value", mxCreateDoubleScalar(have ? value : mxGetNaN()));
+    mxSetField(b, 0, "resid", mxCreateDoubleScalar(resid));
+    mxSetField(b, 0, "lammin", mxCreateDoubleScalar(lammin));
+    mxSetField(b, 0, "valid", mxCreateDoubleScalar(valid));
+    mxSetField(b, 0, "certified", mxCreateDoubleScalar(certified));
+    mxSetField(b, 0, "rigorous", mxCreateDoubleScalar(certified ? rigorous : mxGetNaN()));
+    mxSetField(b, 0, "src", mxCreateString(src));
+    mxSetField(b, 0, side == 1 ? "X" : "y", cert ? cert : mxCreateDoubleMatrix(0, 0, mxREAL));
+    return b;
+}
+static mxArray *vec_or_empty(const double *v, int n) {
+    if (!v || n <= 0) return mxCreateDoubleMatrix(0, 0, mxREAL);
+    mxArray *a = mxCreateDoubleMatrix((mwSize)n, 1, mxREAL);
+    memcpy(mxGetPr(a), v, sizeof(double) * (size_t)n);
+    return a;
+}
+
 static int *int_list(const mxArray *a, int *n, const char *name) {
     if (!mxIsDouble(a) || mxIsComplex(a) || mxIsSparse(a)) { char msg[128]; snprintf(msg, sizeof msg, "brisk_mex: %s must be a real full vector", name); fail("brisk:input", msg); }
     const size_t k = mxGetNumberOfElements(a);
@@ -176,8 +201,19 @@ static void mex_sedumi(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[
     if (nlhs > 1) { plhs[1] = mxCreateDoubleMatrix((mwSize)P.m, 1, mxREAL); if (R.y) memcpy(mxGetPr(plhs[1]), R.y, sizeof(double) * (size_t)P.m); }
     if (nlhs > 2) { plhs[2] = mxCreateDoubleMatrix((mwSize)P.n, 1, mxREAL); if (R.z) memcpy(mxGetPr(plhs[2]), R.z, sizeof(double) * (size_t)P.n); }
     if (nlhs > 3) {
-        const char *fields[] = { "status", "statuscode", "exitcode", "iter", "pobj", "dobj", "dimacs", "time", "have_x", "version" };
-        mxArray *info = mxCreateStructMatrix(1, 1, 10, fields);
+        const char *fields[] = { "status", "statuscode", "exitcode", "iter", "pobj", "dobj", "dimacs", "time", "have_x", "version", "bounds" };
+        mxArray *info = mxCreateStructMatrix(1, 1, 11, fields);
+        {   /* bound mode: each side asked for, with its certificate (x for p, y for d) */
+            const char *sf[] = { "p", "d" };
+            int ns_ = 0; const char *names[2];
+            for (int s = 0; s < 2; s++) if (R.bnd[s].asked) names[ns_++] = sf[s];
+            mxArray *bs_ = mxCreateStructMatrix(1, 1, ns_, names);
+            for (int s = 0; s < 2; s++) if (R.bnd[s].asked)
+                mxSetField(bs_, 0, sf[s], bound_side_struct(s + 1, R.bnd[s].have, R.bnd[s].value, R.bnd[s].resid, R.bnd[s].lammin, R.bnd[s].valid,
+                                                            R.bnd[s].certified, R.bnd[s].rigorous, R.bnd[s].src,
+                                                            s == 0 ? vec_or_empty(R.bnd[0].x, P.n) : vec_or_empty(R.bnd[1].y, P.m)));
+            mxSetField(info, 0, "bounds", bs_);
+        }
         mxSetField(info, 0, "status", mxCreateString(R.status_str));
         mxSetField(info, 0, "statuscode", mxCreateDoubleScalar(R.status));
         mxSetField(info, 0, "exitcode", mxCreateDoubleScalar(rc));
@@ -258,8 +294,19 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     if (nlhs > 2) plhs[2] = block_cell(&res, res.Z);
     if (nlhs > 3) {
         const char *fields[] = { "status", "statuscode", "exitcode", "iter", "pobj", "dobj", "dimacs", "time", "have_x", "version",
-                                 "bound", "resolves", "cause" };
-        mxArray *info = mxCreateStructMatrix(1, 1, 13, fields);
+                                 "bound", "resolves", "cause", "bounds" };
+        mxArray *info = mxCreateStructMatrix(1, 1, 14, fields);
+        {   /* bound mode: each side asked for (info.bounds.p / .d), with its certificate (a cell of X blocks for p, y for d) */
+            const char *sf[] = { "p", "d" };
+            int ns_ = 0; const char *names[2];
+            for (int s = 0; s < 2; s++) if (res.bnd[s].asked) names[ns_++] = sf[s];
+            mxArray *bs_ = mxCreateStructMatrix(1, 1, ns_, names);
+            for (int s = 0; s < 2; s++) if (res.bnd[s].asked)
+                mxSetField(bs_, 0, sf[s], bound_side_struct(s + 1, res.bnd[s].have, res.bnd[s].value, res.bnd[s].resid, res.bnd[s].lammin, res.bnd[s].valid,
+                                                            res.bnd[s].certified, res.bnd[s].rigorous, res.bnd[s].src,
+                                                            s == 0 ? (res.bnd[0].X ? block_cell(&res, res.bnd[0].X) : NULL) : vec_or_empty(res.bnd[1].y, res.m)));
+            mxSetField(info, 0, "bounds", bs_);
+        }
         {   /* 4.38: the bound mode (opts.bound), the re-solves and the likely cause */
             const char *bf[] = { "side", "value", "resid", "lammin", "valid", "certified", "rigorous" };
             mxArray *b = mxCreateStructMatrix(1, 1, 7, bf);

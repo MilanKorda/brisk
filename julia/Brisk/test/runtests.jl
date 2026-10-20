@@ -61,7 +61,11 @@ end
         hp = Brisk.hp_solution()
         @test hd.bound isa BigFloat && hp.bound isa BigFloat
         @test hd.bound <= hp.bound && hp.bound - hd.bound < big"1e-20" * (1 + abs(hd.bound))
-        @test hd.digits >= 90
+        @test hd.digits >= 30 && collect(keys(hd.bounds)) == [:d] && hd.bounds[:d].bound == hd.bound
+        rb = Brisk.solve_sdpa(f; prec = "dd", bound = "pd", output = :silent)        # both sides in one solve
+        hb = Brisk.hp_solution()
+        @test rb.status == 0 && hb.bounds[:p].bound == hp.bound && hb.bounds[:d].bound == hd.bound
+        @test rb.bounds[:p].certified && rb.bounds[:d].certified
         Brisk.solve_sdpa(f; output = :silent)
         @test Brisk.hp_solution() === nothing
     end
@@ -303,7 +307,11 @@ end
     @test rb.bound !== nothing && rb.bound.side == :d && rb.bound.valid && rb.bound.certified
     @test rb.bound.rigorous <= -1 + 1e-9 && rb.bound.rigorous >= -1 - 1e-6   # (P) min -2 X12 = -1: a lower bound
     rn = Brisk.solve_sdpa(tmp2; output = :silent, threads = 1, bound = "d")
-    @test rn.bound !== nothing && !rn.bound.certified && isnan(rn.bound.rigorous)   # certify is off by default
+    @test rn.bound !== nothing && rn.bound.certified                     # a bound is always checked rigorously
+    @test rn.bounds !== nothing && collect(keys(rn.bounds)) == [:d] && rn.bounds[:d].y !== nothing
+    rpd = Brisk.solve_sdpa(tmp2; output = :silent, threads = 1, bound = "pd")   # both sides in one solve
+    @test rpd.bounds[:p].certified && rpd.bounds[:d].certified && rpd.bounds[:p].X !== nothing
+    @test rpd.bounds[:d].rigorous <= -1 + 1e-9 <= rpd.bounds[:p].rigorous + 2e-9
     rm(tmp2)
     set_attribute(model, "bound", "dual")
     set_attribute(model, "certify", true)
@@ -327,9 +335,9 @@ end
     out = logof(() -> Brisk.solve_sdpa_data(data...; output = :julia))
     @test occursin("For higher accuracy, as keywords of Brisk.solve_sdpa_data(...; ...):", out)
     @test occursin("acc = \"high\"", out) && occursin("prec = \"dd\"", out)
-    @test occursin("For a guaranteed bound on the optimal value", out) && occursin("bound = \"d\"", out) && occursin("certify = true", out)
-    out = logof(() -> Brisk.solve_sdpa_data(data...; output = :julia, acc = "high", bound = "d"))
-    @test !occursin("acc = \"high\"", out) && !occursin("For a guaranteed bound", out) && occursin("For a rigorous check of the bound", out)
+    @test occursin("For a guaranteed bound on the optimal value", out) && occursin("bound = \"d\"", out) && !occursin("certify = true", out)
+    out = logof(() -> Brisk.solve_sdpa_data(data...; output = :julia, acc = "high", bound = "d"))   # (a bound is always checked)
+    @test !occursin("acc = \"high\"", out) && !occursin("For a guaranteed bound", out) && !occursin("For a rigorous check of the bound", out)
     out = logof(() -> Brisk.solve_sedumi([1.0 1.0 1.0], [1.0], [1.0, 2.0, 3.0], (l = 3,); output = :julia))
     @test occursin("as keywords of Brisk.solve_sedumi(...; ...):", out) && count("Summary", out) == 1
     model = Model(Brisk.Optimizer)

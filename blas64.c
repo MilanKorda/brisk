@@ -52,6 +52,9 @@ void   B64(dtrmv_)(const char *, const char *, const char *, const bi *, const d
 double B64(ddot_)(const bi *, const double *, const bi *, const double *, const bi *);
 void   B64(daxpy_)(const bi *, const double *, const double *, const bi *, double *, const bi *);
 double B64(dnrm2_)(const bi *, const double *, const bi *);
+void   B64(dcopy_)(const bi *, const double *, const bi *, double *, const bi *);
+void   B64(dswap_)(const bi *, double *, const bi *, double *, const bi *);
+bi     B64(idamax_)(const bi *, const double *, const bi *);
 void   B64(dtrsm_)(const char *, const char *, const char *, const char *, const bi *, const bi *, const double *, const double *, const bi *, double *, const bi *);
 void   B64(dtrmm_)(const char *, const char *, const char *, const char *, const bi *, const bi *, const double *, const double *, const bi *, double *, const bi *);
 void   B64(dpotrf_)(const char *, const bi *, double *, const bi *, bi *);
@@ -73,6 +76,7 @@ void   B64(dgeqrf_)(const bi *, const bi *, double *, const bi *, double *, doub
 void   B64(dsytrd_)(const char *, const bi *, double *, const bi *, double *, double *, double *, double *, const bi *, bi *);
 void   B64(dormtr_)(const char *, const char *, const char *, const bi *, const bi *, const double *, const bi *, const double *, double *, const bi *, double *, const bi *, bi *);
 void   B64(dsytrf_)(const char *, const bi *, double *, const bi *, bi *, double *, const bi *, bi *);
+void   B64(dsytf2_)(const char *, const bi *, double *, const bi *, bi *, bi *);
 void   B64(dsytrs_)(const char *, const bi *, const bi *, const double *, const bi *, const bi *, double *, const bi *, bi *);
 void   B64(dsysv_)(const char *, const bi *, const bi *, double *, const bi *, bi *, double *, const bi *, double *, const bi *, bi *);
 void   B64(dgelsy_)(const bi *, const bi *, const bi *, double *, const bi *, double *, const bi *, bi *, const double *, bi *, double *, const bi *, bi *);
@@ -145,6 +149,18 @@ void BW(daxpy_)(const int *n, const double *al, const double *x, const int *incx
 double BW(dnrm2_)(const int *n, const double *x, const int *incx) {
     const bi N = I(n), IX = I(incx);
     return B64(dnrm2_)(&N, x, &IX);
+}
+void BW(dcopy_)(const int *n, const double *x, const int *incx, double *y, const int *incy) {
+    const bi N = I(n), IX = I(incx), IY = I(incy);
+    B64(dcopy_)(&N, x, &IX, y, &IY);
+}
+void BW(dswap_)(const int *n, double *x, const int *incx, double *y, const int *incy) {
+    const bi N = I(n), IX = I(incx), IY = I(incy);
+    B64(dswap_)(&N, x, &IX, y, &IY);
+}
+int BW(idamax_)(const int *n, const double *x, const int *incx) {
+    const bi N = I(n), IX = I(incx);
+    return (int)B64(idamax_)(&N, x, &IX);
 }
 void BW(dtrsm_)(const char *s, const char *u, const char *t, const char *d, const int *m, const int *n, const double *al, const double *a, const int *lda, double *b, const int *ldb) {
     const bi M = I(m), N = I(n), LA = I(lda), LB = I(ldb);
@@ -322,6 +338,15 @@ void BW(dsytrf_)(const char *u, const int *n, double *a, const int *lda, int *ip
     bi *ip = iget(ib, nn);
     B64(dsytrf_)(u, &N, a, &LA, ip, work, &LW, &inf);
     if (LW != -1) b2i(ipiv, ip, (size_t)N);
+    iput(ib, ip); OUT(info, inf);
+}
+/* ipiv (n) out; brisk_dsytrf's diagonal blocks (1.5.3) */
+void BW(dsytf2_)(const char *u, const int *n, double *a, const int *lda, int *ipiv, int *info) {
+    const bi N = I(n), LA = I(lda); bi inf = 0, ib[IBUF];
+    const size_t nn = (size_t)(N > 0 ? N : 1);
+    bi *ip = iget(ib, nn);
+    B64(dsytf2_)(u, &N, a, &LA, ip, &inf);
+    b2i(ipiv, ip, (size_t)N);
     iput(ib, ip); OUT(info, inf);
 }
 void BW(dsytrs_)(const char *u, const int *n, const int *nrhs, const double *a, const int *lda, const int *ipiv, double *b, const int *ldb, int *info) {

@@ -30,6 +30,17 @@
 
 static void *dx(size_t n) { void *p = calloc(n ? n : 1, 1); if (!p) { fprintf(stderr, "brisk: out of memory\n"); exit(1); } return p; }
 
+/* 19 October 2026: the automatic dual form only for a problem with an objective (b != 0). With b = 0 (a feasibility
+ * problem: a control LMI F(y) >= 0) the dual form's objective b'y vanishes on its feasible set {Z >= 0 : Z = C - A'y},
+ * which is unbounded when the LMI has an interior: the central path does not exist, only the trace bound keeps the
+ * iterates finite, they drift to its scale (1e7 for a state-feedback stabilization LMI of order 8) and y recovered
+ * from them misses the LMI on the data as read (error 9.0). The problem as read is well posed (its primal is X = 0 and
+ * the embedding's dual gives the feasible y): stabilization LMI of order 8, OPTIMAL in 7 iterations. */
+int dualize_has_objective(const Problem *P) {
+    for (int i = 0; i < P->m; i++) if (P->b[i] != 0) return 1;
+    return 0;
+}
+
 PSDual *dualize_apply(Problem *P, int automatic, int verbose) {
     const int m = P->m, nb = P->nblk;
     FreePair *pr = NULL;
@@ -43,7 +54,7 @@ PSDual *dualize_apply(Problem *P, int automatic, int verbose) {
     }
     const long mK = m - np, mD = N + (nlp - 2L * np) + np - m;
     if (automatic) {
-        if (nsdp > 32 || mD < 1 || mD > mK / 2 || mK < 20) { free(pr); return NULL; }
+        if (nsdp > 32 || mD < 1 || mD > mK / 2 || mK < 20 || !dualize_has_objective(P)) { free(pr); return NULL; }
     } else if (mD < 1) { free(pr); return NULL; }
     /* pair slot map: (block, slot) -> pair index or -1 */
     int **pslot = dx(sizeof(int *) * (nb + 1));

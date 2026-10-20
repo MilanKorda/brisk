@@ -25,6 +25,15 @@ typedef struct {
     double err[6];                  /* DIMACS errors 1..6 */
     double time;
     int cone;                       /* 1: solved by the cone solver (0: by the semidefinite solver, which reports itself) */
+    /* bound mode (-bound p|d|pd), per side as BriskResult's bnd: [0] p, an upper bound c'x from the
+     * certificate x (n); [1] d, a lower bound b'y from the certificate y (m). The returned x, y
+     * above are the solve's own point */
+    struct {
+        int asked, have, valid, certified;
+        double value, resid, lammin, rigorous;
+        char src[200];
+        double *x, *y;
+    } bnd[2];
 } SedumiRes;
 int  sedumi_is_mat(const char *fname);
 int  sedumi_read_mat(const char *fname, SedumiProb *P, char *msg, size_t nmsg);

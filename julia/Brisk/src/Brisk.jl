@@ -160,10 +160,15 @@ swapped with respect to the SDPA names -, 3 iteration limit, 4 numerical difficu
 5 reduced accuracy, 6 time limit; -1 not solved), `status_string`, `exit_code` (the command
 line's), `iterations`, `primal_objective` <C,X>, `dual_objective` b'y, `dimacs` (errors 1-6
 on the data given), `solve_time`, `blocksizes`, `y`, `X` (per block: a matrix for an SDP
-block, a vector for an LP block; `nothing` when the engine returned no X), `Z`, and `bound`
-(`nothing` unless the option `bound = "p"` or `"d"` was given): a named tuple `(side, value,
-resid, lammin, valid, certified, rigorous)` — `side` `:p` (an upper bound ⟨C,X⟩) or `:d` (a
-lower bound b'y), `rigorous` the certified bound of `certify = true` (NaN when not run).
+block, a vector for an LP block; `nothing` when the engine returned no X), `Z`, `bound`
+(`nothing` unless the option `bound = "p"`, `"d"` or `"pd"` was given): a named tuple `(side,
+value, resid, lammin, valid, certified, rigorous)` of the first side asked for — `side` `:p`
+(an upper bound ⟨C,X⟩) or `:d` (a lower bound b'y); a bound is checked rigorously whenever it
+is asked for, and `rigorous` is a guaranteed bound only when `certified` (NaN otherwise) —, and
+`bounds`: a `Dict` from each side asked for (`:p`, `:d`) to such a named tuple with `src` (where
+the certificate came from) and the certificate itself, `X` (as `X`) for `:p` and `y` for `:d`
+(`nothing` without a certificate). The returned `y`, `X`, `Z` are the solve's own point, never
+the certificate.
 """
 struct Result
     status::Int
@@ -178,7 +183,8 @@ struct Result
     y::Vector{Float64}
     X::Union{Nothing,Vector{Array{Float64}}}
     Z::Vector{Array{Float64}}
-    bound::Union{Nothing,NamedTuple}   # with "bound" (BRISK's -bound p|d), see below
+    bound::Union{Nothing,NamedTuple}   # with "bound" (BRISK's -bound p|d|pd), the first side asked for
+    bounds::Union{Nothing,Dict{Symbol,NamedTuple}}   # ... each side asked for, with its certificate
 end
 
 function Base.show(io::IO, r::Result)
@@ -217,7 +223,40 @@ function _read_result(r::Ptr{Cvoid})
     bound = side == 0 ? nothing :
         (side = side == 1 ? :p : :d, value = bo[1], resid = bo[2], lammin = bo[3], valid = bo[4] != 0,
          certified = bo[5] != 0, rigorous = bo[6])
-    return Result(st, sstr, ec, it, pobj, dobj, Tuple(err), t, bs, y, X, Z, bound)
+    bounds = _read_bounds(r; X = k -> _block(ccall(_fn(:brisk_result_bound_X), Ptr{Cdouble}, (Ptr{Cvoid}, Cint), r, k - 1), bs[k]),
+                          nb = nb, m = m)
+    return Result(st, sstr, ec, it, pobj, dobj, Tuple(err), t, bs, y, X, Z, bound, bounds)
+end
+
+# each side asked for (-bound p|d|pd) with its certificate: X blocks (SDPA form) or x (SeDuMi
+# form, n) for :p, y for :d; nothing when no side was asked for
+function _read_bounds(r::Ptr{Cvoid}; X = nothing, nb = 0, m = 0, n = 0)
+    out = Dict{Symbol,NamedTuple}()
+    bo = zeros(6)
+    for (side, name) in ((1, :p), (2, :d))
+        st = Int(ccall(_fn(:brisk_result_bound_of), Cint, (Ptr{Cvoid}, Cint, Ptr{Cdouble}), r, side, bo))
+        st == 0 && continue
+        src = unsafe_string(ccall(_fn(:brisk_result_bound_src), Cstring, (Ptr{Cvoid}, Cint), r, side))
+        cert = nothing
+        if side == 1 && st == 2
+            if X !== nothing && nb > 0
+                ok = ccall(_fn(:brisk_result_bound_X), Ptr{Cdouble}, (Ptr{Cvoid}, Cint), r, 0) != C_NULL
+                cert = ok ? Array{Float64}[X(k) for k in 1:nb] : nothing
+            else
+                p = ccall(_fn(:brisk_result_bound_sx), Ptr{Cdouble}, (Ptr{Cvoid},), r)
+                cert = p == C_NULL || n == 0 ? nothing : copy(unsafe_wrap(Array, p, n))
+            end
+        elseif side == 2 && st == 2
+            p = ccall(_fn(:brisk_result_bound_y), Ptr{Cdouble}, (Ptr{Cvoid},), r)
+            cert = p == C_NULL || m == 0 ? nothing : copy(unsafe_wrap(Array, p, m))
+        end
+        out[name] = side == 1 ?
+            (kind = :upper, have = st == 2, value = bo[1], resid = bo[2], lammin = bo[3], valid = bo[4] != 0,
+             certified = bo[5] != 0, rigorous = bo[6], src = src, X = cert) :
+            (kind = :lower, have = st == 2, value = bo[1], resid = bo[2], lammin = bo[3], valid = bo[4] != 0,
+             certified = bo[5] != 0, rigorous = bo[6], src = src, y = cert)
+    end
+    return isempty(out) ? nothing : out
 end
 
 """
@@ -239,10 +278,11 @@ All the digits of the last high-precision solve (option `prec = "dd"`, `"qd"` or
 digits): `(digits, blocksizes, pobj, dobj, y, X, Z)` as `BigFloat`s of sufficient precision
 (`pobj` is `<C,X>`, `dobj` is `b'y`; `X[k]`, `Z[k]` are matrices, or vectors for LP blocks).
 The `Result` of that solve holds the same solution rounded to `Float64`. Returns `nothing`
-when the last solve was not a high-precision one. With `bound = "p"` or `"d"` and a
-certificate, `bound` is the rigorous bound on the optimal value of (P) (upper for p, lower
-for d; rounded outward) and the certificate is the `X` or the `y` returned; otherwise
-`bound` is `nothing`.
+when the last solve was not a high-precision one. The solution is the solve's own point. With
+`bound = "p"`, `"d"` or `"pd"`, `bounds` maps each certified side (`:p`, `:d`) to
+`(bound, X)` or `(bound, y)`: the rigorous bound on the optimal value of (P) (upper for p,
+lower for d; rounded outward) and the certificate with all the digits of its check; `bound` is
+that of the first side (`nothing` without one).
 """
 function hp_solution()
     digits = Int(ccall(_fn(:brisk_hp_digits), Cint, ()))
@@ -259,8 +299,22 @@ function hp_solution()
     bs = [Int(ccall(_fn(:brisk_hp_blocksize), Cint, (Cint,), k - 1)) for k in 1:nb]
     blk(what, k) = bs[k] < 0 ? get(what, k - 1) : permutedims(reshape(get(what, k - 1), bs[k], bs[k]))
     first_or_nothing(v) = isempty(v) ? nothing : v[1]
+    # the certificates, with all the digits of their check
+    cd = Int(ccall(_fn(:brisk_hp_cert_digits), Cint, ()))
+    cprec = ceil(Int, max(cd, digits) * log2(10)) + 16
+    function getc(what, block = 0)
+        n = -ccall(_fn(:brisk_hp_text), Clonglong, (Cint, Cint, Ptr{UInt8}, Clonglong), what, block, C_NULL, 0)
+        n <= 0 && return BigFloat[]
+        buf = Vector{UInt8}(undef, n)
+        len = ccall(_fn(:brisk_hp_text), Clonglong, (Cint, Cint, Ptr{UInt8}, Clonglong), what, block, buf, n)
+        return [parse(BigFloat, t; precision = cprec) for t in split(String(buf[1:len]))]
+    end
+    bounds = Dict{Symbol,NamedTuple}()
+    bp = first_or_nothing(get(6)); bd = first_or_nothing(get(7))
+    bp === nothing || (bounds[:p] = (bound = bp, X = [bs[k] < 0 ? getc(8, k - 1) : permutedims(reshape(getc(8, k - 1), bs[k], bs[k])) for k in 1:nb]))
+    bd === nothing || (bounds[:d] = (bound = bd, y = getc(9)))
     return (digits = digits, blocksizes = bs, pobj = first_or_nothing(get(0)), dobj = first_or_nothing(get(1)), y = get(2),
-            X = [blk(3, k) for k in 1:nb], Z = [blk(4, k) for k in 1:nb], bound = first_or_nothing(get(5)))
+            X = [blk(3, k) for k in 1:nb], Z = [blk(4, k) for k in 1:nb], bound = first_or_nothing(get(5)), bounds = bounds)
 end
 
 function _check(rc, res)
@@ -437,6 +491,7 @@ struct ConeResult
     x::Union{Nothing,Vector{Float64}}
     y::Vector{Float64}
     z::Vector{Float64}
+    bounds::Union{Nothing,Dict{Symbol,NamedTuple}}   # -bound p|d|pd: as Result's, the certificate x (:p) or y (:d)
 end
 
 function Base.show(io::IO, r::ConeResult)
@@ -461,7 +516,8 @@ function _read_cone_result(r::Ptr{Cvoid})
     x = vec(ccall(_fn(:brisk_result_sx), Ptr{Cdouble}, (Ptr{Cvoid},), r), n)
     y = vec(ccall(_fn(:brisk_result_y), Ptr{Cdouble}, (Ptr{Cvoid},), r), m)
     z = vec(ccall(_fn(:brisk_result_sz), Ptr{Cdouble}, (Ptr{Cvoid},), r), n)
-    return ConeResult(st, sstr, ec, it, pobj, dobj, Tuple(err), t, x, y === nothing ? zeros(m) : y, z === nothing ? zeros(n) : z)
+    return ConeResult(st, sstr, ec, it, pobj, dobj, Tuple(err), t, x, y === nothing ? zeros(m) : y, z === nothing ? zeros(n) : z,
+                      _read_bounds(r; m = m, n = n))
 end
 
 _kget(K, k::Symbol) = K isa AbstractDict ? get(K, k, get(K, String(k), nothing)) : (hasproperty(K, k) ? getproperty(K, k) : nothing)

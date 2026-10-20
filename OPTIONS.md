@@ -34,9 +34,9 @@ Interface-specific settings, handled by the interface rather than the solver:
 
 | interface | settings |
 |---|---|
-| Python | `verbose=` (low level), CVXPY's `verbose`, `form` (`"auto"`/`"kernel"`/`"image"`), `soc`, `write_sdpa`, `inaccurate_tol`, `bound` (`"p"`/`"d"`/`"sos"`), `certify` |
+| Python | `verbose=` (low level), CVXPY's `verbose`, `form` (`"auto"`/`"kernel"`/`"image"`), `soc`, `write_sdpa`, `inaccurate_tol`, `bound` (`"p"`/`"d"`/`"pd"`; CVXPY: `"primal"`/`"dual"`/`"sos"`/`"both"`), `certify` (implied by `bound`) |
 | Julia | `"output"` (`:julia`, `:stdout`, `:silent`), `"form"`, `"write_sdpa"`, `"bound"`, `set_silent` |
-| MATLAB | `opts.verbose` (0 quiet, 1 summary, 2 iterations), `opts.bound` (`'p'`, `'d'`, `'sos'`), `opts.sym` (also `true`/`false`) |
+| MATLAB | `opts.verbose` (0 quiet, 1 summary, 2 iterations), `opts.bound` (`'p'`, `'d'`, `'pd'` or `'both'`, `'sos'`), `opts.sym` (also `true`/`false`) |
 
 Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certify-x`,
 `-certify-y`) belong to the command line. The interfaces return the solution in memory.
@@ -47,7 +47,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 
 | option | meaning | default |
 |---|---|---|
-| `acc` | `low`, `default` or `high`: tolerance 1e-6 / 1e-8 / 1e-10 (at `low`, the first-order engine may run first: `fomrace`) | `default` |
+| `acc` | `low`, `default` or `high`: tolerance 1e-6 / 1e-8 / 1e-10 (with `fomrace` > 0 the first-order engine may run first at `low`) | `default` |
 | `tol` | the tolerance itself (overrides `acc`) | 1e-8 |
 | `maxit` | iteration limit | 100 |
 | `timelimit` | wall-clock limit in seconds | none |
@@ -68,7 +68,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
 | `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
 | `freeelim` | eliminate split free variables (kernel-form SOS): `-1` auto, `0` off, `1` on | `-1` |
-| `dualize` | solve the dual form when its Schur complement is at most half the size: `-1` auto, `0` off, `1` force | `-1` |
+| `dualize` | solve the dual form when its Schur complement is at most half the size and the problem has an objective (not for a feasibility problem): `-1` auto, `0` off, `1` force | `-1` |
 | `tracebound` | trace bound with the free elimination | `-1` auto |
 
 ### Method
@@ -84,7 +84,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `cls` | entry-class route of the Schur assembly: a block whose entries fall into classes with the same coefficients in the same constraints (localizing matrices of moment relaxations) is assembled from the much smaller Schur complement of its classes: `-1` auto, `0` off, `1` force | `-1` |
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
-| `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off | 0.2 |
+| `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off (the default since 19 October 2026: it lost wherever it ran on the sets) | 0 |
 | `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
 | `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block and each LP variable is in one constraint at most); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
@@ -146,9 +146,12 @@ digits (the usual result holds it rounded to doubles).
 
 | option | meaning | default |
 |---|---|---|
-| `bound` | `p`: best feasible X (upper bound); `d`: best feasible y (lower bound) | off |
-| `certify` | rigorous check of the bound (interval arithmetic) | off |
-| `bound` with `prec` | the certificate is built and checked in high precision on the problem as read; the rigorous bound has all the digits of `prec`, and the certificate is returned (and written by `-x` / `-y`) with all the digits of its check. `certify` is then implied. `-certify-x` / `-certify-y` with `prec` check a given certificate | – |
+| `bound` | guaranteed bounds on the optimal value, beside the solution: `p` from a feasible X (an upper bound <C,X>), `d` from a feasible y (a lower bound b'y), `pd` both in one solve. The returned point, its status and `-x` / `-y` stay the solve's own; each certificate is checked rigorously on the problem as read and only a certified one is a bound. Python and Julia: `Result.bounds` (per side, with the certificate); MATLAB: `info.bounds.p`, `info.bounds.d`; CVXPY and JuMP: `bound = "primal"`, `"dual"`, `"sos"` or `"both"` | off |
+| `certify` | the rigorous check of a certificate (interval arithmetic, directed rounding, a verified λmin); implied by `bound`, accepted for compatibility | implied |
+| `boundx`, `boundy` | command line: write the certificate X of side p, the y of side d (the `-x` / `-y` formats) | – |
+| `boundprior` | when a certificate has no eigenvalue margin (the other side has no interior): a rigorous bound from a-priori bounds of the other side found from the problem (y bounded through Z(y) ⪰ 0, including pairs y_a ± y_b written by the symmetry reduction; the diagonal of X through equations with positive diagonal entries); `0` off | 1 |
+| `boundprec` | the λmin checks of the bound mode beyond double when only their rounding allowance fails them: `-1` automatic (192 bits, then 384), `0` double only, a number ≥ 128 that many bits | -1 |
+| `bound` with `prec` | the certificate is built and checked in high precision on the problem as read; the rigorous bound has all the digits of `prec`, and the certificate is returned (and written by `-boundx` / `-boundy`) with all the digits of its check; `-x` / `-y` write the solution with the digits of `prec`. `-certify-x` / `-certify-y` with `prec` check a given certificate | – |
 | `boundtol`, `boundmargin` | residual and eigenvalue margin required of a certificate | 1e-10, 1e-13 |
 
 
@@ -205,14 +208,18 @@ termination
   -tol <t>         relative gap / infeasibility tolerance (1e-8)
   -maxit <k>       iteration limit (100)
   -timelimit <s>   wall-clock limit in seconds (0 = none)
-  -bound p|d       return the best GUARANTEED bound instead of the best-balanced pair:
+  -bound p|d|pd    also return GUARANTEED bounds on the optimal value, on the sides asked for:
                    p: a feasible X of (P) (A(X) = b to -boundtol, X > 0 with a margin), <C,X> an
                    upper bound on the optimal value even when the solve does not converge; d: a
-                   feasible y (Z = C - A'y > 0 verified), b'y a lower bound. (P) is the SDPA dual
-                   (min <C,X>, C = -F0): SOS certificates from SeDuMi/GloptiPoly are -bound p;
-                   relaxations of minimisation problems take the lower bound from -bound d.
-                   The certificate replaces its side of the returned pair (-x / -y write it);
-                   -certify makes the bound rigorous. See README (bound mode).
+                   feasible y (Z = C - A'y > 0 verified), b'y a lower bound; pd: both, in one
+                   solve. (P) is the SDPA dual (min <C,X>, C = -F0): SOS certificates from
+                   SeDuMi/GloptiPoly are -bound p; relaxations of minimisation problems take the
+                   lower bound from -bound d. Each certificate is checked rigorously on the
+                   problem as read; only a certified one is a bound. The returned point, its
+                   status and -x / -y stay the solve's own (-boundx / -boundy write the
+                   certificates). Only the sides asked for are evaluated. See README (bound mode).
+  -boundx <f>      with -bound p or pd: write the certificate X (the -x format)
+  -boundy <f>      with -bound d or pd: write the certificate y (the -y format)
   -boundanchor <f> with -bound d: a y (the -y format, as read) whose Z = C - A'y is positive
                    definite, e.g. from a solve of the problem with the largest margin; a
                    candidate whose Z is not positive semidefinite is blended with it
@@ -220,9 +227,16 @@ termination
   -boundmargin <e> eigenvalue margin of the certificate, relative to 1 + max diagonal; at least
                    8 n^2 u per block of order n, what a rigorous check needs (1e-13)
   -boundtrack <t>  residual below which iterates are tracked as candidates (100 x -boundtol)
-  -certify         with -bound, check the certificate rigorously on the
-                   problem as read (the file's decimals enclosed in intervals, directed rounding,
-                   a verified lambda_min) and print the rigorous bound
+  -boundprec <k>   the lambda_min checks of the bound mode beyond double, when only their rounding
+                   allowance fails them (about n^2 u on a unit diagonal): -1 automatic (192 bits,
+                   then 384), 0 double only, > 0 that many bits (mpx arithmetic, a-priori error bounds)
+  -boundprior <k>  when a certificate has no margin (the other side without an interior): a rigorous
+                   bound from a-priori bounds of the other side found from the problem (1, the
+                   default; 0 off): y bounded through Z(y) >= 0 (moment relaxations with a ball or
+                   box constraint), the diagonal of X through equations of positive diagonal entries
+  -certify         (implied by -bound) the rigorous check of a certificate on the problem as
+                   read: the file's decimals enclosed in intervals, directed rounding, a
+                   verified lambda_min; the rigorous bound is printed
   -certify-x <f>   no solve: rigorously check the X in f (-x format: block i j value) as a
   -certify-y <f>   ... p certificate, or the y in f (-y format) as a d certificate; exit code 0
                    when certified, 20 when not (certificates of any solver in these formats)
@@ -246,11 +260,12 @@ high precision
                    Newton method runs in high precision instead, with -lralm 1 the low-rank
                    (X = R R') augmented Lagrangian method. -x/-y/-z write all the digits.
                    Status PRECISION LIMIT: the accuracy the precision reaches on the problem
-                   With -bound p|d the certificate of that side is built in high precision on the
-                   problem as read and checked rigorously (in the precision of -prec plus guard
+                   With -bound p|d|pd the certificate of each side is built in high precision on
+                   the problem as read and checked rigorously (in the precision of -prec plus guard
                    limbs, with a-priori error bounds of the arithmetic); the rigorous bound is
-                   printed with all digits, and -x / -y write the certificate with all the digits
-                   of its check. -certify-x / -certify-y with -prec check a given certificate
+                   printed with all digits, and -boundx / -boundy write the certificates with all
+                   the digits of their check (-x / -y: the solution, with the digits of -prec).
+                   -certify-x / -certify-y with -prec check a given certificate
                    the same way (p needs an interior of (P), d one of (D))
   -hpext <k>       interior-point method: when the precision is exhausted short of the tolerance
                    (problems without an interior that the presolve does not reduce reach about
@@ -313,7 +328,8 @@ presolve
   -tracebound <R>  with the elimination: the row sum tr(X) + s = R that keeps the Gram side
                    bounded (-1 auto: 1e7 (1 + max|b|), 0 off)
   -dualize <k>     solve the dual form (Z + sum y_i A_i = C entrywise, y eliminated) when its
-                   Schur complement is at most half the size: -1 auto, 0 off, 1 force
+                   Schur complement is at most half the size and the problem has an objective
+                   (not for a feasibility problem): -1 auto, 0 off, 1 force
   -mfipm <k>       matrix-free interior-point method: NT Mehrotra steps, Newton systems
                    by preconditioned CG, no Schur complement (1 on, 0 off); for problems with
                    a low-rank optimal side (moment-SOS with few atoms). 2: the hybrid - the
@@ -372,7 +388,8 @@ presolve
                    and a sparse Gram matrix A A' (theta-type problems)
                    that the presolve leaves as they are (no chordal conversion, no dual form)
                    and whose interior-point solve is expected to take 20 s or more, the
-                   first-order engine runs first for the fraction f of that time (0.2; 0 off);
+                   first-order engine runs first for the fraction f of that time (default 0: off;
+                   it lost wherever it ran on the sets, e.g. 0.2);
                    the interior-point method follows if it has not reached the tolerance
   -fomstart-x <f>  start the first-order engine from the X in f (the -x format) ...
   -fomstart-y <f>  ... and the y in f (the -y format): continuing a long run (needs -nosym
@@ -415,8 +432,10 @@ presolve
                    eigendecomposition and two n x n products per block: 0.2 s at n = 1000,
                    1.3 s at n = 1860)
   -blkscale <k>    diagonal congruence scaling of the semidefinite blocks, X = D X' D with D from the
-                   data (Ruiz iterations, powers of two): 1 on, -1 when a block's factors spread by 4
-                   or more, 0 off (the default)
+                   data in powers of two: 2 by the size of the data at each index (D = 1 / the largest
+                   |coefficient| there, within 2^-20..2^20), 1 by Ruiz iterations; -2, -1 the same when
+                   a block's factors spread by 4 or more; 0 off (the default). When the scaled solve
+                   misses the tolerance the problem is solved as given and the better answer kept
   -chordal <k>     chordal decomposition: -1 auto, 0 off, 1 force
   -chordalmin <n>  only blocks at least this large (100)
   -returnx <k>     library calls (MATLAB, Python, Julia): X of a chordal-decomposed block is

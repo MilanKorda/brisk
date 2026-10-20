@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <fenv.h>
 
 struct HPChamp { int have; uint64_t **X, **Z, *y, *pobj, *dobj; double m[5]; };
 #define HP_NANC 6
@@ -744,6 +745,57 @@ static void hp_write(const HPJob *J, const char *yfile, const char *xfile, const
 /* kind: 1 dd, 2 qd, 3 mpx with `digits` decimal digits. Returns the exit code. */
 #include "hppre.inc"
 #include "hpcert.inc"
+
+/* 1 when lambda_min(M) >= need is proved for the symmetric n x n double matrix M (column-major,
+ * taken exactly as given) in mpx arithmetic of at least `bits` bits: the double checks of the
+ * bound mode (boundcert.c) when their rounding allowance (of the order of n u tr M in double) is
+ * what fails them. The proof is hpc_lammin_ge's: the Cholesky factorization of
+ * W = fl(M - c I) runs to the end with c = need + 2 (g tr(W) + u max(|M_ii|, |c|)),
+ * g = gamma_{3n+10}(u), u the model unit of the arithmetic (hpcert.inc), and
+ * tr(W) <= sum |M_ii| + n |c|; then lambda_min(M) >= need. Returns -1 when the matrices do
+ * not fit in the memory (nothing was proved). */
+int brisk_lammin_ge_mp(int n, const double *M, double need, int bits) {
+    if (n <= 0) return 1;
+    if (!isfinite(need)) return 0;
+    if (bits < 128) return -1;                   /* (19 October 2026: at 64 bits and below HPC_U is 1 and the allowance below
+                                                  * went negative: a "proof" of anything) */
+    const int L0 = mpx_L, W0 = mpx_W;
+    mpx_set_prec(bits);
+    const size_t Wm = (size_t)mpx_W;
+    if (2.0 * (double)n * n * Wm * 8.0 > 0.3 * brisk_mem_limit()) { mpx_L = L0; mpx_W = W0; return -1; }
+    HPJob Jd;
+    memset(&Jd, 0, sizeof(Jd));
+    Jd.Lm = mpx_L;
+    const double u = HPC_U(&Jd);
+    double tr = 0, dmax = 0;
+    for (int i = 0; i < n; i++) { const double a = fabs(M[i + (size_t)i * n]); tr += a; if (a > dmax) dmax = a; }
+    tr *= 1.01;
+    if (!isfinite(tr)) { mpx_L = L0; mpx_W = W0; return 0; }
+    if (!((3.0 * n + 10.0) * u < 0.1)) { mpx_L = L0; mpx_W = W0; return -1; }   /* the error analysis needs (3n+10)u < 1 */
+    const double g = 1.01 * (3.0 * n + 10.0) * u / (1 - (3.0 * n + 10.0) * u);
+    /* the shift c >= need + the allowance, computed with upward rounding (in double, need + a tiny allowance rounded to need
+     * and the proof covered only lambda_min >= need - allowance) */
+    const int rm0 = fegetround();
+    fesetround(FE_UPWARD);
+    double c = need;
+    for (int it = 0; it < 4; it++) c = need + (2.02 * (g * (tr + n * fabs(c)) + u * fmax(dmax, fabs(c))) + 1e-290);
+    fesetround(rm0);
+    if (!(c > need)) { mpx_L = L0; mpx_W = W0; return -1; }
+    uint64_t *W = (uint64_t *)calloc((size_t)n * n * Wm + 1, sizeof(uint64_t));
+    if (!W) { mpx_L = L0; mpx_W = W0; return -1; }
+    uint64_t cm[MPX_MAXL + 2], t[MPX_MAXL + 2];
+    mpx_setd(cm, c);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j <= i; j++) {
+            /* the lower triangle of W, row-major as cholr_mp reads it */
+            if (i == j) { mpx_setd(t, M[i + (size_t)i * n]); mpx_sub(W + ((size_t)i * n + i) * Wm, t, cm); }
+            else mpx_setd(W + ((size_t)i * n + j) * Wm, M[i + (size_t)j * n]);
+        }
+    const int ok = cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL) == 0;
+    free(W);
+    mpx_L = L0; mpx_W = W0;
+    return ok;
+}
 #include "hpred.inc"
 static int g_hp_nored = 0;   /* 5.9: the solve is repeated without the reductions of hpred.inc */
 
@@ -943,12 +995,16 @@ static double hp_interior(HPJob *J, double relerr) {
  *   brisk_hp_text(what, block, buf, len)  the values, separated by blanks; returns the length
  *                                      written, or -(needed length) when buf is too short
  * what: 0 primal objective <C,X>, 1 dual objective b'y, 2 y, 3 X of a block, 4 Z of a block,
- * 5 the rigorous bound of a certificate (-bound p|d: rounded up for p, down for d)
+ * 5 the rigorous bound of a certificate (-bound p|d: rounded up for p, down for d; with
+ * -bound pd that of p), 6 the rigorous bound of side p, 7 that of side d, 8 the certificate X
+ * of side p (a block), 9 the certificate y of side d (the certificates with all the digits of
+ * their check, brisk_hp_cert_digits(); the solution with those of -prec)
  * (blocks from 0; a matrix block row by row, n*n values; an LP block its n values). */
-static struct { int digits, Lm, m, nb, *bs; uint64_t **X, **Z, *y, *pobj, *dobj; int bside; uint64_t *bound; } g_hp_last;
+static struct { int digits, cdigits, Lm, m, nb, *bs; uint64_t **X, **Z, *y, *pobj, *dobj; int bside; uint64_t *bound, *bnd[2], **certX, *certy; } g_hp_last;
 static void hp_last_free(void) {
-    for (int k = 0; k < g_hp_last.nb; k++) { if (g_hp_last.X) free(g_hp_last.X[k]); if (g_hp_last.Z) free(g_hp_last.Z[k]); }
+    for (int k = 0; k < g_hp_last.nb; k++) { if (g_hp_last.X) free(g_hp_last.X[k]); if (g_hp_last.Z) free(g_hp_last.Z[k]); if (g_hp_last.certX) free(g_hp_last.certX[k]); }
     free(g_hp_last.X); free(g_hp_last.Z); free(g_hp_last.y); free(g_hp_last.pobj); free(g_hp_last.dobj); free(g_hp_last.bs); free(g_hp_last.bound);
+    free(g_hp_last.bnd[0]); free(g_hp_last.bnd[1]); free(g_hp_last.certX); free(g_hp_last.certy);
     memset(&g_hp_last, 0, sizeof(g_hp_last));
 }
 #if defined(__GNUC__)
@@ -958,12 +1014,16 @@ static void hp_last_free(void) {
 #endif
 void brisk_hp_clear(void) { hp_last_free(); }
 HP_API int brisk_hp_digits(void) { return g_hp_last.digits; }
+HP_API int brisk_hp_cert_digits(void) { return g_hp_last.cdigits ? g_hp_last.cdigits : g_hp_last.digits; }
 HP_API int brisk_hp_nblk(void) { return g_hp_last.nb; }
 HP_API int brisk_hp_blocksize(int block) { return block >= 0 && block < g_hp_last.nb ? g_hp_last.bs[block] : 0; }   /* negative: LP */
 HP_API long long brisk_hp_count(int what, int block) {
     if (!g_hp_last.digits) return 0;
     if (what == 0 || what == 1) return g_hp_last.pobj ? 1 : 0;
     if (what == 5) return g_hp_last.bound ? 1 : 0;                 /* the rigorous bound of -bound / -certify-x / -certify-y */
+    if (what == 6 || what == 7) return g_hp_last.bnd[what - 6] ? 1 : 0;
+    if (what == 8 && g_hp_last.certX && block >= 0 && block < g_hp_last.nb) { const long long n = g_hp_last.bs[block]; return n < 0 ? -n : n * n; }
+    if (what == 9) return g_hp_last.certy ? g_hp_last.m : 0;
     if (what == 2) return g_hp_last.y ? g_hp_last.m : 0;
     if ((what == 3 || what == 4) && block >= 0 && block < g_hp_last.nb) { const long long n = g_hp_last.bs[block]; return n < 0 ? -n : n * n; }
     return 0;
@@ -971,16 +1031,18 @@ HP_API long long brisk_hp_count(int what, int block) {
 HP_API long long brisk_hp_text(int what, int block, char *buf, long long len) {
     const long long cnt = brisk_hp_count(what, block);
     if (cnt <= 0) return 0;
-    const int nd = g_hp_last.digits;
+    const int nd = what >= 8 ? brisk_hp_cert_digits() : g_hp_last.digits;
     const long long need = cnt * (long long)(nd + 40) + 1;
     if (!buf || len < need) return -need;
-    const uint64_t *src = what == 0 ? g_hp_last.pobj : what == 1 ? g_hp_last.dobj : what == 2 ? g_hp_last.y : what == 3 ? g_hp_last.X[block] : what == 5 ? g_hp_last.bound : g_hp_last.Z[block];
+    const uint64_t *src = what == 0 ? g_hp_last.pobj : what == 1 ? g_hp_last.dobj : what == 2 ? g_hp_last.y : what == 3 ? g_hp_last.X[block] : what == 5 ? g_hp_last.bound
+                        : what == 6 || what == 7 ? g_hp_last.bnd[what - 6] : what == 8 ? g_hp_last.certX[block] : what == 9 ? g_hp_last.certy : g_hp_last.Z[block];
     const int L0 = mpx_L, W0 = mpx_W;
     mpx_L = g_hp_last.Lm; mpx_W = mpx_L + 2;
     const size_t Wm = (size_t)mpx_W;
     long long pos = 0;
     for (long long i = 0; i < cnt; i++) {
         if (what == 5) hpc_bound_str(buf + pos, src, nd, g_hp_last.bside == 1 ? +1 : -1);
+        else if (what == 6 || what == 7) hpc_bound_str(buf + pos, src, nd, what == 6 ? +1 : -1);
         else mpx_to_str(buf + pos, src + (size_t)i * Wm, nd);
         pos += (long long)strlen(buf + pos);
         buf[pos++] = i + 1 < cnt ? ' ' : 0;
@@ -1411,12 +1473,13 @@ hp_again:
             nap++;
         }
         for (int a = 1; a < nap; a++) { const HPPoint v = ap[a]; int b = a; while (b > 0 && ap[b - 1].err < v.err) { ap[b] = ap[b - 1]; b--; } ap[b] = v; }   /* older (larger error) first */
-        if (pre && pre->nface && (dualized ? bside == 1 : bside == 2)) {
+        const int sface = dualized ? 1 : 2;       /* the side whose certificate takes the face reduction's direction */
+        if (pre && pre->nface && (bside & sface)) {
             uint64_t **X1 = hpc_alloc_blocks(&J_), **X2 = hpc_alloc_blocks(&J_);
             uint64_t *y1 = (uint64_t *)calloc(((size_t)m_orig + 1) * Wm, sizeof(uint64_t)), *y2 = (uint64_t *)calloc(((size_t)m_orig + 1) * Wm, sizeof(uint64_t));
             hp_map_back(pre, JB, J, dualized, &J_, J->X, J->y, 0.0, X1, y1);
             hp_map_back(pre, JB, J, dualized, &J_, J->X, J->y, 1.0, X2, y2);
-            if (bside == 1) {
+            if (sface == 1) {
                 for (int k = 0; k < nb_orig; k++) { const size_t len = J_.bs[k] < 0 ? (size_t)(-J_.bs[k]) : (size_t)J_.bs[k] * J_.bs[k]; for (size_t i = 0; i < len; i++) mpx_sub(X2[k] + i * Wm, X2[k] + i * Wm, X1[k] + i * Wm); }
                 DirX = X2; hpc_free_blocks(X1, nb_orig); free(y1); free(y2);
             } else {
@@ -1549,26 +1612,46 @@ hp_again:
             if (rc == 0 && J->best_err > 10.0 * accept) rc = 1;
         }
     }
-    /* -bound: the certificate of one side on the problem as read (hpcert.inc); it replaces
-     * its side of the returned pair */
-    HPCertOut cert; int have_cert = 0, tried_cert = 0; char cert_src[200]; double t_cert = 0;
-    memset(&cert, 0, sizeof(cert)); cert_src[0] = 0;
-    if (bside && J->have_iter && rc != 4 && rc != 5) {
+    /* -bound: the certificate of each side asked for on the problem as read (hpcert.inc),
+     * beside the returned point (which stays the solve's own; up to 1.5.1 the certificate
+     * replaced its side of it) */
+    HPCertOut cert[2]; int have_cert[2] = { 0, 0 }, tried_cert[2] = { 0, 0 }; char cert_src[2][200]; double t_cert[2] = { 0, 0 };
+    uint64_t **certX = NULL, *certy = NULL;
+    int prior_[2] = { 0, 0 };                   /* certified by a-priori bounds */
+    memset(cert, 0, sizeof(cert)); cert_src[0][0] = cert_src[1][0] = 0;
+    for (int sd = 1; sd <= 2; sd++) {
+        if (!(bside & sd) || !J->have_iter || rc == 4 || rc == 5) continue;
         const double tc0 = wtime();
-        {
-            PSOrig *Oc = hp_psorig(J);
-            tried_cert = 1;
-            have_cert = hp_bound(J, Oc, data != NULL, bside, nap, ap, DirX, diry, J->verbose, &cert, cert_src, sizeof(cert_src));
-            ps_orig_free(Oc);
-            if (have_cert) {
-                /* the pair is measured again where that is the measure of the problem as read
-                 * (after a face reduction the other side is measured on the face: kept) */
-                if ((bside == 2 && face_dual == 1) || (bside == 1 && face_dual == 2)) face_dual = 0;
-                if (!face_dual) hp_measure(J, J->X, J->y, J->Z, J->tol);
-                else { if (bside == 2) { hp_formZ(J, J->y, J->Z, NULL); mpx_copy(J->dobj, cert.value); } else mpx_copy(J->pobj, cert.value); }
-            }
+        PSOrig *Oc = hp_psorig(J);
+        tried_cert[sd - 1] = 1;
+        uint64_t **Xc = sd == 1 ? hpc_alloc_blocks(J) : NULL;
+        uint64_t *yc = sd == 2 ? (uint64_t *)calloc(((size_t)J->m + 1) * Wm, sizeof(uint64_t)) : NULL;
+        have_cert[sd - 1] = hp_bound(J, Oc, data != NULL, sd, nap, ap, sd == 1 ? DirX : NULL, sd == 2 ? diry : NULL, J->verbose, &cert[sd - 1],
+                                     cert_src[sd - 1], sizeof(cert_src[0]), Xc, yc);
+        if (!have_cert[sd - 1] && par->bound_prior) {
+            /* no margin: a-priori bounds of the other side (boundcert.c), in double precision, for
+             * the returned point rounded to doubles (valid for any point; the bound has double accuracy) */
+            double **Xd = NULL, *yd = NULL, B; char w2[160];
+            if (sd == 1) {
+                Xd = bound_alloc_blocks(Oc);
+                for (int k = 0; k < J->nblk; k++) { const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k]; for (size_t i = 0; i < len; i++) Xd[k][i] = mpx_getd(J->X[k] + i * Wm); }
+            } else { yd = (double *)malloc(sizeof(double) * ((size_t)J->m + 1)); for (int p = 0; p < J->m; p++) yd[p] = mpx_getd(J->y + (size_t)p * Wm); }
+            if (brisk_prior_bound(Oc, sd, Xd, NULL, yd, NULL, data != NULL, J->verbose, &B, NULL, w2, sizeof(w2))) {
+                have_cert[sd - 1] = 1; prior_[sd - 1] = 1;
+                mpx_setd(cert[sd - 1].bound, B);
+                if (sd == 1) { for (int k = 0; k < J->nblk; k++) { const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k]; for (size_t i = 0; i < len; i++) mpx_setd(Xc[k] + i * Wm, Xd[k][i]); } }
+                else for (int p = 0; p < J->m; p++) mpx_setd(yc + (size_t)p * Wm, yd[p]);
+                if (sd == 1) mpx_copy(cert[sd - 1].value, J->pobj); else mpx_copy(cert[sd - 1].value, J->dobj);
+                snprintf(cert_src[sd - 1], sizeof(cert_src[0]), "a-priori bounds of %s (double precision; the margin check failed: %.90s); the returned point",
+                         sd == 1 ? "y" : "the diagonal of X", cert[sd - 1].why);
+            } else { const size_t l = strlen(cert[sd - 1].why); snprintf(cert[sd - 1].why + l, sizeof(cert[0].why) - l, "; a-priori bounds: %.100s", w2); }
+            if (Xd) bound_free_blocks(Xd, Oc->nblk);
+            free(yd);
         }
-        t_cert = wtime() - tc0;
+        ps_orig_free(Oc);
+        if (have_cert[sd - 1] && sd == 1) certX = Xc; else hpc_free_blocks(Xc, sd == 1 ? J->nblk : 0);
+        if (have_cert[sd - 1] && sd == 2) certy = yc; else free(yc);
+        t_cert[sd - 1] = wtime() - tc0;
     }
     for (int a = 0; a < nap; a++) { hpc_free_blocks(ap[a].X, nb_orig); free(ap[a].y); }
     hpc_free_blocks(DirX, nb_orig); free(diry);
@@ -1609,16 +1692,22 @@ hp_again:
         else printf("  X and Z are positive definite (Cholesky in the working precision)\n");
         printf("time: total %.3fs;", wtime() - J->tstart + t_warm);
         for (int l = 0; l <= lev; l++) { if (lk[l] == 3) printf(" mp%d", lb[l]); else printf(" %s", l == 0 ? "d" : lk[l] == 1 ? "dd" : "qd"); printf(" %d it %.3fs%s", itlev[l], tlev[l], l < lev ? "," : "\n"); }
-        if (tried_cert) {
-            const char *sd = bside == 1 ? "P" : "D", *ul = bside == 1 ? "upper" : "lower";
-            if (have_cert) {
-                mpx_to_str(s1, cert.value, nd);
-                printf("BOUND (%s): %s bound %s = %s (certificate: %s)\n", sd, ul, bside == 1 ? "<C,X>" : "b'y", s1, cert_src);
-                hpc_bound_str(s1, cert.bound, nd, bside == 1 ? +1 : -1);
-                mpx_neg(t, cert.bound); hpc_bound_str(s2, t, nd, bside == 1 ? -1 : +1);
+        for (int sd = 1; sd <= 2; sd++) {
+            if (!tried_cert[sd - 1]) continue;
+            const char *SD = sd == 1 ? "P" : "D", *ul = sd == 1 ? "upper" : "lower";
+            const HPCertOut *ce = &cert[sd - 1];
+            if (have_cert[sd - 1]) {
+                mpx_to_str(s1, ce->value, nd);
+                printf("BOUND (%s): %s bound %s = %s (certificate: %s)\n", SD, ul, sd == 1 ? "<C,X>" : "b'y", s1, cert_src[sd - 1]);
+                hpc_bound_str(s1, ce->bound, nd, sd == 1 ? +1 : -1);
+                mpx_neg(t, ce->bound); hpc_bound_str(s2, t, nd, sd == 1 ? -1 : +1);
+                if (prior_[sd - 1])
+                    printf("CERTIFIED (%s): rigorous %s bound %s on the optimal value of %s\n           (SDPA convention: %s bound %s; by a-priori bounds, in double precision; %.2fs)\n",
+                           SD, ul, s1, sd == 1 ? "(D)" : "(P)", sd == 1 ? "a lower" : "an upper", s2, t_cert[sd - 1]);
+                else
                 printf("CERTIFIED (%s): rigorous %s bound %s on the optimal value of (P)\n           (SDPA convention: %s bound %s; %d-bit arithmetic, distance to the feasible point %.1e; %.2fs)\n",
-                       sd, ul, s1, bside == 1 ? "a lower" : "an upper", s2, 64 * (J->Lm - 1), cert.delta, t_cert);
-            } else printf("NOT CERTIFIED (%s): %s (%.2fs)\n", sd, cert.why[0] ? cert.why : "no certificate", t_cert);
+                       SD, ul, s1, sd == 1 ? "a lower" : "an upper", s2, 64 * (J->Lm - 1), ce->delta, t_cert[sd - 1]);
+            } else printf("NOT CERTIFIED (%s): %s: no guaranteed %s bound (%.2fs)\n", SD, ce->why[0] ? ce->why : "no certificate", ul, t_cert[sd - 1]);
         }
         free(s1); free(s2);
     }
@@ -1631,6 +1720,7 @@ hp_again:
         Jo_.Lm = J->Lm; Jo_.m = J->m; Jo_.nblk = sp_.nb0;
         Jo_.bs = (int *)malloc(sizeof(int) * (size_t)(sp_.nb0 + 1)); memcpy(Jo_.bs, sp_.bs0, sizeof(int) * (size_t)sp_.nb0);
         Jo_.X = hp_split_back(&sp_, J, J->X); Jo_.Z = hp_split_back(&sp_, J, J->Z);
+        if (certX) { uint64_t **cb = hp_split_back(&sp_, J, certX); hpc_free_blocks(certX, J->nblk); certX = cb; }
         Jo_.y = J->y; Jo_.pobj = J->pobj; Jo_.dobj = J->dobj; J->y = NULL; J->pobj = NULL; J->dobj = NULL;
         Jo_.iters = J->iters; Jo_.maxit = J->maxit; Jo_.have_iter = J->have_iter; Jo_.verbose = J->verbose;
         Jo_.best_pinf = J->best_pinf; Jo_.best_dinf = J->best_dinf; Jo_.best_gap = J->best_gap; Jo_.best_compl = J->best_compl; Jo_.best_err = J->best_err;
@@ -1642,8 +1732,16 @@ hp_again:
         J = &Jo_; nb = sp_.nb0;
         hp_split_free(&sp_);
     }
-    const int ndw = have_cert ? (int)(64.0 * (J->Lm - 1) * 0.30103) - 1 : nd;
-    hp_write(J, yfile, xfile, zfile, ndw);
+    const int ndw = (have_cert[0] || have_cert[1]) ? (int)(64.0 * (J->Lm - 1) * 0.30103) - 1 : nd;
+    hp_write(J, yfile, xfile, zfile, nd);
+    if (par->bound_xfile || par->bound_yfile) {
+        /* the certificates (-boundx, -boundy), with all the digits of their check */
+        HPJob Jc = *J;
+        Jc.X = certX; Jc.y = certy;
+        if (par->bound_xfile && !certX) fprintf(stderr, "brisk: -boundx: no certificate X to write (it needs -bound p or pd and a certified candidate)\n");
+        if (par->bound_yfile && !certy) fprintf(stderr, "brisk: -boundy: no certificate y to write (it needs -bound d or pd and a certified candidate)\n");
+        hp_write(&Jc, certy ? par->bound_yfile : NULL, certX ? par->bound_xfile : NULL, NULL, ndw);
+    }
     if (res) {
         /* the library interface: the same fields as a double solve; X, y and Z rounded to
          * doubles (the full digits are in the -x / -y / -z files) */
@@ -1667,19 +1765,48 @@ hp_again:
         }
         res->have_x = J->have_iter;
         res->bound_side = 0; res->bound_rigorous = NAN; res->n_resolves = 0; res->t_resolves = 0;
-        if (tried_cert) {
-            res->bound_side = bside; res->bound_certified = have_cert; res->bound_valid = have_cert ? 2 : 0;
-            res->bound_value = have_cert ? mpx_getd(cert.value) : NAN; res->bound_resid = cert.resid; res->bound_lammin = NAN;
-            res->bound_rigorous = have_cert ? hpc_bound_dbl(cert.bound, bside == 1 ? +1 : -1) : NAN;
+        for (int sd = 1; sd <= 2; sd++) {
+            /* each side asked for; the certificate rounded to doubles (all its digits: -boundx /
+             * -boundy, brisk_hp_text) */
+            memset(&res->bnd[sd - 1], 0, sizeof(res->bnd[0]));
+            res->bnd[sd - 1].value = NAN; res->bnd[sd - 1].rigorous = NAN; res->bnd[sd - 1].lammin = NAN;
+            if (!(bside & sd)) continue;
+            res->bnd[sd - 1].asked = 1;
+            if (!tried_cert[sd - 1]) continue;
+            const int hc = have_cert[sd - 1];
+            res->bnd[sd - 1].have = hc; res->bnd[sd - 1].certified = hc; res->bnd[sd - 1].valid = hc ? 2 : 0;
+            res->bnd[sd - 1].value = hc ? mpx_getd(cert[sd - 1].value) : NAN; res->bnd[sd - 1].resid = cert[sd - 1].resid;
+            res->bnd[sd - 1].rigorous = hc ? hpc_bound_dbl(cert[sd - 1].bound, sd == 1 ? +1 : -1) : NAN;
+            if (hc) { memcpy(res->bnd[sd - 1].src, cert_src[sd - 1], sizeof(res->bnd[0].src)); res->bnd[sd - 1].src[sizeof(res->bnd[0].src) - 1] = 0; }
+            if (sd == 1 && certX) {
+                res->bnd[0].X = (double **)calloc((size_t)nb + 1, sizeof(double *));
+                for (int k = 0; k < nb; k++) {
+                    const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k];
+                    res->bnd[0].X[k] = (double *)malloc(sizeof(double) * (len + 1));
+                    for (size_t i = 0; i < len; i++) res->bnd[0].X[k][i] = mpx_getd(certX[k] + i * Wm);
+                }
+            }
+            if (sd == 2 && certy) { res->bnd[1].y = (double *)malloc(sizeof(double) * (size_t)(m + 1)); for (int p = 0; p < m; p++) res->bnd[1].y[p] = mpx_getd(certy + (size_t)p * Wm); }
+        }
+        {
+            const int s0 = (bside & 1) ? 0 : 1;
+            if (bside && tried_cert[s0]) {
+                res->bound_side = s0 + 1; res->bound_certified = res->bnd[s0].certified; res->bound_valid = res->bnd[s0].valid;
+                res->bound_value = res->bnd[s0].value; res->bound_resid = res->bnd[s0].resid; res->bound_lammin = NAN; res->bound_rigorous = res->bnd[s0].rigorous;
+            }
         }
         snprintf(res->cause, sizeof(res->cause), "%s", rc == 0 ? "" : rc == 1 ? "the accuracy this precision can reach on this problem; a higher -prec goes further" : "");
     }
     /* the solution stays available as text (brisk_hp_text) */
     hp_last_free();
-    g_hp_last.digits = ndw; g_hp_last.Lm = J->Lm; g_hp_last.m = m; g_hp_last.nb = nb;
+    g_hp_last.digits = nd; g_hp_last.cdigits = ndw; g_hp_last.Lm = J->Lm; g_hp_last.m = m; g_hp_last.nb = nb;
     g_hp_last.bs = (int *)malloc(sizeof(int) * (size_t)(nb + 1)); memcpy(g_hp_last.bs, J->bs, sizeof(int) * (size_t)nb);
     g_hp_last.X = J->X; g_hp_last.Z = J->Z; g_hp_last.y = J->y; g_hp_last.pobj = J->pobj; g_hp_last.dobj = J->dobj;
-    if (have_cert) { g_hp_last.bside = bside; g_hp_last.bound = (uint64_t *)malloc(Wm * sizeof(uint64_t)); memcpy(g_hp_last.bound, cert.bound, Wm * sizeof(uint64_t)); }
+    for (int sd = 1; sd <= 2; sd++) if (have_cert[sd - 1]) {
+        g_hp_last.bnd[sd - 1] = (uint64_t *)malloc(Wm * sizeof(uint64_t)); memcpy(g_hp_last.bnd[sd - 1], cert[sd - 1].bound, Wm * sizeof(uint64_t));
+        if (!g_hp_last.bound) { g_hp_last.bside = sd; g_hp_last.bound = (uint64_t *)malloc(Wm * sizeof(uint64_t)); memcpy(g_hp_last.bound, cert[sd - 1].bound, Wm * sizeof(uint64_t)); }
+    }
+    g_hp_last.certX = certX; g_hp_last.certy = certy; certX = NULL; certy = NULL;
     J->X = NULL; J->Z = NULL; J->y = NULL; J->pobj = NULL; J->dobj = NULL;
     free(J->dep); J->dep = NULL;
     lr_free(J); hp_free(J);

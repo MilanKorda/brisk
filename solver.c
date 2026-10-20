@@ -181,7 +181,7 @@ void params_default(Params *p) {
     p->fr_fallback = 0.0;    /* 5.17 (the owner, 16 October 2026): no re-solve when the removed duals are not rebuilt; the user is told
                               * how to solve without the reduction (5.16: the re-solve within 4x the solve's time; -frfallback 4) */
     p->sym_fallback = 4.0;   /* 5.16: the solve without an automorphism reduction when the reduced one ends worse than reduced accuracy, within 4x */
-    p->bound_side = 0; p->bound_tol = 1e-10; p->bound_margin = 1e-13; p->bound_track_tol = -1; p->btrack = NULL;
+    p->bound_side = 0; p->bound_tol = 1e-10; p->bound_margin = 1e-13; p->bound_track_tol = -1; p->btrack = NULL; p->btrack2 = NULL; p->bound_xfile = NULL; p->bound_yfile = NULL; p->bound_prior = 1; p->bound_prec = -1;
     p->t_start = 0;
     p->retry_acc = 1e-7;     /* results within 1e-7 are returned as they are (no second solve) */
     p->dd_factor = 1.0;      /* endgame may cost at most as much as the solve itself ... */
@@ -192,7 +192,7 @@ void params_default(Params *p) {
     p->acc_level = 1; p->red_acc = 1e-6; p->retry_hsd1 = 1e-6; p->slow_gate = 1e-5;
     p->tracebound = -1;
     p->dualize = -1;
-    p->symfile = "auto"; p->symtime = 20.0; p->symnodes = 500; p->symbd = 1; p->symmin = 1.5; p->symsign = 1; p->symsigned = 1; p->returnx = -1; p->fom_race = 0.2; p->fom_race_budget = 0; p->hp_kind = 0; p->hp_digits = 0; p->hp_tol = 0; p->hp_ext = 2; p->symalg = -1; p->symalgmax = 1000; p->blkscale = 0; p->bm = -1;
+    p->symfile = "auto"; p->symtime = 20.0; p->symnodes = 500; p->symbd = 1; p->symmin = 1.5; p->symsign = 1; p->symsigned = 1; p->returnx = -1; p->fom_race = 0; p->fom_race_budget = 0; p->hp_kind = 0; p->hp_digits = 0; p->hp_tol = 0; p->hp_ext = 2; p->symalg = -1; p->symalgmax = 1000; p->blkscale = 0; p->bm = -1;
     p->chordal_need = 0;
     p->lralm = 0; p->lr_rank = 1; p->lr_rmax = 32; p->lr_outer = 500; p->lr_inner = 2000; p->lr_escape = 1; p->lr_prec = 1; p->lr_newton = 1; p->lr_sigma = 10.0; p->lr_tol = 1e-6; p->lr_trace = 0;
     p->mfipm = 0; p->mf_rho = 10; p->mf_rmax = 4; p->mf_drop = 0.5; p->mf_kmax = 8000; p->mf_cgmax = 3000; p->mf_cgtol_min = 1e-10; p->mf_cgtol_max = 1e-3; p->mf_diag = 0; p->mf_warm = 1; p->mf_stall = 5; p->mf_cgtime = 0; p->mf_hand = 1e-3; p->mf_handcg = 600; p->mf_try = 1; p->mf_trial = 0; p->mf_trial_total = 0; p->mf_try_tl = 0; p->mf_try_fits = 1; p->mf_proj = 0; p->mf_eta = 0.1; p->fom_sigma0 = 1.0; p->fom_aadr = 1; p->fom_single = 1e-4; p->fom_ssn_stall = 6; p->mf_recycle = 0;
@@ -470,9 +470,8 @@ static int btrack_anchor_slot(BoundTrack *T) {
     }
     return T->na++;
 }
-static void btrack_offer(const Params *par, const Problem *P, struct BS *S, const double *y, double tau,
-                         double mu, const Result *R, int it) {
-    BoundTrack *T = par->btrack;
+static void btrack_offer1(BoundTrack *T, const Problem *P, struct BS *S, const double *y, double tau,
+                          double mu, const Result *R, int it) {
     if (!T || T->disabled || !(tau > 0)) return;
     const double res = T->side == 1 ? R->pinf : R->dinf;
     const double sc = T->side == 1 ? R->pobj : R->dobj;
@@ -498,6 +497,19 @@ static void btrack_offer(const Params *par, const Problem *P, struct BS *S, cons
     btrack_copy(P, S, y, tau, T->X, T->y);
     T->have = 1; T->score = sc; T->mu = mu; T->it = it; T->res = res;
     if (getenv("BRISK_BOUNDDBG")) { printf("   [bound track it %d score %.10e mu %.2e res %.1e; anchors", it, sc, mu, res); for (int a = 0; a < T->na; a++) printf(" %.1e", T->mu_a[a]); printf("]\n"); }
+}
+/* every side asked for (-bound pd: two trackers) */
+static void btrack_offer(const Params *par, const Problem *P, struct BS *S, const double *y, double tau,
+                         double mu, const Result *R, int it) {
+    btrack_offer1(par->btrack, P, S, y, tau, mu, R, it);
+    btrack_offer1(par->btrack2, P, S, y, tau, mu, R, it);
+}
+/* the last iteration at which a tracked bound improved (-1: none) */
+static int btrack_it_imp(const Params *par) {
+    int r = -1;
+    if (par->btrack && par->btrack->have) r = par->btrack->it_imp;
+    if (par->btrack2 && par->btrack2->have && par->btrack2->it_imp > r) r = par->btrack2->it_imp;
+    return r;
 }
 
 /* 4.23: the parallel region only for large n. An "omp parallel if (false)" still enters the
@@ -2253,7 +2265,7 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                     Xp = amalloc(sizeof(double) * n2);
                     Tm = amalloc(sizeof(double) * n2);
                     G  = amalloc(sizeof(double) * n2);
-                    rmap = malloc(sizeof(int) * n);
+                    if (!rmap) rmap = malloc(sizeof(int) * n);   /* (the batched route may have it: leaked before 19 October 2026) */
                 }
                 const double ts0 = g_split_on ? wtime() : 0;
                 int r = At->nr;
@@ -2262,7 +2274,7 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                      * product of inner dimension 2r, read at the upper triangle of the permuted order
                      * only (<A_b, X A_a Zi> = <A_b, H>/2; the diagonal values are halved): half the
                      * entries of the gather for the same flops (the panels stop at the diagonal) */
-                    if (!acc) { acc = calloc((size_t)ns + 1, sizeof(double)); cptr = malloc(sizeof(int) * (3 * (size_t)n + 3)); }
+                    if (!acc) { acc = calloc((size_t)ns + 1, sizeof(double)); if (!cptr) cptr = malloc(sizeof(int) * (3 * (size_t)n + 3)); }
                     int *const cq = cptr + n + 1, *const hq = cptr + 2 * (n + 1);
                     const int u = B->lv_u[a];
                     const int *rank = B->lv_rank, *cp = B->lu_cp, *ca = B->lu_ca, *cr = B->lu_cr, *chh = B->lu_ch;
@@ -2360,7 +2372,7 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                     /* the product on the staircase of the entries that the constraints b >= a read:
                      * live indices 0..u-1 (permuted), column panels, the rows above the panel's
                      * highest entry only; the panel is read while it is in the cache */
-                    if (!acc) { acc = calloc((size_t)ns + 1, sizeof(double)); cptr = malloc(sizeof(int) * (3 * (size_t)n + 3)); }
+                    if (!acc) { acc = calloc((size_t)ns + 1, sizeof(double)); if (!cptr) cptr = malloc(sizeof(int) * (3 * (size_t)n + 3)); }
                     int *const cq = cptr + n + 1, *const hq = cptr + 2 * (n + 1);
                     const int u = B->lv_u[a];
                     const int *rank = B->lv_rank, *cp = B->lv_cp, *ca = B->lv_ca, *cr = B->lv_cr, *chh = B->lv_ch;
@@ -2468,7 +2480,7 @@ static void schur_sdp_id(const Block *B, BS *s, int m, double *M, int identity) 
                      * then <A_b, X A_a Zi> = <A_b, H> / 2 at the upper entries of b >= a (diagonal halved), column by
                      * column (the column of H in the first-level cache, the entries in memory order) */
                     if (!Xs) { Xs = amalloc(sizeof(double) * 2 * n2); Ts = amalloc(sizeof(double) * 2 * n2); }
-                    if (!acc) { acc = calloc((size_t)ns + 1, sizeof(double)); cptr = malloc(sizeof(int) * (3 * (size_t)n + 3)); }
+                    if (!acc) { acc = calloc((size_t)ns + 1, sizeof(double)); if (!cptr) cptr = malloc(sizeof(int) * (3 * (size_t)n + 3)); }
                     for (int k = 0; k < r; k++) { rmap[At->rows[k]] = k; memcpy(Xs + (size_t)k * n, X + (size_t)At->rows[k] * n, sizeof(double) * n); }
                     memset(Ts, 0, sizeof(double) * (size_t)r * n);
                     for (int e = 0; e < At->ef; e++) {
@@ -5626,6 +5638,8 @@ static int hsd_qr_factor(const Problem *P, BS *S, Schur *Sc, double **Zv) {
     return 0;
 }
 static int g_epol_stop = 0;   /* hsd_run stopped on a passing polish probe */
+static int g_objcand = 0;     /* hsd_run returned its objective candidate (BRISK_OBJBEST) */
+static int g_oc_fits = 0;     /* the memory cap of the best iterate leaves room for the candidate's copies (set per solve) */
 static int g_has_soc = 0;     /* 5.16: the problem of this solve has second-order cone blocks */
 static int g_epol_fb = 0;     /* ... or returned a fallback probe candidate (tol below 1e-8) */
 static Result g_epol_R;       /* ... and the measures of its candidate */
@@ -7181,7 +7195,8 @@ static int eig_outside_(int n, double *E, double lo, double hi, double *w, doubl
  * The corrected direction is kept if its step grows by the factor acc.
  * Returns 1 if accepted (dX, dZ, dy, dt, dk, am updated).                          */
 static int g_cbox = 1;
-static int g_pfloor = 1;   /* HSD: stop at the primal residual floor (BRISK_PFLOOR=0 off) */   /* corrector: skip blocks inside the box (BRISK_NOCBOX) */
+static int g_pfloor = 1;   /* HSD: stop at the primal residual floor (BRISK_PFLOOR=0 off) */
+static int g_brkdn = 1;    /* HSD: stop at a primal breakdown at the accuracy floor (BRISK_BREAKDOWN=0 off) */   /* corrector: skip blocks inside the box (BRISK_NOCBOX) */
 static int g_hpar = 0;   /* 4.24: parallel block loops in the embedding (BRISK_HPAR=0 off) */
 #define HPAR_FOR _Pragma("omp parallel for schedule(dynamic, 16) if (g_hpar)")
 /* Blocks too large to balance in a loop over blocks (g_hbig[k]: the block's dense work n^3 exceeds
@@ -7798,6 +7813,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     double score_last = INFINITY;     /* (test BRISK_EPOLFAST) the previous iteration's score */
     static int epolfast = -1; if (epolfast < 0) { const char *e = getenv("BRISK_EPOLFAST"); epolfast = e ? atoi(e) : 0; }
     double *shist = malloc(sizeof(double) * 4096), *phist = calloc(4096, sizeof(double));
+    double *ghist = calloc(4096, sizeof(double));   /* relative gap per iteration (breakdown rule) */
     double *ihist = calloc(4096, sizeof(double)), *mhist = calloc(4096, sizeof(double));
     int it_sprog = 0;   /* last iteration of score progress (caps the steady-progress extension) */
     const int steady_on = !getenv("BRISK_NOSTEADY");
@@ -7832,6 +7848,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     double *bmh = malloc(sizeof(double) * (2 * (size_t)m + 1));
     shc.bmh = bmh;
     { const char *e = getenv("BRISK_PFLOOR"); g_pfloor = e ? atoi(e) : 1; }
+    { const char *e = getenv("BRISK_BREAKDOWN"); g_brkdn = e ? atoi(e) : 1; }
     int kfix = 0, kf_n = 0, tiny_steps = 0, small_steps = 0;
     static int epolish_on = -1; if (epolish_on < 0) { const char *e = getenv("BRISK_EPOLISH"); epolish_on = e ? atoi(e) : 1; }
     int n_epol = 0;
@@ -7852,6 +7869,35 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
      * 2e-7 into the 600 s limit, swissroll 64 -> 130 s, inc_600 37 -> 72 s, no gain) */
     const double ptol = fmax(par->tol, 1e-8);
     double fb_score = INFINITY; Result fb_R; memset(&fb_R, 0, sizeof(fb_R));
+    /* Objective drift (BRISK_DRIFT=1 on; off by default). On a degenerate problem whose optimal face is
+     * thin (moment relaxations with free off-diagonal entries: ni35 order 2 with the full
+     * objective cut), the iterates reach residuals of 1e-11 and a duality gap of 1e-9 while
+     * <C,X> and b'y still fall together by 2e-5 relative per iteration: every tolerance stop
+     * passed at iteration 31 with the value 4.6 (of a 23 gap) short of the optimum the
+     * solve reached ten iterations later. A tolerance stop is therefore held back while
+     * the objectives move by more than max(100 tol, 10 x the previous gap) in one
+     * iteration: ordinary convergence moves them by about the previous gap. */
+    int drift_on; { const char *e = getenv("BRISK_DRIFT"); drift_on = e ? atoi(e) : 0; }   /* (read per solve, as BRISK_BREAKDOWN; off by
+     * default since 20 October 2026, the owner's decision for 1.5.4: its cost on small files and AC-OPF untested; BRISK_DRIFT=1 on) */
+    double po_prev = NAN, dob_prev = NAN, gap_prev = INFINITY;
+    int drift_seen = 0, drift_first = -1;
+    /* (19 October 2026, the review) the hold-back lasts at most drift_max iterations from its first trigger (the cases it
+     * was made for needed 8 and 10 more): a drift that persists (an unattained optimum, tau -> 0) must not keep the run
+     * from its stops until the iteration limit or the infeasibility test; then the guard is off for the run */
+    const int drift_max = 12;
+    /* The objective candidate (BRISK_OBJBEST=0 off): the iterate with the best primal
+     * objective among those with primal and dual residuals within 10 tol. The best
+     * iterate is the one with the smallest DIMACS score, and on such a problem that can be
+     * an early one: ni35 order 2 with the completed objective cut ended at a primal
+     * breakdown after iteration 40 (residuals 2e-8) and returned iteration 20, whose gap
+     * was smaller and whose objective 7 worse. A run that does not end at the tolerance
+     * returns the candidate instead when it is better by more than max(100 tol, 10 x the
+     * best iterate's gap). */
+    int objbest_on; { const char *e = getenv("BRISK_OBJBEST"); objbest_on = e ? atoi(e) : 1; }
+    double **ocX = NULL, **ocZ = NULL, *ocy = NULL, oc_po = INFINITY;
+    int oc_it = -1, oc_used = 0;
+    g_objcand = 0;
+    Result oc_R; memset(&oc_R, 0, sizeof(oc_R));
     double **fbX = NULL, **fbZ = NULL, *fby = NULL;
     static double epol_pgate = -1; if (epol_pgate < 0) { const char *e = getenv("BRISK_EPOLPGATE"); epol_pgate = e ? atof(e) : 100.0; }
     static int refskip_on = -1; if (refskip_on < 0) { const char *e = getenv("BRISK_REFSKIP"); refskip_on = e ? atoi(e) : 1; }
@@ -8082,6 +8128,15 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             g_looseskip = strict ? 0 : looseskip_cls;
         }
         double score = res_score(R);
+        double drift = INFINITY;
+        if (it > 0 && isfinite(po_prev))
+            drift = fmax(fabs(po - po_prev), fabs(dob - dob_prev)) / den;
+        if (drift_on && drift_first >= 0 && it - drift_first > drift_max) {
+            if (par->verbose > 1) printf("   HSD: the objective still moves %d iterations after the tolerance was first met: the drift guard is off for the rest of the run\n", it - drift_first);
+            drift_on = 0; drift_seen = 0;
+        }
+        const int moving = drift_on && it > 0 && drift > fmax(100.0 * par->tol, 10.0 * gap_prev);
+        po_prev = po; dob_prev = dob; gap_prev = R->relgap;
         if (par->verbose)
             printf("%3d %+.8e %+.8e %.2e %.2e %.2e %.2e %.3f %.3f %.3f %7.2f  kap/mu %.1e%s\n",
                    it, po, dob, R->pinf, R->dinf, R->relgap, mu, alpha, alpha, sigma,
@@ -8102,6 +8157,31 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         btrack_offer(par, P, S, y, tau, mu, R, it);
         rcand_offer(rc, P, S, y, tau, R, it);
         const int improved_er = score < *best_score;
+        /* (19 October 2026, the review: the candidate's gap within 10 tol as well, so that it cannot be better in the
+         * objective through a gap; its copies only when the memory cap leaves room for them, allocated with a check) */
+        if (objbest_on && keep_best && g_oc_fits && R->pinf <= 10.0 * ptol && R->dinf <= 10.0 * ptol && fabs(R->relgap) <= 10.0 * ptol && po < oc_po) {
+            if (!ocX) {
+                int okm = (ocX = calloc(nb, sizeof(double *))) && (ocZ = calloc(nb, sizeof(double *))) && (ocy = malloc(sizeof(double) * (m + 1)));
+                for (int k = 0; k < nb && okm; k++) {
+                    const size_t len = bsz(&P->blk[k]);
+                    okm = (ocX[k] = malloc(sizeof(double) * (len + 1))) && (ocZ[k] = malloc(sizeof(double) * (len + 1)));
+                }
+                if (!okm) {
+                    if (ocX) for (int k = 0; k < nb; k++) free(ocX[k]);
+                    if (ocZ) for (int k = 0; k < nb; k++) free(ocZ[k]);
+                    free(ocX); free(ocZ); free(ocy); ocX = ocZ = NULL; ocy = NULL; objbest_on = 0;
+                }
+            }
+        }
+        if (ocX && objbest_on && keep_best && R->pinf <= 10.0 * ptol && R->dinf <= 10.0 * ptol && fabs(R->relgap) <= 10.0 * ptol && po < oc_po) {
+            for (int k = 0; k < nb; k++) {
+                const size_t len = bsz(&P->blk[k]);
+                double *ox = ocX[k], *oz = ocZ[k]; const double *xk = S[k].X, *zk = S[k].Z;
+                PAR_LEN_FOR(len, ox[i] = xk[i] / tau; oz[i] = zk[i] / tau;);
+            }
+            for (int i = 0; i < m; i++) ocy[i] = y[i] / tau;
+            oc_po = po; oc_it = it; oc_R = *R;
+        }
         if (score < *best_score) {
             *best_score = score; *it_best = it; *best = *R;
             mu_best_it = mu;
@@ -8113,7 +8193,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     PAR_LEN_FOR(len, S[k].Xb[i] = S[k].X[i] / tau; S[k].Zb[i] = S[k].Z[i] / tau;);
                 }
         }
-        if (score < par->tol) { status = 0; break; }
+        if (score < par->tol && moving) {
+            if (!drift_seen && par->verbose > 1) printf("   HSD: the tolerance is met but the objective still moves (%.1e per iteration against a gap of %.1e), continuing\n", drift, R->relgap);
+            drift_seen = 1; if (drift_first < 0) drift_first = it;
+        }
+        if (score < par->tol && !moving) { status = 0; break; }
         /* 5.12: the best iterate already meets the tolerance in the DIMACS measures, with a
          * factor 2 to spare, and this iteration did not improve on it: stop and return it.
          * res_score divides by 1 + ||b||_2 and 1 + ||C||_F, the status by 1 + ||b||_1 and
@@ -8121,7 +8205,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * try to close that difference (thetaG51, b of 6910 ones: primal residual 2.8e-8
          * here, 3.4e-10 as read; six iterations and two failed polishes, 30 of 68 s).
          * BRISK_DSTOP=0 off. */
-        if (dstop_on() && keep_best && it > *it_best && dimacs_score(best) <= 0.5 * par->tol) {
+        if (dstop_on() && !moving && !drift_seen && keep_best && it > *it_best && dimacs_score(best) <= 0.5 * par->tol) {
             if (par->verbose > 1) printf("   HSD: the best iterate (%d) meets the tolerance in the DIMACS measures (%.1e), stopping\n", *it_best, dimacs_score(best));
             g_dstop = 1; status = 4; g_hsd_why = "the best iterate meets the tolerance in the DIMACS measures"; break;
         }
@@ -8137,7 +8221,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * times the tolerance, so the next iteration is expected to meet it: no probes now */
         const int fast_conv = epolfast && score_last >= 10.0 * score && score <= 10.0 * par->tol;
         score_last = score;
-        if (epolish_on && !fast_conv && keep_best && !nf && !bord && !g_has_soc && n_epol < 4 && score > par->tol && R->relcomp > par->tol &&
+        if (epolish_on && !fast_conv && keep_best && !nf && !bord && !g_has_soc && n_epol < 4 && score > par->tol && R->relcomp > par->tol && !drift_seen &&
             fmax(R->relgap, R->dinf) <= ptol && R->pinf <= epol_pgate * ptol &&
             fmax(R->pinf, fmax(R->relgap, R->dinf)) <= 0.5 * epol_last) {
             Result Rp = *R;
@@ -8145,9 +8229,13 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             const double sp = probe_polish(P, S, tau, y, Sc, a0, dy, &Rp, &rres, par->tol);
             n_epol++;
             epol_last = fmax(R->pinf, fmax(R->relgap, R->dinf));
+            if (sp <= par->tol && moving) {
+                if (par->verbose > 1 && !drift_seen) printf("   HSD: the probe meets the tolerance but the objective still moves (%.1e per iteration against a gap of %.1e), continuing\n", drift, R->relgap);
+                drift_seen = 1; if (drift_first < 0) drift_first = it;
+            }
             if (par->verbose > 1) printf("   HSD: polish probe at iteration %d: score %.2e -> %.2e (Gram CG residual %.1e; pinf %.1e dinf %.1e gap %.1e comp %.1e err2 %.1e err4 %.1e)%s\n",
-                                         it, score, sp, rres, Rp.pinf, Rp.dinf, Rp.relgap, Rp.relcomp, Rp.err[2], Rp.err[4], sp <= par->tol ? ", stopping" : "");
-            if (sp <= par->tol) {
+                                         it, score, sp, rres, Rp.pinf, Rp.dinf, Rp.relgap, Rp.relcomp, Rp.err[2], Rp.err[4], sp <= par->tol && !moving && !drift_seen ? ", stopping" : "");
+            if (sp <= par->tol && !moving && !drift_seen) {
                 /* the current iterate becomes the best one; brisk_solve returns the probe's
                  * candidate (s->G, s->Q, y/tau) with its measures */
                 g_epol_R = Rp;
@@ -8163,7 +8251,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             /* 5.4: a verified candidate within red_acc is kept too (a cantilever relaxation sent by a user:
              * the probe reached 3.7e-8 at iteration 19 and was dropped for being above 1e-8; the run
              * ended at 1.4e-6 after a re-solve, 137 s instead of 40 s) */
-            if (sp <= fmax(ptol, par->red_acc) && sp < fb_score && sp < *best_score) {
+            if (sp <= fmax(ptol, par->red_acc) && sp < fb_score && sp < *best_score && !moving && !drift_seen) {   /* (not a point of the drift) */
                 if (!fbX) {
                     fbX = calloc(nb, sizeof(double *)); fbZ = calloc(nb, sizeof(double *));
                     fby = malloc(sizeof(double) * (m + 1));
@@ -8196,7 +8284,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 const int okx = polish_xmetric(P, S, Xb2, Zb2, ybest, &Rx, score, Sc, dy, par->verbose, 0);
                 for (int k = 0; k < nb; k++) { memcpy(S[k].W, Wsave[k], sizeof(double) * bsz(&P->blk[k])); free(Wsave[k]); }
                 free(Xb2); free(Zb2); free(Wsave);
-                if (okx && fmax(res_score(&Rx), fmax(Rx.err[2], Rx.err[4])) <= par->tol) {
+                if (okx && !moving && !drift_seen && fmax(res_score(&Rx), fmax(Rx.err[2], Rx.err[4])) <= par->tol) {
                     if (par->verbose > 1) printf("   HSD: the X-metric correction of iteration %d meets the tolerance, stopping\n", it);
                     g_epol_R = Rx;
                     *best_score = score; *it_best = it; *best = *R;
@@ -8228,7 +8316,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
          * have fallen by four more. A user's relaxation with a block of order 473: stop at
          * iteration 33 with 1e-10 instead of six more iterations at steps below 0.3.
          * BRISK_NORPROBE turns it off. */
-        if (rprobe_on && par->polish_r && rc && rc->have && rc->it == it && keep_best && !nf && !bord && !g_has_soc && n_rprobe < 2 && score > par->tol) {
+        if (rprobe_on && par->polish_r && rc && rc->have && rc->it == it && keep_best && !nf && !bord && !g_has_soc && n_rprobe < 2 && score > par->tol && !drift_seen) {
             const double rs = fmax(R->dinf, fabs(R->relcomp));
             if (rs <= 0.5 * par->tol && rs <= 0.25 * rprobe_last && R->pinf >= 4.0 * pinf_lo) {
                 n_rprobe++; rprobe_last = rs;
@@ -8238,7 +8326,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 const int okr = polish_xmetric(P, S, Xr2, Zr2, rc->y, &Rx, score, Sc, dy, par->verbose > 1, 1);
                 for (int k = 0; k < nb; k++) { memcpy(S[k].W, Wsave[k], sizeof(double) * bsz(&P->blk[k])); free(Wsave[k]); }
                 free(Xr2); free(Zr2); free(Wsave);
-                if (okr && fmax(res_score(&Rx), fmax(Rx.err[2], Rx.err[4])) <= par->tol) {
+                if (okr && !moving && !drift_seen && fmax(res_score(&Rx), fmax(Rx.err[2], Rx.err[4])) <= par->tol) {
                     if (par->verbose > 1) printf("   HSD: the restored iterate %d meets the tolerance, stopping\n", it);
                     g_epol_R = Rx;
                     *best_score = score; *it_best = it; *best = *R;
@@ -8334,11 +8422,11 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         /* steady progress of the current iterate also counts: the score can sit above an
          * early best while it falls (split free pairs: their complementarity dominates
          * relcomp until they settle, and the gap measure rose from a lucky early value) */
-        if (it < 4096) { shist[it] = score; phist[it] = R->pinf; ihist[it] = fmax(R->pinf, R->dinf); mhist[it] = mu; }
+        if (it < 4096) { shist[it] = score; phist[it] = R->pinf; ihist[it] = fmax(R->pinf, R->dinf); mhist[it] = mu; ghist[it] = R->relgap; }
         if (onpath && it >= 4 && it < 4096 && score < 0.7 * shist[it - 4] && score < 10.0 * *best_score && it > it_prog) it_prog = it;
         /* 4.38 bound mode (A3): an improving tracked bound is progress: the stall rules do
          * not stop the solve while it improves (the other side may be blowing up) */
-        if (par->btrack && par->btrack->have && par->btrack->it_imp == it) it_prog = it;
+        if (btrack_it_imp(par) == it) it_prog = it;
         if (it_prog > it_sprog) it_sprog = it_prog;
         /* slow but steady convergence (4.22): over 8 iterations the infeasibility fell by
          * 10% and mu by half, while the score (relcomp, as tau falls) does not improve.
@@ -8369,6 +8457,35 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             R->pinf >= 0.9 * phist[it - 4] && fmax(fmax(R->relgap, R->relcomp), R->dinf) < 0.1 * R->pinf) {
             if (par->verbose > 1) printf("   HSD: primal residual floor (%.1e), stopping\n", R->pinf);
             status = 4; g_hsd_why = "primal residual floor"; break;
+        }
+        /* primal breakdown at the accuracy floor: mu has reached the rounding level and the
+         * primal residual, after falling below 1e-6, jumps 100x above its lowest value (or 10x
+         * in two consecutive iterations). The directions have lost their primal accuracy and
+         * do not regain it: on degenerate moment relaxations (singular optima, no strict
+         * complementarity) the residual then stays 1e3-1e6 above its minimum while the run
+         * goes on for 6-11 more iterations (ni35 order 3: 2.3e-8 at iteration 43, 2.8e-5 at
+         * 45, 1e-2 until 56; ni10 order 3: 2.2e-10, then 1.5e-6 .. 8e-4). The score rules
+         * above do not see it, since the relative complementarity keeps the best score at
+         * 1e-6..1e-4 there. The best iterate is returned as by the other rules.
+         * Only once the duality gap had converged (below 1e-7 at the lowest residual): while
+         * the gap is still closing, the iterations after such a jump keep improving it and
+         * the objective (multifreq8: residual 6e-9 -> 4e-5 at gap 1e-6, then the gap fell to
+         * 3e-8 and the objective moved 1e-3 relative; stopping there changed the result).
+         * And only once the best iterate is two iterations old: right after the jump the
+         * objective can still improve, and polishing repairs the residual of such a point
+         * (ni35 order 3: the best iterate 46, after the jump at 45, gave the certified bound;
+         * stopping at 45 would have lost 0.3-0.6 of it). And only once the residual itself is
+         * above the reduced-accuracy level 1e-6: a jump from 1e-15 to 2.6e-8 is no breakdown
+         * (beamSelfWeight_3_msos_ad: stopping there returned 9.1e-9 instead of 2.9e-9). */
+        if (g_brkdn && it >= 8 && it < 4096 && mu < 1e-13) {
+            double pmin = INFINITY;
+            int imin = -1;
+            for (int j = 0; j < it; j++) if (phist[j] > 0 && phist[j] < pmin) { pmin = phist[j]; imin = j; }
+            if (pmin < 1e-6 && imin >= 0 && ghist[imin] < 1e-7 && it - *it_best >= 2 && R->pinf > 1e-6 && (R->pinf > 100.0 * pmin || (R->pinf > 10.0 * pmin && phist[it - 1] > 10.0 * pmin))) {
+                if (par->verbose > 1) printf("   HSD: primal breakdown at the accuracy floor (residual %.1e against %.1e at iteration %d, mu %.1e), stopping\n",
+                                             R->pinf, pmin, imin, mu);
+                status = 4; g_hsd_why = "primal breakdown at the accuracy floor"; break;
+            }
         }
 
         if (use_pat) {
@@ -9566,8 +9683,33 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
 done:
     { extern int g_asmsp, g_ntsp; g_asmsp = 0; g_ntsp = 0; }   /* (single precision belongs to the embedding's iterations only) */
     mvfree_free(Sc);
+    if (ocX) {
+        /* (19 October 2026, the review) only when the run missed the tolerance: not after the DIMACS stop, a probe
+         * stop or an infeasibility verdict, and only when the best iterate itself misses the tolerance; and only when
+         * the candidate scores no worse than the final iterate, which brisk_solve_impl would otherwise return in its
+         * place (the best-scored iterate then lost) */
+        if (status != 0 && status != 1 && status != 2 && !g_dstop && !g_epol_stop && *best_score > par->tol
+            && oc_it >= 0 && oc_it != *it_best && res_score(&oc_R) <= res_score(R)) {
+            const double denb = 1 + fabs(best->pobj + P->obj_off) + fabs(best->dobj + P->obj_off);
+            const double thr = fmax(100.0 * par->tol, 10.0 * best->relgap) * denb;
+            if (oc_po < best->pobj - thr) {
+                if (par->verbose > 0) printf("   HSD: the iterate %d is better in the objective than the best-scored iterate %d by %.1e relative (residuals %.1e, %.1e): returning it\n",
+                                             oc_it, *it_best, (best->pobj - oc_po) / denb, oc_R.pinf, oc_R.dinf);
+                for (int k = 0; k < nb; k++) {
+                    const size_t len = bsz(&P->blk[k]);
+                    memcpy(S[k].Xb, ocX[k], sizeof(double) * len); memcpy(S[k].Zb, ocZ[k], sizeof(double) * len);
+                }
+                memcpy(ybest, ocy, sizeof(double) * m);
+                *best = oc_R; *it_best = oc_it; *best_score = res_score(&oc_R);
+                oc_used = 1; g_objcand = 1;
+            }
+        }
+        for (int k = 0; k < nb; k++) { free(ocX[k]); free(ocZ[k]); }
+        free(ocX); free(ocZ); free(ocy);
+    }
     if (fbX) {
-        if (fb_score < *best_score && !g_epol_stop) {
+        /* a probe candidate of an earlier iteration does not replace the objective candidate */
+        if (fb_score < *best_score && !g_epol_stop && !oc_used) {
             for (int k = 0; k < nb; k++) {
                 const size_t len = bsz(&P->blk[k]);
                 memcpy(S[k].G, fbX[k], sizeof(double) * len); memcpy(S[k].Q, fbZ[k], sizeof(double) * len);
@@ -9642,7 +9784,7 @@ done:
     for (int k = 0; k < nb; k++) free(Zv[k]);
     free(Zv);
     if (par->verbose > 1 && nrebase) printf("   (HSD: residual re-based %d times)\n", nrebase);
-    free(pk_b); free(pk_p); free(pk_q); free(shist); free(phist); free(ihist); free(mhist);
+    free(pk_b); free(pk_p); free(pk_q); free(shist); free(phist); free(ihist); free(mhist); free(ghist);
     if (bord) {
         Sc->bF = NULL; Sc->bP = NULL; free(Sc->bE); Sc->bE = NULL;
         free(bpf); free(bD);
@@ -10281,7 +10423,26 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         }
         Ntot += n;
     }
-    const int keep_best = par->polish && polish_bytes <= par->polish_mem;
+    /* The best iterate's X and Z are stored within polish_mem (512 MB). Above it, the cap grows with
+     * the memory that is left: half of what is available after a reserve for what the solve still
+     * allocates (the Schur matrix, about 1.5 m^2 doubles, and the method's dense block work arrays,
+     * the retry's estimate below). Without the copies a failed solve returns the best iterate's y
+     * with the final X and Z (ni35 order 3, m = 30,305: y of iteration 46 with X of iteration 56
+     * gave a gap of 4.4e-3; iteration 45 had 1.3e-8). At or below 512 MB nothing changes. */
+    double polish_cap = par->polish_mem;
+    const char *bce = getenv("BRISK_BESTCAP");                         /* (BRISK_BESTCAP=0: the fixed cap, as until 1.5.3) */
+    if (polish_bytes > polish_cap && !(bce && atoi(bce) == 0)) {
+        double avail = 0, reserve = 1.5 * 8.0 * (double)m * m;
+        for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) reserve += 12.0 * 8.0 * (double)bsz(&P->blk[k]);
+        mem_fits(0, &avail);
+        polish_cap = fmax(polish_cap, 0.5 * (avail - reserve));
+        if (par->verbose > 0)
+            printf("   best iterate: X and Z %s (%.2f GB; %.2f GB available after a reserve of %.2f GB for the solve)\n",
+                   polish_bytes <= polish_cap ? "stored" : "not stored, only y", polish_bytes / 1e9, avail - reserve > 0 ? (avail - reserve) / 1e9 : 0.0, reserve / 1e9);
+    }
+    const int keep_best = par->polish && polish_bytes <= polish_cap;
+    /* the objective candidate's copies: one more X and Z beside the best iterate's and the restoration's (review S5) */
+    g_oc_fits = keep_best && (par->polish_r ? 3.0 : 2.0) * polish_bytes <= polish_cap;
     /* parallel over blocks when there are several and all are small (larger blocks get
      * more from threaded BLAS inside each block); BLAS runs single-threaded meanwhile,
      * except in the Schur factorization                                               */
@@ -10845,7 +11006,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
     const double t_loop0 = wtime();
     /* the restoration's iterate: stored when the best one is and the memory allows two more copies */
     RCand rc = { NULL, 1e300, 0, 0 };
-    if (keep_best && par->polish_r && 2.0 * polish_bytes <= par->polish_mem) {
+    if (keep_best && par->polish_r && 2.0 * polish_bytes <= polish_cap) {
         rc.y = malloc(sizeof(double) * (m + 1));
         for (int k = 0; k < nb; k++) {
             const size_t len = bsz(&P->blk[k]) * sizeof(double); S[k].Xr = amalloc(len); S[k].Zr = amalloc(len);
@@ -10997,7 +11158,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         /* stop when progress has ended (a shorter window is untested: its first
          * evaluation was confounded, see CHANGES.md) */
         /* 4.38 bound mode (A3): an improving tracked bound counts as progress */
-        const int it_best_eff = par->btrack && par->btrack->have && par->btrack->it_imp > it_best ? par->btrack->it_imp : it_best;
+        const int it_best_eff = btrack_it_imp(par) > it_best ? btrack_it_imp(par) : it_best;
         if (it - it_best_eff >= par->stall_win && best_score < 1e-6) { status = 4; break; }
         if (it - it_best_eff >= 8 && best_score < 1e-4) { status = 4; break; }
         if (it - it_best_eff >= 12) { status = 4; break; }          /* no progress at any level */
@@ -11570,6 +11731,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
     const double work_run = work_it * (it + 1);
     for (int k = 0; k < nb; k++) S[k].zon = 0;     /* polishing and endgame: the dense Zi and factors */
     int xsrc = 0;                 /* returned X: 0 S.X, 1 S.Xb, 2 S.G (polished) */
+    const int objcand = g_objcand; g_objcand = 0;
     int ran_dd = 0;
     if (g_epol_stop) {
         /* 4.27: the embedding stopped on a passing polish probe: its candidate (the
@@ -11788,7 +11950,14 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                     #define CAND_SAVE() for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]) * sizeof(double); \
                         if (!Gs[k]) { Gs[k] = malloc(len + 8); Gs[nb + k] = malloc(len + 8); } memcpy(Gs[k], S[k].G, len); memcpy(Gs[nb + k], S[k].Q, len); }
                     #define CAND_BACK() for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]) * sizeof(double); memcpy(S[k].G, Gs[k], len); memcpy(S[k].Q, Gs[nb + k], len); }
-                    if (rc.have && rc.it != it_ret && rc.score < sc0) {
+                    /* not when the returned iterate is the objective candidate: the restoration's iterate
+                     * is chosen by its dual residual and complementarity, and on the problems where the
+                     * candidate is taken that is an early iterate with the worse objective (ni35 order 2
+                     * with the completed cut: iteration 20 restored, <C,X> 1949.26, instead of iteration
+                     * 40, 1942.44) */
+                    if (objcand && rc.have && rc.it != it_ret && rc.score < sc0 && par->verbose > 1)
+                        printf("   not restoring iteration %d: the returned iterate %d was chosen by its objective\n", rc.it, it_ret);
+                    if (rc.have && rc.it != it_ret && rc.score < sc0 && !objcand) {
                         double **Xr = malloc(sizeof(double *) * nb), **Zr = malloc(sizeof(double *) * nb);
                         for (int k = 0; k < nb; k++) { Xr[k] = S[k].Xr; Zr[k] = S[k].Zr; }
                         if (par->verbose > 1) printf("   restoring the primal feasibility of iteration %d (dual residual and complementarity %.1e)\n", rc.it, rc.score);
@@ -11950,7 +12119,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                            s->lq, s->v1, s->v2, s->dtmp, s->Gd, s->Mdd, s->Ct, s->Dxc, s->ev, s->R0, s->r0v,
                            s->lrV, s->lrPQ, s->lrPd, s->lrQd, s->lrQ, s->Xb, s->Zb, s->Xr, s->Zr,
                            s->ntGbuf, s->ntVt, s->ntT, s->lam, s->dX1, s->dS1, s->dX1t, s->dS1t,
-                           s->dXt, s->dZt, s->Rt };
+                           s->dXt, s->dZt, s->Rt, s->sv, s->stmp };   /* (sv, stmp: the second-order cone's; leaked since 1.4.4) */
         for (size_t q = 0; q < sizeof(bufs) / sizeof(bufs[0]); q++) free(bufs[q]);
         free(s->ntGf); free(s->ntLXf); free(s->ntVtf); free(s->ntTf); free(s->ntT2f); free(s->ntGold); s->ntGold = NULL;
         free(s->r0r); free(s->r0c); free(s->lr_owner);

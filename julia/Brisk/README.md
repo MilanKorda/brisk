@@ -96,8 +96,9 @@ Brisk.write_sdpa("same.dat-s", m, blocksizes, c, mat, blk, i, j, v)
 ```
 
 The log ends with how to get more accuracy and a guaranteed bound, written as keywords of the
-function that was called (`prec = "dd"`, `bound = "d"`, `certify = true`) or, under JuMP, as
-`set_attribute(model, "prec", "dd")`.
+function that was called (`prec = "dd"`, `bound = "d"`) or, under JuMP, as
+`set_attribute(model, "prec", "dd")`. A bound is always checked rigorously; `bounds` holds each
+side asked for (`bound = "p"`, `"d"` or `"pd"`) with its certificate, beside the solution.
 
 `Brisk.Result` uses BRISK's convention: (P) min ⟨C,X⟩ s.t. ⟨A_i,X⟩ = b_i, X ∈ K, and
 (D) max b'y s.t. C − Σ y_i A_i = Z ∈ K, with C = −F0, A_i = F_i and b = c of the SDPA
@@ -140,7 +141,8 @@ as arrays (`solve_sdpa_data`, JuMP) are `Float64` and are taken exactly as given
 OPTIONS.md (`prec`, `hptol`, `hpext`) for the tolerance, the extension levels and the status PRECISION LIMIT.
 With `bound = "d"` (or `"p"`) the certificate is built and checked in the precision of
 `prec`: `Brisk.hp_solution().bound` is the rigorous bound with all the digits (`nothing`
-without a certificate), and `y` (or `X`) is the certificate.
+without a certificate), and `Brisk.hp_solution().bounds[:d]` (or `[:p]`) holds that bound and the certificate
+`y` (or `X`) with all the digits of its check; `y`, `X`, `Z` are the solution (`bound = "pd"`: both sides).
 
 ## How the model is passed (for developers)
 

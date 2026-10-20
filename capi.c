@@ -93,6 +93,24 @@ BRISK_API int brisk_result_bound(const BriskResult *r, double *out) {
     return r->bound_side;
 }
 BRISK_API int brisk_result_bound_side(const BriskResult *r) { return r ? r->bound_side : 0; }
+/* bound mode per side (-bound p|d|pd; side 1 p: an upper bound <C,X>, 2 d: a lower bound b'y):
+ * out = { value, resid, lammin, valid, certified, rigorous } (6 doubles; only a certified one is a
+ * bound, rigorous is NaN otherwise); returns 2 when the side was asked for and has a certificate,
+ * 1 when it was asked for without one, 0 when it was not asked for */
+BRISK_API int brisk_result_bound_of(const BriskResult *r, int side, double *out) {
+    if (!r || side < 1 || side > 2) return 0;
+    const int s = side - 1;
+    if (out) { out[0] = r->bnd[s].value; out[1] = r->bnd[s].resid; out[2] = r->bnd[s].lammin; out[3] = r->bnd[s].valid; out[4] = r->bnd[s].certified; out[5] = r->bnd[s].rigorous; }
+    return r->bnd[s].asked ? 1 + r->bnd[s].have : 0;
+}
+BRISK_API const char *brisk_result_bound_src(const BriskResult *r, int side) { return r && side >= 1 && side <= 2 ? r->bnd[side - 1].src : ""; }
+/* the certificates (pointers into the result): block k of the X of side p (as X; NULL when
+ * absent), the y of side d (m), and for a problem in SeDuMi format the x of side p (sn) */
+BRISK_API const double *brisk_result_bound_X(const BriskResult *r, int k) {
+    return r && r->bnd[0].X && k >= 0 && k < r->nblk ? r->bnd[0].X[k] : NULL;
+}
+BRISK_API const double *brisk_result_bound_y(const BriskResult *r) { return r ? r->bnd[1].y : NULL; }
+BRISK_API const double *brisk_result_bound_sx(const BriskResult *r) { return r ? r->bnd[0].sx : NULL; }
 /* 4.37: re-solves run and their time (s) */
 BRISK_API int brisk_result_resolves(const BriskResult *r, double *t) { if (t) *t = r ? r->t_resolves : 0; return r ? r->n_resolves : 0; }
 /* 4.37: the likely cause of a result that misses the tolerance ("" when none) */

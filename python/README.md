@@ -175,7 +175,7 @@ prints the same list. The interface's own:
 | `soc_arrow_max` | none | with `soc="arrow"`: cones larger than this use the tree |
 | `options` | none | raw command-line strings, e.g. `options=["-acc", "high"]` |
 | `write_sdpa` | none | a file name: write the SDPA problem handed to BRISK, for `./brisk` or other solvers |
-| `bound` | none | `"primal"` or `"sos"` (a feasible point of the model, e.g. the SOS Gram matrices: a guaranteed bound on the value), `"dual"` (a feasible dual). The bound, on CVXPY's minimisation form min c'x + offset, is in `extra_stats["bound"]` (`value`, `kind` upper/lower, `valid`); for a Maximize model CVXPY minimises −f, so the sign and kind flip |
+| `bound` | none | `"primal"` or `"sos"` (a feasible point of the model, e.g. the SOS Gram matrices: a guaranteed bound on the value), `"dual"` (a feasible dual), `"both"` (both sides in one solve). Always checked rigorously; the solution stays the solve's own. The bound, on CVXPY's minimisation form min c'x + offset, is in `extra_stats["bound"]` (`value`, `kind` upper/lower, `valid`, `certified`, `rigorous`; with `"both"`: `extra_stats["bounds"]["upper"]` and `["lower"]`); for a Maximize model CVXPY minimises −f, so the sign and kind flip |
 | `inaccurate_tol` | `1e-4` | after an iteration or time limit, an interrupt or numerical difficulties: `OPTIMAL_INACCURATE` when the largest DIMACS error is at most this, else `USER_LIMIT` / `SOLVER_ERROR` |
 
 **Forms.** CVXPY gives the solver `min c'x  s.t.  b − A x ∈ K`. The interface writes this as an
@@ -242,7 +242,8 @@ The problem is the numbers of an SDPA sparse file:
 | `pobj`, `dobj` | BRISK's ⟨C, X⟩ and b'y (the SDPA value c'x is −dobj) |
 | `dimacs` | the six DIMACS errors on the data as given |
 | `iterations`, `time`, `exit_code`, `blocksizes`, `interrupted` | |
-| `bound` | with the option `bound` (`-bound p\|d`): `side`, `kind` (upper/lower bound on BRISK's (P) value), `value`, `resid`, `lammin`, `valid` (2 with the margin, 1 PSD, 0 not) |
+| `bound` | with the option `bound` (`-bound p\|d\|pd`): the first side asked for: `side`, `kind` (upper/lower bound on BRISK's (P) value), `value`, `resid`, `lammin`, `valid` (2 with the margin, 1 PSD, 0 not), `certified`, `rigorous` |
+| `bounds` | each side asked for (`"p"`, `"d"`): `kind`, `have`, `value`, `resid`, `lammin`, `valid`, `certified`, `rigorous` (a bound only when certified), `src`, and the certificate: `X` (blocks; `x` for a problem in SeDuMi form) for p, `y` for d |
 | `n_resolves`, `t_resolves`, `cause` | re-solves run and their time; the likely cause when the tolerance is missed |
 
 Conventions are those of the command line (`brisk.h`): BRISK solves (P) min ⟨C, X⟩ s.t.
@@ -254,8 +255,11 @@ drops the option; an underscore stands for a dash), a list of strings, or one st
 options raise `RuntimeError`. `verbose=True` sends the solver's output through `sys.stdout`,
 so it shows in Jupyter. The log ends with how to get more accuracy and a guaranteed bound,
 written as entries of `options` for the function that was called (`"prec": "dd"`,
-`"bound": "d"`, `"certify": True`) or as keywords of `prob.solve` under CVXPY (`prec="dd"`,
-`bound="dual"`).
+`"bound": "d"`) or as keywords of `prob.solve` under CVXPY (`prec="dd"`, `bound="dual"`).
+A bound is always checked rigorously; `Result.bounds` holds each side asked for (`"p"`, `"d"`,
+or both with `"bound": "pd"`) with its certificate (`X` for p, `y` for d; `x` for a problem
+in SeDuMi format), beside the solution, which stays the solve's own point. Under CVXPY,
+`bound="both"` gives `extra_stats["bounds"]["upper"]` and `["lower"]`.
 
 **Very large chordal problems.** When BRISK decomposes a large sparse block into cliques
 (AC-OPF relaxations), the dense `X` and `Z` of that block are returned only if they fit in
@@ -370,7 +374,8 @@ r = brisk.solve_file("theta1.dat-s", {"prec": "dd", "bound": "d"})
 r.bound["certified"], r.bound["rigorous"]                  # the bound rounded outward to a double
 h = brisk.hp_solution()
 h["bound"]                                                 # the rigorous lower bound, all digits
-c = brisk.certify("theta1.dat-s", "d", y=h["y"], prec="dd")   # checks a certificate again
+yc = h["bounds"]["d"]["y"]                                 # its certificate (h["y"] is the solution)
+c = brisk.certify("theta1.dat-s", "d", y=yc, prec="dd")    # checks a certificate again
 ```
 
 ## Troubleshooting

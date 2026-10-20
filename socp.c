@@ -46,6 +46,14 @@ static int omp_in_parallel(void) { return 0; }
 #endif
 extern double brisk_mem_scale(void);   /* (main.c) max(1, memory / 8 GB) */
 #include "amd/amd.h"
+#ifndef BLAS_PREFIX
+#define BLAS_PREFIX
+#endif
+#define SC_CAT2(a, b) a##b
+#define SC_CAT(a, b)  SC_CAT2(a, b)
+#define SC_BL(name) SC_CAT(BLAS_PREFIX, name)
+void SC_BL(dsyrk_)(const char *, const char *, const int *, const int *, const double *, const double *, const int *, const double *, double *, const int *);
+void SC_BL(dgemm_)(const char *, const char *, const int *, const int *, const int *, const double *, const double *, const int *, const double *, const int *, const double *, double *, const int *);
 
 /* the supernodal sparse factorization of quasi-definite matrices (sparsechol.c): L S L' with the
  * signs S prescribed, fill-reducing orders, BLAS panels, threaded over the elimination tree */
@@ -303,7 +311,7 @@ typedef struct {
     double *gs, *gV, *gZ, *gH, *gcs; int gm_max; double gm_tol;   /* GMRES on the KKT system */
     double rr_est; double t_mul; double cflops; double last_res; double t_setup, t_factor, t_solve; long nfact; long nback, slnz, nfallback; int sc_ok;
     /* the normal equations A H^-1 A' + delta I (no free variable, small cones, no dense column) */
-    SChol *ne; size_t *ne_off, *ne_doff; double *ne_G; int *ne_r, **ne_rows; int ne_ok, ne_fallback, ne_tiny, ne_left, free_last, dz_refine; double *wdz, *wdx, *wdy, *wdy2; long dz_count; double *ne_W, ne_T[NE_MAXFREE * NE_MAXFREE]; long ndyn_total; long ne_nfact, ne_lnz; double *ne_C; int nr_rot; int **bpos; double *bth; int *Rq; long nboost; int anyrot;
+    SChol *ne; size_t *ne_off, *ne_doff; double *ne_G; int *ne_r, **ne_rows; int ne_ok, ne_fallback, ne_tiny, ne_left, free_last, dz_refine; double *wdz, *wdx, *wdy, *wdy2; long dz_count; double *ne_W, ne_T[NE_MAXFREE * NE_MAXFREE]; long ndyn_total; long ne_nfact, ne_lnz; double *ne_C; int nr_rot; int **bpos; double *bth; int *Rq; long nboost; int anyrot; double ne_dl;
     SChol *sc; size_t *soff; long knz; double *swork;   /* the supernodal factorization, when it is used */
     int refine_max, verbose;
     long refine_total, solves;
@@ -553,6 +561,38 @@ static int ne_setup(Socp *S) {
         for (int a = 0; a < r[k]; a++) posr[rows[k][a]] = a;
         if (d > NE_MAXCONE) {          /* C_k = sum_t J_tt a_t a_t', packed as the pairs (a >= b) */
             double *C = S->ne_C + cpos;
+            /* 19 October 2026 (LP/SOCP): by dsyrk on dense panels of the columns when the dense work r^2 d is at most ten
+             * times the scattered loop's sum of l_t^2 (BLAS-3 against an indexed update) and the r x r buffer fits: a cone
+             * of 10,002 entries over 10,001 dense rows (CBLIB 2013_firL2a) took 417 s by the loop */
+            double lsum = 0; for (int t = 0; t < d; t++) { const double l = S->Ap[c0 + t + 1] - S->Ap[c0 + t]; lsum += l * l; }
+            const double rk = r[k];
+            double *Cf = NULL, *Wp = NULL; const int wp = 256;
+            if (!getenv("BRISK_CONENOSYRK") && rk * rk * (double)d <= 10.0 * lsum && rk * rk * 8.0 <= 2e9 * brisk_mem_scale()) {
+                Cf = (double *)calloc((size_t)r[k] * (size_t)r[k], sizeof(double)); Wp = (double *)malloc(sizeof(double) * (size_t)r[k] * wp);
+            }
+            if (Cf && Wp) {
+                const int rr = r[k]; const double one = 1.0, mone = -1.0, zero = 0.0; int first = 1;
+                for (int t0 = 0; t0 < d; ) {
+                    const int t1 = t0 == 0 ? 1 : (d - t0 < wp ? d : t0 + wp), kk = t1 - t0;       /* (the first column apart: J_00 = +1) */
+                    memset(Wp, 0, sizeof(double) * (size_t)rr * kk);
+                    for (int t = t0; t < t1; t++) { double *wc = Wp + (size_t)(t - t0) * rr; for (int p = S->Ap[c0 + t]; p < S->Ap[c0 + t + 1]; p++) wc[posr[S->Ai[p]]] += S->Ax[p]; }
+                    /* the lower triangle by row blocks of 256 (disjoint parts of Cf, the same bits at any thread count):
+                     * the block's diagonal tile by dsyrk, the rest of its rows by dgemm */
+                    const double *al = t0 == 0 ? &one : &mone, *be = first ? &zero : &one; const int nbk = (rr + 255) / 256;
+                    #pragma omp parallel for schedule(dynamic, 1) num_threads(g_cone_nt) if (g_cone_nt > 1 && !omp_in_parallel())
+                    for (int bk = nbk - 1; bk >= 0; bk--) {
+                        const int i0 = bk * 256, ib = rr - i0 < 256 ? rr - i0 : 256;
+                        SC_BL(dsyrk_)("L", "N", &ib, &kk, al, Wp + i0, &rr, be, Cf + (size_t)i0 * rr + i0, &rr);
+                        if (i0 > 0) SC_BL(dgemm_)("N", "T", &ib, &i0, &kk, al, Wp + i0, &rr, Wp, &rr, be, Cf + i0, &rr);
+                    }
+                    first = 0; t0 = t1;
+                }
+                for (int a = 0; a < rr; a++) for (int b_ = 0; b_ <= a; b_++) C[(long)a * (a + 1) / 2 + b_] = Cf[(size_t)b_ * rr + a];
+                free(Cf); free(Wp);
+                cpos += (long)r[k] * (r[k] + 1) / 2;
+                continue;
+            }
+            free(Cf); free(Wp);
             for (int t = 0; t < d; t++) {
                 const double jt = t == 0 ? 1.0 : -1.0;
                 for (int p = S->Ap[c0 + t]; p < S->Ap[c0 + t + 1]; p++) {
@@ -802,7 +842,12 @@ static void kkt_mul(Socp *S, const double *v, double *w) {
     H_apply(S, v, w);
     for (int i = 0; i < n; i++) w[i] = -w[i];
     At_mul(S, 1.0, v + n, w);
-    const double dl = S->use_dd ? S->sreg : S->sreg0;       /* the (base) dual regularization is part of the system that is solved */
+    /* the (base) dual regularization is part of the system that is solved. 20 October 2026 (LP/SOCP): on the normal
+     * equations' route below the target accuracy (min(1e-9, tol / 100)): that route has no double-double end phase,
+     * which on the full system lowers it to 1e-12, and the base 1e-9 left a floor of about 1e-9 |y| on the primal
+     * residual (MOI's SecondOrderCone_Nonnegatives, two rows, at tol 1e-10: 8.6e-10 for 20 iterations while tau grew
+     * to 4e30; ISSUES 123). The factorization keeps its 1e-9 (the preconditioner); GMRES removes the difference. */
+    const double dl = S->use_dd ? S->sreg : (S->ne && S->ne_ok && S->ne_dl > 0 ? fmin(S->sreg0, S->ne_dl) : S->sreg0);
     for (int i = 0; i < m; i++) w[n + i] = dl * v[n + i];
     A_mul(S, 1.0, v, w + n);
     S->t_mul += sc_time() - tm0;
@@ -1616,6 +1661,7 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
     { const char *e_ = getenv("BRISK_CONEREG"); if (e_) { double a_ = 0, b_ = 0, c_ = 0; const int k_ = sscanf(e_, "%lf,%lf,%lf", &a_, &b_, &c_); if (k_ >= 1) S->sreg = a_; if (k_ >= 2) S->sregx = b_; if (k_ >= 3) S->sregf = c_; } }   /* (test: dual, cone, free) */
     S->F.dyn_delta = 1e-7; S->ref_pred = 0;
     S->sreg0 = S->sreg; S->bump = 1.0; S->bump_on = getenv("BRISK_CONENOBUMP") == NULL;
+    S->ne_dl = getenv("BRISK_CONENEDL0") ? 0.0 : 1e-2 * (opt->tol > 0 ? opt->tol : 1e-8);       /* (BRISK_CONENEDL0: the base 1e-9, as before) */
     S->dd_on = getenv("BRISK_CONENODD") == NULL;
     S->dz_refine = getenv("BRISK_CONENODZ") == NULL;
     S->wdz = (double *)xcalloc((size_t)n + 1, sizeof(double)); S->wdx = (double *)xcalloc((size_t)n + 1, sizeof(double));
@@ -1811,6 +1857,12 @@ static int socp_solve_core(const SocpProb *P, const SocpOpts *opt, SocpRes *R) {
          * the full one near the end */
         if (it == 0) mu0 = mu;
         S->gm_tol = err > gm_switch && mu > 1e-5 * mu0 && S->tau > 1e-3 * fmax(1.0, S->kap) ? gm_tol_early : gm_tol_late;      /* (also full accuracy on the way to an infeasibility certificate) */
+        /* (19 October 2026, LP/SOCP, a test, off: the late tolerance k times the error, as inexact Newton methods do,
+         *  BRISK_CONEGMREL=k. CBLIB's structural-design SOCPs at k = 1e-3: db-plane-strain-prism 33 -> 27 s, joint_FC_7
+         *  173 -> 139 s; but on the 79 SOCP files and 43 CBLIB files 1.12 times the time over 5 s, qssp180old OPTIMAL ->
+         *  REDUCED, nql180old 19 -> 74 iterations: those classes need the tight solves; ISSUES 217) */
+        { static double gmrel = -1; if (gmrel < 0) { const char *e_ = getenv("BRISK_CONEGMREL"); gmrel = e_ ? atof(e_) : 0; }
+          if (gmrel > 0 && S->gm_tol == gm_tol_late) S->gm_tol = fmax(gm_tol_late, fmin(gm_tol_early, gmrel * err)); }
         /* ---- scaling and factorization */
         S->it_maxres = 0.0;
         if (S->bth && !S->ne && !S->use_dd) for (int k = S->nq - S->nr_rot; k < S->nq; k++) {      /* the rotated cones balanced */

@@ -654,6 +654,8 @@ void bound_cert_free(BoundCert *c) {
     if (!c) return;
     bound_free_blocks(c->X, c->nblk);
     free(c->y);
+    bound_free_blocks(c->X0, c->nblk);
+    free(c->y0);
     memset(c, 0, sizeof(*c));
 }
 
@@ -692,6 +694,10 @@ int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na
         const char *how = "";
         if (!margin_ok(O, Xp, margin, work)) {
             int done = 0;
+            out->X0 = bound_alloc_blocks(O);
+            copy_blocks(O, out->X0, Xp);
+            out->value0 = opA(O, Xp, tmp);
+            out->resid0 = out->resid; out->lammin0 = lam_rel(O, Xp, work);
             for (int a = na - 1; a >= 0 && !done; a--) {      /* the most recent anchor first */
                 if (!XA[a]) continue;
                 double **Xap = bound_alloc_blocks(O);
@@ -756,6 +762,7 @@ int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na
         out->value = opA(O, Xp, tmp);
         out->lammin = lam_rel(O, Xp, work);
         out->theta = theta > 0 ? theta : t_id;
+        if (!(out->theta > 0)) { bound_free_blocks(out->X0, O->nblk); out->X0 = NULL; }   /* not moved */
         out->valid = out->lammin >= 0 && out->resid <= tol ? (margin_ok(O, Xp, 0.99 * margin, work) ? 2 : 1) : 0;
         out->X = Xp;
         out->have = 1;
@@ -781,6 +788,11 @@ int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na
         const char *how = "";
         if (!margin_ok(O, Z, margin, work)) {
             int done = 0;
+            out->y0 = malloc(sizeof(double) * (O->m + 1));
+            memcpy(out->y0, yc, sizeof(double) * O->m);
+            out->value0 = 0;
+            for (int i = 0; i < O->m; i++) out->value0 += O->b[i] * yc[i];
+            out->resid0 = 0; out->lammin0 = lam_rel(O, Z, work);
             for (int a = na - 1; a >= 0 && !done; a--) {
                 if (!YA[a]) continue;
                 double *ya = malloc(sizeof(double) * (O->m + 1));       /* the anchor with the equalities of (D) projected, as the candidate */
@@ -851,6 +863,7 @@ int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na
         out->resid = 0;
         out->lammin = lam_rel(O, Z, work);
         out->theta = theta;
+        if (!(theta > 0)) { free(out->y0); out->y0 = NULL; }   /* not moved */
         out->valid = out->lammin >= 0 ? (margin_ok(O, Z, 0.99 * margin, work) ? 2 : 1) : 0;
         out->y = yc;
         out->have = 1;

@@ -11,8 +11,8 @@ function args = brisk_opts2args(opts, caller)
 %     opts.timelimit = 60;  opts.threads = 2;  opts.fom = 1;  opts.mfipm = 1;  opts.lralm = 1;
 %   Fields with a meaning of their own:
 %     opts.verbose   0 quiet (default), 1 summary, 2 iteration log
-%     opts.bound     'p' | 'd' | 'sos' (= 'p': with SeDuMi/GloptiPoly input the SOS side is
-%                    SeDuMi's primal x)
+%     opts.bound     'p' | 'd' | 'pd' (both) | 'sos' (= 'p': with SeDuMi/GloptiPoly input the SOS
+%                    side is SeDuMi's primal x); always checked rigorously; info.bounds.p / .d
 %     opts.args      further options exactly as on the command line: a string
 %                    ('-nofr -dir nt') or a cell array ({'-nofr', '-dir', 'nt'})
 %   Options the MEX interface handles itself are refused: x, y, z (output files; the solution
@@ -37,10 +37,13 @@ if isfield(opts, 'acc')
 end
 if isfield(opts, 'bound')
     % 'p' (upper bound from a feasible X of BRISK's (P)), 'd' (lower bound from a
-    % feasible y); 'sos' = 'p': with SeDuMi/GloptiPoly input the SOS side is SeDuMi's primal x
+    % feasible y), 'pd' or 'both' (both, in one solve); 'sos' = 'p': with SeDuMi/GloptiPoly
+    % input the SOS side is SeDuMi's primal x. A bound is always checked rigorously; the
+    % solution returned stays the solve's own point (info.bounds holds the certificates)
     b = lower(char(opts.bound));
     if strcmp(b, 'sos'), b = 'p'; end
-    if ~any(strcmp(b, {'p', 'd'})), error('brisk:input', 'opts.bound must be ''p'', ''d'' or ''sos'''); end
+    if any(strcmp(b, {'both', 'dp'})), b = 'pd'; end
+    if ~any(strcmp(b, {'p', 'd', 'pd'})), error('brisk:input', 'opts.bound must be ''p'', ''d'', ''pd'' (''both'') or ''sos'''); end
     args = [args, {'-bound', b}];
 end
 if isfield(opts, 'sym')

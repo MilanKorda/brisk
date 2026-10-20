@@ -687,8 +687,9 @@ function _run_options(o::Optimizer)
             # side of the model's variables (the SOS Gram matrices), "dual" the other; MOI's
             # primal is BRISK's (P) in the kernel form and its (D) in the image form
             s = lowercase(String(v))
-            if !(s in ("p", "d"))
-                s in ("primal", "dual", "sos") || throw(ArgumentError("bound must be \"primal\", \"dual\" or \"sos\""))
+            s in ("both", "pd", "dp") && (s = "pd")
+            if !(s in ("p", "d", "pd"))
+                s in ("primal", "dual", "sos") || throw(ArgumentError("bound must be \"primal\", \"dual\", \"sos\" or \"both\""))
                 prim = s != "dual"
                 img = o.cone !== nothing || (o.data !== nothing && o.data.form == :image)
                 s = img ? (prim ? "d" : "p") : (prim ? "p" : "d")
