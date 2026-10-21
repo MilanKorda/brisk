@@ -1,4 +1,4 @@
-# BRISK 1.5.4: the solver in detail
+# BRISK 1.5.5: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -146,6 +146,7 @@ Every automatic choice below can be overridden from the command line.
   in double precision once the residuals and the gap are below 1e-6), by envelope, or by a
   supernodal sparse Cholesky.
 - **Presolve:**
+  - equality constraints that are linear combinations of others removed (their dual values are 0; `-deprows 0` off);
   - facial reduction;
   - sign and permutation symmetry reduction (`-sym none` turns it off);
   - block structure shared by all data matrices of an SDP block, in any orthogonal basis: each
@@ -181,8 +182,8 @@ Every automatic choice below can be overridden from the command line.
   attempt is stopped when a solve away from the optimum needs more CG steps than a sixth of
   one factorization costs, when the steps of a solve grow geometrically (three times the last
   iteration's, or the next solve past that bound at the same growth), or after a quarter of
-  the standard solve's work; unless it ends
-  OPTIMAL the standard method follows (from the attempt's iterate of merit 1e-3 if it got that far). `-mftry 0` turns this off. The attempt is also made when the dense Schur complement does
+  the work of the solve with the factored Schur complement; unless it ends
+  OPTIMAL the interior-point method with the factored Schur complement follows (from the attempt's iterate of merit 1e-3 if it got that far). `-mftry 0` turns this off. The attempt is also made when the dense Schur complement does
   not fit in memory: the first-order engine is then the fallback and a result at reduced
   accuracy is kept; when neither the Schur complement nor the engine's factor of A A' fits,
   the matrix-free method runs as well.
@@ -219,7 +220,7 @@ Every automatic choice below can be overridden from the command line.
   preconditioned CG, so the Schur complement is never formed. It suits problems with a
   low-rank optimal side, e.g. SOS relaxations with a low-rank Gram matrix, or truss topology
   problems (m = 41,616 in 2.5 minutes on one core, where a Schur complement would need 14 GB). **`-mfipm 2`** is
-  the hybrid: the matrix-free iteration while its CG is cheap, then the standard method from
+  the hybrid: the matrix-free iteration while its CG is cheap, then the interior-point method with the factored Schur complement from
   that iterate (a few Schur factorizations instead of thirty; the hand-off at a merit of 1e-3, `-mfhand`). The default does the same by itself when its
   matrix-free attempt gets near but does not end OPTIMAL.
 - **The Burer-Monteiro solver** (`-bm`): X = R Rᵀ, nothing of size n² formed. By default a problem

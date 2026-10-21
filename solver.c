@@ -113,6 +113,7 @@ void params_default(Params *p) {
     p->chordal_density = 0.3;       /* the cost estimate decides; this only skips hopeless blocks early */
     p->chordal_maxclique = 160;   /* 4.22: 80 rejected the large RTE/PEGASE networks (case6468: max clique 60 once past a transient) */
     p->chordal_form = 1;
+    p->deprows = 1;          /* 20 October 2026: dependent equality constraints removed (presolve.c) */
     p->free_elim = -1;       /* 4.30: -1 auto (kernel-form SOS class), 0 off, 1 on */
     p->free_elim_fill = 1e4;
     p->chordal_sup = -1;     /* -1: chosen on the estimated cost among 8, 4, 12, 0 */
@@ -5642,6 +5643,7 @@ static int g_objcand = 0;     /* hsd_run returned its objective candidate (BRISK
 static int g_oc_fits = 0;     /* the memory cap of the best iterate leaves room for the candidate's copies (set per solve) */
 static int g_has_soc = 0;     /* 5.16: the problem of this solve has second-order cone blocks */
 static int g_epol_fb = 0;     /* ... or returned a fallback probe candidate (tol below 1e-8) */
+static int g_drift_held = 0;  /* 20 October 2026: the drift guard held a tolerance stop back in the last embedding run */
 static Result g_epol_R;       /* ... and the measures of its candidate */
 static double probe_polish(const Problem *P, BS *S, double tau, const double *y, Schur *Sc,
                            double *yt, double *w, Result *Rp, double *rres, double tol) {
@@ -7869,7 +7871,8 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
      * 2e-7 into the 600 s limit, swissroll 64 -> 130 s, inc_600 37 -> 72 s, no gain) */
     const double ptol = fmax(par->tol, 1e-8);
     double fb_score = INFINITY; Result fb_R; memset(&fb_R, 0, sizeof(fb_R));
-    /* Objective drift (BRISK_DRIFT=1 on; off by default). On a degenerate problem whose optimal face is
+    int fb_drift = 0;   /* 20 October 2026: the fallback is the probe point the drift guard held back (returned only when the run then ends without a tolerance stop) */
+    /* Objective drift (on by default since 21 October 2026; BRISK_DRIFT=0 off). On a degenerate problem whose optimal face is
      * thin (moment relaxations with free off-diagonal entries: ni35 order 2 with the full
      * objective cut), the iterates reach residuals of 1e-11 and a duality gap of 1e-9 while
      * <C,X> and b'y still fall together by 2e-5 relative per iteration: every tolerance stop
@@ -7877,10 +7880,14 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
      * solve reached ten iterations later. A tolerance stop is therefore held back while
      * the objectives move by more than max(100 tol, 10 x the previous gap) in one
      * iteration: ordinary convergence moves them by about the previous gap. */
-    int drift_on; { const char *e = getenv("BRISK_DRIFT"); drift_on = e ? atoi(e) : 0; }   /* (read per solve, as BRISK_BREAKDOWN; off by
-     * default since 20 October 2026, the owner's decision for 1.5.4: its cost on small files and AC-OPF untested; BRISK_DRIFT=1 on) */
+    int drift_on; { const char *e = getenv("BRISK_DRIFT"); drift_on = e ? atoi(e) : 1; }   /* (read per solve, as BRISK_BREAKDOWN; off in
+     * 1.5.4 (its cost untested); on since 21 October 2026, the owner's decision, in the form without the double-double endgame
+     * after a held-back stop: on SDPLIB, a user's frames and the occupation measures the values reported OPTIMAL 4.7e-7 to
+     * 1.1e-5 off without it are within 1e-8 with it on the 13 files checked against -prec dd, at +1-3 % of the time;
+     * AC-OPF, the control LMIs and option pricing unchanged (REPORT_5.21 §4, §6). BRISK_DRIFT=0 off) */
     double po_prev = NAN, dob_prev = NAN, gap_prev = INFINITY;
     int drift_seen = 0, drift_first = -1;
+    g_drift_held = 0;
     /* (19 October 2026, the review) the hold-back lasts at most drift_max iterations from its first trigger (the cases it
      * was made for needed 8 and 10 more): a drift that persists (an unattained optimum, tau -> 0) must not keep the run
      * from its stops until the iteration limit or the infeasibility test; then the guard is off for the run */
@@ -8251,7 +8258,15 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             /* 5.4: a verified candidate within red_acc is kept too (a cantilever relaxation sent by a user:
              * the probe reached 3.7e-8 at iteration 19 and was dropped for being above 1e-8; the run
              * ended at 1.4e-6 after a re-solve, 137 s instead of 40 s) */
-            if (sp <= fmax(ptol, par->red_acc) && sp < fb_score && sp < *best_score && !moving && !drift_seen) {   /* (not a point of the drift) */
+            /* 20 October 2026: the point the drift guard holds back (it meets the tolerance while the objective moves)
+             * is kept too: when the continuation ends without meeting the tolerance (the residuals leave the path, a
+             * breakdown at the floor: qap9, control7, control8), it is returned instead of the endgame on a worse
+             * iterate; when the continuation stops at the tolerance, its point is returned. Off (BRISK_DRIFTFB=1 on): the
+             * continuation's value is the more accurate one on those files (qap9 4.9e-6 -> 4.2e-8 from the double-double
+             * reference), so the fallback trades that accuracy for the time; the owner's decision */
+            static int drift_fb = -1; if (drift_fb < 0) { const char *e = getenv("BRISK_DRIFTFB"); drift_fb = e ? atoi(e) != 0 : 0; }   /* (off: the owner decides; BRISK_DRIFTFB=1 on) */
+            const int held = drift_fb && sp <= par->tol && moving && !fb_drift;
+            if (held || (sp <= fmax(ptol, par->red_acc) && sp < fb_score && sp < *best_score && !moving && !drift_seen)) {   /* (not a point of the drift, but the held one) */
                 if (!fbX) {
                     fbX = calloc(nb, sizeof(double *)); fbZ = calloc(nb, sizeof(double *));
                     fby = malloc(sizeof(double) * (m + 1));
@@ -8265,8 +8280,8 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                     memcpy(fbX[k], S[k].G, sizeof(double) * len); memcpy(fbZ[k], S[k].Q, sizeof(double) * len);
                 }
                 memcpy(fby, a0, sizeof(double) * m);
-                fb_score = sp; fb_R = Rp;
-                if (par->verbose > 1) printf("   HSD: probe candidate %.2e kept as the fallback\n", sp);
+                fb_score = sp; fb_R = Rp; fb_drift = held;
+                if (par->verbose > 1) printf("   HSD: probe candidate %.2e kept as the fallback%s\n", sp, held ? " (the point the drift guard holds back)" : "");
             }
             /* 5.5: the Euclidean probe failed although the residuals and the gap are within the
              * tolerance and the score is close: the X-metric correction (the one the end of the solve
@@ -9707,9 +9722,10 @@ done:
         for (int k = 0; k < nb; k++) { free(ocX[k]); free(ocZ[k]); }
         free(ocX); free(ocZ); free(ocy);
     }
+    g_drift_held = drift_first >= 0;
     if (fbX) {
         /* a probe candidate of an earlier iteration does not replace the objective candidate */
-        if (fb_score < *best_score && !g_epol_stop && !oc_used) {
+        if (fb_drift ? (status != 0 && !g_epol_stop && !g_dstop && !oc_used) : (fb_score < *best_score && !g_epol_stop && !oc_used)) {
             for (int k = 0; k < nb; k++) {
                 const size_t len = bsz(&P->blk[k]);
                 memcpy(S[k].G, fbX[k], sizeof(double) * len); memcpy(S[k].Q, fbZ[k], sizeof(double) * len);
@@ -10275,6 +10291,7 @@ static int brisk_solve_thr(Problem *P, const Params *par_user, Result *R, double
 }
 static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, double *yout, double **Xout) {
     double t0 = wtime();
+    g_drift_held = 0;             /* (set by this solve's embedding run only) */
     /* direction: -1 = automatic. NT costs about 15 n^3 more dense work per SDP block per
      * iteration than HKM; use it when that is small next to the Schur factorization
      * (m^3/3) plus HKM's own dense work, i.e. on Schur-dominated problems,            */
@@ -11778,7 +11795,13 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
          * Budgeted by estimated work, not by the clock: it may cost at most dd_factor
          * times what the double-precision solve cost so far, or dd_minwork. ---- */
         const int timeout = status == ST_TIME;
-        if (par->dd_end && !par->dd_done && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc) {
+        /* 20 October 2026: not after the drift guard held a stop back (BRISK_DRIFT=1): the continuation's iterate has the
+         * value the guard waited for, and the endgame on it cost the most of the guard's time (qap9 0.75 -> 3.1 s, control8
+         * 1.3 -> 2.3 s; the values the same or near). BRISK_DRIFTDD=1: the endgame as before */
+        static int drift_dd = -1; if (drift_dd < 0) { const char *e = getenv("BRISK_DRIFTDD"); drift_dd = e ? atoi(e) != 0 : 0; }
+        const int skip_dd_drift = g_drift_held && !drift_dd;
+        if (skip_dd_drift && par->verbose > 1 && res_score(R) >= par->tol) printf("   double-double endgame skipped: the drift guard held the stop back\n");
+        if (par->dd_end && !par->dd_done && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc && !skip_dd_drift) {
             double n2 = 0;
             for (int k = 0; k < nb; k++) n2 += (double)bsz(&P->blk[k]);
             /* one dd iteration: Schur assembly through G_t = X A_t Zi (n ef_t + n^2 r_t per
@@ -12153,8 +12176,8 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) need += 12.0 * 8.0 * (double)P->blk[k].n * P->blk[k].n;
         if (!mem_fits(need, &avail)) {
             if (par_user->verbose >= 0) printf("   no retry with the %s: it needs about %.1f GB and %.1f GB are available; the result in hand is returned\n",
-                                               par_local.hsd_first_on ? "standard method" : "self-dual embedding", need / 1e9, avail / 1e9);
-            { extern void brisk_note(const char *, ...); brisk_note("the retry with the %s was not made: it needs about %.1f GB, %.1f GB were available", par_local.hsd_first_on ? "standard method" : "self-dual embedding", need / 1e9, avail / 1e9); }
+                                               par_local.hsd_first_on ? "infeasible-start method" : "self-dual embedding", need / 1e9, avail / 1e9);
+            { extern void brisk_note(const char *, ...); brisk_note("the retry with the %s was not made: it needs about %.1f GB, %.1f GB were available", par_local.hsd_first_on ? "infeasible-start method" : "self-dual embedding", need / 1e9, avail / 1e9); }
             do_retry2 = 0;
         }
     }
@@ -12165,7 +12188,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
         p2.dd_done = par_user->dd_done || ran_dd;
         p2.work_done = par_user->work_done + work_run;
         p2.warm_X = wX; p2.warm_Z = wZ; p2.warm_y = wy;
-        if (par_user->verbose) printf("   retrying with the %s (status %d, accuracy %.1e%s%s)\n", p2.hsd ? "self-dual embedding" : "standard method", status, s1,
+        if (par_user->verbose) printf("   retrying with the %s (status %d, accuracy %.1e%s%s)\n", p2.hsd ? "self-dual embedding" : "infeasible-start method", status, s1,
                                       (!p2.hsd && status == 4 && g_hsd_why) ? "; the embedding stopped: " : "", (!p2.hsd && status == 4 && g_hsd_why) ? g_hsd_why : "");
         Result R2;
         memset(&R2, 0, sizeof(R2));

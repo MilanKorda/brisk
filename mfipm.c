@@ -760,7 +760,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 for (int k = 0; k < nb; k++) { memcpy(hand_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k])); memcpy(hand_Z[k], S.b[k].Z, sizeof(double) * blen(&S.b[k])); }
                 memcpy(hand_y, y, sizeof(double) * m);
                 hand_done = merit <= 1e-2 ? 1 : 2; status = ST_MAXIT;      /* 2: CG gave up early, the point is far from optimal (a warm start from it is no use) */
-                if (verbose > 0) printf("matrix-free IPM: hand-off to the standard method at iteration %d (merit %.1e, last solves %d + %d CG steps)\n", it, merit, last_cg[0], last_cg[1]);
+                if (verbose > 0) printf("matrix-free IPM: hand-off to the interior-point method with the factored Schur complement at iteration %d (merit %.1e, last solves %d + %d CG steps)\n", it, merit, last_cg[0], last_cg[1]);
                 break;
             }
             if (brisk_time_up(par)) { status = ST_TIME; break; }
@@ -897,8 +897,8 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             }
         }
         if (trial_stop) {
-            if (verbose > 0) { if (trial_stop == 1) printf("matrix-free IPM: a solve needs more than %d CG steps at iteration %d: the standard method is cheaper\n", par->mf_trial, it);
-                               else printf("matrix-free IPM: %ld products at iteration %d, a quarter of the standard solve: stopping\n", S.nmv, it); }
+            if (verbose > 0) { if (trial_stop == 1) printf("matrix-free IPM: a solve needs more than %d CG steps at iteration %d: the interior-point method with the factored Schur complement is cheaper\n", par->mf_trial, it);
+                               else printf("matrix-free IPM: %ld products at iteration %d, a quarter of the solve with the factored Schur complement: stopping\n", S.nmv, it); }
             status = ST_MAXIT; break;
         }
         const double gam = 0.9 + 0.09 * fmin(fmin(1.0, ap), fmin(1.0, ad));
@@ -928,7 +928,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             const int r1 = it >= 2 && it <= 10 && now >= 3 * prev && now >= 0.1 * cap;
             const int r2 = it >= 2 && now >= 0.25 * cap && now * g > cap;
             if (grow_on && par->mf_trial && (r1 || r2) && fmax(gap, fmax(pinf, dinf)) > 1e-6) {
-                if (verbose > 0) printf("matrix-free IPM: %d CG steps a solve at iteration %d after %d (cap %d): growing, the standard method is cheaper\n", now, it, prev, par->mf_trial);
+                if (verbose > 0) printf("matrix-free IPM: %d CG steps a solve at iteration %d after %d (cap %d): growing, the interior-point method with the factored Schur complement is cheaper\n", now, it, prev, par->mf_trial);
                 status = ST_MAXIT; break;
             }
         }

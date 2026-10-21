@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 typedef struct { int r, c; double v; } Ent;
 
@@ -711,5 +714,439 @@ int facial_reduction(Problem *P, int verbose) {
         if (removed && verbose >= 2) printf("presolve: facial reduction: %d of the %d removed constraint(s) coupled to the kept indices by the data (their duals are rebuilt only if the reduced slack allows), %d not\n",
                             ncoupled, removed, removed - ncoupled);
     }
+    return removed;
+}
+
+/* 20 October 2026: linearly dependent equality constraints. The Gram matrix G_ij = <A_i, A_j> (the matrices and
+ * the LP and cone parts as one vector each) is factored by the sparse Cholesky with the tiny-pivot rule: the pivot
+ * of constraint i over its diagonal G_ii is the squared sine of the angle between A_i and the span of the constraints
+ * eliminated before it, so a pivot below tol of its diagonal marks A_i as a combination of those (SDPT3's check of the
+ * constraints, checkdepconstr, factors A A' the same way). The right-hand side must follow the same combination:
+ * x = G^+ b by the factor (the marked components 0) gives r = b - A A' x, which is 0 on the kept constraints and, on a
+ * marked one, b_i minus the combination of the kept b_j. When every marked r_i is negligible the marked constraints
+ * are removed (their dual values are 0 in the postsolve: y_i A_i adds nothing that the kept constraints cannot); when
+ * one is not, the constraints are inconsistent, the problem has no feasible point and nothing is removed (*ninc set).
+ * The work is bounded (forming G, its fill and its factorization; the routine returns 0 above the budget): on a
+ * problem whose interior-point solve factors its Schur complement, the pattern of G lies inside that of the Schur
+ * complement and the check costs at most about one iteration. Returns the number of constraints removed. */
+typedef struct { uint64_t key; int con; double v; } DepEnt;
+typedef struct { uint64_t h; int i; } DepPH;
+static int cmp_depph(const void *a, const void *b) {
+    const DepPH *x = a, *y = b;
+    if (x->h != y->h) return x->h < y->h ? -1 : 1;
+    return x->i - y->i;
+}
+static int cmp_depent(const void *a, const void *b) {
+    const DepEnt *x = a, *y = b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return x->con - y->con;
+}
+int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
+    const int mfull = P->m;
+    int m = mfull;
+    *ninc = 0;
+    if (m < 2 || tol <= 0) return 0;
+    const double t0 = wtime();
+    if (!P->orig) { P->morig = m; P->orig = malloc(sizeof(int) * m); for (int i = 0; i < m; i++) P->orig[i] = i; }
+    int *cmap = NULL; double *bb = NULL;
+    size_t ne = 0;
+    for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) ne += (size_t)P->blk[k].A[t].nnz;
+    if (ne == 0) return 0;
+    DepEnt *E = malloc(sizeof(DepEnt) * ne);
+    size_t w = 0;
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *S = &B->A[t];
+            for (int e = 0; e < S->nnz; e++) {
+                if (S->val[e] == 0.0) continue;
+                const uint64_t r = (uint64_t)S->row[e], c = (uint64_t)S->col[e];
+                const int sdp = B->type == BLK_SDP;
+                E[w].key = ((uint64_t)k << 44) | (sdp ? c * (c + 1) / 2 + r : r);
+                E[w].con = B->con[t];
+                E[w].v = sdp && r != c ? M_SQRT2 * S->val[e] : S->val[e];   /* <A, B> counts an off-diagonal pair twice */
+                w++;
+            }
+        }
+    }
+    ne = w;
+    {   /* by position, then constraint: a counting sort over the positions when there are not many more of them than
+         * entries (stable, and the constraints come in ascending order within a block), else qsort (a random problem
+         * with 300 dense 80 x 80 constraints: 0.12 s in qsort) */
+        size_t R = 0;
+        size_t *off = malloc(sizeof(size_t) * ((size_t)P->nblk + 1));
+        for (int k = 0; k < P->nblk; k++) { off[k] = R; const size_t n = (size_t)P->blk[k].n; R += P->blk[k].type == BLK_SDP ? n * (n + 1) / 2 : n; }
+        if (R <= 4 * ne + ((size_t)1 << 20)) {
+            size_t *cnt = calloc(R + 1, sizeof(size_t));
+            for (size_t q = 0; q < ne; q++) { const uint64_t d = off[E[q].key >> 44] + (E[q].key & (((uint64_t)1 << 44) - 1)); E[q].key = d; cnt[d + 1]++; }
+            for (size_t d = 0; d < R; d++) cnt[d + 1] += cnt[d];
+            DepEnt *E2 = malloc(sizeof(DepEnt) * (ne + 1));
+            for (size_t q = 0; q < ne; q++) E2[cnt[E[q].key]++] = E[q];
+            free(cnt); free(E); E = E2;
+        } else qsort(E, ne, sizeof(DepEnt), cmp_depent);
+        free(off);
+    }
+    w = 0;                                     /* (one entry per constraint and position; no zeros: a zero is no entry) */
+    for (size_t q = 0; q < ne; q++) {
+        if (w > 0 && E[w - 1].key == E[q].key && E[w - 1].con == E[q].con) E[w - 1].v += E[q].v; else E[w++] = E[q];
+    }
+    { size_t z = 0; for (size_t q = 0; q < w; q++) if (E[q].v != 0.0) E[z++] = E[q]; w = z; }
+    ne = w;
+    /* A constraint that is alone at some position among the remaining ones takes no part in a dependence (its
+     * coefficient in a vanishing combination of them is 0 there): such constraints are set aside one after another,
+     * and only the rest (the core) goes to the Gram matrix; a dependence of the whole set lies in the core. In a moment
+     * relaxation the highest moments are alone at their positions, then the next ones, and so on. */
+    {
+        size_t ngp = 0;
+        int *gq = malloc(sizeof(int) * (ne + 1)), *cnt = malloc(sizeof(int) * (ne + 1));
+        size_t *gp = malloc(sizeof(size_t) * (ne + 1));
+        for (size_t q = 0; q < ne; ) { size_t q1 = q; while (q1 < ne && E[q1].key == E[q].key) q1++; gp[ngp] = q; cnt[ngp] = (int)(q1 - q); for (size_t t = q; t < q1; t++) gq[t] = (int)ngp; ngp++; q = q1; }
+        gp[ngp] = ne;
+        int *crp = calloc((size_t)m + 1, sizeof(int)), *cri = malloc(sizeof(int) * (ne + 1));
+        for (size_t q = 0; q < ne; q++) crp[E[q].con + 1]++;
+        for (int i = 0; i < m; i++) crp[i + 1] += crp[i];
+        { int *fill = malloc(sizeof(int) * (m + 1)); memcpy(fill, crp, sizeof(int) * m); for (size_t q = 0; q < ne; q++) cri[fill[E[q].con]++] = (int)q; free(fill); }
+        char *aside = calloc((size_t)m + 1, 1);
+        int *stk = malloc(sizeof(int) * (ngp + 1)); size_t ns = 0;
+        for (size_t g = 0; g < ngp; g++) if (cnt[g] == 1) stk[ns++] = (int)g;
+        while (ns > 0) {
+            const int g = stk[--ns];
+            if (cnt[g] != 1) continue;
+            int r = -1;
+            for (size_t q = gp[g]; q < gp[g + 1]; q++) if (!aside[E[q].con]) { r = E[q].con; break; }
+            if (r < 0) continue;
+            aside[r] = 1;
+            for (int t = crp[r]; t < crp[r + 1]; t++) { const int g2 = gq[cri[t]]; if (--cnt[g2] == 1) stk[ns++] = g2; }
+        }
+        int mc = 0;
+        for (int i = 0; i < m; i++) if (!aside[i]) mc++;
+        free(gq); free(cnt); free(gp); free(crp); free(cri); free(stk);
+        if (getenv("BRISK_DEPDBG")) printf("   [dependent constraints: %d of %d set aside (alone at a position), core %d; %.2fs]\n", m - mc, m, mc, wtime() - t0);
+        if (mc == 0) { free(aside); free(E); if (verbose >= 2) printf("presolve: no dependent constraints (each constraint alone at some position once the others are set aside)\n"); return 0; }
+        int *nw = malloc(sizeof(int) * (m + 1)); cmap = malloc(sizeof(int) * (mc + 1)); bb = malloc(sizeof(double) * (mc + 1));
+        int c = 0;
+        for (int i = 0; i < m; i++) { nw[i] = aside[i] ? -1 : c; if (!aside[i]) { cmap[c] = i; bb[c] = P->b[i]; c++; } }
+        w = 0;
+        for (size_t q = 0; q < ne; q++) if (nw[E[q].con] >= 0) { E[w] = E[q]; E[w].con = nw[E[q].con]; w++; }
+        ne = w; m = mc;
+        free(nw); free(aside);
+    }
+    /* Multiples of another constraint (duplicated constraints, the moments a relaxation repeats: 1,350 of the 2,610
+     * dependences of a user's relaxation) are found first, exactly, by a hash of the pattern and of the values over
+     * the first one, and a comparison within each class; only the rest goes to the Gram matrix. */
+    char *pdead = calloc((size_t)mfull + 1, 1);
+    int npar = 0, nparbad = 0; double rpar = 0, bsc0 = 0;
+    {
+        int *prp = calloc((size_t)m + 1, sizeof(int)), *pe = malloc(sizeof(int) * (ne + 1));
+        for (size_t q = 0; q < ne; q++) prp[E[q].con + 1]++;
+        for (int i = 0; i < m; i++) prp[i + 1] += prp[i];
+        { int *fill = malloc(sizeof(int) * ((size_t)m + 1)); for (int i = 0; i < m; i++) fill[i] = prp[i]; for (size_t q = 0; q < ne; q++) pe[fill[E[q].con]++] = (int)q; free(fill); }
+        double *nrm = calloc((size_t)m + 1, sizeof(double));
+        DepPH *ph = malloc(sizeof(DepPH) * ((size_t)m + 1));
+        for (int i = 0; i < m; i++) {
+            double ss = 0; uint64_t h = 1469598103934665603ULL ^ (uint64_t)(prp[i + 1] - prp[i]);
+            const double v0 = prp[i + 1] > prp[i] ? E[pe[prp[i]]].v : 1.0;
+            for (int p = prp[i]; p < prp[i + 1]; p++) {
+                const DepEnt *e = &E[pe[p]]; ss += e->v * e->v;
+                int ex; const double mt = frexp(e->v / v0, &ex);
+                const int64_t mq = llrint(mt * 1099511627776.0);   /* (40 bits of the value over the first one) */
+                h = (h ^ e->key) * 1099511628211ULL; h = (h ^ (uint64_t)mq) * 1099511628211ULL; h = (h ^ (uint64_t)(ex + 2048)) * 1099511628211ULL;
+            }
+            nrm[i] = sqrt(ss); ph[i].h = h; ph[i].i = i;
+            if (nrm[i] > 0) bsc0 = fmax(bsc0, fabs(bb[i]) / nrm[i]);
+        }
+        /* (sorted by the hash, then the index: the representative of a class is its first constraint) */
+        qsort(ph, (size_t)m, sizeof(DepPH), cmp_depph);
+        const double ctol0 = 1e-8 * (bsc0 > 0 ? bsc0 : 1.0);
+        char *cd = calloc((size_t)m + 1, 1);
+        for (int a = 0; a < m; ) {
+            int z = a + 1; while (z < m && ph[z].h == ph[a].h) z++;
+            for (int x = a; x < z; x++) {
+                const int i = ph[x].i; if (cd[i] || !(nrm[i] > 0)) continue;
+                const double vi = E[pe[prp[i]]].v;
+                for (int y = x + 1; y < z; y++) {
+                    const int j = ph[y].i; if (cd[j] || prp[j + 1] - prp[j] != prp[i + 1] - prp[i]) continue;
+                    const double vj = E[pe[prp[j]]].v, r = vj / vi;
+                    int same = 1;
+                    for (int t = 0; t < prp[i + 1] - prp[i] && same; t++) {
+                        const DepEnt *ei = &E[pe[prp[i] + t]], *ej = &E[pe[prp[j] + t]];
+                        if (ei->key != ej->key || fabs(ej->v - r * ei->v) > 1e-14 * fabs(ej->v)) same = 0;
+                    }
+                    if (!same) continue;
+                    const double rel = fabs(bb[j] - r * bb[i]) / nrm[j];
+                    if (rel > ctol0) { nparbad++; continue; }
+                    cd[j] = 1; pdead[cmap[j]] = 1; npar++; if (rel > rpar) rpar = rel;
+                }
+            }
+            a = z;
+        }
+        free(ph); free(prp); free(pe);
+        if (getenv("BRISK_DEPDBG")) printf("   [dependent constraints: %d multiples of another, %d inconsistent; %.2fs]\n", npar, nparbad, wtime() - t0);
+        if (nparbad > 0) {
+            *ninc = nparbad;
+            if (verbose >= 0) printf("presolve: %d equality constraint%s multiples of others with different right-hand sides: the constraints are inconsistent and the problem has no feasible point\n", nparbad, nparbad > 1 ? "s are" : " is");
+            free(cd); free(nrm); free(pdead); free(E); free(cmap); free(bb);
+            return 0;
+        }
+        if (npar > 0) {                   /* the core without them */
+            int *nw = malloc(sizeof(int) * ((size_t)m + 1)), c = 0;
+            for (int i = 0; i < m; i++) { nw[i] = cd[i] ? -1 : c; if (!cd[i]) { cmap[c] = cmap[i]; bb[c] = bb[i]; c++; } }
+            w = 0;
+            for (size_t q = 0; q < ne; q++) if (nw[E[q].con] >= 0) { E[w] = E[q]; E[w].con = nw[E[q].con]; w++; }
+            ne = w; m = c;
+            free(nw);
+        }
+        free(cd); free(nrm);
+    }
+    if (m < 2 || ne == 0) {               /* (the multiples were all) */
+        if (npar > 0) { int *clev = calloc((size_t)mfull + 1, sizeof(int)); compact_removed(P, pdead, clev); free(clev); }
+        if (npar > 0 && verbose >= 1) printf("presolve: %d linearly dependent equality constraints removed (multiples of another; right-hand sides consistent to %.1e)\n", npar, rpar / (bsc0 > 0 ? bsc0 : 1));
+        free(pdead); free(E); free(cmap); free(bb);
+        return npar;
+    }
+    /* the positions (columns of A) and the work of forming G */
+    size_t ng = 0; double work = 0;
+    int *colof = malloc(sizeof(int) * (ne + 1));
+    size_t *gs = malloc(sizeof(size_t) * (ne + 1));
+    for (size_t q = 0; q < ne; ) {
+        size_t q1 = q; while (q1 < ne && E[q1].key == E[q].key) q1++;
+        gs[ng] = q; for (size_t p = q; p < q1; p++) colof[p] = (int)ng;
+        work += (double)(q1 - q) * (double)(q1 - q);
+        ng++; q = q1;
+    }
+    gs[ng] = ne;
+    const double budget = getenv("BRISK_DEPWORK") ? atof(getenv("BRISK_DEPWORK")) : 2e9;
+    int removed = 0;
+    int *rp = NULL, *ri = NULL, *deg = NULL, **nbr = NULL, *pool = NULL, *mark = NULL;
+    double *acc = NULL, *d0 = NULL, *piv = NULL, *x = NULL, *u = NULL, *wk = NULL;
+    char *dead = NULL;
+    SChol *S = NULL;
+    /* dense data (every constraint at most positions): G = A A' by one BLAS-3 product of the dense m x positions matrix,
+     * when that costs less than a tenth of the scalar pairs (a random problem with 300 dense 80 x 80 constraints: 1.2 s
+     * in the pairs) */
+    const double mm = (double)m;
+    const int dense = mm * mm * (double)ng * 0.5 <= 10.0 * work && 8.0 * mm * ((double)ng + mm) <= 0.1 * brisk_mem_limit();
+    if (dense ? mm * mm * (double)ng * 0.5 > 25.0 * budget : work > budget) { if (verbose >= 2) printf("presolve: dependent constraints not checked (forming the Gram matrix: %.2g > %.2g)\n", work, budget); goto out; }
+    /* the entries by constraint */
+    rp = calloc((size_t)m + 1, sizeof(int)); ri = malloc(sizeof(int) * (ne + 1));
+    for (size_t q = 0; q < ne; q++) rp[E[q].con + 1]++;
+    for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
+    { int *fill = malloc(sizeof(int) * ((size_t)m + 1)); for (int i = 0; i < m; i++) fill[i] = rp[i]; for (size_t q = 0; q < ne; q++) ri[fill[E[q].con]++] = (int)q; free(fill); }
+    /* the pattern of G (adjacency without the diagonal) */
+    mark = malloc(sizeof(int) * ((size_t)m + 1)); for (int i = 0; i < m; i++) mark[i] = -1;
+    deg = calloc((size_t)m + 1, sizeof(int));
+    size_t tot = 0;
+    if (dense) { for (int i = 0; i < m; i++) deg[i] = m - 1; tot = (size_t)m * (size_t)(m - 1); }
+    else for (int i = 0; i < m; i++) {
+        mark[i] = i;
+        for (int p = rp[i]; p < rp[i + 1]; p++) { const int g = colof[ri[p]];
+            for (size_t q = gs[g]; q < gs[g + 1]; q++) { const int j = E[q].con; if (mark[j] != i) { mark[j] = i; deg[i]++; } } }
+        tot += (size_t)deg[i];
+    }
+    const size_t fillcap = (size_t)(0.1 * brisk_mem_limit() / 8.0);
+    if (tot > fillcap) goto out;
+    pool = malloc(sizeof(int) * (tot + 1)); nbr = malloc(sizeof(int *) * (m + 1));
+    for (int i = 0; i < m; i++) mark[i] = -1;
+    { size_t o = 0;
+      for (int i = 0; i < m; i++) {
+          nbr[i] = pool + o; int c = 0; mark[i] = i;
+          if (dense) { for (int j = 0; j < m; j++) if (j != i) nbr[i][c++] = j; o += (size_t)c; continue; }
+          for (int p = rp[i]; p < rp[i + 1]; p++) { const int g = colof[ri[p]];
+              for (size_t q = gs[g]; q < gs[g + 1]; q++) { const int j = E[q].con; if (mark[j] != i) { mark[j] = i; nbr[i][c++] = j; } } }
+          o += (size_t)c;
+      } }
+    const int dbg = getenv("BRISK_DEPDBG") != NULL;
+    if (dbg) printf("   [dependent constraints: %zu entries, %zu positions, forming work %.3g, pattern %zu; %.2fs]\n", ne, ng, work, tot, wtime() - t0);
+    /* (AMD alone, as for the LP's normal equations: one factorization does not repay the search for a better ordering;
+     * a pattern of AC-OPF's moment relaxation, 4,517 constraints and 40 % dense: 0.63 -> 0.2 s) */
+    /* (a pattern at least a quarter full is factored as dense: the identity order, the values gathered from a dense
+     * array; the state-feedback LMI with 96 states, 2,304 core constraints and a full pattern: 0.65 s in the ordering
+     * and the scattered additions) */
+    const int dpat = !dense && (double)tot >= 0.25 * mm * (mm - 1.0) && 8.0 * mm * mm <= 0.1 * brisk_mem_limit();
+    int *idp = NULL;
+    if (dpat) { idp = malloc(sizeof(int) * ((size_t)m + 1)); for (int i = 0; i < m; i++) idp[i] = i; schol_set_perm(idp); }
+    const int oamd = schol_set_amd(getenv("BRISK_DEPAMD") ? atoi(getenv("BRISK_DEPAMD")) : 2);
+    S = schol_analyze_adj(m, deg, nbr, fillcap);
+    schol_set_amd(oamd);
+    if (dpat) { schol_set_perm(NULL); free(idp); }
+    if (dbg && S) printf("   [... analysis: factor %zu entries, %.3g flops; %.2fs]\n", schol_nnz(S), schol_flops(S), wtime() - t0);
+    if (!S) { if (verbose >= 2) printf("presolve: dependent constraints not checked (the factor of the Gram matrix exceeds its memory budget)\n"); goto out; }
+    { const double fcap = getenv("BRISK_DEPFLOPS") ? atof(getenv("BRISK_DEPFLOPS")) : 2e10;
+      if (schol_flops(S) > fcap) { if (verbose >= 2) printf("presolve: dependent constraints not checked (factoring the Gram matrix: %.2g flops > %.2g)\n", schol_flops(S), fcap); goto out; } }
+    /* the values */
+    schol_zero(S);
+    acc = calloc((size_t)m, sizeof(double)); d0 = malloc(sizeof(double) * m);
+    if (dense) {
+        double *Ad = calloc((size_t)m * ng, sizeof(double)), *Gd = calloc((size_t)m * m, sizeof(double));
+        for (size_t q = 0; q < ne; q++) Ad[(size_t)E[q].con + (size_t)colof[q] * m] = E[q].v;
+        const int ngi = (int)ng; const double one = 1.0, zero = 0.0;
+        BL(dsyrk_)("L", "N", &m, &ngi, &one, Ad, &m, &zero, Gd, &m);
+        free(Ad);
+        for (int i = 0; i < m; i++) d0[i] = Gd[(size_t)i * m + i];
+        schol_gather_dense(S, Gd);
+        free(Gd);
+    }
+    else if (dpat) {
+        double *Gd = calloc((size_t)m * m, sizeof(double));
+        for (int i = 0; i < m; i++) {
+            double *col = Gd + (size_t)i * m;
+            for (int p = rp[i]; p < rp[i + 1]; p++) { const DepEnt *ei = &E[ri[p]]; const int g = colof[ri[p]];
+                for (size_t q = gs[g]; q < gs[g + 1]; q++) if (E[q].con >= i) col[E[q].con] += ei->v * E[q].v; }
+            d0[i] = col[i];
+        }
+        schol_gather_dense(S, Gd);
+        free(Gd);
+    }
+    else for (int i = 0; i < m; i++) {
+        for (int p = rp[i]; p < rp[i + 1]; p++) { const DepEnt *ei = &E[ri[p]]; const int g = colof[ri[p]];
+            for (size_t q = gs[g]; q < gs[g + 1]; q++) acc[E[q].con] += ei->v * E[q].v; }
+        d0[i] = acc[i];
+        schol_add(S, (size_t)i, (size_t)i, acc[i]); acc[i] = 0;
+        for (int c = 0; c < deg[i]; c++) { const int j = nbr[i][c]; if (j > i) schol_add(S, (size_t)j, (size_t)i, acc[j]); acc[j] = 0; }
+    }
+    if (dbg) printf("   [... values: %.2fs]\n", wtime() - t0);
+    schol_set_tinypiv(S, tol);
+    if (schol_factor(S, 0.0)) goto out;
+    if (dbg) printf("   [... factor: %.2fs]\n", wtime() - t0);
+    piv = malloc(sizeof(double) * m);
+    schol_pivots(S, piv);
+    dead = calloc((size_t)m + 1, 1);
+    char *flag = calloc((size_t)m + 1, 1);
+    int nf = 0;
+    double pmin = INFINITY;                /* (the smallest relative pivot not flagged, for the log) */
+    for (int i = 0; i < m; i++) {
+        if (piv[i] >= 1e100 || !(d0[i] > 0)) { flag[i] = 1; nf++; }
+        else if (piv[i] / d0[i] < pmin) pmin = piv[i] / d0[i];
+    }
+    if (nf == 0) { free(flag); if (verbose >= 2) printf("presolve: no dependent constraints (smallest pivot of the Gram matrix %.1e of its diagonal)\n", pmin); goto out; }
+    /* Each flagged A_i is checked in the space of the data, not through G (which squares the condition): lambda from
+     * G_KK lambda = A_K a_i (K: the constraints not flagged), the residual v = a_i - A_K' lambda, one step of refinement
+     * (G_KK dl = A_K v; the corrected semi-normal equations), and A_i is dependent when |v| <= stol |a_i|; its right-hand
+     * side must then be b_i = lambda' b_K. A flagged constraint that fails the test is kept (it was only left out of the
+     * span the others are checked against, which can hide a dependence but not create one). */
+    {
+        const double vwork = (double)nf * 2.0 * (2.0 * (double)ne + (double)ng + 2.0 * (double)schol_nnz(S));
+        const double vbud = getenv("BRISK_DEPVWORK") ? atof(getenv("BRISK_DEPVWORK")) : 1e10;
+        if (vwork > vbud) { free(flag); if (verbose >= 2) printf("presolve: %d constraints flagged as dependent, not verified (work %.2g > %.2g); kept\n", nf, vwork, vbud); goto out; }
+    }
+    static double stol = -1; if (stol < 0) stol = getenv("BRISK_DEPSIN") ? atof(getenv("BRISK_DEPSIN")) : 1e-9;
+    u = malloc(sizeof(double) * (ng + 1));
+    double bsc = 0;
+    for (int i = 0; i < m; i++) if (d0[i] > 0) bsc = fmax(bsc, fabs(bb[i]) / sqrt(d0[i]));
+    const double ctol = 1e-8 * (bsc > 0 ? bsc : 1.0);
+    int nd = 0, nbad = 0, nkeep = 0;
+    double sdep = 0, skeep = INFINITY, rd = 0;
+    /* the flagged constraints in chunks, their solves together (schol_solve_many) */
+    int *fl = malloc(sizeof(int) * (nf + 1)), nfl = 0;
+    for (int i = 0; i < m; i++) if (flag[i]) {
+        if (!(d0[i] > 0)) { if (bb[i] == 0) { dead[i] = 1; nd++; } else nbad++; }   /* an empty constraint: consistent only with b_i = 0 */
+        else fl[nfl++] = i;
+    }
+    int ch = (int)((1u << 23) / ((size_t)m + 1)); if (ch < 1) ch = 1; if (ch > nfl) ch = nfl > 0 ? nfl : 1;
+    x = malloc(sizeof(double) * (size_t)m * ch); wk = malloc(sizeof(double) * ((size_t)m * ch + m + 1));
+    double *g = malloc(sizeof(double) * (size_t)m * ch);
+    /* the entries by constraint as contiguous arrays (the products A_K v read them row by row) */
+    double *rv = malloc(sizeof(double) * (ne + 1)); int *rcl = malloc(sizeof(int) * (ne + 1));
+    for (size_t p = 0; p < ne; p++) { rv[p] = E[ri[p]].v; rcl[p] = colof[ri[p]]; }
+    int nth = 1;
+#ifdef _OPENMP
+    nth = omp_get_max_threads();
+#endif
+    double *ubuf = malloc(sizeof(double) * ((size_t)ng + 1) * (size_t)nth);
+    double *snc = malloc(sizeof(double) * ((size_t)ch + 1)), *relc = malloc(sizeof(double) * ((size_t)ch + 1));
+    /* v = a_i - A_K' xc over the positions (xc NULL: v = a_i), into uu */
+    #define DEP_RESID(uu, i, xc) do { memset(uu, 0, sizeof(double) * ng); \
+        for (int p_ = rp[i]; p_ < rp[(i) + 1]; p_++) uu[rcl[p_]] = rv[p_]; \
+        if (xc) for (size_t q_ = 0; q_ < ne; q_++) if (!flag[E[q_].con]) uu[colof[q_]] -= E[q_].v * (xc)[E[q_].con]; } while (0)
+    char *ok = malloc((size_t)ch + 1);
+    double t_solve = 0;
+    for (int c0 = 0; c0 < nfl; c0 += ch) {
+        const int nc = nfl - c0 < ch ? nfl - c0 : ch;
+        memset(x, 0, sizeof(double) * (size_t)m * nc); memset(ok, 0, (size_t)nc);
+        for (int pass = 0; pass < 2; pass++) {
+            /* (each candidate on its own, on the threads: the same result at any thread count) */
+            #pragma omp parallel num_threads(nth) if (nth > 1 && nc > 1)
+            {
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                double *uu = ubuf + (size_t)tid * ((size_t)ng + 1);
+                #pragma omp for schedule(dynamic, 1)
+                for (int c = 0; c < nc; c++) {
+                    const int i = fl[c0 + c]; double *xc = x + (size_t)c * m, *gc = g + (size_t)c * m;
+                    if (ok[c]) { memset(gc, 0, sizeof(double) * m); continue; }
+                    if (pass) DEP_RESID(uu, i, xc); else DEP_RESID(uu, i, (double *)NULL);
+                    for (int j = 0; j < m; j++) {
+                        double t = 0;
+                        if (!flag[j]) for (int p = rp[j]; p < rp[j + 1]; p++) t += rv[p] * uu[rcl[p]];
+                        gc[j] = t;
+                    }
+                }
+            }
+            { const double ts_ = wtime(); schol_solve_many_t(S, g, nc, wk); t_solve += wtime() - ts_; }
+            #pragma omp parallel num_threads(nth) if (nth > 1 && nc > 1)
+            {
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                double *uu = ubuf + (size_t)tid * ((size_t)ng + 1);
+                #pragma omp for schedule(dynamic, 1)
+                for (int c = 0; c < nc; c++) {
+                    if (ok[c]) continue;
+                    double *xc = x + (size_t)c * m, *gc = g + (size_t)c * m;
+                    for (int j = 0; j < m; j++) if (!flag[j]) xc[j] += gc[j];
+                    const int i = fl[c0 + c];
+                    DEP_RESID(uu, i, xc);
+                    double vv = 0; for (size_t q = 0; q < ng; q++) vv += uu[q] * uu[q];
+                    snc[c] = sqrt(vv / d0[i]);
+                    /* (the refinement only where the first residual is not already far below stol) */
+                    if (pass == 0 && snc[c] <= 1e-3 * stol) ok[c] = 1;
+                    if (pass == 1 || ok[c]) {
+                        double r = bb[i];
+                        for (int j = 0; j < m; j++) if (!flag[j]) r -= xc[j] * bb[j];
+                        relc[c] = fabs(r) / sqrt(d0[i]);
+                    }
+                }
+            }
+        }
+        for (int c = 0; c < nc; c++) {
+            const int i = fl[c0 + c]; const double sn = snc[c], rel = relc[c];
+            if (sn > stol) { nkeep++; if (sn < skeep) skeep = sn; continue; }
+            if (rel > ctol) { nbad++; continue; }
+            dead[i] = 1; nd++;
+            if (sn > sdep) sdep = sn;
+            if (rel > rd) rd = rel;
+        }
+    }
+    free(ok); free(rv); free(rcl); free(ubuf); free(snc); free(relc);
+    if (getenv("BRISK_DEPDBG")) printf("   [... verification: solves %.2fs]\n", t_solve);
+    #undef DEP_RESID
+    free(fl);
+    free(g); free(flag);
+    if (getenv("BRISK_DEPDBG")) printf("   [... verified: %d of %d flagged dependent (largest sine %.1e), %d kept (smallest sine %.1e), %d inconsistent; %.2fs]\n", nd, nf, sdep, nkeep, skeep, nbad, wtime() - t0);
+    if (nbad > 0) {
+        *ninc = nbad;
+        if (verbose >= 0) printf("presolve: %d equality constraint%s linear combinations of others with different right-hand sides: the constraints are inconsistent and the problem has no feasible point\n", nbad, nbad > 1 ? "s are" : " is");
+        goto out;
+    }
+    if (nd == 0) { if (verbose >= 2 && !npar) printf("presolve: no dependent constraints (%d flagged by the Gram matrix, none confirmed)\n", nf); goto out; }
+    { int *clev = calloc((size_t)mfull + 1, sizeof(int));
+      for (int i = 0; i < m; i++) if (dead[i]) pdead[cmap[i]] = 1;
+      compact_removed(P, pdead, clev); free(clev); }
+    removed = nd + npar;
+    if (verbose >= 1) printf("presolve: %d linearly dependent equality constraints removed (%d multiples of another, %d more by the factorization; rank %d of %d; distance to the span of the others at most %.1e of their norm, right-hand sides consistent to %.1e)\n",
+                             nd + npar, npar, nd, mfull - nd - npar, mfull, sdep, fmax(rd / (bsc > 0 ? bsc : 1), rpar / (bsc0 > 0 ? bsc0 : 1)));
+out:
+    if (!removed && npar > 0 && *ninc == 0) {   /* (the multiples alone: the rest has no dependence, or was not checked) */
+        { int *clev = calloc((size_t)mfull + 1, sizeof(int)); compact_removed(P, pdead, clev); free(clev); }
+        removed = npar;
+        if (verbose >= 1) printf("presolve: %d linearly dependent equality constraints removed (multiples of another; right-hand sides consistent to %.1e)\n", npar, rpar / (bsc0 > 0 ? bsc0 : 1));
+    }
+    free(pdead);
+    if (S) schol_free(S);
+    free(E); free(colof); free(gs); free(rp); free(ri); free(deg); free(nbr); free(pool); free(mark);
+    free(acc); free(d0); free(piv); free(x); free(u); free(wk); free(dead); free(cmap); free(bb);
     return removed;
 }

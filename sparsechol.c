@@ -5235,3 +5235,21 @@ void schol_tree_stats(const SChol *S) {
     }
     free(par); free(c); free(sub); free(nch); free(cp);
 }
+
+/* 20 October 2026: the pivots of the last factorization (the squares of the diagonal of L), by original index; a
+ * pivot replaced by the tiny-pivot rule reads 1e128 */
+void schol_pivots(const SChol *S, double *d) {
+    for (int k = 0; k < S->ns; k++) {
+        const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k];
+        const double *Pk = S->pan + S->pbase[k];
+        for (int cc = 0; cc < w; cc++) { const double l = Pk[(size_t)cc * nr + cc]; d[S->perm[j0 + cc]] = l * l; }
+    }
+}
+/* 20 October 2026: schol_solve_many by the transposed right-hand sides (the path BRISK_SOLVEOLD selects), whatever the
+ * default: many right-hand sides on a factor with a few large supernodes (the presolve's dependent constraints: 276 on
+ * a dense factor of order 2,304, 1.0 -> 0.2 s). Single-threaded callers only (it switches the path for the call). */
+void schol_solve_many_t(const SChol *S, double *Bm, int nrhs, double *work) {
+    const int o = g_tps; g_tps = 0;
+    schol_solve_many(S, Bm, nrhs, work);
+    g_tps = o;
+}

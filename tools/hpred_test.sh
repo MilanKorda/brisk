@@ -32,16 +32,17 @@ while abs(t) > Decimal(10) ** -58:
     k += 2; t = -t * x * x / (k * (k - 1)); c += t
 open(f"{T}/exact.txt", "w").write(str(n * c / (1 + c)))
 PY
+# (the value with all the digits of the working precision: -v; the log shows ten digits otherwise)
 val() { grep "^optimal value" | sed 's/.*: //'; }
 close() { python3 -c "
 import sys
 from decimal import Decimal
 a, b, tol = Decimal(sys.argv[1]), Decimal(sys.argv[2]), Decimal(sys.argv[3])
 sys.exit(0 if abs(a - b) <= tol * (1 + abs(b)) else 1)" "$1" "$2" "$3"; }
-o1=$(BRISK_HPREDSMALL=1 "$B" $T/sym.dat-s -prec dd -threads 1 2>&1); v1=$(echo "$o1" | val)
-o2=$(BRISK_HPNORED=all "$B" $T/sym.dat-s -prec dd -threads 1 2>&1); v2=$(echo "$o2" | val)
-o3=$(BRISK_HPREDSMALL=1 "$B" $T/pert.dat-s -prec dd -threads 1 2>&1); v3=$(echo "$o3" | val)
-o4=$(BRISK_HPNORED=all "$B" $T/pert.dat-s -prec dd -threads 1 2>&1); v4=$(echo "$o4" | val)
+o1=$(BRISK_HPREDSMALL=1 "$B" $T/sym.dat-s -prec dd -threads 1 -v 2>&1); v1=$(echo "$o1" | val)
+o2=$(BRISK_HPNORED=all "$B" $T/sym.dat-s -prec dd -threads 1 -v 2>&1); v2=$(echo "$o2" | val)
+o3=$(BRISK_HPREDSMALL=1 "$B" $T/pert.dat-s -prec dd -threads 1 -v 2>&1); v3=$(echo "$o3" | val)
+o4=$(BRISK_HPNORED=all "$B" $T/pert.dat-s -prec dd -threads 1 -v 2>&1); v4=$(echo "$o4" | val)
 ex=$(cat $T/exact.txt)
 chk() { if eval "$2"; then echo "  ok    $1"; else echo "  FAIL  $1"; fail=1; fi; }
 echo "high-precision reductions test ($B): theta(C_41) = ${ex:0:32}"

@@ -35,6 +35,47 @@ struct BlkScale {
 
 static double p2(double x) { return ldexp(1.0, (int)lround(log2(x))); }
 
+/* mode 2's factors: d_p = 1 / the largest |coefficient| at index p of the block (d[k] NULL: the block is not scaled) */
+static void simple_factors(const Problem *P, double **d, double **acc) {
+    for (int k = 0; k < P->nblk; k++) {
+        if (!d[k]) continue;
+        const Block *B = &P->blk[k]; const int n = B->n;
+        memset(acc[k], 0, sizeof(double) * n);
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *A = &B->A[t];
+            for (int q = 0; q < A->nnz; q++) {
+                const double v = fabs(A->val[q]);
+                if (v > acc[k][A->row[q]]) acc[k][A->row[q]] = v;
+                if (v > acc[k][A->col[q]]) acc[k][A->col[q]] = v;
+            }
+        }
+        for (int p = 0; p < n; p++) d[k][p] = acc[k][p] > 0 ? 1.0 / acc[k][p] : 1.0;
+    }
+}
+
+/* 21 October 2026 (the owner): the spread of the factors -blkscale -2 would apply (1: none), without changing P; the
+ * end-of-log advice names the option when a solve misses the tolerance and this is at least g_blkscale_min. O(nnz) */
+double blkscale_probe(const Problem *P) {
+    const int nb = P->nblk;
+    double **d = calloc(nb, sizeof(double *)), **acc = calloc(nb, sizeof(double *)), spread = 1.0;
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP && P->blk[k].n > 1) {
+        d[k] = malloc(sizeof(double) * P->blk[k].n); acc[k] = malloc(sizeof(double) * P->blk[k].n);
+    }
+    simple_factors(P, d, acc);
+    for (int k = 0; k < nb; k++) {
+        if (!d[k]) continue;
+        double lo = 1e300, hi = 0;
+        for (int p = 0; p < P->blk[k].n; p++) {
+            const double f = p2(fmin(g_blkscale_cap, fmax(1.0 / g_blkscale_cap, d[k][p])));
+            lo = fmin(lo, f); hi = fmax(hi, f);
+        }
+        if (hi / lo >= 2.0) spread = fmax(spread, hi / lo);
+        free(d[k]); free(acc[k]);
+    }
+    free(d); free(acc);
+    return spread;
+}
+
 BlkScale *blkscale_apply(Problem *P, int mode, int verbose) {
     if (mode == 0 || g_blkscale_off) return NULL;
     const int m = P->m, nb = P->nblk;
@@ -53,20 +94,7 @@ BlkScale *blkscale_apply(Problem *P, int mode, int verbose) {
      * coefficients are 1e-4 carries an X* of order 1e8 - a user's thin-face problem, the region-of-attraction LMIs;
      * ISSUES 120); no row factors, no iteration, a bounded spread (below) */
     const int simple = mode == 2 || mode == -2;
-    if (simple) for (int k = 0; k < nb; k++) {
-        if (!d[k]) continue;
-        const Block *B = &P->blk[k]; const int n = B->n;
-        memset(acc[k], 0, sizeof(double) * n);
-        for (int t = 0; t < B->ncon; t++) {
-            const SpSym *A = &B->A[t];
-            for (int q = 0; q < A->nnz; q++) {
-                const double v = fabs(A->val[q]);
-                if (v > acc[k][A->row[q]]) acc[k][A->row[q]] = v;
-                if (v > acc[k][A->col[q]]) acc[k][A->col[q]] = v;
-            }
-        }
-        for (int p = 0; p < n; p++) d[k][p] = acc[k][p] > 0 ? 1.0 / acc[k][p] : 1.0;
-    }
+    if (simple) simple_factors(P, d, acc);
     for (int it = 0; it < (simple ? 0 : 10); it++) {
         memset(rho, 0, sizeof(double) * m);
         for (int k = 0; k < nb; k++) {

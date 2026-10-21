@@ -413,6 +413,11 @@ static void leaf_order(const Gr *g, const int *name, int *perm, int *np) {
 /* 18 October 2026 (LP/SOCP): 0 = no hub rule (a second trial of the LP method's analysis, sparsechol.c) */
 static int g_nd_hubs = 1;
 void nd_set_hubs(int on) { g_nd_hubs = on; }
+/* (20 October 2026, LP/SOCP) the number of bisections per level and the leaf size, set by a caller for one order (-1: the
+ * defaults, 4 or 2 and 200, or BRISK_NDTRY / BRISK_NDLEAF); the cone solver's full system takes one try and leaves of
+ * 5,000: the prism's order in 0.9 s instead of 10 s at 0.63 of AMD's work instead of 0.43 */
+static int g_nd_try_set = -1, g_nd_leaf_set = -1;
+void nd_set_params(int ntry, int leaf) { g_nd_try_set = ntry; g_nd_leaf_set = leaf; }
 static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
     const int n = g->n;
     if (n <= leaf || depth > 60) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
@@ -450,7 +455,7 @@ nohubs:;
     /* several bisections (the matching and the seeds are random), the smallest separator kept */
     /* (the trial without hubs, 18 October 2026: two attempts; on staircase 50 x 500 they gave 9.7e9 flops in 2.5 s
      * against 1.11e10 in 5.6 s with four, one gave 1.35e10) */
-    const int ntry = getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : g_nd_hubs ? 4 : 2;
+    const int ntry = g_nd_try_set > 0 ? g_nd_try_set : getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : g_nd_hubs ? 4 : 2;
     long bestscore = -1;
     for (int t = 0; t < ntry; t++) {
         if (bisect(g, part, t & 1)) break;
@@ -510,6 +515,6 @@ int nd_order(int n, const int *xadj, const int *adjncy, int *perm) {
     }
     g.xadj[n] = w;
     int np = 0;
-    nd_rec(&g, name, perm, &np, getenv("BRISK_NDLEAF") ? atoi(getenv("BRISK_NDLEAF")) : 200, 0);
+    nd_rec(&g, name, perm, &np, g_nd_leaf_set > 0 ? g_nd_leaf_set : getenv("BRISK_NDLEAF") ? atoi(getenv("BRISK_NDLEAF")) : 200, 0);
     return np == n ? 0 : 1;
 }

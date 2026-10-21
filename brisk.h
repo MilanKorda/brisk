@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.5.4"
+#define BRISK_VERSION "1.5.5"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -429,6 +429,7 @@ typedef struct {
     int bound_prior;         /* -boundprior: when the margin check fails, a bound from a-priori bounds of the other side (1, default; 0 off) */
     int soc;                 /* 5.16: semidefinite blocks with arrow data as second-order cones in the embedding: 1 on (default), 0 off */
     int soc_minn;            /* ... blocks of at least this order (3) */
+    int deprows;             /* 20 October 2026: linearly dependent equality constraints removed in the presolve: 1 on (default), 0 off */
 } Params;
 
 #define BOUND_NANCHOR 4
@@ -497,6 +498,7 @@ void lowrank_rng_reset(void);
 void symred_rng_reset(void);
 void problem_free(Problem *P);
 int  facial_reduction(Problem *P, int verbose);
+int  remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc);   /* 20 October 2026: linearly dependent equality constraints (presolve.c) */
 int  chordal_convert(Problem *P, const Params *par, int verbose);
 void problem_from_trips(Problem *P, int m, int nblk, const int *bsz, const double *b,
                         size_t nt, const int *con, const int *blk, const int *ii, const int *jj, const double *v);
@@ -532,6 +534,10 @@ void schol_set_tinypiv(SChol *S, double t);
 void schol_set_dynpiv(SChol *S, double p);       /* signed factorization: wrong-sign pivots replaced by sign * p */
 int schol_ndyn(const SChol *S);
 int schol_ntiny(const SChol *S);
+void schol_set_perm(const int *perm);              /* an ordering for the next analysis (perm[new] = old; NULL: none) */
+int  schol_set_amd(int mode);                       /* the ordering mode of the next analyses (0 own, 1 automatic, 2 AMD alone); returns the previous one */
+void schol_solve_many_t(const SChol *S, double *Bm, int nrhs, double *work);   /* 20 October 2026: schol_solve_many by the transposed right-hand sides */
+void schol_pivots(const SChol *S, double *d);      /* 20 October 2026: pivots of the last factorization by original index (1e128: replaced as tiny) */
 typedef struct SAdj SAdj;
 SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap);
 SChol *schol_analyze_sym(int m, int *deg, int **nbr, size_t fillcap);     /* ordering and symbolic factorization only */
@@ -739,6 +745,7 @@ BlkScale *blkscale_apply(Problem *P, int mode, int verbose);   /* mode 0 off, 1 
 void blkscale_unmap(const BlkScale *S, double **Xp, const double *yp, double ***Xo, double *yo);
 void blkscale_free(BlkScale *S);
 double blkscale_spread(const BlkScale *S);
+double blkscale_probe(const Problem *P);   /* the spread -blkscale -2 would apply, P unchanged (the end-of-log advice) */
 extern int g_blkscale_off;
 extern double g_blkscale_min;
 extern double g_blkscale_cap;   /* -blkscale 2: each factor within [1/cap, cap] */

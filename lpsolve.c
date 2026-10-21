@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
@@ -161,7 +162,12 @@ static int ne_factor(LpS *S) {
         }
     }
     }
-    schol_set_tinypiv(S->sc, getenv("BRISK_LPTINY") ? atof(getenv("BRISK_LPTINY")) : 1e-20);
+    /* (20 October 2026, LP/SOCP: 1e-16 instead of 1e-20. qap15's normal equations (folded or not) have 240-344 dependent
+     * rows of 2,121; the pivots between 1e-20 and 1e-16 were kept as information and the direction was garbage: the gap
+     * reached 5e-6, then the primal residual grew and the method gave up after 40 iterations. At 1e-16 (the rounding
+     * level of a pivot of order one) 17 iterations, 0.9 s; the other 141 LPs of the sets the same status lines and
+     * iterations within one. ISSUES 226.) */
+    schol_set_tinypiv(S->sc, getenv("BRISK_LPTINY") ? atof(getenv("BRISK_LPTINY")) : 1e-16);
     /* 18 October 2026 (LP/SOCP): the large nodes by the tile task graph of sparsechol.c (fnode_dag), the tiny-pivot rule
      * in its diagonal tiles; it was skipped with tiny pivots (BRISK_LPTDAG=0: as before) */
     { static int tdag = -1; if (tdag < 0) { const char *e = getenv("BRISK_LPTDAG"); tdag = !(e && atoi(e) == 0); } schol_set_tinydag(S->sc, tdag); }
@@ -739,6 +745,21 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
         double sigma = pow(mua / mu, 3.0);
         if (sigma > 1.0) sigma = 1.0;
         if (sigma < 1e-6) sigma = 1e-6;
+        /* ---- 20 October 2026 (LP/SOCP): Mehrotra's sigma bounded by 0.3 (BRISK_LPSIGMAX=s; 1 the plain heuristic). On
+         * the transportation LPs the affine step is blocked by the columns that enter the basis (dz / z = -1 - dx / x)
+         * at a point whose products lie within [0.3, 3] mu: the heuristic reads the short step as a lack of centrality
+         * and centres (sigma 0.9, mu falling by 5-10 % an iteration) where a long step is safe. The 142 LPs of the sets:
+         * no status changed, iterations 2,871 -> 2,810, time 0.966 (0.906 over a second); transport_300 38 -> 24,
+         * transport_1000 95 -> 86, cre-b 46 -> 37, pds-20 53 -> 47; pilot4 38 -> 47, perold 38 -> 44. A cap of 0.1
+         * gained the same time with more losses (pilot4 56; perold's LP method failed, the fallback solved it). A test,
+         * off: the cap only at a centred point (BRISK_LPSIGCEN=gamma: every product at least gamma mu) never fires. */
+        { static double smax = -1, scen = -1;
+          if (smax < 0) { const char *e_ = getenv("BRISK_LPSIGMAX"); smax = e_ ? atof(e_) : 0.3; const char *g_ = getenv("BRISK_LPSIGCEN"); scen = g_ ? atof(g_) : 0.0; }
+          if (sigma > smax) {
+              int cen = 1;
+              if (scen > 0) for (int j = 0; j < n && cen; j++) { if (S->fr[j]) continue; if (x[j] * z[j] < scen * mu || (S->bd[j] && s[j] * w[j] < scen * mu)) cen = 0; }
+              if (cen) sigma = smax;
+          } }
         /* ---- 19 October 2026 (LP/SOCP), a test, off (BRISK_LPARC=1): an arc search (Yang's arc-search interior-point
          * methods). The point moves on the ellipse x(a) = x + sin(a) d1 + (1 - cos(a)) d2 through the path's first and
          * second derivatives: d1 = d_aff + c, c the centring direction (sigma mu, no residuals), and d2 from
@@ -753,7 +774,7 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
          * ((1 - cos a) is of second order) and Netlib needed 1,832 iterations. */
         int arc_line = 0;
         static int arcon = -1; if (arcon < 0) { const char *e_ = getenv("BRISK_LPARC"); arcon = e_ ? atoi(e_) : 0; }
-        if (arcon) {
+        if (arcon == 1) {
             if (!S->wa) { S->wa = xm(sizeof(double) * (4 * (size_t)n + m + 4)); }
             double *dxa = S->wa, *dza = dxa + n, *dsa = dza + n, *dwa = dsa + n, *dya = dwa + n;
             memcpy(dxa, dx, sizeof(double) * n); memcpy(dza, dz, sizeof(double) * n); memcpy(dsa, ds, sizeof(double) * n); memcpy(dwa, dw, sizeof(double) * n); memcpy(dya, dy, sizeof(double) * m);
@@ -832,10 +853,71 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
             sigma *= bom;          /* (the centring target that the direction carries, for the correctors below) */
             if (getenv("BRISK_LPDBG")) printf("     [corrector weight %.3f (from %.3f)]\n", bom, om0);
         } else if (!arc_line) {
+            if (arcon == 2) {           /* (test: the affine direction kept for the arc after the line) */
+                if (!S->wa) { S->wa = xm(sizeof(double) * (4 * (size_t)n + m + 4)); }
+                double *dxa = S->wa, *dza = dxa + n, *dsa = dza + n, *dwa = dsa + n;
+                memcpy(dxa, dx, sizeof(double) * n); memcpy(dza, dz, sizeof(double) * n); memcpy(dsa, ds, sizeof(double) * n); memcpy(dwa, dw, sizeof(double) * n);
+            }
             for (int j = 0; j < n; j++) { if (S->fr[j]) { rxz[j] = 0; rsw[j] = 0; continue; } rxz[j] = sigma * mu - x[j] * z[j] - dx[j] * dz[j]; rsw[j] = S->bd[j] ? sigma * mu - s[j] * w[j] - ds[j] * dw[j] : 0.0; }
             direction(S, x, s, z, w, rb, ru, rc, rxz, rsw, dx, dy, dz, ds, dw, g, rtol, maxcg);
         }
         step_max(S, x, s, z, w, dx, ds, dz, dw, &ap, &ad);
+        /* ---- 20 October 2026 (LP/SOCP), a test, off (BRISK_LPSIGSEL=1): sigma chosen by the progress it gives. The
+         * corrected direction is affine in sigma, d(sigma) = d(sigma_M) + (sigma - sigma_M) d_c with d_c the centring
+         * direction (right-hand side mu e, no residuals), so one more solve gives every candidate; the candidate whose
+         * step leaves the smallest mean product is taken. Tried when Mehrotra's sigma is at least BRISK_LPSIGSELT (0.2):
+         * on the transportation LPs the affine step is blocked by the entering columns (dz / z = -1 - dx / x) at a
+         * centred point, and the heuristic centres (sigma 0.9, mu falling 5-10 % an iteration) where a long step is safe. */
+        { static int ssel = -1; static double sselt = 0.2;
+          if (ssel < 0) { const char *e_ = getenv("BRISK_LPSIGSEL"); ssel = e_ ? atoi(e_) : 0; const char *t_ = getenv("BRISK_LPSIGSELT"); if (t_) sselt = atof(t_); }
+          if (ssel && sigma >= sselt && !arc_line) {
+              if (!S->wa) { S->wa = xm(sizeof(double) * (4 * (size_t)n + m + 4)); }
+              double *tx = S->wa, *tz = tx + n, *ts = tz + n, *tw = ts + n;
+              for (int j = 0; j < n; j++) { if (S->fr[j]) { rxz[j] = 0; rsw[j] = 0; continue; } rxz[j] = mu; rsw[j] = S->bd[j] ? mu : 0.0; }
+              direction(S, x, s, z, w, zm, zr, zr, rxz, rsw, dx2, dy2, dz2, ds2, dw2, g, rtol, maxcg);
+              const double cand[7] = { 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7 };
+              double best = 0, bsig = sigma, bap = ap, bad_ = ad;
+              { const double a1 = fmin(1.0, ap), a2 = fmin(1.0, ad);
+                for (int j = 0; j < n; j++) { if (S->fr[j]) continue; best += (x[j] + a1 * dx[j]) * (z[j] + a2 * dz[j]); if (S->bd[j]) best += (s[j] + a1 * ds[j]) * (w[j] + a2 * dw[j]); } }
+              for (int c = 0; c < 7; c++) {
+                  const double ds_ = cand[c] - sigma; if (fabs(ds_) < 1e-3) continue;
+                  for (int j = 0; j < n; j++) { tx[j] = dx[j] + ds_ * dx2[j]; tz[j] = dz[j] + ds_ * dz2[j]; ts[j] = ds[j] + ds_ * ds2[j]; tw[j] = dw[j] + ds_ * dw2[j]; }
+                  double cp, cd; step_max(S, x, s, z, w, tx, ts, tz, tw, &cp, &cd);
+                  const double a1 = fmin(1.0, cp), a2 = fmin(1.0, cd); double v = 0;
+                  for (int j = 0; j < n; j++) { if (S->fr[j]) continue; v += (x[j] + a1 * tx[j]) * (z[j] + a2 * tz[j]); if (S->bd[j]) v += (s[j] + a1 * ts[j]) * (w[j] + a2 * tw[j]); }
+                  if (v < best) { best = v; bsig = cand[c]; bap = cp; bad_ = cd; }
+              }
+              if (bsig != sigma) {
+                  const double ds_ = bsig - sigma;
+                  for (int j = 0; j < n; j++) { dx[j] += ds_ * dx2[j]; dz[j] += ds_ * dz2[j]; ds[j] += ds_ * ds2[j]; dw[j] += ds_ * dw2[j]; }
+                  for (int i = 0; i < m; i++) dy[i] += ds_ * dy2[i];
+                  if (getenv("BRISK_LPDBG")) printf("     [sigma %.2f -> %.2f by the progress: steps %.3f %.3f -> %.3f %.3f]\n", sigma, bsig, ap, ad, bap, bad_);
+                  sigma = bsig; ap = bap; ad = bad_;
+              }
+          } }
+        /* (20 October 2026, LP/SOCP, a test, BRISK_LPARC=2: the arc only after a short line. Mehrotra's direction is
+         * d1 + d2/2 of the arc's d1 = d_aff + c and d2 (from -2 d_aff d_aff, no residuals), so one more solve gives
+         * both; taken when the line's shorter step is below BRISK_LPARCT (0.5) and the arc removes more) */
+        if (arcon == 2 && !arc_line) {
+            static double arct = -1; if (arct < 0) { const char *e_ = getenv("BRISK_LPARCT"); arct = e_ ? atof(e_) : 0.5; }
+            if (fmin(ap, ad) < arct) {
+                double *dxa = S->wa, *dza = dxa + n, *dsa = dza + n, *dwa = dsa + n;
+                for (int j = 0; j < n; j++) { if (S->fr[j]) { rxz[j] = 0; rsw[j] = 0; continue; } rxz[j] = -2.0 * dxa[j] * dza[j]; rsw[j] = S->bd[j] ? -2.0 * dsa[j] * dwa[j] : 0.0; }
+                direction(S, x, s, z, w, zm, zr, zr, rxz, rsw, dx2, dy2, dz2, ds2, dw2, g, rtol, maxcg);
+                for (int j = 0; j < n; j++) { dxa[j] = dx[j] - 0.5 * dx2[j]; dza[j] = dz[j] - 0.5 * dz2[j]; dsa[j] = ds[j] - 0.5 * ds2[j]; dwa[j] = dw[j] - 0.5 * dw2[j]; }
+                double tp, td; arc_max(S, x, s, z, w, dxa, dsa, dza, dwa, dx2, ds2, dz2, dw2, &tp, &td);
+                if (sin(fmin(tp, M_PI / 2)) + sin(fmin(td, M_PI / 2)) > fmin(1.0, ap) + fmin(1.0, ad)) {
+                    const double eta = fmax(0.9, fmin(0.99995, 1.0 - 0.1 * mu / fmax(mu0, 1e-300))), etaf = mu < 1e-6 * mu0 ? 0.9999 : fmax(eta, 0.995);
+                    if (tp < M_PI / 2) tp *= etaf;
+                    if (td < M_PI / 2) td *= etaf;
+                    const double sp = sin(tp), cp = 1.0 - cos(tp), sd = sin(td), cd = 1.0 - cos(td);
+                    for (int j = 0; j < n; j++) { x[j] += sp * dxa[j] + cp * dx2[j]; z[j] += sd * dza[j] + cd * dz2[j]; if (S->bd[j]) { s[j] += sp * dsa[j] + cp * ds2[j]; w[j] += sd * dwa[j] + cd * dw2[j]; } }
+                    for (int i = 0; i < m; i++) y[i] += sd * (dy[i] - 0.5 * dy2[i]) + cd * dy2[i];
+                    if (verbose > 1) printf("%4d %+.9e %+.9e %8.1e %8.1e %8.1e %8.1e %5.3f %5.3f %6.0e %3ld %7.0e %d arc\n", it + 1, pobj, dobj, e_p, e_d, e_g, mu, sp, sd, sigma, S->ncg - cg0, S->worst, schol_ntiny(S->sc));
+                    continue;
+                }
+            }
+        }
         /* a blocked step: the second-order term was wrong for this point - a centering step instead */
         if (fmin(ap, ad) < 0.1 && !getenv("BRISK_LPNOSAFE")) {
             sigma = fmax(sigma, 0.5);
@@ -1085,14 +1167,216 @@ static int lp_dual_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
     free(Bp); free(Bi); free(Bx); free(b2); free(c2); free(u2);
     return st;
 }
+/* ---- 20 October 2026 (LP/SOCP): folding by the coarsest equitable partition ----
+ * Rows and columns are coloured (rows by b_i, columns by c_j, u_j and whether they are free) and the colouring is
+ * refined until it is stable: a row's new colour is its colour with the multiset of (a_ij, colour of j) over its
+ * entries, a column's likewise. The stable colouring is an equitable partition of the weighted bipartite graph of
+ * A: for every row class I_l and column class J_k the sums Ahat_lk = sum_{j in J_k} a_ij are the same for every
+ * i in I_l, and B_kl = sum_{i in I_l} a_ij the same for every j in J_k, with n_k B_kl = m_l Ahat_lk (both are the
+ * sum over the block). Averaging a feasible x over each column class keeps it feasible with the same objective
+ * (sum the rows of a class), so the LP in the class averages X,
+ *     min sum_k n_k c_k X_k,   sum_k Ahat_lk X_k = b_l,   X free / 0 <= X <= u / X >= 0 by class,
+ * has the same optimal value, and x_j = X_k is optimal and interior when X is; the duals come back as
+ * y_i = Y_l / m_l and z_j = Z_k / n_k. (The quotient is what MOSEK's presolve calls folding; a QAP linearization
+ * folds to 0.28 of its size and its factor to a few percent of the work.) The hashes of the refinement are
+ * only a guide: the sums are verified before the fold is taken. BRISK_LPNOFOLD=1 turns it off. */
+static uint64_t fold_mix(uint64_t x) { x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull; return x ^ (x >> 31); }
+static uint64_t fold_dbl(double v) { uint64_t u; if (v == 0.0) v = 0.0; memcpy(&u, &v, 8); return fold_mix(u); }
+static const uint64_t *fold_keys_g;
+static int fold_cmp(const void *a, const void *b) { const uint64_t ka = fold_keys_g[*(const int *)a], kb = fold_keys_g[*(const int *)b]; return ka < kb ? -1 : ka > kb ? 1 : (*(const int *)a < *(const int *)b ? -1 : 1); }
+/* classes 0..k-1 by increasing key; returns k */
+static int fold_relabel(int n, const uint64_t *keys, int *cls, int *idx) {
+    for (int i = 0; i < n; i++) idx[i] = i;
+    fold_keys_g = keys; qsort(idx, (size_t)n, sizeof(int), fold_cmp);
+    int k = 0;
+    for (int t = 0; t < n; t++) { if (t > 0 && keys[idx[t]] != keys[idx[t - 1]]) k++; cls[idx[t]] = k; }
+    return n > 0 ? k + 1 : 0;
+}
+/* the partition; returns the number of row classes (in *nrc) and column classes (*ncc), or 0 when there is nothing to fold */
+int lp_fold_partition(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
+                             int *rcl, int *ccl, int *nrc, int *ncc) {
+    const int nz = Ap[n];
+    int *Rp = xz(sizeof(int) * (m + 2)), *Rj = xm(sizeof(int) * (nz + 1)); double *Rx = xm(sizeof(double) * (nz + 1));
+    for (int p = 0; p < nz; p++) Rp[Ai[p] + 2]++;
+    for (int i = 0; i < m; i++) Rp[i + 2] += Rp[i + 1];
+    for (int j = 0; j < n; j++) for (int p = Ap[j]; p < Ap[j + 1]; p++) { const int q = Rp[Ai[p] + 1]++; Rj[q] = j; Rx[q] = Ax[p]; }
+    uint64_t *kr = xm(sizeof(uint64_t) * (m + 1)), *kc = xm(sizeof(uint64_t) * (n + 1));
+    int *idx = xm(sizeof(int) * (m > n ? m : n) + 4);
+    for (int i = 0; i < m; i++) kr[i] = fold_dbl(b[i]);
+    for (int j = 0; j < n; j++) kc[j] = fold_mix(fold_dbl(c[j]) ^ fold_mix(fold_dbl(u && u[j] < 1e30 ? u[j] : 1e300)) ^ (j < nfree ? 0x5bd1e995ull : 0));
+    int nr = fold_relabel(m, kr, rcl, idx), nc = fold_relabel(n, kc, ccl, idx);
+    for (int round = 0; round < m + n + 2; round++) {
+        for (int i = 0; i < m; i++) { uint64_t h = fold_mix((uint64_t)rcl[i] * 0x9e3779b97f4a7c15ull); for (int p = Rp[i]; p < Rp[i + 1]; p++) h += fold_mix(fold_dbl(Rx[p]) ^ fold_mix((uint64_t)ccl[Rj[p]] + 0x1234567ull)); kr[i] = h; }
+        const int nr2 = fold_relabel(m, kr, rcl, idx);
+        for (int j = 0; j < n; j++) { uint64_t h = fold_mix((uint64_t)ccl[j] * 0x94d049bb133111ebull); for (int p = Ap[j]; p < Ap[j + 1]; p++) h += fold_mix(fold_dbl(Ax[p]) ^ fold_mix((uint64_t)rcl[Ai[p]] + 0x7654321ull)); kc[j] = h; }
+        const int nc2 = fold_relabel(n, kc, ccl, idx);
+        const int done = nr2 == nr && nc2 == nc;
+        nr = nr2; nc = nc2;
+        if (done) break;
+        /* 21 October 2026 (the integrator, the owner's decision): the refinement only splits classes, so once they number
+         * more than 0.8 (m + n) the quotient would keep more than 80 % of the problem and save less than its own
+         * construction costs: stop and do not fold. On ken-18 (LP) the full refinement took 3.5 s to remove 10 of 42,836
+         * rows, on pds-20 (LP) 2.5 s for 0.5 %, against solves of 2.6 and 3.7 s. */
+        if ((double)nr + nc > 0.8 * ((double)m + n)) { nr = m; nc = n; break; }
+    }
+    free(Rp); free(Rj); free(Rx); free(kr); free(kc); free(idx);
+    *nrc = nr; *ncc = nc;
+    return nr < m || nc < n;
+}
+/* (20 October 2026, LP/SOCP, a measurement) the partition with the cones kept together: the columns start with the colour
+ * of (kind, cone dimension, position in the cone, c_j), the refinement as above, and after each round a cone's colour (the
+ * hash of its entries' colours in order) is folded into its entries, so that the cones of a class have the same colour
+ * pattern position by position. Returns the number of row classes, column classes and cone classes. */
+int lp_fold_partition_cones(int m, int n, int nfree, int nlin, int nq, const int *q, int nr, const int *r,
+                            const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c,
+                            int *rcl, int *ccl, int *nrc, int *ncc, int *nkc) {
+    const int nz = Ap[n], ncone = nq + nr;
+    int *Rp = xz(sizeof(int) * (m + 2)), *Rj = xm(sizeof(int) * (nz + 1)); double *Rx = xm(sizeof(double) * (nz + 1));
+    for (int p = 0; p < nz; p++) Rp[Ai[p] + 2]++;
+    for (int i = 0; i < m; i++) Rp[i + 2] += Rp[i + 1];
+    for (int j = 0; j < n; j++) for (int p = Ap[j]; p < Ap[j + 1]; p++) { const int q_ = Rp[Ai[p] + 1]++; Rj[q_] = j; Rx[q_] = Ax[p]; }
+    int *cstart = xm(sizeof(int) * (ncone + 2)), *cdim = xm(sizeof(int) * (ncone + 2)), *colk = xm(sizeof(int) * (n + 1)), *pos = xm(sizeof(int) * (n + 1));
+    { int s0 = nfree + nlin; for (int k = 0; k < ncone; k++) { cstart[k] = s0; cdim[k] = k < nq ? q[k] : r[k - nq]; s0 += cdim[k]; } }
+    for (int j = 0; j < n; j++) { colk[j] = -1; pos[j] = 0; }
+    for (int k = 0; k < ncone; k++) for (int t = 0; t < cdim[k]; t++) { colk[cstart[k] + t] = k; pos[cstart[k] + t] = t; }
+    uint64_t *kr = xm(sizeof(uint64_t) * (m + 1)), *kc = xm(sizeof(uint64_t) * (n + 1)), *kk = xm(sizeof(uint64_t) * (ncone + 1));
+    int *idx = xm(sizeof(int) * (m > n ? m : n) + 4), *kcl = xm(sizeof(int) * (ncone + 1));
+    for (int i = 0; i < m; i++) kr[i] = fold_dbl(b[i]);
+    for (int j = 0; j < n; j++) {
+        const int k = colk[j];
+        const uint64_t kind = j < nfree ? 1 : j < nfree + nlin ? 2 : k < nq ? 3 : 4;
+        kc[j] = fold_mix(fold_dbl(c[j]) ^ fold_mix(kind * 0x9e3779b97f4a7c15ull + (k >= 0 ? (uint64_t)cdim[k] * 0x100000001b3ull + (uint64_t)pos[j] * 0xff51afd7ed558ccdull : 0)));
+    }
+    int nrc_ = fold_relabel(m, kr, rcl, idx), ncc_ = fold_relabel(n, kc, ccl, idx), nkc_ = 0;
+    for (int round = 0; round < m + n + 2; round++) {
+        for (int i = 0; i < m; i++) { uint64_t h = fold_mix((uint64_t)rcl[i] * 0x9e3779b97f4a7c15ull); for (int p = Rp[i]; p < Rp[i + 1]; p++) h += fold_mix(fold_dbl(Rx[p]) ^ fold_mix((uint64_t)ccl[Rj[p]] + 0x1234567ull)); kr[i] = h; }
+        const int nr2 = fold_relabel(m, kr, rcl, idx);
+        for (int j = 0; j < n; j++) { uint64_t h = fold_mix((uint64_t)ccl[j] * 0x94d049bb133111ebull); for (int p = Ap[j]; p < Ap[j + 1]; p++) h += fold_mix(fold_dbl(Ax[p]) ^ fold_mix((uint64_t)rcl[Ai[p]] + 0x7654321ull)); kc[j] = h; }
+        /* the cones: a cone's colour from its entries' colours in order, folded back into the entries */
+        for (int k = 0; k < ncone; k++) { uint64_t h = 0x2545f4914f6cdd1dull; for (int t = 0; t < cdim[k]; t++) h = fold_mix(h ^ kc[cstart[k] + t]); kk[k] = h; }
+        for (int k = 0; k < ncone; k++) for (int t = 0; t < cdim[k]; t++) kc[cstart[k] + t] = fold_mix(kc[cstart[k] + t] ^ kk[k]);
+        const int nc2 = fold_relabel(n, kc, ccl, idx);
+        const int nk2 = ncone > 0 ? fold_relabel(ncone, kk, kcl, idx) : 0;
+        const int done = nr2 == nrc_ && nc2 == ncc_ && nk2 == nkc_;
+        nrc_ = nr2; ncc_ = nc2; nkc_ = nk2;
+        if (done) break;
+    }
+    free(Rp); free(Rj); free(Rx); free(cstart); free(cdim); free(colk); free(pos); free(kr); free(kc); free(kk); free(idx); free(kcl);
+    *nrc = nrc_; *ncc = ncc_; *nkc = nkc_;
+    return nrc_ < m || ncc_ < n;
+}
+/* the quotient built and verified (the sums over the blocks the same for every row of a class and every column of a
+ * class, to 1e-9 relative); the free classes first. Returns 0 when the partition is not equitable. */
+int lp_fold_quotient(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
+                            int *rcl, int *ccl, int nr, int nc, int *nfree_h, int **Ap_h, int **Ai_h, double **Ax_h, double **b_h, double **c_h, double **u_h,
+                            int *rcnt, int *ccnt) {
+    /* the free classes first */
+    { int *map = xm(sizeof(int) * (nc + 1)), *isf = xz(sizeof(int) * (nc + 1));
+      for (int j = 0; j < nfree; j++) isf[ccl[j]] = 1;
+      int w = 0; for (int k = 0; k < nc; k++) if (isf[k]) map[k] = w++;
+      *nfree_h = w; for (int k = 0; k < nc; k++) if (!isf[k]) map[k] = w++;
+      for (int j = 0; j < n; j++) ccl[j] = map[ccl[j]];
+      free(map); free(isf); }
+    for (int l = 0; l < nr; l++) rcnt[l] = 0;
+    for (int k = 0; k < nc; k++) ccnt[k] = 0;
+    for (int i = 0; i < m; i++) rcnt[rcl[i]]++;
+    for (int j = 0; j < n; j++) ccnt[ccl[j]]++;
+    /* the column sums B_kl, by the columns (the first column of a class defines them, the others are checked) */
+    int *first_c = xm(sizeof(int) * (nc + 1)); for (int k = 0; k < nc; k++) first_c[k] = -1;
+    for (int j = 0; j < n; j++) if (first_c[ccl[j]] < 0) first_c[ccl[j]] = j;
+    /* (21 October 2026, LP/SOCP, ISSUES 227: the members of each class linked once; the search of the later columns for a
+     * class's members, a scan of all of them per class, was quadratic: 5.2 s of osa-60's (LP) 6.8 s) */
+    int *nxt_c = xm(sizeof(int) * (n + 1));
+    { int *last = xm(sizeof(int) * (nc + 1)); for (int k = 0; k < nc; k++) last[k] = -1;
+      for (int j = n - 1; j >= 0; j--) { nxt_c[j] = last[ccl[j]]; last[ccl[j]] = j; }
+      free(last); }
+    double *acc = xz(sizeof(double) * (nr + 1)); int *touch = xm(sizeof(int) * (2 * nr + 2)); char *seen = xz(nr + 1);
+    long nzh = 0; for (int k = 0; k < nc; k++) { const int j = first_c[k]; nzh += Ap[j + 1] - Ap[j]; }
+    int *Bp = xz(sizeof(int) * (nc + 2)), *Bi = xm(sizeof(int) * (nzh + 1)); double *Bx = xm(sizeof(double) * (nzh + 1));
+    int ok = 1; long w = 0;
+    for (int k = 0; k < nc && ok; k++) {
+        const int j0 = first_c[k]; int nt = 0;
+        for (int p = Ap[j0]; p < Ap[j0 + 1]; p++) { const int l = rcl[Ai[p]]; if (!seen[l]) { seen[l] = 1; touch[nt++] = l; } acc[l] += Ax[p]; }
+        Bp[k] = (int)w;
+        for (int t = 0; t < nt; t++) { Bi[w] = touch[t]; Bx[w] = acc[touch[t]]; w++; }
+        for (int t = 0; t < nt; t++) seen[touch[t]] = 0;      /* (acc kept for the check) */
+        /* the other columns of the class */
+        for (int j = nxt_c[j0]; j >= 0 && ok; j = nxt_c[j]) {
+            int nt2 = 0;
+            for (int p = Ap[j]; p < Ap[j + 1]; p++) { const int l = rcl[Ai[p]]; if (!seen[l]) { seen[l] = 1; touch[nt + nt2++] = l; } acc[l] -= Ax[p]; }
+            for (int t = 0; t < nt2; t++) { const int l = touch[nt + t]; double ref = 0; for (long q = Bp[k]; q < w; q++) if (Bi[q] == l) { ref = Bx[q]; break; } if (fabs(acc[l]) > 1e-9 * (1.0 + fabs(ref))) ok = 0; seen[l] = 0; acc[l] = ref; }   /* (the column's sums subtracted from the reference: zero when equal) */
+            if (nt2 != nt) ok = 0;
+        }
+        for (int t = 0; t < nt; t++) acc[touch[t]] = 0.0;
+    }
+    Bp[nc] = (int)w;
+    free(first_c); free(nxt_c);
+    if (!ok) { free(acc); free(touch); free(seen); free(Bp); free(Bi); free(Bx); return 0; }
+    /* the rows checked the same way: every row of a class has the same sums over the column classes (needed for Ahat) */
+    { double *acc2 = xz(sizeof(double) * (nc + 1)); int *touch2 = xm(sizeof(int) * (nc + 1)); char *seen2 = xz(nc + 1);
+      int *Rp = xz(sizeof(int) * (m + 2)), *Rj = xm(sizeof(int) * (Ap[n] + 1)); double *Rx = xm(sizeof(double) * (Ap[n] + 1));
+      for (int p = 0; p < Ap[n]; p++) Rp[Ai[p] + 2]++;
+      for (int i = 0; i < m; i++) Rp[i + 2] += Rp[i + 1];
+      for (int j = 0; j < n; j++) for (int p = Ap[j]; p < Ap[j + 1]; p++) { const int q = Rp[Ai[p] + 1]++; Rj[q] = j; Rx[q] = Ax[p]; }
+      int *first_r = xm(sizeof(int) * (nr + 1)); for (int l = 0; l < nr; l++) first_r[l] = -1;
+      for (int i = 0; i < m; i++) if (first_r[rcl[i]] < 0) first_r[rcl[i]] = i;
+      double *ref = xm(sizeof(double) * (nc + 1)); int *rk = xm(sizeof(int) * (nc + 1));
+      for (int i = 0; i < m && ok; i++) {
+          const int l = rcl[i], i0 = first_r[l]; if (i == i0) continue;
+          int nt = 0; for (int p = Rp[i0]; p < Rp[i0 + 1]; p++) { const int k = ccl[Rj[p]]; if (!seen2[k]) { seen2[k] = 1; touch2[nt++] = k; } acc2[k] += Rx[p]; }
+          for (int t = 0; t < nt; t++) { ref[t] = acc2[touch2[t]]; rk[t] = touch2[t]; acc2[touch2[t]] = 0.0; }
+          int nt2 = 0; for (int p = Rp[i]; p < Rp[i + 1]; p++) { const int k = ccl[Rj[p]]; if (seen2[k] == 1) { seen2[k] = 2; nt2++; } acc2[k] += Rx[p]; }
+          if (nt2 != nt) ok = 0;
+          for (int p = Rp[i]; p < Rp[i + 1]; p++) if (seen2[ccl[Rj[p]]] == 0) ok = 0;    /* (an entry in a class the first row does not touch) */
+          for (int t = 0; t < nt; t++) { const int k = rk[t]; if (fabs(acc2[k] - ref[t]) > 1e-9 * (1.0 + fabs(ref[t]))) ok = 0; acc2[k] = 0.0; seen2[k] = 0; }
+      }
+      free(acc2); free(touch2); free(seen2); free(Rp); free(Rj); free(Rx); free(first_r); free(ref); free(rk); }
+    free(acc); free(touch); free(seen);
+    if (!ok) { free(Bp); free(Bi); free(Bx); return 0; }
+    /* Ahat_lk = n_k B_kl / m_l, by columns k (the rows l ascending within a column: sorted) */
+    for (int k = 0; k < nc; k++) {
+        for (long q = Bp[k]; q < Bp[k + 1]; q++) Bx[q] = Bx[q] * (double)ccnt[k] / (double)rcnt[Bi[q]];
+        /* insertion sort by row (the column of a class is as long as one column of A) */
+        for (long q = Bp[k] + 1; q < Bp[k + 1]; q++) { const int bi = Bi[q]; const double bx = Bx[q]; long r = q - 1; while (r >= Bp[k] && Bi[r] > bi) { Bi[r + 1] = Bi[r]; Bx[r + 1] = Bx[r]; r--; } Bi[r + 1] = bi; Bx[r + 1] = bx; }
+    }
+    *Ap_h = Bp; *Ai_h = Bi; *Ax_h = Bx;
+    *b_h = xm(sizeof(double) * (nr + 1)); *c_h = xm(sizeof(double) * (nc + 1)); *u_h = xm(sizeof(double) * (nc + 1));
+    for (int i = 0; i < m; i++) (*b_h)[rcl[i]] = b[i];
+    for (int j = 0; j < n; j++) { (*c_h)[ccl[j]] = c[j] * (double)ccnt[ccl[j]]; (*u_h)[ccl[j]] = u && u[j] < 1e30 ? u[j] : 1e300; }
+    return 1;
+}
+
 int lpipm_solve(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
                 const LpIpmOpts *opt, double *x, double *y, double *z, LpIpmInfo *info) {
     /* (18 October 2026: the busy-machine rule of the other engines, solver.c: only the free cores; restored on return) */
 #ifdef _OPENMP
     const int ntb = omp_in_parallel() ? -1 : brisk_threads_busy(0);
 #endif
-    int st = lp_dual_solve(m, n, nfree, Ap, Ai, Ax, b, c, u, opt, x, y, z, info);
-    if (st < 0) st = lpipm_core(m, n, nfree, Ap, Ai, Ax, b, c, u, opt, x, y, z, info, NULL, NULL);
+    int st = -1, folded = 0;
+    if (!getenv("BRISK_LPNOFOLD") && m > 0 && n > 0) {       /* (20 October 2026: the coarsest equitable partition, when it is coarser than the trivial one) */
+        int *rcl = xm(sizeof(int) * (m + 1)), *ccl = xm(sizeof(int) * (n + 1)); int nr = m, nc = n;
+        const double tf = lp_time();
+        if (lp_fold_partition(m, n, nfree, Ap, Ai, Ax, b, c, u, rcl, ccl, &nr, &nc)) {
+            int nfh = 0, *Aph = NULL, *Aih = NULL; double *Axh = NULL, *bh = NULL, *ch = NULL, *uh = NULL;
+            int *rcnt = xm(sizeof(int) * (nr + 1)), *ccnt = xm(sizeof(int) * (nc + 1));
+            if (lp_fold_quotient(m, n, nfree, Ap, Ai, Ax, b, c, u, rcl, ccl, nr, nc, &nfh, &Aph, &Aih, &Axh, &bh, &ch, &uh, rcnt, ccnt)) {
+                if (opt->verbose > 0) printf("folding: %d rows -> %d, %d columns -> %d (the coarsest equitable partition of the constraint graph; %.2fs)\n", m, nr, n, nc, lp_time() - tf);
+                double *xh = xz(sizeof(double) * (nc + 1)), *yh = xz(sizeof(double) * (nr + 1)), *zh = xz(sizeof(double) * (nc + 1));
+                st = lp_dual_solve(nr, nc, nfh, Aph, Aih, Axh, bh, ch, uh, opt, xh, yh, zh, info);
+                if (st < 0) st = lpipm_core(nr, nc, nfh, Aph, Aih, Axh, bh, ch, uh, opt, xh, yh, zh, info, NULL, NULL);
+                for (int j = 0; j < n; j++) x[j] = xh[ccl[j]];
+                for (int i = 0; i < m; i++) y[i] = yh[rcl[i]] / (double)rcnt[rcl[i]];
+                if (z) for (int j = 0; j < n; j++) z[j] = zh[ccl[j]] / (double)ccnt[ccl[j]];
+                free(xh); free(yh); free(zh); folded = 1;
+            } else if (opt->verbose > 0) printf("folding: the partition of the hashes is not equitable (%d rows, %d columns): not taken\n", nr, nc);
+            free(Aph); free(Aih); free(Axh); free(bh); free(ch); free(uh); free(rcnt); free(ccnt);
+        }
+        free(rcl); free(ccl);
+    }
+    if (!folded) {
+        st = lp_dual_solve(m, n, nfree, Ap, Ai, Ax, b, c, u, opt, x, y, z, info);
+        if (st < 0) st = lpipm_core(m, n, nfree, Ap, Ai, Ax, b, c, u, opt, x, y, z, info, NULL, NULL);
+    }
 #ifdef _OPENMP
     if (ntb > 0) omp_set_num_threads(ntb);
 #endif

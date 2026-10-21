@@ -8,6 +8,7 @@
  *  - a reader for MATLAB MAT-files (level 5, as written by save -v6 / -v7: plain or compressed
  *    elements), with its own inflate: variables A or At, b, c, K.
  */
+#include "lpsolve.h"
 #include "brisk.h"
 #include "socp.h"
 #include "sedumi.h"
@@ -440,7 +441,40 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
         socp_printf = brisk_printf;
 #endif
         socp_stop = (volatile int *)&brisk_stop_flag;
-        const int st = socp_solve(&Q, &o, &S);
+        /* (20 October 2026, LP/SOCP: a linear program in this form (no cones) folded by the coarsest equitable partition,
+         * as the LP method's path (IMPLEMENTATION 26.8); the interfaces' linear programs and the LP method's fallback
+         * come here. BRISK_LPNOFOLD=1 turns it off.) */
+        int st; int folded = 0;
+        if (getenv("BRISK_FOLDMEASURE") && m > 0 && n > 0) {      /* (test: the partition's size with every column as a linear one: an upper bound of a cone fold) */
+            int *rcl = (int *)malloc(sizeof(int) * ((size_t)m + 1)), *ccl = (int *)malloc(sizeof(int) * ((size_t)n + 1)); int nr = m, nc = n;
+            lp_fold_partition(m, n, Q.nf, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, NULL, rcl, ccl, &nr, &nc);
+            printf("foldmeasure: rows %d -> %d, columns %d -> %d (free %d, linear %d, cones %d, rotated %d)\n", m, nr, n, nc, Q.nf, Q.nl, Q.nq, Q.nr);
+            { int nr3 = m, nc3 = n, nk3 = 0; lp_fold_partition_cones(m, n, Q.nf, Q.nl, Q.nq, Q.q, Q.nr, Q.r, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, rcl, ccl, &nr3, &nc3, &nk3);
+              printf("foldmeasure cones: rows %d -> %d, columns %d -> %d, cones %d -> %d classes\n", m, nr3, n, nc3, Q.nq + Q.nr, nk3); }
+            free(rcl); free(ccl); R->exit_code = 1; return 1;
+        }
+        if (Q.nq == 0 && Q.nr == 0 && m > 0 && n > 0 && !getenv("BRISK_LPNOFOLD")) {
+            int *rcl = (int *)malloc(sizeof(int) * ((size_t)m + 1)), *ccl = (int *)malloc(sizeof(int) * ((size_t)n + 1)); int nr = m, nc = n;
+            if (rcl && ccl && lp_fold_partition(m, n, Q.nf, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, NULL, rcl, ccl, &nr, &nc)) {
+                int nfh = 0, *Aph = NULL, *Aih = NULL; double *Axh = NULL, *bh = NULL, *ch = NULL, *uh = NULL;
+                int *rcnt = (int *)malloc(sizeof(int) * ((size_t)nr + 1)), *ccnt = (int *)malloc(sizeof(int) * ((size_t)nc + 1));
+                if (rcnt && ccnt && lp_fold_quotient(m, n, Q.nf, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, NULL, rcl, ccl, nr, nc, &nfh, &Aph, &Aih, &Axh, &bh, &ch, &uh, rcnt, ccnt)) {
+                    if (o.verbose > 0) socp_printf("folding: %d rows -> %d, %d columns -> %d (the coarsest equitable partition of the constraint graph)\n", m, nr, n, nc);
+                    SocpProb Qh = { nr, nc, Aph, Aih, Axh, bh, ch, nfh, nc - nfh, 0, NULL, 0, NULL };
+                    st = socp_solve(&Qh, &o, &S);
+                    if (st != SOCP_INPUT && S.x && S.y && S.z) {
+                        double *x = (double *)calloc((size_t)n + 1, sizeof(double)), *y = (double *)calloc((size_t)m + 1, sizeof(double)), *z = (double *)calloc((size_t)n + 1, sizeof(double));
+                        for (int j = 0; j < n; j++) { x[j] = S.x[ccl[j]]; z[j] = S.z[ccl[j]] / (double)ccnt[ccl[j]]; }
+                        for (int i = 0; i < m; i++) y[i] = S.y[rcl[i]] / (double)rcnt[rcl[i]];
+                        free(S.x); free(S.y); free(S.z); S.x = x; S.y = y; S.z = z;
+                        folded = 1;
+                    } else if (st != SOCP_INPUT) folded = 1;
+                }
+                free(Aph); free(Aih); free(Axh); free(bh); free(ch); free(uh); free(rcnt); free(ccnt);
+            }
+            free(rcl); free(ccl);
+        }
+        if (!folded) st = socp_solve(&Q, &o, &S);
         if (st == SOCP_INPUT) { fprintf(stderr, "brisk: the cone dimensions (K) do not match the number of columns of A\n"); R->exit_code = 2; return 2; }
         R->status = st; snprintf(R->status_str, sizeof R->status_str, "%s", socp_status_str(st));
         R->cone = 1;

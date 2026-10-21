@@ -1,5 +1,46 @@
 # BRISK change log
 
+## Version 1.5.5 (October 2026)
+
+Semidefinite programs:
+- **Linearly dependent equality constraints are removed in the presolve** (`-deprows 1`, the default). Constraints
+  that are linear combinations of others (exact multiples, and the rest found by a factorization of the constraints'
+  Gram matrix, each one verified on the data) are removed, with dual value 0; inconsistent right-hand sides are
+  reported as an infeasible problem. On a moment relaxation of frame design with 2,610 dependent constraints of 4,604,
+  the dual of the problem as read goes from an error of 7e-2 to 5.5e-8, without the facial reduction it needed before.
+- **The objective-drift guard is on by default** (`BRISK_DRIFT=0` turns it off): a stop at the tolerance is held
+  back while the objective still moves by more than the remaining gap allows, and the high-precision endgame is not
+  run after such a hold-back. On problems with a thin optimal face (SDPLIB control and qap9, relaxations of frame
+  design) the values reported OPTIMAL without it were up to 1e-5 off; with it they agree with the high-precision value
+  to 1e-8, at 1-3 % more time on those sets.
+- **The high-precision solver's log ends with a Summary** like the standard solver's: the problem as read, each
+  preprocessing step applied, the solve (method, precision, iterations), the time and the errors on the problem as
+  read; the optimal value is printed to ten digits (all digits with `-v`).
+- The end of the log names `-blkscale -2` when a solve misses the tolerance on semidefinite blocks whose data differ
+  in scale by a factor 4 or more between indices.
+- The Summary gives the sizes as the problem was written (equality constraints, semidefinite blocks, nonnegative and
+  free variables); a re-solve is reported there as "Solve 1", "Solve 2", with the option that avoids it.
+- `-dir nt` and `-dir hkm` also set the direction of the self-dual embedding (they set only the infeasible-start
+  method's before).
+
+Linear programs:
+- **Folding by symmetry.** A linear program whose rows and columns fall into classes with equal sums (the coarsest
+  equitable partition of its constraint graph) is solved in the class averages and the solution spread back: QAP
+  linearizations fold to a quarter of their size (qap15 45.7 -> 1.1 s, qap12 2.0 -> 0.2 s). The partition is given up
+  as soon as it would keep more than 80 % of the problem. `BRISK_LPNOFOLD=1` turns it off.
+- **Mehrotra's centering parameter bounded** (at most 0.3): on transportation problems the method no longer
+  re-centres for dozens of iterations (transport_300 38 -> 24 iterations, transport_1000 95 -> 86); over 142 LPs the
+  same statuses with 2 % fewer iterations.
+
+Second-order cone programs:
+- **Dense columns in the normal equations.** Dense linear columns and small cones with dense columns enter the normal
+  equations as a dense block computed by matrix-matrix kernels, and the full system is analysed only if needed: two
+  CBLIB problems 68.8 -> 26.3 s and 233 -> 57 s, a group lasso 4.7 -> 3.0 s.
+- **Fewer iterations with rotated cones:** the boost of a rotated cone now maps the dual residual too (a model
+  predictive control problem 17 -> 10 iterations); free copies of a variable at any scale are taken as renamings.
+- The iterative refinement stops when it no longer gains (a degenerate problem 28.6 -> 21.5 s; one CBLIB problem from
+  reduced accuracy to OPTIMAL).
+
 ## Version 1.5.4 (October 2026)
 
 Semidefinite programs:
@@ -290,7 +331,7 @@ Second-order cone programs:
     complement does not fit in memory: an augmented Lagrangian method with L-BFGS and an exact line
     search.
 
-  If it misses the tolerance within half the time limit, the standard method follows; `-bm 0` turns
+  If it misses the tolerance within half the time limit, the interior-point method with the factored Schur complement follows; `-bm 0` turns
   it off, `-bm 1` uses it for any problem with one semidefinite block. Four threads, the default
   tolerance 1e-8, the same optimal values: maxG55 (order 5000) 46 → 1.5 s, maxG60 (7000) 79 → 3.3 s,
   G55mc 39 → 1.8 s, checker_1.5 23.5 → 0.9 s, ice_2.0 119 → 4.4 s, p_auss2_3.0 127 → 8.9 s; a
@@ -535,7 +576,7 @@ within 3 % of 1.3.2 in their medians. Five problems end with a better status, on
   step length without cancellation. Truss topology problems with tens of thousands of
   constraints are solved in minutes on one core (the largest ones to an accuracy of 1e-7
   rather than 1e-8). The method is not chosen automatically. `-mfipm 2` is a hybrid: the matrix-free method
-  while its conjugate gradients are cheap, then the standard method from its iterate.
+  while its conjugate gradients are cheap, then the interior-point method with the factored Schur complement from its iterate.
 - **Semidefinite programs**: the Schur complement of constraint matrices with small row
   supports is assembled only where later constraints read it (dense moment relaxations
   without symmetry: 10-40 % faster); a symmetry reduction is also applied when the estimated

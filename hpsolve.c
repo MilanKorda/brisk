@@ -8,6 +8,7 @@
  * precision on the data as read.
  */
 #include "brisk.h"
+#include <stdarg.h>
 #include "hp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -798,6 +799,16 @@ int brisk_lammin_ge_mp(int n, const double *M, double need, int bits) {
 }
 #include "hpred.inc"
 static int g_hp_nored = 0;   /* 5.9: the solve is repeated without the reductions of hpred.inc */
+/* 20 October 2026 (the owner): the preprocessing for the Summary at the end of the log, in the words of the standard
+ * solver's Summary (main.c); filled once the presolve has run */
+static char g_hpsum[2048]; static size_t g_hpsum_n;
+static void hp_sum(const char *fmt, ...) {
+    if (g_hpsum_n + 8 >= sizeof g_hpsum) return;
+    va_list ap; va_start(ap, fmt);
+    const int w = vsnprintf(g_hpsum + g_hpsum_n, sizeof g_hpsum - g_hpsum_n, fmt, ap);
+    va_end(ap);
+    if (w > 0) g_hpsum_n = g_hpsum_n + (size_t)w < sizeof g_hpsum ? g_hpsum_n + (size_t)w : sizeof g_hpsum - 1;
+}
 
 /* the pattern structures of the low-rank method */
 typedef struct { long long key; int src; } LrKey;
@@ -1070,6 +1081,10 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     J->Lm = mpx_L;
     if (data ? hp_from_data(data, J) : hp_read(fname, J)) { hp_free(J); return 2; }
     const size_t Wm = (size_t)J->Lm + 2;
+    /* the problem as read, for the Summary */
+    int rd_m = J->m, rd_sdp = 0, rd_maxn = 0, rd_lp = 0;
+    for (int k = 0; k < J->nblk; k++) { if (J->bs[k] > 0) { rd_sdp++; if (J->bs[k] > rd_maxn) rd_maxn = J->bs[k]; } else rd_lp += -J->bs[k]; }
+    g_hpsum_n = 0; g_hpsum[0] = 0;
     /* blocks split by their aggregate sparsity pattern (hppre.inc): from here on J is the
      * split problem; the results are put back into the layout as read at the end */
     HPSplit sp_; int split = 0;
@@ -1132,6 +1147,25 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     if (dualized && !pre) { hp_free(&Jd_); JB = J; dualized = 0; pre = hp_presolve(JB, &Jr_, par->verbose >= 0, 1); }
     if (dualized && par->verbose >= 0) printf("presolve: the dual form (%d rows over the positions of the cone, %d after the elimination of y; m was %d)\n", JB->m, Jr_.m, m_orig);
     const int nb_base = JB->nblk, m_base = JB->m;
+    const int hp_nfree_read = pre && !dualized ? pre->nfree : 0;   /* (for the Summary; pre is freed before it) */
+    /* the Summary's preprocessing lines (one per step, as the standard solver's) */
+    if (split) hp_sum("%d semidefinite block%s split by their sparsity pattern (blocks %d -> %d%s)\n", sp_.nsplit, sp_.nsplit > 1 ? "s" : "", sp_.nb0, nb_orig,
+                      sp_.nlp ? "; diagonal entries alone in their pattern as nonnegative variables" : "");
+    if (reduced) for (int q = 0; q < red_.n; q++) {
+        const HPStage *St = &red_.st[q];
+        if (St->kind == 1) hp_sum("sign symmetry: equality constraints %d -> %d, blocks %d -> %d\n", St->m0, St->m1, St->nb0, St->nb1);
+        else if (St->kind == 2) hp_sum("symmetry reduction: equality constraints %d -> %d, blocks %d -> %d\n", St->m0, St->m1, St->nb0, St->nb1);
+        else if (St->kind == 3) hp_sum("block structure shared by the data: blocks %d -> %d\n", St->nb0, St->nb1);
+        else if (St->kind == 4) hp_sum("chordal decomposition: blocks %d -> %d, equality constraints %d -> %d\n", St->nb0, St->nb1, St->m0, St->m1);
+        else if (St->kind == 5) hp_sum("%d equality constraint%s left without entries removed\n", St->m0 - St->m1, St->m0 - St->m1 > 1 ? "s" : "");
+    }
+    if (g_hp_nored) hp_sum("the symmetry and structure reductions did not hold in the working precision: solved without them\n");
+    if (dualized) hp_sum("the dual form, its free variables eliminated (equality constraints %d -> %d)\n", m_orig, Jr_.m);
+    if (pre && !dualized) {
+        if (pre->nfree) hp_sum("%d free variable%s eliminated by substitution\n", pre->nfree, pre->nfree > 1 ? "s" : "");
+        if (pre->nface) hp_sum("facial reduction: %d constraint%s removed\n", pre->nface, pre->nface > 1 ? "s" : "");
+        if (pre->ndrop) hp_sum("%d equality constraint%s made redundant by these eliminations removed\n", pre->ndrop, pre->ndrop > 1 ? "s" : "");
+    } else if (pre && pre->nface) hp_sum("facial reduction of the dual form: %d reduction%s\n", pre->nface, pre->nface > 1 ? "s" : "");
     if (pre) { Jr_.tstart = J->tstart; J = &Jr_; }
     int nb = J->nblk, m = J->m;
     J->X = (uint64_t **)calloc((size_t)nb, sizeof(uint64_t *)); J->Z = (uint64_t **)calloc((size_t)nb, sizeof(uint64_t *));
@@ -1662,11 +1696,14 @@ hp_again:
         char *s1 = (char *)malloc((size_t)nd + 64), *s2 = (char *)malloc((size_t)nd + 64);
         uint64_t t[MPX_MAXL + 2];
         printf("status: %s (max rel error %.1e)   iterations: %d\n", status, J->best_err, J->iters + it_warm);
-        mpx_neg(t, J->pobj); mpx_to_str(s1, t, nd);
+        /* 20 October 2026 (the owner): the values to ten significant digits in the log (all of the working precision's
+         * digits with -v, verbosity 2 and more) */
+        const int ndp = J->verbose > 2 || nd < 10 ? nd : 10;   /* (J->verbose is the verbosity + 1) */
+        mpx_neg(t, J->pobj); mpx_to_str(s1, t, ndp);
         printf("optimal value (SDPA/SDPLIB convention, max <F0,Y>): %s\n", s1);
-        mpx_to_str(s1, J->pobj, nd); mpx_to_str(s2, J->dobj, nd);
+        mpx_to_str(s1, J->pobj, ndp); mpx_to_str(s2, J->dobj, ndp);
         printf("  primal obj <C,X> = %s\n  dual obj b'y     = %s\n", s1, s2);
-        printf("  errors (in the working precision, on the data as read): pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
+        printf("  errors (in the working precision, on the data as read (before presolve)): pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
         if ((rc == 1 || rc == 0) && J->have_iter) {
             /* 5.16: the double solver's diagnosis of a side without an attained optimum (main.c, the same rule), which
              * no precision changes: a user's SOS problem crept at every precision with tr X = 6e7 (ISSUES 88). Also on
@@ -1678,7 +1715,7 @@ hp_again:
             for (int c = 0; c < m; c++) { nb1 += fabs(mpx_getd(J->b + (size_t)c * Wm_)); y1 += fabs(mpx_getd(J->y + (size_t)c * Wm_)); }
             const double po = mpx_getd(J->pobj), dob = mpx_getd(J->dobj), obj = fabs(po) > fabs(dob) ? po : dob;
             if (trX > 1e5 * (1 + nb1) && trX > 1e4 * (1 + fabs(obj)))
-                printf("  note: tr X = %.1e is large against the data: either the optimum is not attained ((D) without a strictly feasible\n  point) or the solution's scale is that large (the certificates of a moment-SOS hierarchy of high order are);\n  <C,X> is still an upper bound (-bound p)%s\n", trX,
+                printf("  note: tr X = %.1e is large against the data: either the optimum is not attained ((D) without a strictly feasible\n  point) or the solution's scale is that large;\n  <C,X> is still an upper bound (-bound p)%s\n", trX,
                        rc == 0 ? "; the status holds in the working precision, in double precision the primal is not usable" : "");
             else if (y1 > 1e5 * (1 + nC1) && y1 > 1e4 * (1 + fabs(obj)))
                 printf("  note: |y|_1 = %.1e is large against the data: either the optimum is not attained ((P) without a strictly feasible\n  point) or the solution's scale is that large; b'y is still a lower bound (-bound d)%s\n", y1,
@@ -1708,6 +1745,37 @@ hp_again:
                 printf("CERTIFIED (%s): rigorous %s bound %s on the optimal value of (P)\n           (SDPA convention: %s bound %s; %d-bit arithmetic, distance to the feasible point %.1e; %.2fs)\n",
                        SD, ul, s1, sd == 1 ? "a lower" : "an upper", s2, 64 * (J->Lm - 1), ce->delta, t_cert[sd - 1]);
             } else printf("NOT CERTIFIED (%s): %s: no guaranteed %s bound (%.2fs)\n", SD, ce->why[0] ? ce->why : "no certificate", ul, t_cert[sd - 1]);
+        }
+        /* 20 October 2026 (the owner): a Summary as the standard solver's: the problem as read, the preprocessing, the
+         * solve, the time and the errors */
+        if (!getenv("BRISK_NOSUMMARY")) {
+            /* (a free variable passed as the difference of two nonnegative ones is counted as free, as the standard
+             * Summary does: the pairs the presolve eliminated) */
+            const int rd_free = hp_nfree_read, rd_nn = rd_lp - 2 * rd_free;
+            printf("Summary\n  Problem as read:   %d equality constraints, %d semidefinite block%s (largest of order %d)", rd_m, rd_sdp, rd_sdp == 1 ? "" : "s", rd_maxn);
+            if (rd_nn > 0) printf(", %d nonnegative variable%s", rd_nn, rd_nn > 1 ? "s" : "");
+            if (rd_free > 0) printf(", %d free variable%s", rd_free, rd_free > 1 ? "s" : "");
+            printf("\n");
+            const char *lab = "  Preprocessing:     ";
+            if (!g_hpsum_n) printf("%snone applied\n", lab);
+            else { const char *p0 = g_hpsum; int first = 1;
+                   while (*p0) { const char *e = strchr(p0, '\n'); const int len = e ? (int)(e - p0) : (int)strlen(p0);
+                                 printf("%s%.*s\n", first ? lab : "                     ", len, p0); first = 0; p0 += len + (e ? 1 : 0); } }
+            char pn[64];
+            if (kind == 1) snprintf(pn, sizeof pn, "double-double (about 31 digits)");
+            else if (kind == 2) snprintf(pn, sizeof pn, "quad-double (about 63 digits)");
+            else snprintf(pn, sizeof pn, "%d bits (about %d digits)", final_bits, nd);
+            printf("  Solve:             %s in %s, %d iterations (", J->method == 2 ? "low-rank augmented Lagrangian method" : J->method == 1 ? "augmented Lagrangian method with semismooth Newton steps" : "interior-point method",
+                   pn, J->iters + it_warm);
+            int first = 1;
+            for (int l = 0; l <= lev; l++) {
+                if (itlev[l] == 0) continue;
+                if (lk[l] == 3) printf("%s%d bits %d", first ? "" : ", ", lb[l], itlev[l]);
+                else printf("%s%s %d", first ? "" : ", ", l == 0 ? "double precision" : lk[l] == 1 ? "double-double" : "quad-double", itlev[l]);
+                first = 0;
+            }
+            printf(")\n  Time:              %.2f s\n", wtime() - J->tstart + t_warm);
+            printf("  Errors:            pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e (on the problem as read, in the working precision)\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
         }
         free(s1); free(s2);
     }

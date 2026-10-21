@@ -9,7 +9,9 @@
 #   4. a linear program is advised the tolerance only,
 #   5. second-order cone input gets the same advice from the cone solver and from the SDP
 #      solver (-conesolver 0), with one summary each,
-#   6. -q prints no advice.
+#   6. -q prints no advice,
+#   7. a solve that misses the tolerance on badly scaled blocks names -blkscale -2 (not an OPTIMAL solve, not
+#      after -blkscale -2).
 # usage: tools/advice_test.sh [brisk]
 B=${1:-./brisk}; D=$(dirname "$0")/../examples; fail=0
 has() { echo "$out" | grep -qF -- "$1"; }
@@ -32,4 +34,8 @@ out=$($B $D/soc_small.mat -threads 1 2>&1);                chk "second-order con
 out=$($B $D/soc_small.mat -threads 1 -conesolver 0 2>&1);  chk "second-order cones, SDP solver" "$A|  -prec dd |$G" ""
 [ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL -conesolver 0: not exactly one summary"; fail=1; }
 out=$($B $D/truss1.dat-s -threads 1 -q 2>&1);              chk "-q: no advice" "" "$A|$G"
+S="whose blocks are badly scaled"
+out=$($B $D/control1.dat-s -threads 1 -tol 1e-13 2>&1);    chk "badly scaled blocks, tolerance missed: -blkscale -2" "$S|  -blkscale -2 |$A" ""
+out=$($B $D/control1.dat-s -threads 1 2>&1);               chk "badly scaled blocks, OPTIMAL: no -blkscale advice" "" "$S"
+out=$($B $D/control1.dat-s -threads 1 -tol 1e-13 -blkscale -2 2>&1); chk "-blkscale -2 is not advised again" "" "$S"
 [ $fail = 0 ] && echo "advice_test: all checks passed" || { echo "advice_test: FAILED"; exit 1; }

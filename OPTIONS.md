@@ -67,6 +67,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra. | −1 |
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
 | `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
+| `deprows` | remove the equality constraints that are linear combinations of others (found by a factorization of the matrix of inner products ⟨A_i, A_j⟩, each one verified in the data with its right-hand side; their dual values are 0; inconsistent right-hand sides are reported and nothing is removed): `1` on, `0` off | `1` |
 | `freeelim` | eliminate split free variables (kernel-form SOS): `-1` auto, `0` off, `1` on | `-1` |
 | `dualize` | solve the dual form when its Schur complement is at most half the size and the problem has an objective (not for a feasibility problem): `-1` auto, `0` off, `1` force | `-1` |
 | `tracebound` | trace bound with the free elimination | `-1` auto |
@@ -85,8 +86,8 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off (the default since 19 October 2026: it lost wherever it ran on the sets) | 0 |
-| `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the standard method from that iterate | 0 |
-| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block and each LP variable is in one constraint at most); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the standard solve in all), and the standard method follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
+| `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the interior-point method with the factored Schur complement from that iterate | 0 |
+| `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block and each LP variable is in one constraint at most); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the solve with the factored Schur complement in all), and the interior-point method with the factored Schur complement follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
 | `lralm` | low-rank augmented Lagrangian (experimental; very large sparse SDPs such as AC-OPF) | 0 |
 | `bm` | the Burer-Monteiro solver (X = R Rᵀ, nothing of size n² formed): `1` always, `0` never, `-1` automatically for one block of order n ≥ 500 whose constraints fix its diagonal (max-cut and its relatives; stopped on a certified bound, the interior-point method if it misses), or for one block whose constraints each fix one entry (matrix completion) when the dense Schur complement does not fit in memory (the first-order engine if it misses) | -1 |
 | `blkscale` | diagonal congruence scaling of the semidefinite blocks (X = D X' D, D from the data): `1` on, `-1` when a block's factors spread by 4 or more, `0` off | 0 |
@@ -284,14 +285,15 @@ method
                    on most problems, the infeasible start first on large dense blocks with a cheap
                    Schur complement; each method is the other's fallback)
   -hsdfirst <0|1>  automatic method: the embedding first when its extra dense work is small or the
-                   problem tiny (1; 0: standard first); many split free pairs and the chordal moment
+                   problem tiny (1; 0: the infeasible start first); many split free pairs and the chordal moment
                    form use the embedding either way
   -hsdfirstc <c>   ... i.e. when c * sum n^3 <= m^3/3 (12),
   -hsdfirstasm <f> ... or <= f * (m^3/3 + the estimated work of the Schur assembly) (0.5; 0: off)
-  -stdslow <k>     standard method: stop for the retry when the best score has not halved in k iterations (10; 0 off)
+  -stdslow <k>     infeasible-start method: stop for the retry when the best score has not halved in k iterations (10; 0 off)
   -retryacc <a>    retry with the embedding only if the first result is worse than a (1e-7)
   -warm <l>        re-solve from l x (first point) + (1 - l) x (standard start) (0 = off; measured slower)
-  -dir auto|hkm|nt search direction (auto)
+  -dir auto|hkm|nt search direction of the interior-point method, with either start (auto;
+                   -hsddir sets the self-dual embedding's alone)
   -zsparse <n>     HKM direction: blocks of order >= n whose dual matrix Z keeps a sparse
                    pattern (max-cut, structural designs) use a sparse Cholesky factor of Z for
                    Z^{-1}, its products and the dual step length; X stays dense (200; 0 off)
@@ -323,6 +325,8 @@ presolve
                    correct, and how to solve again without the reduction for the dual)
   -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated
                    without the reduction, within this multiple of the solve's time (4; 0 = never)
+  -deprows <k>     remove the equality constraints that are linear combinations of others (their dual values
+                   are 0): 1 on (default), 0 off
   -freeelim <k>    eliminate split free-variable pairs by pivoting: -1 auto (kernel-form SOS
                    problems: few SDP blocks, pairs >= 1% of the rows), 0 off, 1 on
   -tracebound <R>  with the elimination: the row sum tr(X) + s = R that keeps the Gram side
@@ -347,9 +351,10 @@ presolve
                    optimum needs more CG steps than a sixth of a Schur factorization costs,
                    or the steps of a solve grow geometrically (three times the last
                    iteration's, or the next solve past that bound at the same growth),
-                   or the attempt more than a quarter of the standard solve; unless it
-                   ends OPTIMAL, the standard method follows (from the attempt's iterate
-                   of merit 1e-3 if it got that far); also when the Schur complement does
+                   or the attempt more than a quarter of the solve with the factored Schur
+                   complement; unless it ends OPTIMAL, the interior-point method with the
+                   factored Schur complement follows (from the attempt's iterate of merit
+                   1e-3 if it got that far); also when the Schur complement does
                    not fit in memory (the first-order engine follows then)
   -mfrho <r>, -mfrmax <k>, -mfdrop <d>, -mfkmax <k>   preconditioner: bulk spread (10), outlier
                    eigenvectors per block (4), dropped pairs (0.5), largest capacitance (8000)

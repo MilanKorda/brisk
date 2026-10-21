@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: BLAS/LAPACK
-        run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev
+        run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list && sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev
       - name: Build
         run: make
       - name: Examples
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev
+      - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list && sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev
       - run: make libbrisk
       - uses: julia-actions/setup-julia@v2
         with:
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev octave && (sudo apt-get install -y octave-dev || sudo apt-get install -y liboctave-dev)
+      - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list && sudo apt-get update && sudo apt-get install -y liblapack-dev libopenblas-dev octave && (sudo apt-get install -y octave-dev || sudo apt-get install -y liboctave-dev)
       - name: MEX build and tests
         run: cd matlab && octave-cli --eval "build_brisk_mex; test_brisk"
 
