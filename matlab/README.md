@@ -60,7 +60,7 @@ system libraries and crashed on the first BLAS call.)
 `min c'x  s.t.  A x = b, x in K`, with `K.f` (free), `K.l` (nonnegative), `K.q` (second-order
 cones `x(1) >= norm(x(2:end))`), `K.r` (rotated cones `2*x(1)*x(2) >= norm(x(3:end))^2`) and
 `K.s` (PSD blocks, `vec(X)` column-major, the symmetric part of the data is used — as in
-SeDuMi). A problem without `K.s` is solved by BRISK's cone solver for linear and second-order
+SeDuMi). A problem without `K.s` is solved by BRISK's SOCP solver for linear and second-order
 cone programs (`opts.conesolver = 0` forces the semidefinite solver, which takes the cones as
 arrow blocks). Complex data are not supported. `info` has SeDuMi's
 `pinf`, `dinf`, `numerr` (0 solved, 1 reduced accuracy, 2 failure), `iter`, `cpusec`, plus

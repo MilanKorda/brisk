@@ -759,7 +759,8 @@ typedef struct { int m, mr, order, NI, nblk; int *cls; int **G; int *off, *gblk;
                  int bd, nbr, nsb, lpblk; int *bsr; SymBlk *sb; int *brep, **bmap;
                  signed char **gsg;   /* 4.37: signed generators: index signs (NULL: a permutation) */
                  signed char *csg;    /* 4.37: sign of each file constraint relative to its orbit's aggregate (cls = -1: dropped) */
-                 signed char **bsgn;  /* 4.37: signs of the exchanged blocks' maps (NULL: none) */ } PSSym;
+                 signed char **bsgn;  /* 4.37: signs of the exchanged blocks' maps (NULL: none) */
+                 int *lpos;           /* 22 October 2026: per global index, an LP variable's position (its orbit) in its reduced LP block; NULL: in place */ } PSSym;
 /* the Gram matrix A A* of the (scaled) problem, factored: sparse (supernodal Cholesky) or
  * dense (fom.c; also used by the matrix-free IPM for its exact primal projection) */
 typedef struct { int m, dense; double *M; SChol *S; double *work; double reg; } Gram;

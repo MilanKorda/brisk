@@ -2,7 +2,7 @@
  *
  *     min / max  c'x + c0,   rl <= A x <= ru,   l <= x <= u
  *
- * for the cone solver (socp.c through sedumi.c), with the map back to the variables of the file.
+ * for the SOCP solver (socp.c through sedumi.c), with the map back to the variables of the file.
  *
  * MPS: fixed and free format (fields split at white space: names without blanks), sections
  * NAME, OBJSENSE (MAX / MAXIMIZE), OBJSENSE inline, ROWS, COLUMNS (MARKER lines skipped: integer
@@ -18,7 +18,9 @@
  *     fixed at that bound;
  *   - a free column with one entry in an equality row: the row defines it (row and column go, the
  *     costs of the row's other variables are updated); in an inequality row with zero cost the row
- *     is redundant.
+ *     is redundant;
+ *   - dominated columns (level 2, when nothing else changes): bounds on the row duals from the columns'
+ *     dual constraints, and a column whose reduced cost has one sign over those bounds fixed at its bound.
  * Rows are removed, never changed, so the map back needs the fixed values and, for the free
  * singletons, the row they were defined by (in reverse order).
  *
@@ -361,6 +363,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             int force = 0;
             if (!imax && rl[i] > -LP_INF && fabs(amax - rl[i]) <= ftol * (sc + fabs(rl[i]))) force = 1;       /* at amax */
             else if (!imin && ru[i] < LP_INF && fabs(amin - ru[i]) <= ftol * (sc + fabs(ru[i]))) force = -1;   /* at amin */
+            if (force && getenv("BRISK_LPNOFORCING")) force = 0;     /* (experiments) */
             if (force) {
                 for (int q = Rp[i]; q < Rp[i + 1]; q++) {
                     const int j = Rj[q]; if (!ca[j]) continue;
@@ -392,6 +395,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 if (a > 0) { if (rl[i] > -LP_INF) down_ok = 0; if (ru[i] < LP_INF) up_ok = 0; }
                 else { if (ru[i] < LP_INF) down_ok = 0; if (rl[i] > -LP_INF) up_ok = 0; }
             }
+            if (getenv("BRISK_LPNODUALFIX")) down_ok = up_ok = 0;      /* (experiments) */
             if (down_ok && c[j] > 0) { if (l[j] <= -LP_INF) continue; FIXCOL(j, l[j]); changed = 1; continue; }
             if (up_ok && c[j] < 0) { if (u[j] >= LP_INF) continue; FIXCOL(j, u[j]); changed = 1; continue; }
             if (down_ok && c[j] == 0 && l[j] > -LP_INF) { FIXCOL(j, l[j]); changed = 1; continue; }
@@ -428,6 +432,82 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                     DROPROW(i); changed = 1; continue;
                 }
             }
+        }
+        /* ---- dominated columns by the bounds of the row duals (21 October 2026, LP/SOCP; Andersen and Andersen 1995).
+         * At every dual feasible y the reduced cost is d_j = c_j - a_j'y, with y_i >= 0 on a row with only a lower side,
+         * y_i <= 0 with only an upper side. A column with no upper bound needs d_j >= 0 (no lower bound: d_j <= 0), which
+         * bounds each y_i of its rows by the others' extreme values. A column whose d_j is positive for every y in those
+         * bounds is at its lower bound in every optimum (negative: at its upper bound) and is fixed there. An upper bound
+         * counts as absent when c_j > 0 and at x_j = u_j each row of the column holds whatever its other variables do
+         * (all the other entries of the row of one sign, from finite lower bounds): no optimum has x_j > u_j then, so
+         * dropping the bound leaves the optimal set as it is. Set covering, x in [0, 1] and A x >= 1: y_i <= the least
+         * cost of a column covering row i, and a column costlier than the sum of those over its rows goes (lp_setcover_5k:
+         * 33,000 of 40,001 columns). BRISK_LPNODOMCOL=1: off. */
+        if (!changed && presolve > 1 && status == 0 && !getenv("BRISK_LPNODOMCOL")) {
+            double *ylo = xm(sizeof(double) * (m + 1)), *yhi = xm(sizeof(double) * (m + 1)), *slp = xz(sizeof(double) * (m + 1)), *sln = xz(sizeof(double) * (m + 1));
+            int *npos = xz(sizeof(int) * (m + 1)), *nneg = xz(sizeof(int) * (m + 1)), *nplinf = xz(sizeof(int) * (m + 1)), *nnlinf = xz(sizeof(int) * (m + 1));
+            for (int i = 0; i < m; i++) {
+                ylo[i] = rl[i] > -LP_INF && ru[i] >= LP_INF ? 0.0 : -LP_INF; yhi[i] = ru[i] < LP_INF && rl[i] <= -LP_INF ? 0.0 : LP_INF;
+                if (!ra[i]) continue;
+                for (int q = Rp[i]; q < Rp[i + 1]; q++) { const int k = Rj[q]; if (!ca[k]) continue; const double a = Rx[q];
+                    if (a > 0) { npos[i]++; if (l[k] > -LP_INF) slp[i] += a * l[k]; else nplinf[i]++; }
+                    else if (a < 0) { nneg[i]++; if (l[k] > -LP_INF) sln[i] += a * l[k]; else nnlinf[i]++; } }
+            }
+            /* the effective bounds: an upper bound that no optimum can exceed counts as none */
+            char *unone = xz(n + 1);
+            for (int j = 0; j < n; j++) {
+                if (!ca[j]) continue;
+                if (u[j] >= LP_INF) { unone[j] = 1; continue; }
+                if (!(c[j] > 0) || l[j] <= -LP_INF) continue;
+                int ok = 1;
+                for (int p = L->Ap[j]; p < L->Ap[j + 1] && ok; p++) {
+                    const int i = L->Ai[p]; if (!ra[i]) continue; const double a = L->Ax[p];
+                    if (a > 0 && rl[i] > -LP_INF) {           /* lowering x_j to u_j must keep the row above rl */
+                        if (nneg[i] || nplinf[i]) { ok = 0; break; }
+                        const double rest = slp[i] - a * l[j];
+                        if (!(a * u[j] + rest >= rl[i] - 1e-12 * (1.0 + fabs(rl[i])))) ok = 0;
+                    } else if (a < 0 && ru[i] < LP_INF) {     /* and below ru */
+                        if (npos[i] || nnlinf[i]) { ok = 0; break; }
+                        const double rest = sln[i] - a * l[j];
+                        if (!(a * u[j] + rest <= ru[i] + 1e-12 * (1.0 + fabs(ru[i])))) ok = 0;
+                    }
+                }
+                unone[j] = ok;
+            }
+            /* the bounds of y from the columns: a_j'y <= c_j (no upper bound), a_j'y >= c_j (no lower bound) */
+            for (int j = 0; j < n; j++) {
+                if (!ca[j]) continue;
+                const int nolo = l[j] <= -LP_INF;
+                for (int side = 0; side < 2; side++) {          /* side 0: a_j'y <= c_j; side 1: -a_j'y <= -c_j */
+                    if (side == 0 ? !unone[j] : !nolo) continue;
+                    const double sg = side == 0 ? 1.0 : -1.0, cc = sg * c[j];
+                    double S_ = 0; int nI = 0;
+                    for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { const int i = L->Ai[p]; if (!ra[i]) continue; const double a = sg * L->Ax[p];
+                        const double mn = a > 0 ? (ylo[i] > -LP_INF ? a * ylo[i] : -LP_INF) : (yhi[i] < LP_INF ? a * yhi[i] : -LP_INF);
+                        if (mn <= -LP_INF) nI++; else S_ += mn; }
+                    if (nI > 1) continue;
+                    for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { const int i = L->Ai[p]; if (!ra[i]) continue; const double a = sg * L->Ax[p]; if (a == 0.0) continue;
+                        const double mn = a > 0 ? (ylo[i] > -LP_INF ? a * ylo[i] : -LP_INF) : (yhi[i] < LP_INF ? a * yhi[i] : -LP_INF);
+                        double rest;
+                        if (nI == 0) rest = S_ - mn; else if (mn <= -LP_INF) rest = S_; else continue;
+                        const double bnd = (cc - rest) / a;      /* a y_i <= cc - rest */
+                        if (a > 0) { if (bnd < yhi[i]) yhi[i] = bnd; } else { if (bnd > ylo[i]) ylo[i] = bnd; }
+                    }
+                }
+            }
+            /* the columns whose reduced cost has one sign over the box of y */
+            int ndom = 0;
+            for (int j = 0; j < n; j++) {
+                if (!ca[j]) continue;
+                double mx = 0, mn = 0; int imx = 0, imn = 0;
+                for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { const int i = L->Ai[p]; if (!ra[i]) continue; const double a = L->Ax[p];
+                    if (a > 0) { if (yhi[i] < LP_INF) mx += a * yhi[i]; else imx++; if (ylo[i] > -LP_INF) mn += a * ylo[i]; else imn++; }
+                    else if (a < 0) { if (ylo[i] > -LP_INF) mx += a * ylo[i]; else imx++; if (yhi[i] < LP_INF) mn += a * yhi[i]; else imn++; } }
+                if (l[j] > -LP_INF && !imx && c[j] - mx > 1e-9 * (1.0 + fabs(c[j]) + fabs(mx))) { FIXCOL(j, l[j]); ndom++; changed = 1; continue; }
+                if (u[j] < LP_INF && !imn && c[j] - mn < -1e-9 * (1.0 + fabs(c[j]) + fabs(mn))) { FIXCOL(j, u[j]); ndom++; changed = 1; continue; }
+            }
+            if (ndom && verbose > 1) printf("presolve: %d dominated columns fixed at a bound (the bounds of the row duals)\n", ndom);
+            free(ylo); free(yhi); free(slp); free(sln); free(npos); free(nneg); free(nplinf); free(nnlinf); free(unone);
         }
         if (!changed) break;
     }
@@ -473,7 +553,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
      * other columns as they are now) are dropped: the column can then be a pivot of the eliminator,
      * and the interior-point method has one bound less. Row by row, each test with the current
      * bounds, so that no bound is dropped on the strength of one dropped before. */
-    int nredb = 0;
+    int nredb = 0; double *udrop = NULL;        /* (the bounds dropped: a substitution of a row of two entries may need them back) */
     if (bform && presolve > 1 && status == 0 && !getenv("BRISK_LPNOREDB")) {
         for (int i = 0; i < m; i++) {
             if (!ra[i] || rcnt[i] < 2) continue;
@@ -498,7 +578,8 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 if (ub <= u[j] + 1e-9 * (1.0 + fabs(u[j]))) {
                     /* the totals of this row without the bound */
                     if (a > 0) { smax -= a * u[j]; imax++; } else { smin -= a * u[j]; imin++; }
-                    u[j] = LP_INF; nredb++;
+                    if (!udrop) { udrop = xm(sizeof(double) * (n + 1)); for (int t = 0; t < n; t++) udrop[t] = LP_INF; }
+                    udrop[j] = u[j]; u[j] = LP_INF; nredb++;
                 }
             }
         }
@@ -518,9 +599,10 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             ccap[j] = ccnt[j] + 4; cr[j] = xm(sizeof(int) * ccap[j]);
             for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { const int i = L->Ai[p]; if (!ra[i] || L->Ax[p] == 0.0) continue; rc[i][rn[i]] = j; rv[i][rn[i]++] = L->Ax[p]; cr[j][cn[j]++] = i; cl[j]++; }
         }
-        int *pos = xz(sizeof(int) * (n + 1)); long dbg[6] = {0, 0, 0, 0, 0, 0};
+        int *pos = xz(sizeof(int) * (n + 1)); long dbg[6] = {0, 0, 0, 0, 0, 0}, d2[4] = {0, 0, 0, 0};
         const int maxlc = getenv("BRISK_LPELIMLC") ? atoi(getenv("BRISK_LPELIMLC")) : 12;
         const int xfill = getenv("BRISK_LPELIMFILL") ? atoi(getenv("BRISK_LPELIMFILL")) : 40;
+        const int dbl2 = getenv("BRISK_LPELIM2") ? atoi(getenv("BRISK_LPELIM2")) : 1;
         for (int round = 0; round < 6; round++) {
             int did = 0;
             for (int i = 0; i < m; i++) {
@@ -538,10 +620,10 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 for (int q = 0; q < lr; q++) {
                     const int j = rc[i][q]; const double a = rv[i][q];
                     const int lc = cl[j];
-                    if (lc > maxlc) { dbg[0]++; continue; }
+                    if (lc > maxlc && (lr != 2 || dbl2 == 0)) { dbg[0]++; if (lr == 2) d2[0]++; continue; }
                     if (lc >= blc) continue;
                     if ((long)(lr - 1) * (lc - 1) > (long)lr + lc - 1 + xfill) { dbg[1]++; continue; }
-                    if (fabs(a) < 1e-2 * amax) continue;
+                    if (fabs(a) < 1e-2 * amax) { if (lr == 2) d2[1]++; continue; }
                     /* the rest of the row: [rmin, rmax] */
                     double rmin, rmax; int fmin_ = 1, fmax_ = 1;       /* finite */
                     { double cmin, cmax; int nmin = imin, nmax = imax;
@@ -562,15 +644,16 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                         const int k2 = rc[i][1 - q]; const double ak = rv[i][1 - q];
                         const int needs_lo = a > 0 ? u[j] < LP_INF : l[j] > -LP_INF, needs_hi = a > 0 ? l[j] > -LP_INF : u[j] < LP_INF;   /* sides of ak x_k */
                         const int new_l = ak > 0 ? needs_lo : needs_hi, new_u = ak > 0 ? needs_hi : needs_lo;
-                        if ((new_l && l[k2] <= -LP_INF) || (new_u && u[k2] >= LP_INF)) { dbg[2 + (lo_ok ? 1 : 0)]++; continue; }
+                        if ((new_l && l[k2] <= -LP_INF) || (new_u && u[k2] >= LP_INF && !(dbl2 && udrop && udrop[k2] < LP_INF))) { dbg[2 + (lo_ok ? 1 : 0)]++; d2[2]++; continue; }
                     }
                     /* a pivot that is not small in its column either */
                     double cmaxa = 0;
                     for (int t = 0; t < cn[j]; t++) { const int r = cr[j][t]; if (!ra[r]) continue; for (int e = 0; e < rn[r]; e++) if (rc[r][e] == j) { cmaxa = fmax(cmaxa, fabs(rv[r][e])); break; } }
-                    if (fabs(a) < 1e-2 * cmaxa) continue;
+                    if (fabs(a) < 1e-2 * cmaxa && (lr != 2 || dbl2 == 0)) { if (lr == 2) d2[3]++; continue; }
                     bj = j; bq = q; blc = lc;
                 }
-                if (bj < 0) continue;
+                if (bj < 0) { if (lr == 2) dbg[4]++; continue; }
+                if (lr == 2) dbg[5]++;
                 const int j = bj; const double a = rv[i][bq], b = rl[i];
                 if (lr == 2) {
                     /* x_j = (b - ak x_k) / a in [l_j, u_j]: the interval of x_k that keeps it there */
@@ -583,6 +666,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                     else { if (hi < LP_INF) lk = hi / ak; if (lo > -LP_INF) uk = lo / ak; }
                     if (lk > l[k]) l[k] = lk;
                     if (uk < u[k]) u[k] = uk;
+                    if (uk < LP_INF && udrop && udrop[k] < u[k]) u[k] = udrop[k];       /* (a bound dropped as implied comes back, the tighter) */
                     if (l[k] > u[k] + 1e-9 * (1.0 + fabs(l[k]))) { status = 1; break; }
                     if (l[k] > u[k]) l[k] = u[k] = 0.5 * (l[k] + u[k]);
                 }
@@ -627,7 +711,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             if (!did || status) break;
         }
         free(pos);
-        if (getenv("BRISK_LPDBG")) printf("   [eliminator: %d taken; candidates refused: column too long %ld, fill %ld, lower bound not implied %ld, upper bound not implied %ld]\n", nelim, dbg[0], dbg[1], dbg[2], dbg[3]);
+        if (getenv("BRISK_LPDBG")) printf("   [eliminator: %d taken; candidates refused: column too long %ld, fill %ld, lower bound not implied %ld, upper bound not implied %ld; rows of two entries: %ld refused, %ld taken (candidates refused: long %ld, small in the row %ld, a new bound on a free column %ld, small in the column %ld)]\n", nelim, dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], d2[0], d2[1], d2[2], d2[3]);
         if (nelim) {
             /* the matrix after the substitutions, by columns */
             long nz2 = 0; for (int i = 0; i < m; i++) if (ra[i]) nz2 += rn[i];
@@ -657,7 +741,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
     M->nrow_removed = nrowrm; M->ncol_removed = nfixed;
     if (status) {
         if (verbose > 0) printf("presolve: the problem is %s\n", status == 1 ? "primal infeasible" : "unbounded or infeasible (a column with a cost and no bound in its direction)");
-        free(c); free(l); free(u); free(rl); free(ru); free(Rp); free(Rj); free(Rx); free(ra); free(ca); free(rcnt); free(ccnt); free(xfix);
+        free(c); free(l); free(u); free(rl); free(ru); free(Rp); free(Rj); free(Rx); free(ra); free(ca); free(rcnt); free(ccnt); free(xfix); free(udrop);
         free(E_p); free(E_i); free(E_x);
         M->c0 = c0;
         return 0;
@@ -714,7 +798,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
         printf("presolve: %d of %d rows and %d of %d columns removed (%ld of %d nonzeros); standard form: %d rows, %d columns (%d free), %ld nonzeros; %d %s\n",
                nrowrm, m, nfixed, n, M->nnz_removed, L->Ap[n], ms, ns, nfree, w, nbnd0 + nrng0, bform ? "upper bounds" : "bound rows");
     free(bndrow); free(E_p); free(E_i); free(E_x);
-    free(c); free(l); free(u); free(rl); free(ru); free(Rp); free(Rj); free(Rx); free(ra); free(ca); free(rcnt); free(ccnt); free(xfix);
+    free(c); free(l); free(u); free(rl); free(ru); free(Rp); free(Rj); free(Rx); free(ra); free(ca); free(rcnt); free(ccnt); free(xfix); free(udrop);
     return 0;
 }
 
@@ -796,6 +880,20 @@ void lp_errors(const LpProb *L, const double *x, double *ebound, double *erow) {
     }
     free(ax); free(an);
     *ebound = eb > 0 ? eb : 0; *erow = er > 0 ? er : 0;
+}
+/* (21 October 2026, the night) the largest row violation against the row's activity, (violation) / (1 + |side| +
+ * sum_j |a_ij x_j|): unlike lp_errors' measure it does not grow with the terms of a row (agg, pilot.we: 1.6e-10 and
+ * 3.2e-10 at points lp_errors puts at 3.0e-5 and 1.4e-6), so a point off by more than the solve's tolerance shows */
+double lp_rowviol_act(const LpProb *L, const double *x) {
+    const int m = L->m, n = L->n;
+    double *ax = xz(sizeof(double) * (m + 1)), *an = xz(sizeof(double) * (m + 1)), ea = 0;
+    for (int j = 0; j < n; j++) for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { ax[L->Ai[p]] += L->Ax[p] * x[j]; an[L->Ai[p]] += fabs(L->Ax[p] * x[j]); }
+    for (int i = 0; i < m; i++) {
+        if (L->rl[i] > -LP_INF) ea = fmax(ea, (L->rl[i] - ax[i]) / (1.0 + fabs(L->rl[i]) + an[i]));
+        if (L->ru[i] < LP_INF) ea = fmax(ea, (ax[i] - L->ru[i]) / (1.0 + fabs(L->ru[i]) + an[i]));
+    }
+    free(ax); free(an);
+    return ea;
 }
 
 /* ---- CBF (conic benchmark format, CBLIB): continuous problems with linear and second-order cones ----

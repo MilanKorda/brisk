@@ -119,11 +119,11 @@ the end are those of the problem as read.
 
 | option | meaning | default |
 |---|---|---|
-| `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the cone solver; `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
+| `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the SOCP solver; `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
 | `soc` | `1`: semidefinite blocks whose data are arrow matrices (the second-order cones of a problem with semidefinite blocks, and norm constraints written as matrix inequalities) are solved as second-order cones in the self-dual embedding, O(q) work per cone of dimension q instead of O(q³); `0`: as semidefinite blocks. A solve with cones that ends worse than reduced accuracy is repeated with them as semidefinite blocks. | 1 |
 | `socmin` | the smallest order of an arrow block that `soc` solves as a cone | 3 |
 
-The cone solver takes `tol`, `acc` (low 1e-6, default 1e-8, high 1e-10), `maxit`, `timelimit`,
+The SOCP solver takes `tol`, `acc` (low 1e-6, default 1e-8, high 1e-10), `maxit`, `timelimit`,
 `threads`, `q`, `v`, and on the command line `-x`, `-y`, `-z` (x, y and z = c − A'y, one value
 per line). Its statuses are those of the semidefinite solver (OPTIMAL, SOLVED TO REDUCED
 ACCURACY, PRIMAL/DUAL INFEASIBLE with a certificate, …).
@@ -160,8 +160,8 @@ digits (the usual result holds it rounded to doubles).
 
 | option | meaning | default |
 |---|---|---|
-| `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows) | 2 |
-| `lpmethod` | `1` the LP interior-point method (bounds as bounds, normal equations; the cone solver takes over when it gives up), `0` the cone solver directly | 1 |
+| `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows); `3` with `lpmethod` 1, first parallel rows and columns, doubleton equations and slack columns, then as `2` | 3 |
+| `lpmethod` | `1` the LP interior-point method (bounds as bounds, normal equations; the SOCP solver takes over when it gives up), `0` the SOCP solver directly | 1 |
 | `lpcorr` | centrality correctors per iteration | 0–3 from the cost of a factorization against a solve (flop ratio above 10, 30, 50) |
 
 Also `tol` (1e-8), `maxit` (200), `timelimit`, `q`, `v`, and `-x file` (x of the problem as read).
@@ -182,13 +182,18 @@ usage: brisk problem.dat-s [options]      (an SDPA sparse file)
        brisk problem.cbf[.gz] [options]   (CBF, the format of CBLIB: linear and second-order cones;
                                            integer variables are relaxed)
 A linear program read from an MPS file is presolved and solved by the LP interior-point method
-(bounds kept as bounds, normal equations); the cone solver takes over when that method gives up
+(bounds kept as bounds, normal equations); the SOCP solver takes over when that method gives up
 (infeasible or unbounded problems: it returns the certificates). Its options: -tol, -maxit,
 -timelimit, -q, -v, -x <file> (x of the problem as read, one value per line), and
   -lppresolve <k>  0 none, 1 rows and columns (fixed, singleton, redundant, forcing, dual fixing),
-                   2 (default) also substitutions: free column singletons, opposite column pairs,
-                   implied free columns by their equality rows
-  -lpmethod <k>    1 (default) the LP interior-point method, 0 the cone solver directly
+                   2 also substitutions: free column singletons, opposite column pairs, implied free
+                   columns by their equality rows; 3 (default) with -lpmethod 1, first parallel rows
+                   and columns, doubleton equations and slack columns, then as 2
+  -lpmethod <k>    1 (default) the LP interior-point method, 0 the SOCP solver directly,
+                   2 the dual simplex method, 3 the primal simplex method, 4 the interior-point method
+                   followed by a crossover, 5 chosen automatically between 2 and 4 (2-5: an optimal basic solution;
+                   with 5 and two threads or more, 2 and 4 run at the same time and the first to finish gives
+                   the result, which can then differ from run to run; -threads 1 gives the same result every run)
   -lpcorr <k>      centrality correctors per iteration (default: 0-3 from the cost of a
                    factorization against a solve)
 A problem in SeDuMi format without semidefinite blocks (a linear or second-order cone program)
@@ -278,7 +283,7 @@ high precision
                    2^(-0.6 bits) (1e-19, 1e-38, 1e-62) counts as OPTIMAL; -fom / -lralm aim at the latter
 method
   -conesolver 0    a problem in SeDuMi format without semidefinite blocks: by the semidefinite solver
-                   (second-order cones as arrow blocks) instead of the cone solver (default 1)
+                   (second-order cones as arrow blocks) instead of the SOCP solver (default 1)
   -dual            dual-scaling method (DSDP-style: potential reduction, correctors, verified
                    certificates); falls back to the primal-dual method unless certified
   -hsd | -nohsd    force | forbid the self-dual embedding (default: automatic - the embedding first
@@ -460,7 +465,7 @@ Schur complement and linear algebra
                    cores). Tiny problems use one thread; on Linux the interior-point solve
                    uses fewer while other processes occupy its cores (at the start, and when its
                    threads wait for cores) and more again when they are free (BRISK_NOBUSY=1:
-                   exactly k). The LP method runs its factorizations on them; the cone solver
+                   exactly k). The LP method runs its factorizations on them; the SOCP solver
                    runs on one thread
   -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on
   -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)

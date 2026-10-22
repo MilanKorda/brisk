@@ -158,7 +158,9 @@ static inline int an_over(size_t total, double flops, size_t fillcap) {
     }
     return total > fillcap || (g_flopcap > 0 && flops > g_flopcap) || (g_flopcap_own > 0 && flops > g_flopcap_own);
 }
-/* the ordering mode of the next analyses (BRISK_AMD: 0 own, 1 automatic, 2 AMD alone); returns the previous one (-1: not yet set) */
+/* the ordering mode of the next analyses (BRISK_AMD: 0 own, 1 automatic, 2 AMD alone; 3 AMD alone without the own
+ * orderings when it gives up, for an estimate under a cap: the LP method's cost model, 22 October 2026); returns the
+ * previous one (-1: not yet set) */
 static int g_amd;
 int schol_set_amd(int mode) { const int old = g_amd; g_amd = mode; return old; }
 /* AMD's dense-row parameter for the next analyses (0: its default, 10): rows with more than this times sqrt(n) entries are ordered last */
@@ -510,6 +512,12 @@ void schol_set_signs(SChol *S, const signed char *sgn_orig) {
 
 static double g_amalg = 0.0;
 double schol_set_amalg(double f) { const double o = g_amalg; g_amalg = f; return o; }
+/* (21 October 2026, LP/SOCP) the relaxed amalgamation also merges consecutive siblings whose row patterns below the
+ * diagonal are the same (their diagonal block stored with explicit zeros): set by the LP method only (0 elsewhere: no
+ * change); a transportation LP's 1,000 supply columns were 1,000 one-column nodes, each a rank-one update of the same
+ * dense block */
+static int g_amalg_sib = 0;
+int schol_set_amalg_siblings(int on) { const int o = g_amalg_sib; g_amalg_sib = on; return o; }
 static unsigned an_settings(void);
 static int an_amd_competes(int m);
 /* 17 October 2026: the ordering and the symbolic factorization alone (an estimate of the cost needs no more);
@@ -865,7 +873,7 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
     if (g_amd < 0) { const char *e = getenv("BRISK_AMD"); g_amd = e ? atoi(e) : 1; }
     if (g_amd_big < 0) { const char *e = getenv("BRISK_AMDBIG"); g_amd_big = e ? atoi(e) : 20000; }
     g_an_ph = 1;
-    if (g_amd == 2 && m >= 64 && !schol_order_amd(m, adj, fillcap, &perm, &plen, &pat, &flops, &nnz)) ord_ok = 1;
+    if ((g_amd == 2 || g_amd == 3) && m >= 64 && !schol_order_amd(m, adj, fillcap, &perm, &plen, &pat, &flops, &nnz)) ord_ok = 1;
     g_an_ph = 0;
     g_nd_used = 0;
     /* (only where the factorization costs: the dissection itself takes the time of a few of them.
@@ -876,35 +884,60 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
      * that has no small separators, and the dissection only costs its time (set covering 5,000 rows, 89 % full: 6 s of
      * two dissections for the same flops; min-cost flow on a random graph, 37 %: 12 s; the meshes of DC power flow,
      * 13-15 %, gain 2.6-5.4 times in flops). The dissection serves the LP method only.) */
+    /* 21 October 2026 (the evening): and not when AMD's fill is light for the graph: the dissection's time grows with the
+     * graph's edges, what it can save with the fill AMD leaves, which AMD's flops per edge measure. On 14 LP normal
+     * equations it saved 20 % or more from 6,000 flops an edge (s100 6,500, triptim1 10,400, dfl001 13,800, rail01 16,800,
+     * pds-20 27,800, rail02 124,000), at most 19 % below 1,000 (s250r10 924), nothing at temuka 517 (two dissections of
+     * 63 s), cygnet 1,140 (7 s), supportcase19 280 (4 s), k1mushroom 309; physiciansched3-3 4,400 (two dissections of 22 s for nothing): below 5,000 it is not tried.
+     * BRISK_NDEDGE: the threshold (0: none). */
+    double ned = 0; for (int i = 0; i < m; i++) ned += adj[i].n;
+    static double ndedge = -1; if (ndedge < 0) { const char *e = getenv("BRISK_NDEDGE"); ndedge = e ? atof(e) : 5000.0; }
+    /* (21 October 2026, the night) the rule that kept the dissection from patterns AMD fills by more than a quarter is
+     * replaced by a time budget: two factorizations' worth (AMD's flops at 2e10 a second, at least a second) when AMD fills
+     * more than a quarter, ten otherwise; past it the dissection gives way to AMD (nd.c checks the clock between the tries,
+     * the levels and in the vertex cover's matching; an 8,000-row set covering: 1.1 s for a budget of 1 s). A quarter separated nothing: ex9's
+     * dual form, 36 % full, has separators (the dissection halves its flops, 2.5e10 -> 1.2e10), a min-cost flow on a random
+     * graph, 37 %, had none. BRISK_NDQUARTER=1: the rule as before. */
+    extern void nd_set_deadline(double seconds);
+    const int ndfull = (double)nnz > 0.25 * 0.5 * (double)m * (m + 1.0);
+    static int ndq = -1; if (ndq < 0) { const char *e = getenv("BRISK_NDQUARTER"); ndq = e && atoi(e) == 1; }
     if (ord_ok && g_nd_try && m >= 1000 && flops >= (getenv("BRISK_NDMINFLOPS") ? atof(getenv("BRISK_NDMINFLOPS")) : 1e9) && !g_force_perm
-        && (double)nnz <= 0.25 * 0.5 * (double)m * (m + 1.0)) {
+        && !(ndq && ndfull) && flops >= ndedge * ned) {
+        const double ndcap = fmax(1.0, (ndfull ? 2.0 : 10.0) * flops / 2e10);
         int *perm2 = NULL, *plen2 = NULL, **pat2 = NULL;
         double flops2 = 0; size_t nnz2 = 0;
         const double tm = (double)clock() / CLOCKS_PER_SEC;
+        nd_set_deadline(ndcap);
         const int rs = schol_order_nd(m, adj, (size_t)(1.2 * (double)nnz) + (size_t)m, &perm2, &plen2, &pat2, &flops2, &nnz2);
+        nd_set_deadline(0);
         if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; nested dissection %s %.3g flops %zu nnz (%.2fs)]\n", m, flops, nnz, rs ? "failed/over" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - tm);
+        const double famd = flops;
         if (rs == 0 && flops2 < 0.9 * flops) {
             for (int j = 0; j < m; j++) free(pat[j]);
             free(pat); free(plen); free(perm);
             perm = perm2; plen = plen2; pat = pat2; flops = flops2; nnz = nnz2; g_nd_used = 1;
-        } else {
-            if (rs == 0) { for (int j = 0; j < m; j++) free(pat2[j]); free(pat2); free(plen2); free(perm2); }
+        } else if (rs == 0) { for (int j = 0; j < m; j++) free(pat2[j]); free(pat2); free(plen2); free(perm2); }
+        {
             /* 18 October 2026 (LP/SOCP): the dissection's hub rule (vertices of more than five times the mean degree
              * ordered last, unsearched) puts every period's resource rows of a staircase LP into the top separator: the
              * dissection's fill passes AMD's. Without the rule it finds the periods' separators (staircase 50 x 500:
              * 3.85e10 flops by AMD, 1.11e10 by the dissection, 1.27e10 by MOSEK's graph partitioning; 200 x 500:
              * 2.37e12 -> 5.55e10), but it takes longer (6 and 23 s against 0.15 s). So the second trial is made when
              * the first did not beat AMD and AMD's factorization costs 1e10 flops or more: at 30 factorizations, tens of
-             * seconds that a better order recovers. (The dissection serves the LP method only.) BRISK_NDHUB2=0: off. */
+             * seconds that a better order recovers. (The dissection serves the LP method only.) BRISK_NDHUB2=0: off.
+             * 21 October 2026 (the evening): also when the first beat AMD, the cheaper of the two kept: on the normal
+             * equations of set covering the rule puts the rows of many columns last unsearched (rail01: 913 rows over
+             * the first four levels; 1.20e10 flops with it, 1.06e10 without, METIS 7.6e9; rail02: 1.29e11, 1.06e11, METIS
+             * 9.8e10), for 2.7 and 5.9 s more of ordering. */
             extern void nd_set_hubs(int on);
-            if (flops >= 1e10 && !(getenv("BRISK_NDHUB2") && atoi(getenv("BRISK_NDHUB2")) == 0)) {
+            if (famd >= 1e10 && !(getenv("BRISK_NDHUB2") && atoi(getenv("BRISK_NDHUB2")) == 0)) {
                 perm2 = NULL; plen2 = NULL; pat2 = NULL; flops2 = 0; nnz2 = 0;
                 const double tm2 = (double)clock() / CLOCKS_PER_SEC;
-                nd_set_hubs(0);
+                nd_set_hubs(0); nd_set_deadline(ndcap);
                 const int rs3 = schol_order_nd(m, adj, (size_t)(1.2 * (double)nnz) + (size_t)m, &perm2, &plen2, &pat2, &flops2, &nnz2);
-                nd_set_hubs(1);
+                nd_set_hubs(1); nd_set_deadline(0);
                 if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: nested dissection without hubs %s %.3g flops %zu nnz (%.2fs)]\n", m, rs3 ? "failed/over" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - tm2);
-                if (rs3 == 0 && flops2 < 0.9 * flops) {
+                if (rs3 == 0 && flops2 < (g_nd_used ? 1.0 : 0.9) * flops) {     /* (against the first dissection: fewer flops) */
                     for (int j = 0; j < m; j++) free(pat[j]);
                     free(pat); free(plen); free(perm);
                     perm = perm2; plen = plen2; pat = pat2; flops = flops2; nnz = nnz2; g_nd_used = 1;
@@ -991,7 +1024,7 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
         ord_ok = 1;
     }
 #endif
-    if (!ord_ok) {
+    if (!ord_ok && (g_amd != 3 || m < 64)) {
         /* the own orderings: minimum degree with least-fill ties (better than AMD on the
          * clique-structured moment-SOS patterns: attr_vdp_d10_I 4.1e8 flops against a
          * rejected factor), but O(flops) work; on large patterns they give up */
@@ -1136,7 +1169,12 @@ ordered:
             if (k < ns && afrac > 0) {
                 const int e = S->ss[k], lc = e - 1;
                 const int par = (S->cp[lc + 1] - S->cp[lc] > 1) ? S->ci[S->cp[lc] + 1] : -1;
-                if (par == e) {
+                int sib = 0;
+                if (par != e && g_amalg_sib && !getenv("BRISK_AMALGNOSIB")) {     /* (siblings: the same pattern below the diagonal, so the same parent) */
+                    const int l1 = S->cp[lc + 1] - S->cp[lc], l2 = S->cp[e + 1] - S->cp[e];
+                    if (l1 == l2 && l1 > 1 && !memcmp(S->ci + S->cp[lc] + 1, S->ci + S->cp[e] + 1, sizeof(S->ci[0]) * (size_t)(l1 - 1))) sib = 1;
+                }
+                if (par == e || sib) {
                     const int wn = S->ss[k + 1] - cj0, nrn = (e - cj0) + (S->cp[e + 1] - S->cp[e]);
                     double tn = ctrue;
                     for (int c = e; c < S->ss[k + 1]; c++) tn += S->cp[c + 1] - S->cp[c];
@@ -1722,11 +1760,26 @@ static inline int panel_team(double work) {
     (void)work; return 1;
 #endif
 }
-#define SIGNED_TR 256
+/* (22 October 2026, LP/SOCP) tiles of 512 rows instead of 256: fewer, larger products for the dense roots of the cone
+ * solver's factorizations; the 122 cone programs (SOCP) 0.988 in total time, no status changed; the sparse-feature SVMs
+ * 200k x 20k 520 -> 453 s, 100k x 8000 50.9 -> 46.6 s. BRISK_SIGNEDTR=t: tiles of t rows */
+#define SIGNED_TR 512
+/* (21 October 2026, LP/SOCP) the block width by the node's: w / 32 within [SIGNED_SB, 256], so that the trailing updates of
+ * a wide node (the dense root of a sparse-feature SVM, 8,002 columns) are products of rank 256 rather than 48: its
+ * factorization 2.17 -> 1.78 s, the solve 67.6 -> 60.2 s; a node of a few hundred columns keeps 48. BRISK_SIGNEDSB=b: b */
+static int signed_sb(int w) { static int v = -1; if (v < 0) { const char *e = getenv("BRISK_SIGNEDSB"); v = e && atoi(e) > 0 ? atoi(e) : 0; }
+    if (v > 0) return v;
+    const int b = w / 32; return b < SIGNED_SB ? SIGNED_SB : b > 256 ? 256 : b; }
+static int signed_tr(void) { static int v = -1; if (v < 0) { const char *e = getenv("BRISK_SIGNEDTR"); v = e && atoi(e) >= 64 ? atoi(e) : SIGNED_TR; } return v; }
 static int signed_chol_blocked(double *P, int ld, int w, const signed char *sg, double dynpiv, int *nrep) {
     double *buf = NULL;
-    if (w > 2 * SIGNED_SB && dynpiv > 0) buf = (double *)malloc(sizeof(double) * (size_t)w * SIGNED_SB);   /* (blocks for the cone solver; the column loop, as before, otherwise) */
-    const int sb = buf ? SIGNED_SB : w;
+    const int SB_ = signed_sb(w), TR_ = signed_tr();
+    static int one_ = -1; if (one_ < 0) { const char *e = getenv("BRISK_SIGNEDONE"); one_ = e && atoi(e) == 1; }     /* (off until measured: BRISK_SIGNEDONE=1) */
+    double *dscr = NULL; int dscr_n = 0;
+    if (w >= 1000 && getenv("BRISK_SIGNEDDBG")) { int np_ = 0; for (int c = 0; c < w; c++) np_ += sg[c] > 0;
+        fprintf(stderr, "   [signed node: %d columns, %d positive, %d below, block %d, tile %d]\n", w, np_, ld - w, SB_, TR_); }
+    if (w > 2 * SB_ && dynpiv > 0) buf = (double *)malloc(sizeof(double) * (size_t)w * SB_);   /* (blocks for the cone solver; the column loop, as before, otherwise) */
+    const int sb = buf ? SB_ : w;
     for (int j0 = 0; j0 < w; j0 += sb) {
         const int jb = w - j0 < sb ? w - j0 : sb, j1 = j0 + jb;
         for (int c = j0; c < j1; c++) {
@@ -1738,7 +1791,7 @@ static int signed_chol_blocked(double *P, int ld, int w, const signed char *sg, 
                 for (int r = c; r < j1; r++) col[r] -= f * ck[r];
             }
             double d = col[c]; const double sc = sg[c];
-            if (!(d * sc > 0)) { if (!(dynpiv > 0)) { free(buf); return 1; } d = sc * dynpiv; (*nrep)++; }
+            if (!(d * sc > 0)) { if (!(dynpiv > 0)) { free(buf); free(dscr); return 1; } d = sc * dynpiv; (*nrep)++; }
             const double l = sqrt(fabs(d)), il = 1.0 / (l * sc);
             col[c] = l;
             for (int r = c + 1; r < j1; r++) col[r] *= il;
@@ -1751,26 +1804,51 @@ static int signed_chol_blocked(double *P, int ld, int w, const signed char *sg, 
         if (buf) {
             /* 17 October 2026: the rows below and the trailing update by fixed tiles of SIGNED_TR rows (by tile pairs
              * below the diagonal), on the team of panel_team for a large node; the same arithmetic for any team */
-            const int nti = (below + SIGNED_TR - 1) / SIGNED_TR, tn = panel_team((double)below * below * jb);
+            const int nti = (below + TR_ - 1) / TR_, tn = panel_team((double)below * below * jb);
             int npos = 0, nneg = 0;
             for (int c = 0; c < jb; c++) { if (sg[j0 + c] < 0) nneg++; else npos++; }
             #pragma omp parallel for schedule(static) num_threads(tn) if (tn > 1 && nti > 1)
             for (int t = 0; t < nti; t++) {
-                const int r0 = t * SIGNED_TR, rr = below - r0 < SIGNED_TR ? below - r0 : SIGNED_TR;
+                const int r0 = t * TR_, rr = below - r0 < TR_ ? below - r0 : TR_;
                 sc_trsm(rr, jb, L11, ld, P21 + r0, ld);
                 for (int c = 0; c < jb; c++) if (sg[j0 + c] < 0) { double *col = P21 + (size_t)c * ld + r0; for (int r = 0; r < rr; r++) col[r] = -col[r]; }
-                if (npos != jb && nneg != jb) {          /* the positive and the negative columns side by side in buf */
+                if (npos != jb && nneg != jb) {
+                    if (one_) {                           /* buf = L21 diag(-sg): one product of rank jb per tile */
+                        for (int c = 0; c < jb; c++) { const double f = -(double)sg[j0 + c]; const double *src = P21 + (size_t)c * ld + r0; double *dst = buf + (size_t)c * below + r0; for (int r = 0; r < rr; r++) dst[r] = f * src[r]; }
+                    } else {                              /* the positive and the negative columns side by side in buf */
                     int a = 0, b = npos;
                     for (int c = 0; c < jb; c++) memcpy(buf + (size_t)(sg[j0 + c] > 0 ? a++ : b++) * below + r0, P21 + (size_t)c * ld + r0, sizeof(double) * (size_t)rr);
+                    }
                 }
             }
             const int npair = nti * (nti + 1) / 2;
+            if (one_ && npos != jb && nneg != jb) {
+                /* (22 October 2026, LP/SOCP) a node of mixed signs: the trailing update C += L21 diag(-sg) L21' as one
+                 * product of rank jb per tile (the diagonal tiles through a scratch tile, their lower triangle added),
+                 * instead of one product for each sign: a pass over the trailing matrix per block step instead of two,
+                 * and no product of rank 1 when a block has one row among the columns of a large cone (the dense root of
+                 * a sparse-feature SVM: 7,959 columns and 1 row). BRISK_SIGNEDONE=1: on (being measured) */
+                if (!dscr || dscr_n < tn) { free(dscr); dscr = (double *)malloc(sizeof(double) * (size_t)TR_ * TR_ * (size_t)tn); dscr_n = tn; }
+                #pragma omp parallel for schedule(dynamic, 1) num_threads(tn) if (tn > 1 && nti > 1)
+                for (int q = 0; q < npair; q++) {
+                    int ti = 0; while ((ti + 1) * (ti + 2) / 2 <= q) ti++;
+                    const int tj = q - ti * (ti + 1) / 2;
+                    const int i0 = ti * TR_, ni = below - i0 < TR_ ? below - i0 : TR_;
+                    const int c0 = tj * TR_, nc = below - c0 < TR_ ? below - c0 : TR_;
+                    double *C = P22 + (size_t)c0 * ld + i0;
+                    if (ti != tj) { BL(dgemm_)("N", "T", &ni, &nc, &jb, &one, P21 + i0, &ld, buf + c0, &below, &one, C, &ld); continue; }
+                    double *D = dscr + (size_t)TR_ * TR_ * (size_t)(tn > 1 && nti > 1 ? omp_get_thread_num() : 0); const double zero = 0.0;
+                    BL(dgemm_)("N", "T", &ni, &ni, &jb, &one, P21 + i0, &ld, buf + c0, &below, &zero, D, &ni);
+                    for (int c = 0; c < ni; c++) { double *cc = C + (size_t)c * ld; const double *dd = D + (size_t)c * ni; for (int r = c; r < ni; r++) cc[r] += dd[r]; }
+                }
+                continue;
+            }
             #pragma omp parallel for schedule(dynamic, 1) num_threads(tn) if (tn > 1 && nti > 1)
             for (int q = 0; q < npair; q++) {
                 int ti = 0; while ((ti + 1) * (ti + 2) / 2 <= q) ti++;
                 const int tj = q - ti * (ti + 1) / 2;
-                const int i0 = ti * SIGNED_TR, ni = below - i0 < SIGNED_TR ? below - i0 : SIGNED_TR;
-                const int c0 = tj * SIGNED_TR, nc = below - c0 < SIGNED_TR ? below - c0 : SIGNED_TR;
+                const int i0 = ti * TR_, ni = below - i0 < TR_ ? below - i0 : TR_;
+                const int c0 = tj * TR_, nc = below - c0 < TR_ ? below - c0 : TR_;
                 double *C = P22 + (size_t)c0 * ld + i0;
                 const double *Pp = npos == jb || nneg == jb ? P21 : buf, *Pn = npos == jb || nneg == jb ? P21 : buf + (size_t)npos * below;
                 const int lp = npos == jb || nneg == jb ? ld : below;
@@ -1802,7 +1880,7 @@ static int signed_chol_blocked(double *P, int ld, int w, const signed char *sg, 
             BL(dsyrk_)("L", "N", &below, &nneg, &one, buf, &below, &one, P22, &ld);
         }
     }
-    free(buf);
+    free(buf); free(dscr);
     return 0;
 }
 

@@ -11815,7 +11815,10 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
                     sum_ef += B->A[t].ef;
                     if (B->type == BLK_SDP) assem += nk * B->A[t].ef + nk * nk * B->A[t].nr;
                 }
-                if (B->type == BLK_SDP) n3 += 30.0 * nk * nk * nk;
+                /* (21 October 2026, ISSUES 228: a block of order >= 512 has its steps from eigenvalues (ddend.c, DD_EIG_N) and
+                 * its products on the threads, but they cost more per n^3 than the small blocks' measured rate: 50 n^3 from
+                 * shmup5, four blocks of order 1,861, 37 s a block and an iteration at the solve's 1.7e11 units per second) */
+                if (B->type == BLK_SDP) n3 += (nk >= 512 ? 50.0 : 30.0) * nk * nk * nk;
             }
             assem += 0.5 * (double)m * sum_ef;
             /* 5.9: the endgame factors the Schur complement as a sparse matrix (ddend.c): the work

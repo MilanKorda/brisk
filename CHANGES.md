@@ -3,6 +3,20 @@
 ## Version 1.5.5 (October 2026)
 
 Semidefinite programs:
+- **Large blocks at the end of a solve.** The high-precision final steps run on all threads for blocks of order 128
+  and more (with the same results at any thread count), and for blocks of order 512 and more their step length comes
+  from one eigenvalue computation in double precision, confirmed in high precision; their cost is estimated as
+  measured, so they are not started where they cannot pay. A Mittelmann problem with large blocks (shmup5): 1,238 ->
+  397 s, OPTIMAL.
+- **The symmetry reduction also reduces the LP variables.** LP variables that a symmetry of the problem exchanges
+  become one variable per orbit in the reduced problem. They were kept apart, which gave the reduced problem
+  duplicate columns and, for free variables, a singular linear system: clique relaxations from CBLIB 34 -> 11
+  iterations, 2.6 -> 1.1 s.
+- **Re-solves always run.** A re-solve after the first solve (the check of an infeasibility found on the presolved
+  problem, the solve without the elimination of free variables or without the symmetry reduction, ...) could stop at
+  its start when the problem called for another method first, and the first answer was kept: a moment relaxation of
+  Mittelmann's set (e_moment_quadknap_17_100) was reported dual infeasible under small perturbations of its data. It
+  is now solved to OPTIMAL.
 - **Linearly dependent equality constraints are removed in the presolve** (`-deprows 1`, the default). Constraints
   that are linear combinations of others (exact multiples, and the rest found by a factorization of the constraints'
   Gram matrix, each one verified on the data) are removed, with dual value 0; inconsistent right-hand sides are
@@ -24,6 +38,23 @@ Semidefinite programs:
   method's before).
 
 Linear programs:
+- **A stronger presolve before the LP interior-point method** (`-lppresolve 3`, the new default; `-lppresolve 2` is
+  the former one): constraints that are multiples of another are merged into one range constraint, an equation in
+  two variables expresses one through the other, and a variable that appears in one constraint only with zero cost
+  (a slack) is removed with the inequality restored. If the method gives up on the reduced problem, it solves the
+  problem again with the former presolve.
+- **The stopping test measures the gap against the objective as written in the file**, its constant included: two
+  MIPLIB relaxations were reported optimal with objectives wrong in the 5th and 7th digit.
+- **Every constraint of the problem as read is checked after the solve:** one violated by more than 1e-6 of its size
+  gives SOLVED TO REDUCED ACCURACY instead of OPTIMAL.
+- **Primal-dual regularization late in a solve**, when the linear system of the iteration becomes numerically
+  singular (centred at the current point, so the answer does not change): rail01 97.7 -> 30.7 s, splice1k1 90.2 ->
+  44.4 s, and three MIPLIB relaxations no longer fall back to the SOCP solver.
+- The search for classes of interchangeable rows and columns (the folding below) and the folded problem are built
+  much faster (neos-631710 32 -> 1 s, chromaticindex1024-7 94 -> 0.6 s), and the estimates that choose between
+  the problem and its dual stop as soon as an option is clearly too expensive.
+- When a problem is solved a second time, the Summary lists "Solve 1", "Solve 2" with the method, time and reason,
+  and the advice names the option that avoids it.
 - **Folding by symmetry.** A linear program whose rows and columns fall into classes with equal sums (the coarsest
   equitable partition of its constraint graph) is solved in the class averages and the solution spread back: QAP
   linearizations fold to a quarter of their size (qap15 45.7 -> 1.1 s, qap12 2.0 -> 0.2 s). The partition is given up
@@ -33,6 +64,17 @@ Linear programs:
   same statuses with 2 % fewer iterations.
 
 Second-order cone programs:
+- **Relaxed supernodes** in the SOCP solver's factorization when its columns are long: nonnegative least-squares
+  deblurring 201.6 -> 68.3 s.
+- **Rotated cones of more than four entries start on their own central path** (the epigraph of a quadratic): TV
+  denoising 15-17 -> 12-13 iterations; the lasso, least-squares and SVM models start closer to the central path.
+- **The dual point is checked by its cone membership at the end:** two scheduling problems of the DIMACS set from
+  reduced accuracy to OPTIMAL, 3 % fewer iterations over 122 SOCPs.
+- **The primal error is also checked row by row** at an accepted point: a point whose residual is small only
+  against the largest right-hand side is no longer reported OPTIMAL.
+- **After a step direction that is not finite, the factorization in double-double precision first:** a portfolio
+  problem with 20,000 assets from reduced accuracy to OPTIMAL.
+- A faster dense kernel for large dense nodes of the factorization: sparse-feature SVMs 520 -> 453 s.
 - **Dense columns in the normal equations.** Dense linear columns and small cones with dense columns enter the normal
   equations as a dense block computed by matrix-matrix kernels, and the full system is analysed only if needed: two
   CBLIB problems 68.8 -> 26.3 s and 233 -> 57 s, a group lasso 4.7 -> 3.0 s.
@@ -64,7 +106,7 @@ Semidefinite programs:
 - The memory cap of the best-iterate copies scales with the available memory.
 
 Second-order cone programs:
-- **Small problems at high accuracy.** On the normal-equations route the cone solver's dual regularization is now
+- **Small problems at high accuracy.** On the normal-equations route the SOCP solver's dual regularization is now
   below the target accuracy; at `acc = "high"` two-row problems with the optimum on the cone's boundary ended
   ALMOST_OPTIMAL (two of MathOptInterface's tests), now OPTIMAL in 6 iterations.
 - A large cone's product for the normal equations by matrix-matrix kernels on dense panels when a cost model says
@@ -110,7 +152,7 @@ Linear programs:
   regressions (many residuals, few coefficients) are solved through their dual: from minutes, killed runs
   or out of memory to a few seconds (an L1 regression with 2,000 residuals: 32 s → 0.1 s).
 - **Dense columns, large factors.** The normal equations are formed by one symmetric product when dense;
-  dense columns that lose the accuracy of their low-rank correction go to the cone solver instead of a
+  dense columns that lose the accuracy of their low-rank correction go to the SOCP solver instead of a
   dense factor; the factor's fill is capped by the memory and `-timelimit` is honoured before a
   factorization; the large nodes of the factor run as a task graph; no nested dissection on a nearly dense
   pattern, and a second ordering trial where the first is expensive (set covering 2-3x faster, a staircase
@@ -125,7 +167,7 @@ Second-order cone programs:
   during the iteration: total-variation denoising 1.3-4x faster, group lasso and portfolio problems
   1.5-2x. Blocks in no row are fixed or proved unbounded in the presolve (100,000 small cones: 4.7 → 0.3 s).
   More of the solver's passes run on the threads, with the same results at any thread count.
-- **`-vv` prints the cone solver's iteration log.**
+- **`-vv` prints the SOCP solver's iteration log.**
 
 ## Version 1.5.1 (October 2026)
 
@@ -553,14 +595,14 @@ within 3 % of 1.3.2 in their medians. Five problems end with a better status, on
 ## Version 1.2.1 (October 2026)
 
 - The log states the number of threads the solver uses: a line `Number of threads: k` after
-  the solver's banner, in every interface (not in quiet mode). The cone solver and the solver
+  the solver's banner, in every interface (not in quiet mode). The SOCP solver and the solver
   for linear programs are sequential and report 1.
 
 ## Version 1.2 (October 2026)
 
 - **Second-order cones.** Problems with free variables, linear variables, second-order and
   rotated second-order cones, with or without semidefinite blocks. A problem without
-  semidefinite blocks goes to a cone solver of its own (homogeneous model, sparse
+  semidefinite blocks goes to an SOCP solver of its own (homogeneous model, sparse
   factorization of the reduced KKT system), which returns certificates of infeasibility.
   - Input in SeDuMi format: `brisk problem.mat` (a MAT-file with `A`, `b`, `c`, `K`),
     `brisk_solve_sedumi` in the C library, `brisk.solve_sedumi` in Python,

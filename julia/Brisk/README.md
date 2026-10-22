@@ -114,11 +114,11 @@ r.status, r.status_string, r.primal_objective, r.dual_objective, r.x, r.y, r.z, 
 r = Brisk.solve_sedumi("problem.mat")        # a MAT-file with A (or At), b, c, K
 ```
 
-Without semidefinite blocks the problem is solved by BRISK's cone solver; with them, or with
+Without semidefinite blocks the problem is solved by BRISK's SOCP solver; with them, or with
 `conesolver = 0`, `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm`, by the semidefinite
 solver (second-order cones as arrow blocks). In JuMP, `SecondOrderCone` and
 `RotatedSecondOrderCone` constraints are supported; a model without PSD constraints goes to
-the cone solver (`set_attribute(model, "conesolver", 0)` forces the semidefinite solver).
+the SOCP solver (`set_attribute(model, "conesolver", 0)` forces the semidefinite solver).
 
 **Very large chordal problems.** When BRISK decomposes a large sparse block into cliques
 (AC-OPF relaxations), the dense `X` and `Z` of that block are returned only if they fit in

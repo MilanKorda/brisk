@@ -849,13 +849,42 @@ static int sym_blockdiag(const Problem *P, PSSym *S, const int *cls, const int *
         free(bmap);
         if (bsgn) { for (int k = 0; k < nb; k++) free(bsgn[k]); free(bsgn); bsgn = NULL; }
     } else {
+        /* 22 October 2026: the LP variables by their orbits. An LP variable and its images were kept apart, so the
+         * aggregated constraint of an orbit held their columns side by side: identical columns (buck5's slacks; the
+         * clique relaxations' slacks and free variables, whose duplicate columns made the free variables' saddle
+         * matrix singular, ISSUES 231 and 233). On invariant points x_i = x_g(i): one variable t per orbit, x_i = t on
+         * the orbit, its column and cost the sums over the orbit; the postsolve copies t back. Not when an orbit
+         * leaves its LP block or a generator changes the sign of an LP variable (BRISK_SYMLP=0: never) */
+        int *lpos = NULL, *lpn = NULL;
+        {
+            static int lpon = -1; if (lpon < 0) { const char *e = getenv("BRISK_SYMLP"); lpon = !(e && atoi(e) == 0); }
+            int ok = lpon;
+            int *upar = sx(sizeof(int) * (NI + 1)); for (int u = 0; u < NI; u++) upar[u] = u;
+            for (int s = 0; s < ngen && ok; s++) for (int k = 0; k < nb && ok; k++) {
+                if (P->blk[k].type != BLK_LP) continue;
+                for (int i = 0; i < P->blk[k].n; i++) {
+                    const int u = off[k] + i, v = gen[s][u];
+                    if (gblk[v] != k || (S->gsg && S->gsg[s] && S->gsg[s][u] < 0)) { ok = 0; break; }
+                    const int a = uf_find(upar, u), b2 = uf_find(upar, v);
+                    if (a < b2) upar[b2] = a; else if (b2 < a) upar[a] = b2;     /* the root: the orbit's smallest index */
+                }
+            }
+            if (ok) {
+                lpos = sx(sizeof(int) * (NI + 1)); lpn = calloc(nb + 1, sizeof(int));
+                for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP)
+                    for (int i = 0; i < P->blk[k].n; i++) { const int u = off[k] + i; if (uf_find(upar, u) == u) lpos[u] = lpn[k]++; }
+                for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP)
+                    for (int i = 0; i < P->blk[k].n; i++) { const int u = off[k] + i; lpos[u] = lpos[uf_find(upar, u)]; }
+            }
+            free(upar);
+        }
         /* reduced blocks: (k, t) for the representative SDP blocks in that order, LP blocks in place */
         int nbr = 0; for (int k = 0; k < nb; k++) { if (P->blk[k].type == BLK_LP) nbr++; else if (brep[k] == k) nbr += nbt[k]; }
         int *bsr = sx(sizeof(int) * (nbr + 1)), *lpr = sx(sizeof(int) * (nb + 1)), **rkt = calloc(nb + 1, sizeof(int *));
         S->nsb = nbr; S->sb = calloc(nbr + 1, sizeof(SymBlk));
         int r = 0;
         for (int k = 0; k < nb; k++) {
-            if (P->blk[k].type == BLK_LP) { lpr[k] = r; bsr[r] = -P->blk[k].n; S->sb[r].k = k; S->sb[r].t = -1; S->sb[r].n = P->blk[k].n; r++; continue; }
+            if (P->blk[k].type == BLK_LP) { const int nl_k = lpn ? lpn[k] : P->blk[k].n; lpr[k] = r; bsr[r] = -nl_k; S->sb[r].k = k; S->sb[r].t = -1; S->sb[r].n = nl_k; r++; continue; }
             if (brep[k] != k) continue;
             rkt[k] = sx(sizeof(int) * (nbt[k] + 1));
             for (int t = 0; t < nbt[k]; t++) { rkt[k][t] = r; S->sb[r].k = k; S->sb[r].t = t; S->sb[r].d = bdt[k][t]; S->sb[r].n = 0; r++; }
@@ -923,7 +952,7 @@ static int sym_blockdiag(const Problem *P, PSSym *S, const int *cls, const int *
                 const SpSym *A = t < 0 ? &B->C : &B->A[t];
                 const double sgc = t < 0 ? 1.0 : (double)S->csg[B->con[t]];
                 for (int q = 0; q < A->nnz; q++) {
-                    if (islp) { EMIT(c, S->sb[lpr[k]].rblk, A->row[q], A->row[q], sgc * A->val[q]); continue; }
+                    if (islp) { const int v_ = lpos ? lpos[off[k] + A->row[q]] : A->row[q]; EMIT(c, S->sb[lpr[k]].rblk, v_, v_, sgc * A->val[q]); continue; }
                     const int a = off[k] + A->row[q], b2 = off[k] + A->col[q]; const double v = sgc * A->val[q] * scale;
                     for (int ea = lp[a]; ea < lp[a + 1]; ea++) for (int eb = lp[b2]; eb < lp[b2 + 1]; eb++) {
                         if (lr[ea] != lr[eb]) continue;
@@ -949,8 +978,10 @@ static int sym_blockdiag(const Problem *P, PSSym *S, const int *cls, const int *
         if (verbose >= 0) {
             printf("presolve: symmetry-adapted basis: blocks");
             for (int k = 0; k < nb; k++) { if (P->blk[k].type == BLK_LP || brep[k] != k) continue; printf(" %d%s ->", P->blk[k].n, bscale[k] > 1 ? "(x)" : ""); int n1 = 0; for (r = 0; r < nbr; r++) if (S->sb[r].k == k) { if (S->sb[r].n == 1) n1++; else printf(" %d%s", S->sb[r].n, S->sb[r].d > 1 ? "*" : ""); } if (n1) printf(" %dx1", n1); printf(";"); }
+            if (lpos) { int n0 = 0, n1 = 0; for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP) { n0 += P->blk[k].n; n1 += lpn[k]; } if (n1 < n0) printf(" LP variables %d -> %d (their orbits);", n0, n1); }
             printf(" (x): one of %s exchanged blocks; *: representation of dimension > 1; 1 x 1 pieces are LP variables (%.2f s)\n", "several", wtime() - t0);
         }
+        S->lpos = lpos; lpos = NULL; free(lpn); lpn = NULL;
         S->bd = 1; S->nbr = rb; S->bsr = bsr; S->brep = brep; S->bmap = bmap; S->bsgn = bsgn; brep = NULL; bmap = NULL; bsgn = NULL;
         *nt_out = nt; *tc_out = tc; *tb_out = tb; *ti_out = ti; *tj_out = tj; *tv_out = tv; *nbr_out = rb; *bsr_out = bsr;
         ret = 1;
@@ -1360,7 +1391,11 @@ void sym_unmap(const PSSym *S, double **Xred0, const double *yred, double **Xo, 
         for (int k = 0; k < nb; k++) { const int n = abs(bs[k]); Xbd[k] = calloc((bs[k] < 0 ? (size_t)n : (size_t)n * n) + 1, sizeof(double)); }
         for (int r = 0; r < S->nsb; r++) {
             const SymBlk *B = &S->sb[r]; const int k = B->k, nk = abs(bs[k]), nr = B->n;
-            if (B->t < 0) { memcpy(Xbd[k], Xred0[B->rblk], sizeof(double) * nk); continue; }
+            if (B->t < 0) {                     /* (22 October 2026: an LP variable takes its orbit's value) */
+                if (S->lpos) for (int i = 0; i < nk; i++) Xbd[k][i] = Xred0[B->rblk][S->lpos[S->off[k] + i]];
+                else memcpy(Xbd[k], Xred0[B->rblk], sizeof(double) * nk);
+                continue;
+            }
             const int d = B->d; const double one = 1.0;
             const double *Xr = B->lp ? Xred0[S->lpblk] + B->p : Xred0[B->rblk];
             double *T = sx(sizeof(double) * (size_t)nk * nr);
@@ -1453,6 +1488,7 @@ void sym_free(PSSym *S) {
     for (int r = 0; r < S->nsb; r++) free(S->sb[r].W);
     if (S->bmap) for (int k = 0; k < S->nblk; k++) free(S->bmap[k]);
     free(S->sb); free(S->bsr); free(S->brep); free(S->bmap);
+    free(S->lpos);
     free(S->gen); free(S->G); free(S->cls); free(S->off); free(S->gblk); free(S->b0); free(S);
 }
 

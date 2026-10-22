@@ -1,7 +1,7 @@
 /* sedumi.c - problems in SeDuMi form (5.4):   min c'x  s.t.  A x = b,  x in K
  *   K = R^f x R^l_+ x Q^{q_1} x ... x Qr^{r_1} x ... x S^{s_1}_+ x ...   (K.f, K.l, K.q, K.r, K.s)
  *
- *  - without semidefinite blocks the problem goes to the cone solver (socp.c);
+ *  - without semidefinite blocks the problem goes to the SOCP solver (socp.c);
  *  - with them it is written in SDPA form for the semidefinite solver: free variables as split
  *    pairs, a second-order cone of dimension d as a d x d block with arrow-shaped data (the dual
  *    form z = c - A'y in Q  <=>  Arw(z) >= 0, exact, no extra constraint; x0 = tr X, x_t = 2 X_0t);
@@ -395,7 +395,7 @@ static int cmp_strip(const void *a, const void *b) {
 }
 static const int g_exit_of_status[8] = { 0, 11, 12, 13, 14, 10, 15, 2 };
 
-/* options of the cone solver from the command line's words; returns 0, 1 with a message, or 2:
+/* options of the SOCP solver from the command line's words; returns 0, 1 with a message, or 2:
  * the options ask for the semidefinite solver (-conesolver 0, high precision, bounds, first-order methods) */
 static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nmsg) {
     socp_default_opts(o);

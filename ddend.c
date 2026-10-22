@@ -152,8 +152,17 @@ static dd dd_dot(size_t n, const dd *x, const dd *y) {
     return r;
 }
 /* C = A B (column-major): column j of C is the combination of the columns of A with column j of B */
+/* (21 October 2026: the columns on the threads, each column's sums in the same order, so the bits are those of one
+ * thread; the endgame's block algebra was single-threaded and cost 830 s for one step on a structural design problem
+ * with four blocks of order 1,861, ISSUES 228) */
+#define DD_PAR_N 128
+/* (21 October 2026) the eigenvalue step only where the bisection costs real time: 28 double-double Cholesky factorizations
+ * of n^3/3 a call are about 1 s at n = 500; below, the bisection's path is kept (roa_vdp_inner_d14_K, a block of order 148:
+ * the eigenvalue step moved its endgame from 9.0e-5 to 1.05e-4 and into a re-solve, 24.6 -> 34.6 s) */
+#define DD_EIG_N 512
 static void dd_gemm(int n, const dd *A, const dd *B, dd *C) {
     memset(C, 0, sizeof(dd) * (size_t)n * n);
+    #pragma omp parallel for schedule(static) if (n >= DD_PAR_N)
     for (int j = 0; j < n; j++) {
         dd *Cj = C + (size_t)j * n;
         for (int k = 0; k < n; k++) { const dd bkj = B[k + (size_t)j * n]; if (bkj.h == 0 && bkj.l == 0) continue; dd_axpy((size_t)n, bkj, A + (size_t)k * n, Cj); }
@@ -167,12 +176,23 @@ static void dd_sym(int n, dd *A) {
         }
 }
 /* lower Cholesky of the lower triangle of A into L (left-looking by columns); returns 1 on failure */
+/* (21 October 2026, ISSUES 228: for a large block the rows of each column on the threads in chunks: every entry's
+ * updates in the same order over k, so the bits are those of one thread) */
 static int dd_chol(int n, const dd *A, dd *L) {
     memset(L, 0, sizeof(dd) * (size_t)n * n);
     for (int j = 0; j < n; j++) {
         dd *Lj = L + (size_t)j * n;
         memcpy(Lj + j, A + (size_t)j * n + j, sizeof(dd) * (size_t)(n - j));
-        for (int k = 0; k < j; k++) { const dd v = L[j + (size_t)k * n]; if (v.h == 0 && v.l == 0) continue; dd_axpy((size_t)(n - j), dd_neg(v), L + (size_t)k * n + j, Lj + j); }
+        const int len = n - j;
+        if (n >= DD_PAR_N && len >= 64 && j >= 16) {
+            const int nch = (len + 63) / 64;
+            #pragma omp parallel for schedule(static)
+            for (int c = 0; c < nch; c++) {
+                const int i0 = j + 64 * c, cl = i0 + 64 <= n ? 64 : n - i0;
+                for (int k = 0; k < j; k++) { const dd v = L[j + (size_t)k * n]; if (v.h == 0 && v.l == 0) continue; dd_axpy((size_t)cl, dd_neg(v), L + (size_t)k * n + i0, Lj + i0); }
+            }
+        } else
+            for (int k = 0; k < j; k++) { const dd v = L[j + (size_t)k * n]; if (v.h == 0 && v.l == 0) continue; dd_axpy((size_t)len, dd_neg(v), L + (size_t)k * n + j, Lj + j); }
         if (!(Lj[j].h > 0)) return 1;
         const dd d = dd_sqrt(Lj[j]), inv = dd_div(dd_of(1.0), d);
         Lj[j] = d;
@@ -192,6 +212,16 @@ static void dd_solve_chol(int m, const dd *L, dd *x) {
 }
 /* inverse of a symmetric positive definite matrix from its Cholesky factor */
 static void dd_inv_from_chol(int n, const dd *L, dd *Inv, dd *col) {
+    if (n >= DD_PAR_N) {            /* (21 October 2026, ISSUES 228: the columns are independent: on the threads, solved in place) */
+        (void)col;
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < n; j++) {
+            dd *cj = Inv + (size_t)j * n;
+            for (int i = 0; i < n; i++) cj[i] = dd_of(i == j ? 1.0 : 0.0);
+            dd_solve_chol(n, L, cj);
+        }
+        return;
+    }
     for (int j = 0; j < n; j++) {
         for (int i = 0; i < n; i++) col[i] = dd_of(i == j ? 1.0 : 0.0);
         dd_solve_chol(n, L, col);
@@ -451,6 +481,34 @@ static void dd_lp_limiter(const DBlk *b, int side, double *ratio, int *idx, doub
     }
     if (*idx >= 0) { *v = dd_d(V[*idx]); *d = dd_d(D[*idx]); *v2 = dd_d(W[*idx]); *d2 = dd_d(E[*idx]); }
 }
+/* (21 October 2026, ISSUES 228) the largest a with V + a D >= 0, in double: V = L L' (dpotrf), W = L^-1 D L^-T (two dtrsm),
+ * a = -1 / lambda_min(W) (dsyevr, the smallest eigenvalue only); 1e300 when lambda_min >= 0; -1 when V is not positive
+ * definite in double or LAPACK fails. */
+static double dd_eig_step(int n, const dd *V, const dd *D) {
+    const size_t len = (size_t)n * n;
+    double *L = malloc(sizeof(double) * len), *W = malloc(sizeof(double) * len);
+    if (!L || !W) { free(L); free(W); return -1; }
+    for (size_t i = 0; i < len; i++) { L[i] = dd_d(V[i]); W[i] = dd_d(D[i]); }
+    int info = 0; double res = -1;
+    BL(dpotrf_)("L", &n, L, &n, &info);
+    if (info == 0) {
+        const double one = 1.0;
+        BL(dtrsm_)("L", "L", "N", "N", &n, &n, &one, L, &n, W, &n);
+        BL(dtrsm_)("R", "L", "T", "N", &n, &n, &one, L, &n, W, &n);
+        for (int j = 0; j < n; j++) for (int i = j + 1; i < n; i++) { const double v = 0.5 * (W[i + (size_t)j * n] + W[j + (size_t)i * n]); W[i + (size_t)j * n] = W[j + (size_t)i * n] = v; }
+        int il = 1, iu = 1, mfound = 0, lwork = -1, liwork = -1, iwq = 0; double vl = 0, vu = 0, abstol = 0, ev[2], wq = 0, z = 0; int ldz = 1, isup[2];
+        BL(dsyevr_)("N", "I", "L", &n, W, &n, &vl, &vu, &il, &iu, &abstol, &mfound, ev, &z, &ldz, isup, &wq, &lwork, &iwq, &liwork, &info);
+        lwork = (int)wq + 1; liwork = iwq + 1;
+        double *work = malloc(sizeof(double) * lwork); int *iwork = malloc(sizeof(int) * liwork);
+        if (work && iwork) {
+            BL(dsyevr_)("N", "I", "L", &n, W, &n, &vl, &vu, &il, &iu, &abstol, &mfound, ev, &z, &ldz, isup, work, &lwork, iwork, &liwork, &info);
+            if (info == 0 && mfound >= 1) res = ev[0] >= 0 ? 1e300 : -1.0 / ev[0];
+        }
+        free(work); free(iwork);
+    }
+    free(L); free(W);
+    return res;
+}
 static void dd_steps(const Problem *P, DBlk *b, int nb, dd *apo, dd *ado) {
     dd ap = dd_of(1.0), ad = dd_of(1.0);
     g_lim_p = g_lim_d = -1;
@@ -459,6 +517,26 @@ static void dd_steps(const Problem *P, DBlk *b, int nb, dd *apo, dd *ado) {
         for (int side = 0; side < 2; side++) {
             const dd *V = side ? b[k].Z : b[k].X, *D = side ? b[k].dZ : b[k].dX;
             dd lo = dd_of(0.0), hi = side ? ad : ap;
+            /* 21 October 2026 (ISSUES 228): a large block's bound from the eigenvalues of L^-1 D L^-T in double (V = L L'),
+             * for blocks of order >= DD_EIG_N, one Cholesky, two triangular solves and the smallest eigenvalue on the threaded BLAS, confirmed by one
+             * double-double Cholesky at the bound less 2^-14; the bisection (14 double-double Cholesky factorizations a
+             * side, 80 % of an endgame iteration on blocks of order 1,861) only when the double estimate fails or is not
+             * confirmed. BRISK_DDBISECT=1: the bisection always. */
+            static int bisect_only = -1; if (bisect_only < 0) bisect_only = getenv("BRISK_DDBISECT") != NULL;
+            if (b[k].type != BLK_LP && n >= DD_EIG_N && !bisect_only) {
+                const double a_est = dd_eig_step(n, V, D);
+                if (a_est > 0) {
+                    const double a = fmin(dd_d(hi), a_est) * (1.0 - 1.0 / 16384.0);
+                    const dd ad_ = dd_of(a);
+                    for (size_t i = 0; i < b[k].len; i++) b[k].T1[i] = dd_add(V[i], dd_mul(ad_, D[i]));
+                    if (!dd_chol(n, b[k].T1, b[k].T2)) {
+                        lo = ad_;
+                        if (side) { if (dd_d(lo) < 0.999 * dd_d(ad)) g_lim_d = k; ad = lo; } else { if (dd_d(lo) < 0.999 * dd_d(ap)) g_lim_p = k; ap = lo; }
+                        continue;
+                    }
+                    hi = ad_;            /* (not confirmed: the bisection below the estimate) */
+                }
+            }
             for (int s = 0; s < 14; s++) {                /* 2^-14: the step is scaled by 0.9-0.99 anyway */
                 dd mid = dd_muld(dd_add(lo, hi), 0.5);
                 int ok = 1;
@@ -1248,6 +1326,7 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         for (int k = 0; k < nb; k++) dd_dir(&P->blk[k], &b[k], dy, smu, 1);
         if (nfree > 0) dd_free_dir(b, prs, nfree, fnew);
         dd_steps(P, b, nb, &ap, &ad);
+        DDPH(7);   /* (21 October 2026: the corrector's direction and steps were booked nowhere) */
 
         double mn = fmin(dd_d(ap), dd_d(ad));
         double gam = 0.9 + (par->gamma_max - 0.9) * mn;

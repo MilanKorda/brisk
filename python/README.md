@@ -279,7 +279,7 @@ r.status, r.status_str, r.pobj, r.dobj, r.x, r.y, r.z, r.dimacs, r.iterations, r
 r = brisk.solve_file("problem.mat")          # a MAT-file with A (or At), b, c, K
 ```
 
-Without semidefinite blocks the problem is solved by BRISK's cone solver (a separate
+Without semidefinite blocks the problem is solved by BRISK's SOCP solver (a separate
 interior-point code for linear and second-order cone programs); its options are `tol`, `acc`,
 `maxit`, `timelimit`, `threads`. With semidefinite blocks, or with `conesolver=0`, `prec`,
 `bound`, `certify`, `fom`, `mfipm`, `lralm`, the semidefinite solver is used (second-order

@@ -20,10 +20,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <time.h>
 #include "amd/amd.h"
 
 typedef struct { int n; int *xadj, *adj, *ew, *vw; long tvw; } Gr;
 
+/* (21 October 2026) a time budget: once past it the rest is ordered by AMD and nd_order reports failure (the caller keeps its
+ * own order); 0: none */
+static double g_nd_dead = 0; static int g_nd_abort = 0;
+static double nd_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+void nd_set_deadline(double seconds) { g_nd_dead = seconds > 0 ? nd_now() + seconds : 0; g_nd_abort = 0; }
 static unsigned int nd_seed;
 static unsigned int nd_rand(void) { nd_seed = nd_seed * 1664525u + 1013904223u; return nd_seed >> 8; }
 static void gr_free(Gr *g) { free(g->xadj); free(g->adj); free(g->ew); free(g->vw); }
@@ -35,6 +41,20 @@ static int coarsen(const Gr *g, Gr *c, int *cmap, long maxvw) {
     if (!match || !ord) { free(match); free(ord); return 1; }
     for (int i = 0; i < n; i++) { match[i] = -1; ord[i] = i; }
     for (int i = n - 1; i > 0; i--) { const int j = (int)(nd_rand() % (unsigned)(i + 1)), t = ord[i]; ord[i] = ord[j]; ord[j] = t; }
+    /* (21 October 2026) the random order sorted by degree, ascending and stable, as METIS's sorted heavy-edge matching:
+     * the vertices of few neighbours match first, while their neighbours are free (rail01 1.12e10 -> 1.07e10 flops,
+     * triptim1 6.5e9 -> 6.0e9, pds-20 1.52e9 -> 1.35e9; over 14 LP normal equations 0.673 -> 0.663 of AMD's flops) */
+    {
+        int maxd = 0; for (int v = 0; v < n; v++) { const int d = g->xadj[v + 1] - g->xadj[v]; if (d > maxd) maxd = d; }
+        int *cnt = calloc((size_t)maxd + 2, sizeof(int)), *o2 = malloc(sizeof(int) * (n + 1));
+        if (cnt && o2) {
+            for (int k = 0; k < n; k++) cnt[g->xadj[ord[k] + 1] - g->xadj[ord[k]] + 1]++;
+            for (int d = 0; d <= maxd; d++) cnt[d + 1] += cnt[d];
+            for (int k = 0; k < n; k++) { const int v = ord[k]; o2[cnt[g->xadj[v + 1] - g->xadj[v]]++] = v; }
+            memcpy(ord, o2, sizeof(int) * n);
+        }
+        free(cnt); free(o2);
+    }
     int nc = 0;
     for (int k = 0; k < n; k++) {
         const int v = ord[k];
@@ -180,7 +200,9 @@ static int bisect(const Gr *g0, char *part0, int mode) {
         if (coarsen(g, &lev[nl], cmap, maxvw)) { free(cmap); break; }
         if (lev[nl].n > 0.95 * g->n) { gr_free(&lev[nl]); free(cmap); break; }       /* (nothing left to match) */
         cmaps[nl] = cmap; g = &lev[nl]; nl++;
+        if (g_nd_dead > 0 && nd_now() > g_nd_dead) { g_nd_abort = 1; break; }
     }
+    if (g_nd_abort) { for (int k = 0; k < nl; k++) { gr_free(&lev[k]); free(cmaps[k]); } return 1; }   /* (past the time budget) */
     if (getenv("BRISK_NDDBG") && atoi(getenv("BRISK_NDDBG")) >= 9) { fprintf(stderr, "      [bisect n %d: levels", g0->n); for (int k = 0; k < nl; k++) fprintf(stderr, " %d", lev[k].n); fprintf(stderr, "]\n"); }
     /* the coarsest graph: regions grown from several seeds */
     const int n = g->n;
@@ -190,6 +212,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
     long bestcut = -1;
     const int ntry = n <= 2 ? 1 : 10;
     for (int t = 0; t < ntry; t++) {
+        if (t > 0 && g_nd_dead > 0 && nd_now() > g_nd_dead) { g_nd_abort = 1; break; }
         memset(part, 1, (size_t)n);
         long wa = 0; int qh = 0, qt = 0, next = 0;
         const int seed = (int)(nd_rand() % (unsigned)(n > 0 ? n : 1));
@@ -230,7 +253,8 @@ static int bisect(const Gr *g0, char *part0, int mode) {
             const Gr *f = k == 0 ? g0 : &lev[k - 1];
             char *pf = k == 0 ? part0 : malloc((size_t)f->n + 1);
             for (int v = 0; v < f->n; v++) pf[v] = cur[cmaps[k][v]];
-            refine(f, pf, maxside, 6);
+            if (!g_nd_abort && g_nd_dead > 0 && nd_now() > g_nd_dead) g_nd_abort = 1;
+            if (!g_nd_abort) refine(f, pf, maxside, 6);
             if (cur != bestp) free(cur);
             cur = pf;
         }
@@ -239,7 +263,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
         vertex_cover(g0, part0, sepc);
         for (int v = 0; v < g0->n; v++) if (sepc[v]) part0[v] = 2;
         free(sepc);
-        node_refine(g0, part0, 8);
+        if (!g_nd_abort) node_refine(g0, part0, 8);
     } else {
         /* the separator of the coarsest bisection, projected (the members of a coarse separator
          * vertex are separator vertices) and refined at every level */
@@ -247,7 +271,8 @@ static int bisect(const Gr *g0, char *part0, int mode) {
             const Gr *f = k == 0 ? g0 : &lev[k - 1];
             char *pf = k == 0 ? part0 : malloc((size_t)f->n + 1);
             for (int v = 0; v < f->n; v++) pf[v] = cur[cmaps[k][v]];
-            node_refine(f, pf, 6);
+            if (!g_nd_abort && g_nd_dead > 0 && nd_now() > g_nd_dead) g_nd_abort = 1;
+            if (!g_nd_abort) node_refine(f, pf, 6);
             if (cur != bestp) free(cur);
             cur = pf;
         }
@@ -255,7 +280,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
     }
     free(part); free(bestp);
     for (int k = 0; k < nl; k++) { gr_free(&lev[k]); free(cmaps[k]); }
-    return 0;
+    return g_nd_abort ? 1 : 0;
 }
 
 /* maximum matching in the bipartite graph of the cut edges (Kuhn's augmenting paths) */
@@ -290,7 +315,15 @@ static void vertex_cover(const Gr *g, const char *part, char *sep) {
         free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
         return;
     }
-    for (int a = 0; a < na; a++) aug(a, g, part, bidx, mb, seen, a + 1, alist);
+    for (int a = 0; a < na; a++) {
+        if ((a & 31) == 0 && g_nd_dead > 0 && nd_now() > g_nd_dead) {      /* (past the time budget: the smaller side) */
+            g_nd_abort = 1;
+            if (na <= nb) for (int a2 = 0; a2 < na; a2++) sep[alist[a2]] = 1; else for (int b = 0; b < nb; b++) sep[blist[b]] = 1;
+            free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
+            return;
+        }
+        aug(a, g, part, bidx, mb, seen, a + 1, alist);
+    }
     for (int a = 0; a < na; a++) ma[a] = -1;
     for (int b = 0; b < nb; b++) if (mb[b] >= 0) ma[mb[b]] = b;
     /* Z: reachable from the unmatched A vertices by alternating paths; cover = (A \ Z) + (B in Z) */
@@ -333,7 +366,74 @@ static inline void nd_setst(const Gr *g, char *st, int *pw, int v, int s) {
         if (s < 2) q[s] += w;
     }
 }
+/* (21 October 2026) the one-sided refinement of a vertex separator (the moves of METIS's one-sided node refinement): in a pass the separator
+ * vertices move into one side only, each drawing its neighbours of the other side into the separator, and a vertex drawn
+ * in may move on in the same pass, so the separator can sweep across many layers; the passes alternate the sides, each
+ * back to the smallest separator it passed (ties: the better balance); the end when two passes in a row gain nothing.
+ * The two-sided refinement below locks a vertex once moved, so a separator shifts by about one layer a pass. Over 14 LP
+ * normal equations 0.663 -> 0.623 of AMD's flops in the geometric mean (dfl001 7.8e8 -> 5.0e8, rail01 1.07e10 -> 9.1e9,
+ * s250r10 1.21e9 -> 9.8e8), the order no slower. BRISK_NDREF=0: the two-sided refinement (experiments). */
+static void node_refine1(const Gr *g, char *st, int niter) {
+    const int n = g->n;
+    int *pw = calloc(2 * (size_t)n + 2, sizeof(int));
+    for (int v = 0; v < n; v++)
+        for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (st[u] < 2) pw[2 * v + st[u]] += g->vw[u]; }
+    int *mv = malloc(sizeof(int) * (n + 1)), *mp = malloc(sizeof(int) * (n + 2));
+    int *pulled = NULL, npl = 0, plcap = 0;
+    Heap H = { NULL, NULL, 0, 0 };
+    long w[3] = { 0, 0, 0 };
+    for (int v = 0; v < n; v++) w[(int)st[v]] += g->vw[v];
+    const long maxside = (long)(0.6 * (double)g->tvw) + 1;
+    int to = w[0] < w[1] ? 1 : 0, idle = 0;
+    for (int pass = 0; pass < 2 * niter && idle < 2; pass++) {
+        const int other = to; to = 1 - to;
+        H.n = 0; npl = 0;
+        int nsep = 0;
+        for (int v = 0; v < n; v++) if (st[v] == 2) { hpush(&H, g->vw[v] - pw[2 * v + other], v); nsep++; }
+        const long init = w[2];
+        long best = w[2], bestdiff = labs(w[0] - w[1]);
+        int nm = 0, bestk = 0;
+        const int limit = nsep < 100 ? 3 * nsep + 10 : (3 * nsep < 300 ? 3 * nsep : 300);
+        mp[0] = 0;
+        while (H.n > 0) {
+            const int v = H.v[0];
+            if (st[v] != 2) { hpop(&H); continue; }
+            const int gn = g->vw[v] - pw[2 * v + other];
+            if (gn != H.g[0]) { hpop(&H); hpush(&H, gn, v); continue; }
+            if (w[to] + g->vw[v] > maxside) break;
+            hpop(&H);
+            nd_setst(g, st, pw, v, to); w[2] -= g->vw[v]; w[to] += g->vw[v];
+            mv[nm] = v;
+            for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
+                const int u = g->adj[p];
+                if (st[u] != other) continue;
+                nd_setst(g, st, pw, u, 2); w[other] -= g->vw[u]; w[2] += g->vw[u];
+                if (npl == plcap) { plcap = 2 * plcap + 256; pulled = realloc(pulled, sizeof(int) * plcap); }
+                pulled[npl++] = u;
+                hpush(&H, g->vw[u] - pw[2 * u + other], u);
+                /* its separator neighbours lose a neighbour on the other side: they move into `to` for more */
+                for (int q = g->xadj[u]; q < g->xadj[u + 1]; q++) { const int x = g->adj[q]; if (st[x] == 2 && x != u) hpush(&H, g->vw[x] - pw[2 * x + other], x); }
+            }
+            nm++; mp[nm] = npl;
+            const long diff = labs(w[0] - w[1]);
+            if (w[2] < best || (w[2] == best && diff < bestdiff)) { best = w[2]; bestdiff = diff; bestk = nm; }
+            else if (nm - bestk > 3 * limit || (nm - bestk > limit && w[2] > 1.1 * best)) break;
+        }
+        for (int k = nm - 1; k >= bestk; k--) {
+            const int v = mv[k];
+            for (int q = mp[k]; q < mp[k + 1]; q++) { const int u = pulled[q]; nd_setst(g, st, pw, u, other); w[other] += g->vw[u]; w[2] -= g->vw[u]; }
+            nd_setst(g, st, pw, v, 2); w[to] -= g->vw[v]; w[2] += g->vw[v];
+        }
+        idle = best < init ? 0 : idle + 1;
+    }
+    free(pw); free(mv); free(mp); free(pulled); free(H.g); free(H.v);
+}
+static void node_refine2(const Gr *g, char *st, int npass);
 static void node_refine(const Gr *g, char *st, int npass) {
+    static int r1 = -1; if (r1 < 0) { const char *e = getenv("BRISK_NDREF"); r1 = !(e && atoi(e) == 0); }
+    if (r1) node_refine1(g, st, 10); else node_refine2(g, st, npass);
+}
+static void node_refine2(const Gr *g, char *st, int npass) {
     const int n = g->n;
     int *pw = calloc(2 * (size_t)n + 2, sizeof(int));
     for (int v = 0; v < n; v++)
@@ -420,6 +520,8 @@ static int g_nd_try_set = -1, g_nd_leaf_set = -1;
 void nd_set_params(int ntry, int leaf) { g_nd_try_set = ntry; g_nd_leaf_set = leaf; }
 static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
     const int n = g->n;
+    if (g_nd_dead > 0 && !g_nd_abort && nd_now() > g_nd_dead) g_nd_abort = 1;
+    if (g_nd_abort) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     if (n <= leaf || depth > 60) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     /* hubs (vertices of many times the mean degree) go last without a search: they are in every
      * good separator of what they connect, and an edge bisection cannot afford to cut their edges */
@@ -450,6 +552,42 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
         }
     }
 nohubs:;
+    /* (21 October 2026) a graph of several connected components: each is ordered on its own, with no separator between
+     * them (neos-2075418-temuka's normal equations without their hub rows: 147 components, which the bisections split
+     * with empty separators at the cost of a multilevel bisection each) */
+    {
+        int *cc = malloc(sizeof(int) * (n + 1)), *qq = malloc(sizeof(int) * (n + 1)), ncc = 0;
+        if (cc && qq) {
+            for (int v = 0; v < n; v++) cc[v] = -1;
+            for (int s0 = 0; s0 < n; s0++) if (cc[s0] < 0) {
+                int h = 0, t = 0; qq[t++] = s0; cc[s0] = ncc;
+                while (h < t) { const int v = qq[h++]; for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) if (cc[g->adj[p]] < 0) { cc[g->adj[p]] = ncc; qq[t++] = g->adj[p]; } }
+                ncc++;
+            }
+        }
+        if (ncc > 1) {
+            int *csz = calloc((size_t)ncc + 1, sizeof(int)), *cnz = calloc((size_t)ncc + 1, sizeof(int)), *loc = malloc(sizeof(int) * (n + 1));
+            for (int v = 0; v < n; v++) { loc[v] = csz[cc[v]]++; cnz[cc[v]] += g->xadj[v + 1] - g->xadj[v]; }
+            Gr *sub = malloc(sizeof(Gr) * ncc); int **sname = malloc(sizeof(int *) * ncc), *fill = calloc((size_t)ncc + 1, sizeof(int)), *wpos = calloc((size_t)ncc + 1, sizeof(int));
+            for (int c = 0; c < ncc; c++) {
+                sub[c].n = csz[c]; sub[c].tvw = csz[c];
+                sub[c].xadj = malloc(sizeof(int) * (csz[c] + 1)); sub[c].adj = malloc(sizeof(int) * (cnz[c] + 1)); sub[c].ew = malloc(sizeof(int) * (cnz[c] + 1)); sub[c].vw = malloc(sizeof(int) * (csz[c] + 1));
+                sname[c] = malloc(sizeof(int) * (csz[c] + 1));
+            }
+            for (int v = 0; v < n; v++) {
+                const int c = cc[v], k = fill[c]++;
+                sub[c].xadj[k] = wpos[c]; sub[c].vw[k] = 1; sname[c][k] = name[v];
+                for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { sub[c].adj[wpos[c]] = loc[g->adj[p]]; sub[c].ew[wpos[c]] = 1; wpos[c]++; }
+            }
+            for (int c = 0; c < ncc; c++) sub[c].xadj[csz[c]] = wpos[c];
+            free(cc); free(qq); free(csz); free(cnz); free(loc); free(fill); free(wpos);
+            gr_free(g); free(name);
+            for (int c = 0; c < ncc; c++) nd_rec(&sub[c], sname[c], perm, np, leaf, depth + 1);
+            free(sub); free(sname);
+            return;
+        }
+        free(cc); free(qq);
+    }
     char *part = malloc((size_t)n + 1), *sep = malloc((size_t)n + 1), *bpart = malloc((size_t)n + 1), *bsep = malloc((size_t)n + 1);
     if (!part || !sep || !bpart || !bsep) { free(part); free(sep); free(bpart); free(bsep); leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     /* several bisections (the matching and the seeds are random), the smallest separator kept */
@@ -458,6 +596,7 @@ nohubs:;
     const int ntry = g_nd_try_set > 0 ? g_nd_try_set : getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : g_nd_hubs ? 4 : 2;
     long bestscore = -1;
     for (int t = 0; t < ntry; t++) {
+        if (g_nd_dead > 0 && t > 0 && nd_now() > g_nd_dead) { g_nd_abort = 1; break; }   /* (past the time budget: no more tries) */
         if (bisect(g, part, t & 1)) break;
         long c[3] = { 0, 0, 0 };
         for (int v = 0; v < n; v++) c[(int)part[v]]++;
@@ -516,5 +655,5 @@ int nd_order(int n, const int *xadj, const int *adjncy, int *perm) {
     g.xadj[n] = w;
     int np = 0;
     nd_rec(&g, name, perm, &np, g_nd_leaf_set > 0 ? g_nd_leaf_set : getenv("BRISK_NDLEAF") ? atoi(getenv("BRISK_NDLEAF")) : 200, 0);
-    return np == n ? 0 : 1;
+    return np == n && !g_nd_abort ? 0 : 1;
 }

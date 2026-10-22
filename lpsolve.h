@@ -9,6 +9,13 @@ typedef struct {
     double timelimit;           /* seconds; <= 0: none */
     const volatile int *stop;   /* set to nonzero from outside to stop (may be NULL) */
     int kcorr;                  /* centrality correctors per iteration; < 0: chosen from the costs */
+    double objoff;              /* (22 October 2026) the problem's objective is c'x + objoff (the constant the standard form
+                                   dropped, from columns shifted to their bounds and the presolve): the gap is measured
+                                   against |c'x + objoff|, the objective as given, as Gurobi and MOSEK measure it */
+    double dthr;                /* (22 October 2026) the dense columns: 0 chosen by cost, > 0 the columns longer than
+                                   this, < 0 the default rule (the dual form passes the choice its cost model made) */
+    int nopdreg;                /* (22 October 2026) 1: no primal-dual regularization at a breakdown (the crossover's
+                                   solve: a regularized end point cost dfl001's crossover 17,075 iterations against 3) */
 } LpIpmOpts;
 typedef struct {
     int status;                 /* 0 optimal, 3 iteration limit, 4 stalled or diverging (see why), 6 stopped */
@@ -26,6 +33,14 @@ int lpipm_solve(int m, int n, int nfree, const int *Ap, const int *Ai, const dou
  * where unbounded) and the class sizes rcnt (nr), ccnt (nc); returns 0 when the partition is not equitable. */
 int lp_fold_partition(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
                       int *rcl, int *ccl, int *nrc, int *ncc);
+/* (22 October 2026) the same partition by incremental refinement (the work of a pass is that of the elements that
+ * changed class); the classes numbered differently. The LP method's own (lpipm_solve, the command line's check) */
+int lp_fold_partition_inc(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
+                          int *rcl, int *ccl, int *nrc, int *ncc);
+/* the same, stopping with "no fold" (0, every row and column its own class) as soon as the classes exceed stop (m + n):
+ * the refinement only splits classes, so their number then stays above (the command line's check, stop 0.5) */
+int lp_fold_partition_stop(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
+                           int *rcl, int *ccl, int *nrc, int *ncc, double stop);
 int lp_fold_quotient(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
                      int *rcl, int *ccl, int nr, int nc, int *nfree_h, int **Ap_h, int **Ai_h, double **Ax_h, double **b_h, double **c_h, double **u_h,
                      int *rcnt, int *ccnt);

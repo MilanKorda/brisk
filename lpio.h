@@ -36,6 +36,7 @@ int  lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M)
 int  lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, double **ub);
 /* x of the general form from the standard form's solution; returns the objective (file convention) */
 double lp_recover(const LpProb *L, const LpMap *M, const double *xstd, double *x);
+double lp_rowviol_act(const LpProb *L, const double *x);
 /* errors of x on the problem as read: max bound and row violations, relative */
 void lp_errors(const LpProb *L, const double *x, double *ebound, double *erow);
 void lp_map_free(LpMap *M);

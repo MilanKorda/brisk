@@ -19,7 +19,7 @@ and `K`): min c'x, A x = b, x in K, with K.f (free), K.l (nonnegative), K.q (sec
 cones), K.r (rotated second-order cones) and K.s (semidefinite blocks). The same data are
 taken by `brisk.solve_sedumi` (Python), `Brisk.solve_sedumi` (Julia), `brisk_sedumi`
 (MATLAB/Octave) and `brisk_solve_sedumi` (C). A problem without semidefinite blocks is solved
-by a separate cone solver for linear and second-order cone programs; with semidefinite blocks
+by a separate SOCP solver for linear and second-order cone programs; with semidefinite blocks
 (or with `-conesolver 0`, `-prec`, `-bound`, `-certify`) the semidefinite solver takes the
 second-order cones as arrow blocks. CVXPY and JuMP models with second-order cone constraints
 are routed the same way.
@@ -28,7 +28,7 @@ are routed the same way.
 
 `./brisk problem.mps` reads a linear program in MPS format (free or fixed), presolves it and
 solves it by an interior-point method for linear programs (upper bounds kept as bounds, normal
-equations); infeasible and unbounded problems are handed to the cone solver, which returns the
+equations); infeasible and unbounded problems are handed to the SOCP solver, which returns the
 certificate. `-x file` writes x of the problem as read. The solution is an interior one (no
 crossover). `./brisk problem.cbf` (or `.cbf.gz`) reads the conic benchmark format of CBLIB for
 linear and second-order cone problems; integer variables are relaxed.

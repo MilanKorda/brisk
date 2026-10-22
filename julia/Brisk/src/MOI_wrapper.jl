@@ -626,7 +626,7 @@ function _build_cone(cache::OptimizerCache, sense::MOI.OptimizationSense, a0::Ve
     return ConeData(max(m, 1), length(seq), Ap, Ai, Ax, bs, c, nz, nn, q, r, sd, col, rowcol, roww)
 end
 
-# the cone solver takes a model without semidefinite constraints unless the options ask for
+# the SOCP solver takes a model without semidefinite constraints unless the options ask for
 # features of the semidefinite solver
 function _wants_cone(o, cache::OptimizerCache)
     F = MOI.VectorAffineFunction{Float64}

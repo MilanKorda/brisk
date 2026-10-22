@@ -9,7 +9,7 @@ BRISK is an interior-point solver for semidefinite programs (SDPs) with linear b
 ```
 
 Since version 1.2 it also solves problems with second-order cones and free variables (a
-cone solver of its own when there is no semidefinite block) and linear programs from MPS
+SOCP solver of its own when there is no semidefinite block) and linear programs from MPS
 files.
 
 It is written in C on BLAS/LAPACK, reads SDPA sparse files (`.dat-s`), SeDuMi MAT-files, MPS

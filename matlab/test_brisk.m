@@ -63,14 +63,14 @@ catch err
     ok = ~isempty(strfind(err.identifier, 'brisk')); %#ok<STREMP>
 end
 nfail = nfail + check('an invalid option raises an error (and MATLAB keeps running)', ok);
-% second-order cones (K.q, K.r): the cone solver, the semidefinite solver (mixed), high precision
+% second-order cones (K.q, K.r): the SOCP solver, the semidefinite solver (mixed), high precision
 Kq = struct('f', 2, 'l', 3, 'q', [4 3], 'r', 4);
 Aq = sprandn(5, 16, 0.6);
 pt = @() [3; 0.5 * randn(3, 1); 2; 0.5 * randn(2, 1); 1; 1; 0.3 * randn(2, 1)];
 xq = [randn(2, 1); rand(3, 1) + 0.1; pt()]; zq = [zeros(2, 1); rand(3, 1) + 0.1; pt()];
 bq = Aq * xq; cq = Aq' * randn(5, 1) + zq;
 [x, y, info, z] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0));
-nfail = nfail + check('SeDuMi second-order cone program (K.q, K.r): cone solver', strcmp(info.status, 'OPTIMAL') && ...
+nfail = nfail + check('SeDuMi second-order cone program (K.q, K.r): SOCP solver', strcmp(info.status, 'OPTIMAL') && ...
     norm(Aq * x - bq) < 1e-7 * (1 + norm(bq)) && abs(info.pobj - info.dobj) < 1e-7 * (1 + abs(info.pobj)) && ...
     x(6) >= norm(x(7:9)) - 1e-8 && 2 * x(13) * x(14) >= norm(x(15:16))^2 - 1e-8 && norm(z - (cq - Aq' * y)) < 1e-6 * (1 + norm(cq)));    % z is the solver's slack (in K); c - A'y up to the dual residual
 pq = info.pobj;

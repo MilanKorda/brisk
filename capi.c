@@ -196,7 +196,7 @@ BRISK_API int brisk_solve_file(const char *fname, int nopt, const char *const *o
  * A is m x n by columns (Ap: n + 1 column starts, Ai: rows, 0-based, Ax); K = nf free variables,
  * nl nonnegative ones, second-order cones q[0..nq-1] (x0 >= |x(1:)|), rotated cones r[0..nr-1]
  * (2 x0 x1 >= |x(2:)|^2), semidefinite blocks s[0..ns-1] (each as its d*d entries by columns),
- * in this order. Without semidefinite blocks the problem goes to the cone solver (socp.c), with
+ * in this order. Without semidefinite blocks the problem goes to the SOCP solver (socp.c), with
  * them to the semidefinite solver. The result: brisk_result_sx (x), brisk_result_y, brisk_result_sz
  * (z), status, values (pobj = c'x, dobj = b'y) and errors as for the other calls. */
 BRISK_API int brisk_solve_sedumi(int m, int n, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c,

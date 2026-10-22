@@ -7,7 +7,7 @@
 #   2. what was asked for is not advised again (-acc high, -bound d, -bound d -certify),
 #   3. the high-precision solver advises the bound only, and nothing with -bound,
 #   4. a linear program is advised the tolerance only,
-#   5. second-order cone input gets the same advice from the cone solver and from the SDP
+#   5. second-order cone input gets the same advice from the SOCP solver and from the SDP
 #      solver (-conesolver 0), with one summary each,
 #   6. -q prints no advice,
 #   7. a solve that misses the tolerance on badly scaled blocks names -blkscale -2 (not an OPTIMAL solve, not
@@ -29,8 +29,8 @@ out=$($B $D/truss1.dat-s -threads 1 -bound d -certify 2>&1); chk "-bound d -cert
 out=$($B $D/truss1.dat-s -threads 1 -prec dd 2>&1);        chk "-prec dd: the bound only" "$G|  -bound d " "$A|  -certify "
 out=$($B $D/truss1.dat-s -threads 1 -prec dd -bound d 2>&1); chk "-prec dd -bound d: nothing" "certif" "$A|$G|$R"
 out=$($B $D/afiro.mps -threads 1 2>&1);                    chk "linear program: the tolerance only" "$A|  -tol <t> " "  -prec dd |$G"
-out=$($B $D/soc_small.mat -threads 1 2>&1);                chk "second-order cones, cone solver" "cone solver|$A|  -prec dd |$G" ""
-[ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL cone solver: not exactly one summary"; fail=1; }
+out=$($B $D/soc_small.mat -threads 1 2>&1);                chk "second-order cones, SOCP solver" "SOCP solver|$A|  -prec dd |$G" ""
+[ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL SOCP solver: not exactly one summary"; fail=1; }
 out=$($B $D/soc_small.mat -threads 1 -conesolver 0 2>&1);  chk "second-order cones, SDP solver" "$A|  -prec dd |$G" ""
 [ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL -conesolver 0: not exactly one summary"; fail=1; }
 out=$($B $D/truss1.dat-s -threads 1 -q 2>&1);              chk "-q: no advice" "" "$A|$G"

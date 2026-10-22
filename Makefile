@@ -47,7 +47,7 @@ endif
 # an FMA follows the inlining, so an edit of one function moved the last bits of others (the ill-posed files of the
 # regression sets moved with every switch of a change off); the time per iteration is the same within the noise
 CFLAGS  ?= -O3 $(ARCHFLAG) -funroll-loops -ffp-contract=off $(OMPFLAG) -std=gnu11 -Wall -Wextra -Wno-unused-parameter
-SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c momaff.c blkscale.c fom.c mfipm.c lralm.c bm.c bmip.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c
+SRC      = problem.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c momaff.c blkscale.c fom.c mfipm.c lralm.c bm.c bmip.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c simplex.c simplex_lu.c simplex_pre.c
 BLAS    ?= system
 
 ifeq ($(BLAS),scipy)
@@ -102,6 +102,9 @@ hpsolve.o libobj/hpsolve.o: hp.h hpipm.inc hpfom.inc hplr.inc hppre.inc hpcert.i
 hpmp.o libobj/hpmp.o: hp.h
 socp.o libobj/socp.o: socp.h
 sedumi.o libobj/sedumi.o main.o libobj/main.o: socp.h sedumi.h
+# (22 October 2026) the LP method's options struct is shared by these: a field added to it in lpsolve.h left main.o with
+# the old layout (memset of the smaller struct, the new field from the stack)
+lpsolve.o libobj/lpsolve.o main.o libobj/main.o sedumi.o libobj/sedumi.o simplex.o libobj/simplex.o: lpsolve.h
 
 # the bundled OpenMP runtime against serial results, 1..8 threads (needs clang)
 omptest: omp/test_omp.c omp/brisk_omp.c omp/omp.h
