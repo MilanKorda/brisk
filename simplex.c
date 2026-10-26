@@ -3573,6 +3573,22 @@ static double auto_budget(void *vctx, double work) {
     A->declined = 1;
     return 0;
 }
+/* the test of dual_route's first step: a problem it would consider solving through its dual (outside the parallel
+ * code: ipm_route uses it in every build; inside it, the builds without SX_RACE, the bundled OpenMP runtime of
+ * macOS and OMP=0, did not link) */
+static int dual_route_applies_f(const LpProb *R, double f) {
+    if (getenv("BRISK_SXNODUAL")) return 0;
+    if (getenv("BRISK_SXFORCEDUAL")) return 1;      /* (an experiment, 23 October 2026: savsched1, which Gurobi dualizes) */
+    const double df = getenv("BRISK_SXDUALF") ? atof(getenv("BRISK_SXDUALF")) : f;
+    int est = 0;
+    for (int j = 0; j < R->n; j++) {
+        if (R->l[j] == R->u[j]) continue;
+        const int boxed = R->l[j] > -HUGEB && R->u[j] < HUGEB;
+        if (R->Ap[j + 1] - R->Ap[j] > 1 || boxed) est++;
+    }
+    return df * est <= R->m;
+}
+static int dual_route_applies(const LpProb *R) { return dual_route_applies_f(R, 2.0); }
 #ifdef SX_RACE
 /* the race by the clock (the owner's decision of 21 October 2026: the default with two free threads or more). The simplex
  * method starts alone with the first budget of the automatic choice, so that a cheap problem never starts the
@@ -3617,20 +3633,6 @@ static void *dir_job(void *p) {
     }
     return NULL;
 }
-/* the test of dual_route's first step: a problem it would consider solving through its dual */
-static int dual_route_applies_f(const LpProb *R, double f) {
-    if (getenv("BRISK_SXNODUAL")) return 0;
-    if (getenv("BRISK_SXFORCEDUAL")) return 1;      /* (an experiment, 23 October 2026: savsched1, which Gurobi dualizes) */
-    const double df = getenv("BRISK_SXDUALF") ? atof(getenv("BRISK_SXDUALF")) : f;
-    int est = 0;
-    for (int j = 0; j < R->n; j++) {
-        if (R->l[j] == R->u[j]) continue;
-        const int boxed = R->l[j] > -HUGEB && R->u[j] < HUGEB;
-        if (R->Ap[j + 1] - R->Ap[j] > 1 || boxed) est++;
-    }
-    return df * est <= R->m;
-}
-static int dual_route_applies(const LpProb *R) { return dual_route_applies_f(R, 2.0); }
 static double g_race_wait;   /* (diagnostic) the time spent waiting for a losing interior-point method to stop */
 static double race_budget(void *vctx, double work) {
     RaceCtx *C = vctx;

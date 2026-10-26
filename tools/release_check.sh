@@ -23,6 +23,7 @@ run "Python and CVXPY"                        make pytest
 run "MATLAB's ILP64 BLAS layer (R2, R3)"      make blas64test
 run "library under AddressSanitizer (R5)"     make asantest
 run "clang + bundled OpenMP (R6)"             bash -c 'have() { command -v "$1" > /dev/null; }; have clang && make omptest'
+run "solver with the bundled OpenMP (R14)"    bash -c 'command -v clang > /dev/null || exit 1; d=$(mktemp -d); trap "rm -rf $d" EXIT; cp -r Makefile ./*.c ./*.h ./*.inc libbrisk.map libbrisk.exp amd omp tools "$d" && make -s -C "$d" clean && make -s -C "$d" -j4 OMP=bundled CC=clang brisk && "$d/brisk" examples/afiro.mps -q && "$d/brisk" examples/theta1.dat-s -q'
 run "Octave: MEX build and test_brisk"        bash -c 'command -v octave-cli > /dev/null && cd matlab && octave-cli --eval "build_brisk_mex; test_brisk" | tee /dev/stderr | grep -q "test_brisk: all checks passed"'
 run "Julia + JuMP + full MOI suite (R7)"      bash -c "[ -x '$JULIA' ] && cd julia/Brisk && BRISK_TEST_MOI=1 '$JULIA' --project=. -e 'import Pkg; Pkg.test(\"Brisk\")'"
 echo "passed: ${#pass[@]}, failed: ${#fail[@]}"
