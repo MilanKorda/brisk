@@ -41,10 +41,9 @@ int dualize_has_objective(const Problem *P) {
     return 0;
 }
 
-PSDual *dualize_apply(Problem *P, int automatic, int verbose) {
+PSDual *dualize_apply(Problem *P, int automatic, int verbose, PSOrig **pOf) {
     const int m = P->m, nb = P->nblk;
-    FreePair *pr = NULL;
-    const int np = free_pairs_detect(P, &pr);
+    if (pOf) *pOf = NULL;
     /* sizes: N (cone dimension), nonneg LP variables, SDP blocks */
     long N = 0; int nsdp = 0, nlp = 0;
     for (int k = 0; k < nb; k++) {
@@ -52,10 +51,17 @@ PSDual *dualize_apply(Problem *P, int automatic, int verbose) {
         if (B->type == BLK_SDP) { N += (long)B->n * (B->n + 1) / 2; nsdp++; }
         else nlp += B->n;
     }
+    /* 23 October 2026: the parts of the automatic rule that need no pairs first, and the copy of the problem as read
+     * (pOf) only once the form is taken (a D-optimal design with 64 blocks and 9.9 million entries: 1.0 s of pair
+     * detection and copy for a form the block count excludes) */
+    if (automatic && (nsdp > 32 || !dualize_has_objective(P))) return NULL;
+    FreePair *pr = NULL;
+    const int np = free_pairs_detect(P, &pr);
     const long mK = m - np, mD = N + (nlp - 2L * np) + np - m;
     if (automatic) {
-        if (nsdp > 32 || mD < 1 || mD > mK / 2 || mK < 20 || !dualize_has_objective(P)) { free(pr); return NULL; }
+        if (mD < 1 || mD > mK / 2 || mK < 20) { free(pr); return NULL; }
     } else if (mD < 1) { free(pr); return NULL; }
+    if (pOf) *pOf = ps_orig_build(P);
     /* pair slot map: (block, slot) -> pair index or -1 */
     int **pslot = dx(sizeof(int *) * (nb + 1));
     for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP) { pslot[k] = dx(sizeof(int) * (P->blk[k].n + 1)); for (int l = 0; l < P->blk[k].n; l++) pslot[k][l] = -1; }

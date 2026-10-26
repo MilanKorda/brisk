@@ -27,16 +27,53 @@ typedef struct { int n; int *xadj, *adj, *ew, *vw; long tvw; } Gr;
 
 /* (21 October 2026) a time budget: once past it the rest is ordered by AMD and nd_order reports failure (the caller keeps its
  * own order); 0: none */
-static double g_nd_dead = 0; static int g_nd_abort = 0;
+/* (23 October 2026, the night) the budget in work, not in seconds: the edges each phase goes over (coarsening, the
+ * refinements' passes, the vertex cover, the leaves' AMD), so the order is the same on every run and at any load; the
+ * clock made it depend on the host and on the other threads (triptim1, LP: factors of 7.8 and 14.1 million entries from
+ * one run to the next). The caller's seconds are converted at ND_RATE units a second; thread-local, since orderings run
+ * on several threads at once. BRISK_NDCLOCK=1: the wall clock as before. */
+#define ND_RATE 2e8
+static _Thread_local double g_nd_wdead = 0, g_nd_work = 0, g_nd_dead = 0; static _Thread_local int g_nd_abort = 0;
+/* (24 October 2026, the night) the flops of the order the dissection must beat (AMD's), for the bounds on its first
+ * bisection (bisect, nd_rec); 0: none. g_nd_first: the first bisection not yet made; g_nd_top: the vertices already put
+ * last above it (hubs) */
+static _Thread_local double g_nd_target = 0; static _Thread_local int g_nd_first = 0, g_nd_top = 0;
+/* a first separator of s vertices that cannot lead to an order beating the target: ordered last, it fills into a dense
+ * block whose factorization alone costs s^3/3 flops. (A first try that does not separate is no reason to stop: a later
+ * try may; stopping there lost opm2-z10-s4's order, LP, 1.14e10 flops against AMD's 1.76e10.) */
+static int nd_first_hopeless(double s, double small) {
+    (void)small;
+    if (!g_nd_first || g_nd_target <= 0) return 0;
+    const double st = s + g_nd_top;
+    return st * st * st / 3.0 > g_nd_target;
+}
 static double nd_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
-void nd_set_deadline(double seconds) { g_nd_dead = seconds > 0 ? nd_now() + seconds : 0; g_nd_abort = 0; }
-static unsigned int nd_seed;
+static int nd_clock(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_NDCLOCK"); c = e && atoi(e) == 1; } return c; }
+void nd_set_deadline(double seconds) {
+    g_nd_wdead = seconds > 0 ? g_nd_work + seconds * ND_RATE : 0; g_nd_dead = seconds > 0 ? nd_now() + seconds : 0; g_nd_abort = 0;
+}
+double nd_work_count(void) { return g_nd_work; }
+double nd_work_rate(void) { return ND_RATE; }
+static int nd_past(void) { return nd_clock() ? (g_nd_dead > 0 && nd_now() > g_nd_dead) : (g_nd_wdead > 0 && g_nd_work > g_nd_wdead); }
+/* (22 October 2026, the SOCP developer, for the QP method) a budget of work set by the caller (sparsechol.c, when the
+ * QP method sets the ordering's budget): the vertices and edges the coarsening and the refinement passes go through,
+ * counted as on its branch (ND_WORK), so that the QP method's orders are those it was measured with; 0: none. Merged on
+ * 26 October 2026 beside the LP developer's counted deadline above (g_nd_work, in its own units) */
+static _Thread_local double g_nd_qwork = 0, g_nd_wlim = 0;
+void nd_set_work_budget(double units) { g_nd_wlim = units > 0 ? units : 0; if (units > 0) g_nd_qwork = 0; g_nd_abort = 0; }   /* (the count kept after a 0, for the log) */
+double nd_work_done(void) { return g_nd_qwork; }
+int nd_aborted(void) { return g_nd_abort; }      /* (the last nd_order stopped at its budget) */
+static int nd_over(void) { return nd_past() || (g_nd_wlim > 0 && g_nd_qwork > g_nd_wlim); }
+#define ND_WORK(units) (g_nd_qwork += (double)(units))
+static _Thread_local unsigned int nd_seed;     /* (per thread: orderings run on several threads at once) */
 static unsigned int nd_rand(void) { nd_seed = nd_seed * 1664525u + 1013904223u; return nd_seed >> 8; }
 static void gr_free(Gr *g) { free(g->xadj); free(g->adj); free(g->ew); free(g->vw); }
 
 /* one level of coarsening; cmap[v]: the coarse vertex of v. 0: done, 1: no memory */
 static int coarsen(const Gr *g, Gr *c, int *cmap, long maxvw) {
     const int n = g->n;
+    g_nd_work += 2.0 * g->xadj[n] + n;
+    ND_WORK(n + g->xadj[n]);
     int *match = malloc(sizeof(int) * (n + 1)), *ord = malloc(sizeof(int) * (n + 1));
     if (!match || !ord) { free(match); free(ord); return 1; }
     for (int i = 0; i < n; i++) { match[i] = -1; ord[i] = i; }
@@ -117,12 +154,62 @@ static void hpop(Heap *h) {
     h->g[i] = gain; h->v[i] = v;
 }
 
+/* (24 October 2026) the same heap indexed by vertex: a vertex is in it at most once and a new gain updates its entry in
+ * place, where the plain heap took a new entry and left the old one to be popped as stale (a vertex pushed once for every
+ * neighbour that moved: on rail01, LP, 14 million pops in the analysis, a sixth of its time). The choices are those of
+ * the plain heap up to the order among equal gains. BRISK_NDIHEAP=0: the plain heap */
+static int nd_iheap(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_NDIHEAP"); c = !(e && atoi(e) == 0); } return c; }
+typedef struct { int *g, *v, *pos; int n, cap; } IHeap;
+static void ih_init(IHeap *h, int nv) { h->g = h->v = NULL; h->n = h->cap = 0; h->pos = malloc(sizeof(int) * ((size_t)nv + 1)); for (int i = 0; i < nv; i++) h->pos[i] = -1; }
+static void ih_free(IHeap *h) { free(h->g); free(h->v); free(h->pos); }
+static void ih_clear(IHeap *h) { for (int i = 0; i < h->n; i++) h->pos[h->v[i]] = -1; h->n = 0; }
+static void ih_up(IHeap *h, int i) {
+    const int gain = h->g[i], v = h->v[i];
+    while (i > 0) { const int p = (i - 1) >> 1; if (h->g[p] >= gain) break; h->g[i] = h->g[p]; h->v[i] = h->v[p]; h->pos[h->v[i]] = i; i = p; }
+    h->g[i] = gain; h->v[i] = v; h->pos[v] = i;
+}
+static void ih_down(IHeap *h, int i) {
+    const int gain = h->g[i], v = h->v[i];
+    for (;;) {
+        int c = 2 * i + 1;
+        if (c >= h->n) break;
+        if (c + 1 < h->n && h->g[c + 1] > h->g[c]) c++;
+        if (h->g[c] <= gain) break;
+        h->g[i] = h->g[c]; h->v[i] = h->v[c]; h->pos[h->v[i]] = i; i = c;
+    }
+    h->g[i] = gain; h->v[i] = v; h->pos[v] = i;
+}
+static void ih_set(IHeap *h, int gain, int v) {
+    int i = h->pos[v];
+    if (i >= 0) { const int old = h->g[i]; h->g[i] = gain; if (gain > old) ih_up(h, i); else if (gain < old) ih_down(h, i); return; }
+    if (h->n == h->cap) { h->cap = 2 * h->cap + 64; h->g = realloc(h->g, sizeof(int) * h->cap); h->v = realloc(h->v, sizeof(int) * h->cap); }
+    i = h->n++; h->g[i] = gain; h->v[i] = v; h->pos[v] = i; ih_up(h, i);
+}
+static void ih_pop(IHeap *h) {
+    h->pos[h->v[0]] = -1;
+    if (--h->n == 0) return;
+    h->g[0] = h->g[h->n]; h->v[0] = h->v[h->n]; h->pos[h->v[0]] = 0; ih_down(h, 0);
+}
+
+/* the heap of the refinements: indexed or plain (nd_iheap) */
+typedef struct { Heap h; IHeap ih; int idx; } PQ;
+static void pq_init(PQ *q, int nv) { q->idx = nd_iheap(); q->h.g = q->h.v = NULL; q->h.n = q->h.cap = 0; if (q->idx) ih_init(&q->ih, nv); }
+static void pq_free(PQ *q) { if (q->idx) ih_free(&q->ih); else { free(q->h.g); free(q->h.v); } }
+static void pq_clear(PQ *q) { if (q->idx) ih_clear(&q->ih); else q->h.n = 0; }
+static inline int pq_n(const PQ *q) { return q->idx ? q->ih.n : q->h.n; }
+static inline int pq_v(const PQ *q) { return q->idx ? q->ih.v[0] : q->h.v[0]; }
+static inline int pq_g(const PQ *q) { return q->idx ? q->ih.g[0] : q->h.g[0]; }
+static inline void pq_push(PQ *q, int gain, int v) { if (q->idx) ih_set(&q->ih, gain, v); else hpush(&q->h, gain, v); }
+static inline void pq_pop(PQ *q) { if (q->idx) ih_pop(&q->ih); else hpop(&q->h); }
+
 /* refinement of the bisection part[] (0/1); returns the cut */
 static long refine(const Gr *g, char *part, long maxside, int npass) {
     const int n = g->n;
+    g_nd_work += (double)(npass + 1) * (g->xadj[n] + n);
+    ND_WORK((double)npass * (n + g->xadj[n]));
     int *ed = malloc(sizeof(int) * (n + 1)), *id = malloc(sizeof(int) * (n + 1)), *moved = malloc(sizeof(int) * (n + 1));
     char *lock = malloc((size_t)n + 1);
-    Heap H[2] = { { NULL, NULL, 0, 0 }, { NULL, NULL, 0, 0 } };
+    PQ H[2]; pq_init(&H[0], n); pq_init(&H[1], n);
     long cut = 0, w[2] = { 0, 0 };
     for (int v = 0; v < n; v++) {
         int e = 0, i = 0;
@@ -132,8 +219,8 @@ static long refine(const Gr *g, char *part, long maxside, int npass) {
     cut /= 2;
     for (int pass = 0; pass < npass; pass++) {
         memset(lock, 0, (size_t)n);
-        H[0].n = H[1].n = 0;
-        for (int v = 0; v < n; v++) if (ed[v] > 0 || g->xadj[v + 1] == g->xadj[v]) hpush(&H[(int)part[v]], ed[v] - id[v], v);
+        pq_clear(&H[0]); pq_clear(&H[1]);
+        for (int v = 0; v < n; v++) if (ed[v] > 0 || g->xadj[v + 1] == g->xadj[v]) pq_push(&H[(int)part[v]], ed[v] - id[v], v);
         const int ok0 = w[0] <= maxside && w[1] <= maxside;
         long best = ok0 ? cut : LONG_MAX, cur = cut, bestimb = labs(w[0] - w[1]);
         int nm = 0, bestk = 0, bad = 0;
@@ -141,15 +228,15 @@ static long refine(const Gr *g, char *part, long maxside, int npass) {
         while (bad < limit) {
             /* the side to move from: the one over its limit, else the better gain */
             int side = -1;
-            for (int s = 0; s < 2; s++) while (H[s].n > 0 && (lock[H[s].v[0]] || part[H[s].v[0]] != s || H[s].g[0] != ed[H[s].v[0]] - id[H[s].v[0]])) hpop(&H[s]);
-            if (w[0] > maxside && H[0].n > 0) side = 0;
-            else if (w[1] > maxside && H[1].n > 0) side = 1;
-            else if (H[0].n > 0 && H[1].n > 0) side = H[0].g[0] > H[1].g[0] ? 0 : H[0].g[0] < H[1].g[0] ? 1 : (w[0] >= w[1] ? 0 : 1);
-            else if (H[0].n > 0) side = 0;
-            else if (H[1].n > 0) side = 1;
+            for (int s = 0; s < 2; s++) while (pq_n(&H[s]) > 0 && (lock[pq_v(&H[s])] || part[pq_v(&H[s])] != s || pq_g(&H[s]) != ed[pq_v(&H[s])] - id[pq_v(&H[s])])) pq_pop(&H[s]);
+            if (w[0] > maxside && pq_n(&H[0]) > 0) side = 0;
+            else if (w[1] > maxside && pq_n(&H[1]) > 0) side = 1;
+            else if (pq_n(&H[0]) > 0 && pq_n(&H[1]) > 0) side = pq_g(&H[0]) > pq_g(&H[1]) ? 0 : pq_g(&H[0]) < pq_g(&H[1]) ? 1 : (w[0] >= w[1] ? 0 : 1);
+            else if (pq_n(&H[0]) > 0) side = 0;
+            else if (pq_n(&H[1]) > 0) side = 1;
             if (side < 0) break;
-            const int v = H[side].v[0], gain = H[side].g[0];
-            hpop(&H[side]);
+            const int v = pq_v(&H[side]), gain = pq_g(&H[side]);
+            pq_pop(&H[side]);
             if (w[1 - side] + g->vw[v] > maxside && w[side] <= maxside) { lock[v] = 1; continue; }     /* (would unbalance: this vertex stays) */
             part[v] = (char)(1 - side); lock[v] = 1;
             w[side] -= g->vw[v]; w[1 - side] += g->vw[v];
@@ -158,7 +245,7 @@ static long refine(const Gr *g, char *part, long maxside, int npass) {
             for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
                 const int u = g->adj[p], ww = g->ew[p];
                 if (part[u] == side) { ed[u] += ww; id[u] -= ww; } else { ed[u] -= ww; id[u] += ww; }
-                if (!lock[u] && ed[u] > 0) hpush(&H[(int)part[u]], ed[u] - id[u], u);
+                if (!lock[u] && ed[u] > 0) pq_push(&H[(int)part[u]], ed[u] - id[u], u);
             }
             moved[nm++] = v;
             const long imb = labs(w[0] - w[1]);
@@ -182,7 +269,7 @@ static long refine(const Gr *g, char *part, long maxside, int npass) {
         cut = best;
         if (!improved) break;
     }
-    free(ed); free(id); free(moved); free(lock); free(H[0].g); free(H[0].v); free(H[1].g); free(H[1].v);
+    free(ed); free(id); free(moved); free(lock); pq_free(&H[0]); pq_free(&H[1]);
     return cut;
 }
 
@@ -200,7 +287,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
         if (coarsen(g, &lev[nl], cmap, maxvw)) { free(cmap); break; }
         if (lev[nl].n > 0.95 * g->n) { gr_free(&lev[nl]); free(cmap); break; }       /* (nothing left to match) */
         cmaps[nl] = cmap; g = &lev[nl]; nl++;
-        if (g_nd_dead > 0 && nd_now() > g_nd_dead) { g_nd_abort = 1; break; }
+        if (nd_over()) { g_nd_abort = 1; break; }
     }
     if (g_nd_abort) { for (int k = 0; k < nl; k++) { gr_free(&lev[k]); free(cmaps[k]); } return 1; }   /* (past the time budget) */
     if (getenv("BRISK_NDDBG") && atoi(getenv("BRISK_NDDBG")) >= 9) { fprintf(stderr, "      [bisect n %d: levels", g0->n); for (int k = 0; k < nl; k++) fprintf(stderr, " %d", lev[k].n); fprintf(stderr, "]\n"); }
@@ -212,7 +299,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
     long bestcut = -1;
     const int ntry = n <= 2 ? 1 : 10;
     for (int t = 0; t < ntry; t++) {
-        if (t > 0 && g_nd_dead > 0 && nd_now() > g_nd_dead) { g_nd_abort = 1; break; }
+        if (t > 0 && nd_over()) { g_nd_abort = 1; break; }
         memset(part, 1, (size_t)n);
         long wa = 0; int qh = 0, qt = 0, next = 0;
         const int seed = (int)(nd_rand() % (unsigned)(n > 0 ? n : 1));
@@ -253,12 +340,32 @@ static int bisect(const Gr *g0, char *part0, int mode) {
             const Gr *f = k == 0 ? g0 : &lev[k - 1];
             char *pf = k == 0 ? part0 : malloc((size_t)f->n + 1);
             for (int v = 0; v < f->n; v++) pf[v] = cur[cmaps[k][v]];
-            if (!g_nd_abort && g_nd_dead > 0 && nd_now() > g_nd_dead) g_nd_abort = 1;
+            if (!g_nd_abort && nd_over()) g_nd_abort = 1;
             if (!g_nd_abort) refine(f, pf, maxside, 6);
             if (cur != bestp) free(cur);
             cur = pf;
         }
         if (nl == 0) memcpy(part0, bestp, (size_t)g0->n);
+        /* (24 October 2026, the night) before the matching (most of the time of a dense cut): any cover of the cut edges has
+         * at least (cut edges) / (the most cut edges at one vertex) vertices; at the first bisection, a bound that leaves no
+         * hope stops the dissection (lp_setcover_8k, LP: 20 s for AMD's own flops) */
+        if (g_nd_first && g_nd_target > 0) {
+            long ce = 0, cmax = 0, w0 = 0, w1 = 0;
+            for (int v = 0; v < g0->n; v++) {
+                long c = 0;
+                for (int p = g0->xadj[v]; p < g0->xadj[v + 1]; p++) c += part0[g0->adj[p]] != part0[v];
+                ce += c; if (c > cmax) cmax = c;
+                if (part0[v] == 0) w0++; else w1++;
+            }
+            g_nd_work += (double)g0->xadj[g0->n] + g0->n;
+            ce /= 2;
+            if (cmax > 0 && nd_first_hopeless((double)ce / (double)cmax, (double)(w0 < w1 ? w0 : w1))) {
+                g_nd_abort = 1;
+                for (int k = 0; k < nl; k++) { gr_free(&lev[k]); free(cmaps[k]); }
+                free(bestp); free(part);
+                return 1;
+            }
+        }
         char *sepc = malloc((size_t)g0->n + 1);
         vertex_cover(g0, part0, sepc);
         for (int v = 0; v < g0->n; v++) if (sepc[v]) part0[v] = 2;
@@ -271,7 +378,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
             const Gr *f = k == 0 ? g0 : &lev[k - 1];
             char *pf = k == 0 ? part0 : malloc((size_t)f->n + 1);
             for (int v = 0; v < f->n; v++) pf[v] = cur[cmaps[k][v]];
-            if (!g_nd_abort && g_nd_dead > 0 && nd_now() > g_nd_dead) g_nd_abort = 1;
+            if (!g_nd_abort && nd_over()) g_nd_abort = 1;
             if (!g_nd_abort) node_refine(f, pf, 6);
             if (cur != bestp) free(cur);
             cur = pf;
@@ -286,7 +393,11 @@ static int bisect(const Gr *g0, char *part0, int mode) {
 /* maximum matching in the bipartite graph of the cut edges (Kuhn's augmenting paths) */
 static int aug(int a, const Gr *g, const char *part, const int *bidx, int *mb, int *seen, int stamp, const int *alist) {
     const int v = alist[a];
+    /* (24 October 2026, the night: the edges each search goes over counted in the work: uncounted, the matching of a set
+     * covering's dense cut, most of its dissection's time, ran past the budget: lp_setcover_8k, LP, 4.3e8 units counted in
+     * 15.7 s) */
     for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
+        g_nd_work += 1.0;
         const int u = g->adj[p];
         if (part[u] == part[v]) continue;
         const int b = bidx[u];
@@ -299,6 +410,7 @@ static int aug(int a, const Gr *g, const char *part, const int *bidx, int *mb, i
 /* the separator of the bisection: sep[v] = 1 for the vertices of a minimum vertex cover of the cut edges */
 static void vertex_cover(const Gr *g, const char *part, char *sep) {
     const int n = g->n;
+    g_nd_work += 2.0 * g->xadj[n] + n;
     int *bidx = malloc(sizeof(int) * (n + 1)), *alist = malloc(sizeof(int) * (n + 1)), *blist = malloc(sizeof(int) * (n + 1));
     int na = 0, nb = 0;
     for (int v = 0; v < n; v++) {
@@ -316,7 +428,7 @@ static void vertex_cover(const Gr *g, const char *part, char *sep) {
         return;
     }
     for (int a = 0; a < na; a++) {
-        if ((a & 31) == 0 && g_nd_dead > 0 && nd_now() > g_nd_dead) {      /* (past the time budget: the smaller side) */
+        if ((a & 31) == 0 && nd_over()) {      /* (past the time budget: the smaller side) */
             g_nd_abort = 1;
             if (na <= nb) for (int a2 = 0; a2 < na; a2++) sep[alist[a2]] = 1; else for (int b = 0; b < nb; b++) sep[blist[b]] = 1;
             free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
@@ -375,33 +487,35 @@ static inline void nd_setst(const Gr *g, char *st, int *pw, int v, int s) {
  * s250r10 1.21e9 -> 9.8e8), the order no slower. BRISK_NDREF=0: the two-sided refinement (experiments). */
 static void node_refine1(const Gr *g, char *st, int niter) {
     const int n = g->n;
+    g_nd_work += (double)(niter + 1) * (g->xadj[n] + n);
+    ND_WORK((double)niter * (n + g->xadj[n]));
     int *pw = calloc(2 * (size_t)n + 2, sizeof(int));
     for (int v = 0; v < n; v++)
         for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (st[u] < 2) pw[2 * v + st[u]] += g->vw[u]; }
     int *mv = malloc(sizeof(int) * (n + 1)), *mp = malloc(sizeof(int) * (n + 2));
     int *pulled = NULL, npl = 0, plcap = 0;
-    Heap H = { NULL, NULL, 0, 0 };
+    PQ H; pq_init(&H, n);
     long w[3] = { 0, 0, 0 };
     for (int v = 0; v < n; v++) w[(int)st[v]] += g->vw[v];
     const long maxside = (long)(0.6 * (double)g->tvw) + 1;
     int to = w[0] < w[1] ? 1 : 0, idle = 0;
     for (int pass = 0; pass < 2 * niter && idle < 2; pass++) {
         const int other = to; to = 1 - to;
-        H.n = 0; npl = 0;
+        pq_clear(&H); npl = 0;
         int nsep = 0;
-        for (int v = 0; v < n; v++) if (st[v] == 2) { hpush(&H, g->vw[v] - pw[2 * v + other], v); nsep++; }
+        for (int v = 0; v < n; v++) if (st[v] == 2) { pq_push(&H, g->vw[v] - pw[2 * v + other], v); nsep++; }
         const long init = w[2];
         long best = w[2], bestdiff = labs(w[0] - w[1]);
         int nm = 0, bestk = 0;
         const int limit = nsep < 100 ? 3 * nsep + 10 : (3 * nsep < 300 ? 3 * nsep : 300);
         mp[0] = 0;
-        while (H.n > 0) {
-            const int v = H.v[0];
-            if (st[v] != 2) { hpop(&H); continue; }
+        while (pq_n(&H) > 0) {
+            const int v = pq_v(&H);
+            if (st[v] != 2) { pq_pop(&H); continue; }
             const int gn = g->vw[v] - pw[2 * v + other];
-            if (gn != H.g[0]) { hpop(&H); hpush(&H, gn, v); continue; }
+            if (gn != pq_g(&H)) { if (H.idx) pq_push(&H, gn, v); else { pq_pop(&H); pq_push(&H, gn, v); } continue; }
             if (w[to] + g->vw[v] > maxside) break;
-            hpop(&H);
+            pq_pop(&H);
             nd_setst(g, st, pw, v, to); w[2] -= g->vw[v]; w[to] += g->vw[v];
             mv[nm] = v;
             for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
@@ -410,9 +524,9 @@ static void node_refine1(const Gr *g, char *st, int niter) {
                 nd_setst(g, st, pw, u, 2); w[other] -= g->vw[u]; w[2] += g->vw[u];
                 if (npl == plcap) { plcap = 2 * plcap + 256; pulled = realloc(pulled, sizeof(int) * plcap); }
                 pulled[npl++] = u;
-                hpush(&H, g->vw[u] - pw[2 * u + other], u);
+                pq_push(&H, g->vw[u] - pw[2 * u + other], u);
                 /* its separator neighbours lose a neighbour on the other side: they move into `to` for more */
-                for (int q = g->xadj[u]; q < g->xadj[u + 1]; q++) { const int x = g->adj[q]; if (st[x] == 2 && x != u) hpush(&H, g->vw[x] - pw[2 * x + other], x); }
+                for (int q = g->xadj[u]; q < g->xadj[u + 1]; q++) { const int x = g->adj[q]; if (st[x] == 2 && x != u) pq_push(&H, g->vw[x] - pw[2 * x + other], x); }
             }
             nm++; mp[nm] = npl;
             const long diff = labs(w[0] - w[1]);
@@ -426,7 +540,7 @@ static void node_refine1(const Gr *g, char *st, int niter) {
         }
         idle = best < init ? 0 : idle + 1;
     }
-    free(pw); free(mv); free(mp); free(pulled); free(H.g); free(H.v);
+    free(pw); free(mv); free(mp); free(pulled); pq_free(&H);
 }
 static void node_refine2(const Gr *g, char *st, int npass);
 static void node_refine(const Gr *g, char *st, int npass) {
@@ -435,6 +549,8 @@ static void node_refine(const Gr *g, char *st, int npass) {
 }
 static void node_refine2(const Gr *g, char *st, int npass) {
     const int n = g->n;
+    g_nd_work += (double)(npass + 1) * (g->xadj[n] + n);
+    ND_WORK((double)npass * (n + g->xadj[n]));
     int *pw = calloc(2 * (size_t)n + 2, sizeof(int));
     for (int v = 0; v < n; v++)
         for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (st[u] < 2) pw[2 * v + st[u]] += g->vw[u]; }
@@ -501,6 +617,7 @@ static void node_refine2(const Gr *g, char *st, int npass) {
 /* AMD on the graph g; its vertices' original names in name[]; appended to perm at *np */
 static void leaf_order(const Gr *g, const int *name, int *perm, int *np) {
     const int n = g->n;
+    g_nd_work += 10.0 * (g->xadj[n] + n);
     int *P = malloc(sizeof(int) * (n + 1));
     double Control[AMD_CONTROL], Info[AMD_INFO];
     amd_defaults(Control);
@@ -511,8 +628,9 @@ static void leaf_order(const Gr *g, const int *name, int *perm, int *np) {
 }
 
 /* 18 October 2026 (LP/SOCP): 0 = no hub rule (a second trial of the LP method's analysis, sparsechol.c) */
-static int g_nd_hubs = 1;
+static _Thread_local int g_nd_hubs = 1;
 void nd_set_hubs(int on) { g_nd_hubs = on; }
+void nd_set_target(double flops) { g_nd_target = flops; }
 /* (20 October 2026, LP/SOCP) the number of bisections per level and the leaf size, set by a caller for one order (-1: the
  * defaults, 4 or 2 and 200, or BRISK_NDTRY / BRISK_NDLEAF); the cone solver's full system takes one try and leaves of
  * 5,000: the prism's order in 0.9 s instead of 10 s at 0.63 of AMD's work instead of 0.43 */
@@ -520,7 +638,8 @@ static int g_nd_try_set = -1, g_nd_leaf_set = -1;
 void nd_set_params(int ntry, int leaf) { g_nd_try_set = ntry; g_nd_leaf_set = leaf; }
 static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
     const int n = g->n;
-    if (g_nd_dead > 0 && !g_nd_abort && nd_now() > g_nd_dead) g_nd_abort = 1;
+    ND_WORK(n);
+    if (!g_nd_abort && nd_over()) g_nd_abort = 1;
     if (g_nd_abort) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     if (n <= leaf || depth > 60) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     /* hubs (vertices of many times the mean degree) go last without a search: they are in every
@@ -545,6 +664,7 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
             r.xadj[k] = w;
             if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: n %d, %d hubs (degree > %.0f) last]\n", depth, n, nh, hubf * avg);
             free(loc); gr_free(g); free(name);
+            if (g_nd_first) g_nd_top += nh;
             nd_rec(&r, rname, perm, np, leaf, depth + 1);
             for (int i = 0; i < nh; i++) perm[(*np)++] = hubs[i];
             free(hubs);
@@ -596,8 +716,10 @@ nohubs:;
     const int ntry = g_nd_try_set > 0 ? g_nd_try_set : getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : g_nd_hubs ? 4 : 2;
     long bestscore = -1;
     for (int t = 0; t < ntry; t++) {
-        if (g_nd_dead > 0 && t > 0 && nd_now() > g_nd_dead) { g_nd_abort = 1; break; }   /* (past the time budget: no more tries) */
+        if (t > 0 && nd_over()) { g_nd_abort = 1; break; }   /* (past the time budget: no more tries) */
+        const double wt0 = g_nd_work;
         if (bisect(g, part, t & 1)) break;
+        const double wtry = g_nd_work - wt0;
         long c[3] = { 0, 0, 0 };
         for (int v = 0; v < n; v++) c[(int)part[v]]++;
         if (c[0] == 0 || c[1] == 0) continue;
@@ -605,7 +727,31 @@ nohubs:;
         const long big = c[0] > c[1] ? c[0] : c[1];
         const long score = c[2] * 100 + (c[2] + 1) * (100 * big / (n > 0 ? n : 1) - 50);
         if (bestscore < 0 || score < bestscore) { bestscore = score; for (int v = 0; v < n; v++) { bsep[v] = part[v] == 2; bpart[v] = part[v] == 2 ? 0 : part[v]; } }
+        /* (24 October 2026, the night) the first bisection's separator, with the hubs put last above it, is ordered last and
+         * fills into a dense block: its factorization alone costs (s^3)/3 flops. When that passes the order to beat, no
+         * dissection beats it: stop here (the caller keeps its own order). lp_setcover_8k (LP; AMD's factor 81 % full): the
+         * dissection found AMD's flops after 15 s at one thread; ex9's dual form (36 % full) has small separators */
+        if (nd_first_hopeless((double)c[2], (double)(c[0] < c[1] ? c[0] : c[1]))) { g_nd_abort = 1; break; }
+        /* (24 October 2026, the night) another try only where the separator is worth it: the best separator's s vertices
+         * fill into a dense block of s^3/3 flops a factorization, and a try costs about the work of the one just made. A
+         * try made when the block costs less than 10 times that work rarely pays over the interior-point method's 20 to 30
+         * factorizations (the dissection's counted work runs at about 5e8 units a second, the factorization at 1e11 flops
+         * on four threads): deep in the recursion and on graphs with small separators one try, at the top of graphs with
+         * large separators the four. On ten LP normal equations, ordering plus 25 factorizations at 1e11 flops a second:
+         * 78.1 -> 68.4 s (mzzv11 1.45 -> 0.71, triptim1 3.52 -> 2.20, rail01 3.76 -> 2.68, rail02 12.3 -> 9.7; the
+         * orderings 1.2 -> 0.4, 2.0 -> 0.6, 1.5 -> 0.4, 4.1 -> 1.2 s, the flops up 1 to 13 %). BRISK_NDTRYC: the factor
+         * (negative: every try) */
+        {
+            static double tc = -2; if (tc < -1) { const char *e = getenv("BRISK_NDTRYC"); tc = e ? atof(e) : 10.0; }
+            if (tc >= 0 && t + 1 < ntry) {
+                long bs = 0; for (int v = 0; v < n; v++) bs += bsep[v];
+                const double sb = (double)bs;
+                if (sb * sb * sb / 3.0 < tc * wtry) break;
+            }
+        }
     }
+    g_nd_first = 0;
+    if (g_nd_abort) { free(part); free(sep); free(bpart); free(bsep); leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     if (bestscore < 0) { free(part); free(sep); free(bpart); free(bsep); leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     memcpy(part, bpart, (size_t)n); memcpy(sep, bsep, (size_t)n);
     free(bpart); free(bsep);
@@ -642,6 +788,7 @@ nohubs:;
 int nd_order(int n, const int *xadj, const int *adjncy, int *perm) {
     if (n <= 0) return 1;
     nd_seed = 12345u;
+    g_nd_first = 1; g_nd_top = 0;
     Gr g; g.n = n; g.tvw = n;
     const int nz = xadj[n];
     g.xadj = malloc(sizeof(int) * (n + 1)); g.adj = malloc(sizeof(int) * (nz + 1)); g.ew = malloc(sizeof(int) * (nz + 1)); g.vw = malloc(sizeof(int) * (n + 1));
@@ -655,5 +802,10 @@ int nd_order(int n, const int *xadj, const int *adjncy, int *perm) {
     g.xadj[n] = w;
     int np = 0;
     nd_rec(&g, name, perm, &np, g_nd_leaf_set > 0 ? g_nd_leaf_set : getenv("BRISK_NDLEAF") ? atoi(getenv("BRISK_NDLEAF")) : 200, 0);
+    /* (23 October 2026, a test: BRISK_NDPARTIAL=1) past the budget the rest is ordered by AMD (leaf_order): that order, the
+     * top levels' separators and AMD below, is a valid permutation, offered to the caller, who keeps it when its factor is
+     * cheaper than AMD's; without it the dissection's work up to the budget is thrown away */
+    { static int part = -1; if (part < 0) { const char *e = getenv("BRISK_NDPARTIAL"); part = e && atoi(e) == 1; }
+      if (part && np == n) return 0; }
     return np == n && !g_nd_abort ? 0 : 1;
 }

@@ -36,7 +36,14 @@ static int cmp_edge(const void *A2, const void *B2) {
     if (x->a != y2->a) return x->a - y2->a;
     return x->b - y2->b;
 }
-static int cmp_w(const void *A2, const void *B2) { return ((const Edge *)B2)->w - ((const Edge *)A2)->w; }
+/* (24 October 2026: ties by the pair, so that the clique tree does not depend on whether the library's qsort is stable;
+ * glibc's is, and on the pairs sorted by cmp_edge it gave this order) */
+static int cmp_w(const void *A2, const void *B2) {
+    const Edge *x = A2, *y2 = B2;
+    if (x->w != y2->w) return y2->w - x->w;
+    if (x->a != y2->a) return x->a - y2->a;
+    return x->b - y2->b;
+}
 static int find2(int *u2, int x) { while (u2[x] != x) { u2[x] = u2[u2[x]]; x = u2[x]; } return x; }
 
 typedef struct { int *v, n, cap, alive, parent, rep; } Clique;
@@ -64,10 +71,37 @@ static int cl_has(const Clique *c, int x) {
 
 /* adjacency with dynamic arrays */
 typedef struct { int *a, n, cap; } Adj;
-static void adj_add(Adj *A, int x) {
-    for (int i = 0; i < A->n; i++) if (A->a[i] == x) return;
+static int adj_add(Adj *A, int x) {        /* (1 when x was not there) */
+    for (int i = 0; i < A->n; i++) if (A->a[i] == x) return 0;
     if (A->n == A->cap) { A->cap = A->cap ? 2 * A->cap : 8; A->a = realloc(A->a, sizeof(int) * A->cap); }
     A->a[A->n++] = x;
+    return 1;
+}
+
+/* 24 October 2026: a tree of minima over the node indices (leaf i at L + i, each inner node the minimum of its two
+ * children, INT_MAX for an eliminated node), for the minimum-degree elimination below: the smallest degree is the root,
+ * and the first nodes in index order whose degree is at most a limit come out by a descent that skips every subtree
+ * whose minimum is above it */
+typedef struct { int L, *t; } MinTree;
+static void mt_init(MinTree *T, const int *val, int n) {
+    int L = 1; while (L < n) L <<= 1;
+    T->L = L; T->t = malloc(sizeof(int) * 2 * (size_t)L);
+    for (int i = 0; i < L; i++) T->t[L + i] = i < n ? val[i] : 0x7fffffff;
+    for (int k = L - 1; k >= 1; k--) T->t[k] = T->t[2 * k] < T->t[2 * k + 1] ? T->t[2 * k] : T->t[2 * k + 1];
+}
+static void mt_set(MinTree *T, int i, int v) {
+    int k = T->L + i; T->t[k] = v;
+    for (k >>= 1; k >= 1; k >>= 1) {
+        const int m = T->t[2 * k] < T->t[2 * k + 1] ? T->t[2 * k] : T->t[2 * k + 1];
+        if (T->t[k] == m) break;          /* (the ancestors keep their minima) */
+        T->t[k] = m;
+    }
+}
+static int mt_first(const MinTree *T, int k, int lim, int *out, int nout, int cap) {
+    if (nout >= cap || T->t[k] > lim) return nout;
+    if (k >= T->L) { out[nout++] = k - T->L; return nout; }
+    nout = mt_first(T, 2 * k, lim, out, nout, cap);
+    return mt_first(T, 2 * k + 1, lim, out, nout, cap);
 }
 
 /* Convert one SDP block. Returns the number of cliques, or 0 if the block is left alone.
@@ -131,17 +165,20 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
     if (mfill < 0) { const char *e = getenv("BRISK_CH_MINFILL"); mfill = e ? atoi(e) : 3; }
     int *cand = cm(sizeof(int) * n), *mk2 = cm(sizeof(int) * n);
     for (int i = 0; i < n; i++) mk2[i] = -1;
+    /* the degrees (neighbours not yet eliminated) kept current: an elimination lowers its neighbours' by one and raises
+     * the two ends' of each fill edge; the node of smallest degree (the first in index order) and the candidates (the
+     * first 64 in index order within the slack) are read from the tree of minima. Until 24 October 2026 every step
+     * recounted every degree from the adjacency lists, O(n nnz): 8.9 s on the block of order 27,317 of
+     * pglib_opf_case13659_pegase (SDP); the same nodes are chosen. */
+    for (int i = 0; i < n; i++) deg[i] = adj[i].n;
+    MinTree MT; mt_init(&MT, deg, n);
     for (int step = 0; step < n; step++) {
-        int best = -1, bd = 1 << 30, nc = 0;
-        for (int i = 0; i < n; i++) {
-            if (gone[i]) continue;
-            int d = 0;
-            for (int q = 0; q < adj[i].n; q++) if (!gone[adj[i].a[q]]) d++;
-            deg[i] = d;
-            if (d < bd) { bd = d; best = i; }
-        }
+        int best = -1;
+        const int bd = MT.t[1];
+        if (bd == 0x7fffffff) break;
+        mt_first(&MT, 1, bd, &best, 0, 1);
         /* candidates: degree within mfill_slack of the minimum (at most 64) */
-        for (int i = 0; i < n && nc < 64; i++) if (!gone[i] && deg[i] <= bd + (mfill > 1 ? mfill - 1 : 0)) cand[nc++] = i;
+        const int nc = mt_first(&MT, 1, bd + (mfill > 1 ? mfill - 1 : 0), cand, 0, 64);
         /* ties of the minimum degree broken by the fill they create (TSSOS's MF chordal
          * extension is minimum fill; plain minimum degree gave cliques up to 32 against
          * 26 on the 162-bus AC-OPF, 1.8x the Schur factorization) */
@@ -167,13 +204,16 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
         int nb = 0;
         for (int q = 0; q < adj[best].n; q++) if (!gone[adj[best].a[q]]) buf[nb++] = adj[best].a[q];
         if (nb + 1 > par->chordal_maxclique) {                 /* treewidth too large */
+            if (getenv("BRISK_CLIQUEHASH")) printf("   [clique hash: n %d, stopped at step %d, node %d]\n", n, step, best);
             for (int i = 0; i < n; i++) free(adj[i].a);
             for (int i = 0; i < n; i++) free(cl[i].v);
-            free(adj); free(gone); free(pos); free(deg); free(cl); free(buf); free(mark); free(cand); free(mk2);
+            free(adj); free(gone); free(pos); free(deg); free(cl); free(buf); free(mark); free(cand); free(mk2); free(MT.t);
             return 0;
         }
         for (int a = 0; a < nb; a++)                            /* fill */
-            for (int b2 = a + 1; b2 < nb; b2++) { adj_add(&adj[buf[a]], buf[b2]); adj_add(&adj[buf[b2]], buf[a]); }
+            for (int b2 = a + 1; b2 < nb; b2++) { if (adj_add(&adj[buf[a]], buf[b2])) { deg[buf[a]]++; deg[buf[b2]]++; } adj_add(&adj[buf[b2]], buf[a]); }
+        for (int a = 0; a < nb; a++) { deg[buf[a]]--; mt_set(&MT, buf[a], deg[buf[a]]); }
+        mt_set(&MT, best, 0x7fffffff);
         cl[step].v = malloc(sizeof(int) * (nb + 1));
         cl[step].v[0] = best;
         memcpy(cl[step].v + 1, buf, sizeof(int) * nb);
@@ -184,7 +224,12 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
         pos[best] = step;
         gone[best] = 1;
     }
-    free(cand); free(mk2);
+    free(cand); free(mk2); free(MT.t);
+    if (getenv("BRISK_CLIQUEHASH")) {     /* (experiments: a hash of the elimination order and its cliques) */
+        uint64_t h = 1469598103934665603ULL;
+        for (int s = 0; s < n; s++) { h = (h ^ (uint64_t)pos[s]) * 1099511628211ULL; for (int q = 0; q < cl[s].n; q++) h = (h ^ (uint64_t)cl[s].v[q]) * 1099511628211ULL; }
+        printf("   [clique hash: n %d, largest %d, %016llx]\n", n, maxc, (unsigned long long)h);
+    }
     const int ncl0 = n;
     /* ---- maximality: C_v \ {v} is contained in the clique of its earliest member */
     int *repv = cm(sizeof(int) * n);                            /* node -> clique index */
@@ -276,25 +321,51 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
                 int v2 = cl[lst[i]].v[q];
                 lists[ptr[v2] + fill2[v2]++] = i;
             }
-        /* candidate edges with weights */
+        /* candidate edges with weights: each pair of cliques once per node they share (the weight |C_a ∩ C_b|).
+         * 24 October 2026: a node in k cliques gave all k(k-1)/2 pairs (a star of 8,184 cliques of two in
+         * pglib_opf_case13659_pegase, SDP: 33 million pairs, 5.5 s). Kruskal takes the edges by weight, then by pair
+         * (cmp_w), and a pair (a, b) whose shared nodes all lie in a clique c < a is never taken: (c, a) and (c, b) weigh
+         * at least as much and come first, so a, b and c are joined before (a, b) is reached. Hence a node in more than 32
+         * cliques (a hub) adds only the pairs of its first clique with the others, and a pair's weight counts the hub it
+         * shares directly. When no clique holds two hubs every pair the tree can take is still there with its weight, so
+         * the tree is the same; otherwise every pair, as before. */
+        const int HUB = 32;
+        int *hubof = NULL;
+        {
+            int nhub = 0, two = 0;
+            for (int v2 = 0; v2 < n; v2++) if (cnt2[v2] > HUB) nhub++;
+            if (nhub) {
+                hubof = malloc(sizeof(int) * (nlive ? nlive : 1));
+                for (int i = 0; i < nlive; i++) hubof[i] = -1;
+                for (int v2 = 0; v2 < n && !two; v2++) if (cnt2[v2] > HUB)
+                    for (int x = ptr[v2]; x < ptr[v2 + 1]; x++) { if (hubof[lists[x]] >= 0) { two = 1; break; } hubof[lists[x]] = v2; }
+                if (two) { free(hubof); hubof = NULL; }
+            }
+        }
         size_t ecap = 1024, ne2 = 0;
         Edge *E2 = malloc(sizeof(Edge) * ecap);
-        for (int v2 = 0; v2 < n; v2++)
-            for (int x = ptr[v2]; x < ptr[v2 + 1]; x++)
+        for (int v2 = 0; v2 < n; v2++) {
+            const int hub = hubof && cnt2[v2] > HUB;
+            for (int x = ptr[v2]; x < ptr[v2 + 1] && (!hub || x == ptr[v2]); x++)
                 for (int y2 = x + 1; y2 < ptr[v2 + 1]; y2++) {
                     if (ne2 == ecap) { ecap *= 2; E2 = realloc(E2, sizeof(Edge) * ecap); }
-                    E2[ne2].a = lists[x]; E2[ne2].b = lists[y2]; E2[ne2].w = 1;
+                    E2[ne2].a = lists[x]; E2[ne2].b = lists[y2]; E2[ne2].w = hub ? 0 : 1;
                     ne2++;
                 }
+        }
         /* accumulate duplicate pairs */
         for (size_t q = 0; q < ne2; q++) if (E2[q].a > E2[q].b) { int t2 = E2[q].a; E2[q].a = E2[q].b; E2[q].b = t2; }
         qsort(E2, ne2, sizeof(Edge), cmp_edge);
         size_t w2 = 0;
         for (size_t q = 0; q < ne2; q++) {
-            if (w2 > 0 && E2[w2 - 1].a == E2[q].a && E2[w2 - 1].b == E2[q].b) E2[w2 - 1].w++;
+            if (w2 > 0 && E2[w2 - 1].a == E2[q].a && E2[w2 - 1].b == E2[q].b) E2[w2 - 1].w += E2[q].w;
             else E2[w2++] = E2[q];
         }
         ne2 = w2;
+        if (hubof) {
+            for (size_t q = 0; q < ne2; q++) if (hubof[E2[q].a] >= 0 && hubof[E2[q].a] == hubof[E2[q].b]) E2[q].w++;
+            free(hubof);
+        }
         qsort(E2, ne2, sizeof(Edge), cmp_w);
         int *uf = malloc(sizeof(int) * nlive);
         for (int i = 0; i < nlive; i++) uf[i] = i;
@@ -341,6 +412,11 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
         }
         free(ea); free(eb); free(deg2); free(off); free(nbr); free(fl); free(seen); free(queue);
         free(lst); free(where); free(cnt2); free(ptr); free(lists); free(fill2); free(E2); free(uf);
+    }
+    if (getenv("BRISK_CLIQUEHASH")) {     /* (experiments: a hash of the clique tree) */
+        uint64_t h = 1469598103934665603ULL;
+        for (int s = 0; s < ncl0; s++) if (cl[s].alive) h = (h ^ (uint64_t)(cl[s].parent + 1)) * 1099511628211ULL;
+        printf("   [clique tree hash: %016llx]\n", (unsigned long long)h);
     }
     *cliq_out = cl;
     *repof_out = repv;
@@ -1587,7 +1663,12 @@ static int chordal_convert_moment(Problem *P, const Params *par, int verbose) {
     if (!any) return 0;
     Params q = *par;
     q.chordal = 1;
-    const double c0 = par->chordal > 0 ? 1e300 : iter_cost(P, NULL, 0);
+    /* the unconverted problem's estimate, made once a converted candidate is there to be compared with it (24 October
+     * 2026: before, always; pglib_opf_case89_pegase__min, SDP, spent 11.2 s on it for a block without a decomposition,
+     * and the solve could not take its analysis, which it takes only when it is the one it would compute itself) */
+    double c0 = -2;
+#define CH_C0() do { if (c0 == -2) { const double tc00 = wtime(); c0 = par->chordal > 0 ? 1e300 : iter_cost(P, NULL, 0); \
+                         if (getenv("BRISK_SETUPT")) printf("   [setup: the unconverted problem's cost estimate %.2fs]\n", wtime() - tc00); } } while (0)
     /* candidates (support-clique threshold, merge ratio). With the inequality multipliers
      * eliminated, the plain chordal extension without support cliques or merging gives
      * the TSSOS structure (case793: 1346 cliques, 8589 rows against TSSOS's 1352 / 8546)
@@ -1613,10 +1694,15 @@ static int chordal_convert_moment(Problem *P, const Params *par, int verbose) {
         q.chordal_sup = cand[ci];
         if (par->chordal_sup < 0) q.chordal_merge = merge_auto[ci];
         int nd = 0, maxc = 0, ok = 1;
+        static int setupt = -1; if (setupt < 0) setupt = getenv("BRISK_SETUPT") != NULL;
+        const double tc0 = wtime();
         for (int i = 0; i < nord && ok; i++) {
             const int k = ord[i]; int mc = 0;
             PSChordal r;
-            if (!cliques_pack(&P->blk[k], &q, &r, &mc)) {
+            const double tk = wtime();
+            const int packed = cliques_pack(&P->blk[k], &q, &r, &mc);
+            if (setupt) printf("   [setup: cliques of block %d (n = %d) %.2fs]\n", k + 1, P->blk[k].n, wtime() - tk);
+            if (!packed) {
                 if (verbose) printf("chordal (moment form): no clique decomposition of block %d (n = %d; clique limit %d)\n", k + 1, P->blk[k].n, q.chordal_maxclique);
                 if (P->blk[k].n > maxsmall) ok = 0;       /* too large to be written entrywise */
                 continue;
@@ -1625,9 +1711,13 @@ static int chordal_convert_moment(Problem *P, const Params *par, int verbose) {
             if (mc > maxc) maxc = mc;
         }
         Problem Qc; PSMoment Mc;
-        if (!ok || nd == 0 || !moment_build(P, nd, kcs, rs, &Qc, &Mc, maxsmall)) {
+        const double tb = wtime();
+        const int built = ok && nd > 0 && moment_build(P, nd, kcs, rs, &Qc, &Mc, maxsmall);
+        if (setupt) printf("   [setup: cliques %.2fs, moment form built %.2fs]\n", tb - tc0, wtime() - tb);
+        if (!built) {
             if (verbose) printf("chordal (moment form): not in moment form (%d block(s) decomposed; a block above %d without a decomposition)\n", nd, maxsmall);
         } else {
+            CH_C0();
             double spf = 0, tic = wtime();
             double bud = c0 < 1e300 ? par->chordal_gain2 * c0 : 0;
             if (best < 1e300 && (bud == 0 || best < bud)) bud = best;       /* cannot win: stop early */
@@ -1682,6 +1772,7 @@ static int chordal_convert_moment(Problem *P, const Params *par, int verbose) {
     if (ps) ps->mom = M; else ps_moment_free(M);
     return ndec;
 }
+#undef CH_C0
 
 int chordal_convert(Problem *P, const Params *par, int verbose) {
     if (par->chordal == 0) return 0;

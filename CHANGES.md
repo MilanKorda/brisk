@@ -1,5 +1,67 @@
 # BRISK change log
 
+## Version 1.6 (October 2026)
+
+New: quadratic programs
+- **Convex quadratic programs (QP).** `brisk problem.qps` reads a QP in the QPS format (an MPS file with a QUADOBJ,
+  QMATRIX or QSECTION section). A small QP whose quadratic term is positive definite (as in model predictive control)
+  is solved by the dual active-set method of Goldfarb and Idnani, any other by an interior-point method for QPs (the
+  regularized quasi-definite system, or the normal equations when the quadratic term is diagonal, with a presolve);
+  `-qpas` and `-qpipm` choose the method. Infeasible and unbounded QPs are reported with a certificate; a QP that is
+  not convex is refused. All 138 QPs of the Maros-Meszaros set are solved.
+- **Convex quadratically constrained programs (QCQP)**, QPS files with QCMATRIX sections: each quadratic constraint
+  becomes a second-order cone, the SOCP solver solves the problem, and a few sequential QP steps polish the point to
+  the QCQP's own optimality conditions.
+- **From Python, CVXPY and C:** `brisk.solve_qp(P, q, A, l, u, lb, ub)`, `brisk.solve_file` on a QPS file,
+  `prob.solve(solver=brisk.BRISK_QP())` in CVXPY, `brisk_solve_qp` in the C library.
+- **Re-solves for branch and bound:** a QP object (`brisk.QpModel`, `brisk_qp_create` ... `brisk_qp_resolve`)
+  re-solves after changes of bounds, row bounds and costs from the previous active set, and an SOCP object
+  (`brisk.SocpModel`, `brisk_socp_create` ...) re-solves an SOCP after bound changes, warm-started from the previous
+  point, with a cutoff for the incumbent. The QP and QCQP solvers are not yet in the Julia and MATLAB interfaces.
+
+Semidefinite programs:
+- **Doubly nonnegative programs.** Constraints X_ij >= 0 on the entries of a semidefinite block, which a model writes
+  as one equality row with an extra nonnegative variable each, are recognised and solved by the first-order engine
+  with the bounds as a cone of their own (only the other rows enter its linear system), before the interior-point
+  method. k-means and theta-plus relaxations are solved to 1e-8 many times faster: a k-means relaxation with 240
+  points from over a quarter of an hour, at reduced accuracy, to under a minute (`-fombound 0` turns it off).
+- **The end of a solve at a degenerate optimum:** a few final iterations whose Newton system is solved in its
+  augmented form, which keeps the equations satisfied where the Schur complement has lost its accuracy (Mittelmann's
+  buck3, buck4, vibra3, rose15 and SDPLIB's equalG11, equalG51, control10 now OPTIMAL). The point returned at the end
+  of a solve is chosen by the same measure as the one reported, on the problem as read.
+- **Time limits are kept by every method**, the presolve's steps, the matrix-free method, the high-precision solver
+  and the postsolve included, and the reported time counts every attempt of the run.
+- **Faster presolve on large sparse problems** (the clique search of the chordal conversion, the ordering of the
+  dependent-constraint check: an AC power flow with 13,659 buses 35 -> 10 s of presolve) and on problems where it finds
+  nothing; the symmetry search finds the whole group of vertex-transitive problems (DIMACS hamming_10_2 111 -> 6 s,
+  hamming_11_2 solved).
+- **Faces exposed by the linear constraints of a lifted relaxation** are removed by the facial reduction (Mittelmann's
+  cancer_100); **quantum state tomography** problems are solved in complex arithmetic of half the order; second-order
+  cones in SeDuMi files stay cones through to the output.
+- **The threaded sparse solves** group small subtrees into tasks of a minimum size: a problem of 30,000 blocks of
+  order 2 from 7.9 to 2.5 s, with the same results.
+- **The high-precision solver** checks its infeasibility verdicts with a certificate on the problem as read, keeps its
+  time limit, and returns the double-precision solution it started from when it cannot improve on it.
+
+Linear programs:
+- **The automatic choice of method (`-lpmethod 5`)** runs the dual simplex method and the interior-point method with
+  its crossover at the same time when it has two threads or more, and the first to finish gives the result; the
+  crossover is more stable and cheaper, and the interior-point method solves a tall problem through its dual.
+- **Sifting on the rows:** the dual simplex method solves the problem on a working set of rows, which grows until
+  every row is satisfied.
+- **A stronger presolve for the simplex method** (dominated columns, forcing and redundant rows, bounded substitution,
+  the problem's symmetry), faster solves and factorizations in the simplex method, and claims of infeasibility only
+  with a proof.
+- The ordering of the interior-point method's normal equations is the same on every run and at any thread count;
+  `-threads` is honoured by every LP method; the MPS reader is faster and refuses, with a message, the sections it does not support (indicator constraints,
+  special ordered sets).
+
+Second-order cone programs:
+- **Warm starts** for sequences of related SOCPs (the SOCP object above): in a branch and bound on 123 mixed-integer SOCPs of
+  CBLIB the node solves take about two thirds of the iterations of cold starts.
+- **Robustness:** badly scaled, nearly infeasible and degenerate SOCPs, dense rows kept as one dense block, the time
+  limit kept between iterations, files cut short refused.
+
 ## Version 1.5.5 (October 2026)
 
 Semidefinite programs:

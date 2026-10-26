@@ -42,6 +42,7 @@ struct SChol {
     size_t nnz;
     /* workspace */
     double *acc;
+    struct SPart *part;      /* (23 October 2026) the solve by independent subtrees: schol_solve_part */
     int *head, *next, *mark, *stack;
     double *acc2;            /* block-solve workspace */
     /* supernodal layout: columns [ss[k], ss[k+1]) share the row pattern of column ss[k];
@@ -50,6 +51,7 @@ struct SChol {
     size_t *pbase, pansz;
     double *pan, *pmat;
     int inplace;             /* 4.22: factor over the assembled values (pan == pmat) */
+    double *dg0;             /* (24 October 2026) in place with tiny pivots: the original diagonals, by column (the test reads them) */
     int *relind, *relidx, *snhead, *snnext, *snptr;
     double *upd;
     size_t updcap;
@@ -65,6 +67,10 @@ struct SChol {
     int ntiny;
     int tinydag;                     /* 18 October 2026 (LP/SOCP): with tinypiv, large nodes by the tile task graph too
                                       * (fnode_dag, the tiny-pivot rule in its diagonal tiles); set by the LP method only */
+    int lpsmall;                     /* (26 October 2026, the merge for 1.6) the LP method's small sources straight into the
+                                      * target (below, BRISK_LPSMALL); set by the LP method only: the tiny-pivot rule
+                                      * alone is no sign of the LP method, the SDP solver's Schur complement, the
+                                      * presolve's dependent-row check and the QP method set it too */
     double dynpiv;                   /* > 0 (signed factorization): a pivot of the wrong sign is replaced by
                                       * sign * dynpiv and counted, instead of failing */
     int ndyn;
@@ -94,6 +100,7 @@ struct SChol {
     int *sch_ptr, *sch_idx;  /* 4.24: children of each supernode, ascending */   /* 4.24: chunked M x (fixed chunks) */
     int *spar, *sfd;         /* parent supernode (-1: root), first descendant (postorder) */
     double *swk, *ssub;      /* node work estimate, subtree work */
+    double tps_par;          /* (the solve) its entries over those of the longest root-to-leaf path; 0: not computed */
     int fail;
 };
 
@@ -101,11 +108,23 @@ static const double DONE = 1.0, DZERO = 0.0;
 static const int IONE = 1;
 
 static void *sx(size_t n) { void *p = calloc(n ? n : 1, 1); if (!p) { fprintf(stderr, "brisk: out of memory\n"); exit(1); } return p; }
+/* (25 October 2026, the SOCP developer) every allocation of the analysis and the factorization checked: a work buffer that
+ * could not be allocated was written through a null pointer (QPUNB_20000, QP: a factor of 1.6e8 entries under a memory
+ * limit, a segmentation fault in dgemm instead of a message) */
+static void *sxm(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (the factorization needs %.2g GB more)\n", n / 1e9); exit(1); } return p; }
+static void *sxr(void *q, size_t n) { void *p = realloc(q, n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (the factorization needs %.2g GB more)\n", n / 1e9); exit(1); } return p; }
+/* a work buffer of doubles grown to twice what is needed, or to exactly that when twice does not fit (QPUNB_20000: the
+ * update matrix's 2.5 GB asked as 5 GB) */
+static double *sxgrow(double *q, size_t *cap, size_t need) {
+    double *p = realloc(q, sizeof(double) * 2 * need);
+    if (p) { *cap = 2 * need; return p; }
+    p = sxr(q, sizeof(double) * need); *cap = need; return p;
+}
 
 struct SAdj { int *a; int n, cap; };
 typedef struct SAdj SAdj;
 static void sadj_add(SAdj *A, int x) {
-    if (A->n == A->cap) { A->cap = A->cap ? 2 * A->cap : 8; A->a = realloc(A->a, sizeof(int) * A->cap); }
+    if (A->n == A->cap) { A->cap = A->cap ? 2 * A->cap : 8; A->a = sxr(A->a, sizeof(int) * A->cap); }
     A->a[A->n++] = x;
 }
 
@@ -140,13 +159,15 @@ void schol_set_flopcap(double cap) { g_flopcap = cap; }
 /* 17 October 2026: what the caps did in an analysis (schol_analyze_sym): whether an attempt stopped at one, and the
  * largest fill and flops an attempt reached; an analysis that met no cap is the one any caps above those give
  * (schol_analysis_fits) */
-static int g_an_hit; static size_t g_an_tot, g_an_fillcap; static double g_an_fl;
+/* (23 October 2026, the night: these and g_flopcap_own per thread, since analyses run on several threads at once: the
+ * dense-column candidates, the dissection's two trials) */
+static _Thread_local int g_an_hit; static _Thread_local size_t g_an_tot, g_an_fillcap; static _Thread_local double g_an_fl;
 /* ... by phase (g_an_ph: 1 an AMD attempt, 2 the own orderings after a failed AMD attempt, 0 the rest): a caller's cap
  * met outside the AMD attempts, where the AMD attempts stopped, and what the own orderings reached */
-static int g_an_ph, g_an_hit_other, g_an_own; static size_t g_an_amd_tot, g_an_own_tot; static double g_an_amd_fl, g_an_own_fl;
+static _Thread_local int g_an_ph, g_an_hit_other, g_an_own; static _Thread_local size_t g_an_amd_tot, g_an_own_tot; static _Thread_local double g_an_amd_fl, g_an_own_fl;
 /* ... and a limit of the analysis's own (not the caller's): the second ordering stops once its flops pass those of the
  * first, which it then cannot beat (schol_analyze) */
-static double g_flopcap_own = 0;
+static _Thread_local double g_flopcap_own = 0;
 static inline int an_over(size_t total, double flops, size_t fillcap) {
     if (total > g_an_tot) g_an_tot = total;
     if (flops > g_an_fl) g_an_fl = flops;
@@ -289,7 +310,7 @@ static int schol_order_super(int m, SAdj *adj, size_t fillcap, int **perm_out, i
             total += (size_t)len;
             flops += (double)len * len;
             if (an_over(total, flops, fillcap)) { rc = 1; break; }
-            int *pp = malloc(sizeof(int) * len);
+            int *pp = sxm(sizeof(int) * len);
             for (int c2 = c; c2 < w; c2++) pp[c2 - c] = mem[mptr[best] + c2];
             memcpy(pp + (w - c), ebuf, sizeof(int) * ne);
             perm[step] = mem[mptr[best] + c];
@@ -378,7 +399,7 @@ static int schol_order(int m, SAdj *adj, size_t fillcap, int **perm_out, int **c
         {
             const int r = m - step;
             if (r > 64 && mind <= m && (double)mind >= 0.9 * (r - 1)) {
-                int *rem = malloc(sizeof(int) * r), nr_ = 0;
+                int *rem = sxm(sizeof(int) * r), nr_ = 0;
                 for (int i = 0; i < m; i++) if (!gone[i]) rem[nr_++] = i;
                 double fl2 = 0; size_t tot2 = 0;
                 for (int t = 0; t < nr_; t++) { const double len = nr_ - t; fl2 += len * len; tot2 += (size_t)(nr_ - t); }
@@ -391,7 +412,7 @@ static int schol_order(int m, SAdj *adj, size_t fillcap, int **perm_out, int **c
                 }
                 for (int t = 0; t < nr_; t++) {
                     const int len = nr_ - t;
-                    pat[step + t] = malloc(sizeof(int) * len);
+                    pat[step + t] = sxm(sizeof(int) * len);
                     memcpy(pat[step + t], rem + t, sizeof(int) * len);
                     plen[step + t] = len;
                     perm[step + t] = rem[t];
@@ -426,7 +447,7 @@ static int schol_order(int m, SAdj *adj, size_t fillcap, int **perm_out, int **c
             free(bnext); free(bprev); free(bhead); free(bin);
             return 1;
         }
-        pat[step] = malloc(sizeof(int) * (nb + 1));
+        pat[step] = sxm(sizeof(int) * (nb + 1));
         pat[step][0] = best;
         memcpy(pat[step] + 1, buf, sizeof(int) * nb);
         plen[step] = nb + 1;
@@ -496,6 +517,19 @@ size_t schol_pansz(const SChol *S) { return S->pansz; }
 void schol_release_factor(SChol *S) { if (S->pan != S->pmat) free(S->pan); S->pan = NULL; }
 /* (in place, the products read the compact copy mval, gathered through moff: not once moff is gone, sc_drop_moff) */
 void schol_set_inplace(SChol *S, int on) { S->inplace = on && S->moff; }
+int schol_inplace(const SChol *S) { return S ? S->inplace : 0; }
+/* (24 October 2026, the SOCP developer) in place with tiny-pivot replacement: the test compares each pivot with its
+ * original diagonal, which the factorization overwrites; the diagonals are saved by column first (m values instead of
+ * a copy of the factor: the QP method's normal equations). Returns 1 when saved (0: out of memory, the copy is used) */
+static int sc_save_diag0(SChol *S) {
+    if (!S->dg0) S->dg0 = (double *)sxm(sizeof(double) * ((size_t)S->m + 1));
+    if (!S->dg0) return 0;
+    for (int k = 0; k < S->ns; k++) {
+        const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k]; const double *P = S->pmat + S->pbase[k];
+        for (int c = 0; c < w; c++) S->dg0[j0 + c] = P[(size_t)c * nr + c];
+    }
+    return 1;
+}
 /* 18 October 2026: when the products read the factor's input directly (mdirect) and the factor has its own storage,
  * nothing reads M's offsets after the first factorization: freed before that storage is allocated (8 bytes per
  * entry of M; broyden25 155 MB) */
@@ -506,7 +540,7 @@ double *schol_values(SChol *S) { sc_ensure(S); S->mval_ok = 0; return S->pmat; }
  * of such a matrix has an L S L' factorization without pivoting. */
 void schol_set_signs(SChol *S, const signed char *sgn_orig) {
     if (!sgn_orig) { free(S->sgn); S->sgn = NULL; return; }
-    if (!S->sgn) S->sgn = malloc(S->m + 1);
+    if (!S->sgn) S->sgn = sxm(S->m + 1);
     for (int j = 0; j < S->m; j++) S->sgn[j] = sgn_orig[S->perm[j]] < 0 ? -1 : 1;
 }
 
@@ -526,7 +560,7 @@ SChol *schol_analyze_sym(int m, int *deg, int **nbr, size_t fillcap) {
     SAdj *adj = sx(sizeof(SAdj) * m);
     for (int i = 0; i < m; i++) {
         adj[i].n = adj[i].cap = deg[i];
-        adj[i].a = malloc(sizeof(int) * (deg[i] ? deg[i] : 1));
+        adj[i].a = sxm(sizeof(int) * (deg[i] ? deg[i] : 1));
         memcpy(adj[i].a, nbr[i], sizeof(int) * deg[i]);
     }
     SChol *S = schol_analyze(m, adj, fillcap);
@@ -611,6 +645,32 @@ SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap) {
     if (S) schol_attach_pattern(S, deg, nbr);
     return S;
 }
+/* (23 October 2026, the SOCP developer) the analysis S again, its ordering kept, with the relaxed amalgamation f: for a
+ * caller that knows the factor's size only after the analysis (the QP method: its factors with long columns run their
+ * narrow exact supernodes at a fraction of the dense kernels' rate). The pattern is the one attached to S. Returns the new
+ * analysis, S freed; S itself when the new one fails */
+static int g_nd_try;           /* (defined below with the dissection's settings) */
+SChol *schol_reanalyze_amalg(SChol *S, double f) {
+    if (!S || !S->mcp || !S->mri || !S->perm) return S;
+    const int m = S->m;
+    int *deg = calloc((size_t)m + 1, sizeof(int));
+    for (int j = 0; j < m; j++) for (int q = S->mcp[j]; q < S->mcp[j + 1]; q++) { const int pr = S->mri[q]; if (pr != j) { deg[S->perm[pr]]++; deg[S->perm[j]]++; } }
+    size_t tot = 0; for (int i = 0; i < m; i++) tot += deg[i];
+    int *pool = malloc(sizeof(int) * (tot + 1)), **nbr = malloc(sizeof(int *) * ((size_t)m + 1)), *perm = malloc(sizeof(int) * ((size_t)m + 1));
+    if (!deg || !pool || !nbr || !perm) { free(deg); free(pool); free(nbr); free(perm); return S; }
+    { size_t o = 0; for (int i = 0; i < m; i++) { nbr[i] = pool + o; o += deg[i]; deg[i] = 0; } }
+    for (int j = 0; j < m; j++) for (int q = S->mcp[j]; q < S->mcp[j + 1]; q++) { const int pr = S->mri[q]; if (pr != j) { const int r = S->perm[pr], c = S->perm[j]; nbr[r][deg[r]++] = c; nbr[c][deg[c]++] = r; } }
+    memcpy(perm, S->perm, sizeof(int) * (size_t)m);
+    const int oamd = schol_set_amd(3), ond = g_nd_try; g_nd_try = 0;
+    const double oam = schol_set_amalg(f);
+    schol_set_perm(perm);
+    SChol *S2 = schol_analyze_adj(m, deg, nbr, (size_t)1 << 32);
+    schol_set_perm(NULL); schol_set_amalg(oam); schol_set_amd(oamd); g_nd_try = ond;
+    free(deg); free(pool); free(nbr); free(perm);
+    if (!S2) return S;
+    schol_free(S);
+    return S2;
+}
 
 
 #ifdef HAVE_AMD
@@ -642,6 +702,47 @@ static int schol_order_amd(int m, SAdj *adj, size_t fillcap, int **perm_out, int
     return schol_symb_perm(m, adj, fillcap, P, perm_out, cpat_len, cpat, flops_out, nnz_out);
 }
 #endif
+/* (23 October 2026) the cost of a factorization in AMD's order from AMD's own counts, without the symbolic factorization:
+ * per pivot block of f columns over r rows below, AMD counts lnz = f r + f (f - 1) / 2 and s = sum_{k<f} (r + k)^2; the
+ * columns' lengths with the diagonal are r + 1 .. r + f, so this file's measures (flops = sum of the squared lengths, nnz
+ * = their sum) are flops = sum s + 2 lnz + m and nnz = lnz + m. AMD's counts are slight upper bounds (mass elimination
+ * with approximate degrees; the rows AMD takes as dense it counts as full rows at the end, a rough bound: without its
+ * dense rows the estimate of neos-4763324-toguru's default rule took 3.9 s instead of 2.1). It
+ * keeps no state, so estimates can run on several threads at once. 0: done. */
+#ifdef HAVE_AMD
+extern __thread const volatile double *brisk_amd_cap;
+extern __thread int brisk_amd_capped;
+#endif
+/* (25 October 2026) with cap (may be NULL): the ordering stops once its count of the factor's work passes *cap (read as
+ * it runs; the caller may lower it from another thread); the counts so far are then returned, a lower bound, and 2 */
+int schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatile double *cap, double *flops_out, double *nnz_out);
+int schol_amd_estimate(int m, const int *deg, int *const *nbr, double *flops_out, double *nnz_out) {
+    return schol_amd_estimate_cap(m, deg, nbr, NULL, flops_out, nnz_out);
+}
+int schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatile double *cap, double *flops_out, double *nnz_out) {
+#ifndef HAVE_AMD
+    (void)m; (void)deg; (void)nbr; (void)cap; (void)flops_out; (void)nnz_out; return 1;
+#else
+    size_t nz = 0;
+    for (int i = 0; i < m; i++) nz += (size_t)deg[i];
+    int *Ap = malloc(sizeof(int) * ((size_t)m + 1)), *Ai = malloc(sizeof(int) * (nz + 1)), *P = malloc(sizeof(int) * ((size_t)m + 1));
+    if (!Ap || !Ai || !P) { free(Ap); free(Ai); free(P); return 1; }
+    Ap[0] = 0;
+    for (int i = 0; i < m; i++) { memcpy(Ai + Ap[i], nbr[i], sizeof(int) * (size_t)deg[i]); Ap[i + 1] = Ap[i] + deg[i]; }
+    double Control[AMD_CONTROL], Info[AMD_INFO];
+    amd_defaults(Control);
+    Control[AMD_AGGRESSIVE] = 1;
+    brisk_amd_cap = cap; brisk_amd_capped = 0;
+    const int st = amd_order(m, Ap, Ai, P, Control, Info);
+    const int capped = brisk_amd_capped;
+    brisk_amd_cap = NULL; brisk_amd_capped = 0;
+    free(Ap); free(Ai); free(P);
+    if (st != AMD_OK && st != AMD_OK_BUT_JUMBLED) return 1;
+    *flops_out = Info[AMD_NMULTSUBS_LU] + 2.0 * Info[AMD_LNZ] + m;
+    *nnz_out = Info[AMD_LNZ] + m;
+    return capped ? 2 : 0;
+#endif
+}
 /* symbolic factorization along the elimination order P (P[k] = vertex eliminated k-th;
  * takes P); same outputs as schol_order */
 __attribute__((unused)) static int schol_symb_perm(int m, SAdj *adj, size_t fillcap, int *P, int **perm_out, int **cpat_len,
@@ -752,7 +853,12 @@ static int schol_order_metis(int m, SAdj *adj, size_t fillcap, int **perm_out, i
 /* 5.5: the own nested dissection (nd.c); the order is kept when its factorization is cheaper than AMD's */
 int nd_order(int n, const int *xadj, const int *adjncy, int *perm);
 static int g_nd_try = 0, g_nd_used = 0;
+static int *g_ordc_P = NULL, g_ordc_m = 0, g_ordc_used = 0; static double g_ordc_ned = 0; static uint64_t g_ordc_h = 0; static unsigned g_ordc_set = 0;   /* (the order cache, schol_analyze) */
 void schol_set_nd(int on) { g_nd_try = on; }
+/* the dissection's time budget in factorizations' worth of AMD's flops (at 2e10 a second, at least a second; 10 for the LP
+ * method; a caller that expects fewer factorizations sets fewer; 0: the default) */
+static double g_nd_budget = 0;
+void schol_set_nd_budget(double factorizations) { g_nd_budget = factorizations; }
 extern int g_nd_block;
 static unsigned an_settings(void) { return (unsigned)(g_amd + 2) | (unsigned)(g_nd_try != 0) << 8 | (unsigned)(g_nd_block != 0) << 9 | (unsigned)(g_force_perm != NULL) << 10 | (unsigned)(g_peo_try != 0) << 11; }
 int schol_nd_used(void) { return g_nd_used; }
@@ -826,6 +932,7 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
     double flops = 0;
     size_t nnz = 0;
     int ord_ok = 0;
+    int ocache = 0; uint64_t ohash = 1469598103934665603ull; double oned = 0;    /* (the order cache, below) */
     g_an_peo = 0;
     if (g_peo_try && !g_force_perm && !g_nd_block && m >= 64) {
         int *P = mcs_order(m, adj);
@@ -869,6 +976,30 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
         }
     }
 #ifdef HAVE_AMD
+    /* (24 October 2026, the night) the last order the dissection made, kept with the pattern it was made for (its size,
+     * entries and a hash of the adjacency lists, and the analysis' settings): the same pattern analyzed again takes it
+     * without ordering anew. The LP method analyzes a form once to choose it (the problem as read against the presolved
+     * one, IMPLEMENTATION 27.10) and again to solve it: rail02 (LP) ordered its 95,791 rows twice, 5.3 s each.
+     * BRISK_NDCACHE=0: off */
+    ocache = g_nd_try && !g_force_perm && m >= 1000 && !(getenv("BRISK_NDCACHE") && atoi(getenv("BRISK_NDCACHE")) == 0);
+    if (ocache) {
+        for (int i = 0; i < m; i++) {
+            oned += adj[i].n; ohash = (ohash ^ (uint64_t)adj[i].n) * 1099511628211ull;
+            for (int q = 0; q < adj[i].n; q++) ohash = (ohash ^ (uint64_t)(unsigned)adj[i].a[q]) * 1099511628211ull;
+        }
+        int *P = NULL, used = 0;
+        #pragma omp critical(schol_ordcache)
+        {
+            if (g_ordc_P && g_ordc_m == m && g_ordc_ned == oned && g_ordc_h == ohash && g_ordc_set == an_settings()) {
+                P = malloc(sizeof(int) * ((size_t)m + 1)); if (P) memcpy(P, g_ordc_P, sizeof(int) * (size_t)m); used = g_ordc_used;
+            }
+        }
+        if (P && schol_symb_perm(m, adj, fillcap, P, &perm, &plen, &pat, &flops, &nnz) == 0) {    /* (takes P) */
+            ord_ok = 1; g_nd_used = used;
+            if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: the order made for the same pattern before, %.3g flops %zu nnz]\n", m, flops, nnz);
+            goto ordered;
+        }
+    }
     /* BRISK_AMD: 0 never, 1 when the own ordering gives up (default), 2 always */
     if (g_amd < 0) { const char *e = getenv("BRISK_AMD"); g_amd = e ? atoi(e) : 1; }
     if (g_amd_big < 0) { const char *e = getenv("BRISK_AMDBIG"); g_amd_big = e ? atoi(e) : 20000; }
@@ -898,19 +1029,99 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
      * the levels and in the vertex cover's matching; an 8,000-row set covering: 1.1 s for a budget of 1 s). A quarter separated nothing: ex9's
      * dual form, 36 % full, has separators (the dissection halves its flops, 2.5e10 -> 1.2e10), a min-cost flow on a random
      * graph, 37 %, had none. BRISK_NDQUARTER=1: the rule as before. */
-    extern void nd_set_deadline(double seconds);
+    extern void nd_set_deadline(double seconds), nd_set_target(double flops); extern double nd_work_count(void), nd_work_rate(void);
     const int ndfull = (double)nnz > 0.25 * 0.5 * (double)m * (m + 1.0);
     static int ndq = -1; if (ndq < 0) { const char *e = getenv("BRISK_NDQUARTER"); ndq = e && atoi(e) == 1; }
+    /* (24 October 2026, the night) not at all when AMD's factor fills more than half the triangle: such a graph has no
+     * separator worth ordering last, the dissection's budget is then lost whole (lp_setcover_8k, LP, 80 % full: 6.3e8 units
+     * of work, 4.6 s of the analysis's 5.5, and no order; lp_setcover_5k, 59 %: 1.8 s for AMD's own flops), and where it
+     * won a factor was at most 36 % full (ex9's dual form). BRISK_NDHALF=0: tried as below */
+    static int ndh = -1; if (ndh < 0) { const char *e = getenv("BRISK_NDHALF"); ndh = !(e && atoi(e) == 0); }
+    const int ndhalf = ndh && (double)nnz > 0.5 * 0.5 * (double)m * (m + 1.0);
     if (ord_ok && g_nd_try && m >= 1000 && flops >= (getenv("BRISK_NDMINFLOPS") ? atof(getenv("BRISK_NDMINFLOPS")) : 1e9) && !g_force_perm
-        && !(ndq && ndfull) && flops >= ndedge * ned) {
-        const double ndcap = fmax(1.0, (ndfull ? 2.0 : 10.0) * flops / 2e10);
+        && !(ndq && ndfull) && !ndhalf && flops >= ndedge * ned) {
+        /* (22 October 2026) the factorization's rate per thread, and one budget for both trials below: at 2e10 a second
+         * in all, the budget of an 8,000-row set covering (1.23e11 flops, factored at 1.5e11 a second on four threads)
+         * was 12.3 s a trial, and its two dissections took 12.9 s for AMD's own order (lp_setcover_8k, LP: 13.7 of its
+         * 30.8 s) */
+        int nthr = 1;
+#ifdef _OPENMP
+        nthr = omp_get_max_threads();
+#endif
+        /* (23 October 2026, the night) the budget in the dissection's counted work (nd.c), the same at any number of threads:
+         * divided by the threads, as before, it stopped the dissection on the LPs where it pays most (at four threads
+         * triptim1 needed 1.25e9 units for a budget of 6.2e8 and fell back to AMD's order, 2.47e10 flops a factorization
+         * against 6.15e9; rail01 and s100 likewise), since the dissection runs on one thread; and the order, so the
+         * interior-point method's path, now does not depend on the threads. BRISK_NDCLOCK=1: the clock and the division
+         * as before */
+        const int ndclk = getenv("BRISK_NDCLOCK") && atoi(getenv("BRISK_NDCLOCK")) == 1;
+        /* (24 October 2026, the night) above a quarter full: two factorizations at 8e10 flops a second (the old rule's
+         * budget at four threads, now at any number): the dissection rarely pays there, and the set coverings' took 15 s of
+         * the thread-independent budget for AMD's own flops (lp_setcover_8k, LP); ex9's dual form (36 %) keeps its second */
+        /* (22 October 2026, the SOCP developer) a caller that sets the budget (the QP method) gets it as work, counted by nd.c
+         * at 1.5e8 units a second (measured 1.6-1.9e8 on QPLIB_8602, CVXQP3_L and QPLIB_8785, 0.7e8 on NNLS_100), so that
+         * its order does not depend on the machine's load; its two trials run one after the other. (Merged on 26 October
+         * 2026 beside the LP developer's budget in counted work of 23 October, which serves every other caller.) */
+        extern void nd_set_work_budget(double units); extern int nd_aborted(void);
+        const int ndwork = g_nd_budget > 0;
+        const double ndb = ndwork ? g_nd_budget : 10.0;
+        const double ndcap = ndwork ? fmax(1.0, (ndfull ? fmin(2.0, ndb) : ndb) * flops / 2e10)
+                           : ndclk ? fmax(1.0, (ndfull ? 2.0 : 10.0) * flops / (2e10 * nthr))
+                                   : fmax(1.0, ndfull ? 2.0 * flops / 8e10 : 10.0 * flops / 2e10);
+#define ND_BUDGET_ON(sec) do { if (ndwork) { nd_set_deadline(0); nd_set_work_budget(1.5e8 * ndcap); } else nd_set_deadline(sec); } while (0)
+#define ND_BUDGET_OFF() do { nd_set_deadline(0); nd_set_work_budget(0); } while (0)
+        const double ndt0 = (double)clock() / CLOCKS_PER_SEC, ndw0 = nd_work_count();
         int *perm2 = NULL, *plen2 = NULL, **pat2 = NULL;
         double flops2 = 0; size_t nnz2 = 0;
         const double tm = (double)clock() / CLOCKS_PER_SEC;
-        nd_set_deadline(ndcap);
-        const int rs = schol_order_nd(m, adj, (size_t)(1.2 * (double)nnz) + (size_t)m, &perm2, &plen2, &pat2, &flops2, &nnz2);
-        nd_set_deadline(0);
-        if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; nested dissection %s %.3g flops %zu nnz (%.2fs)]\n", m, flops, nnz, rs ? "failed/over" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - tm);
+        extern void nd_set_hubs(int on);
+        const int hub2 = !(getenv("BRISK_NDHUB2") && atoi(getenv("BRISK_NDHUB2")) == 0);
+        /* (23 October 2026, the night) the second trial (without the hub rule, below) at the same time as the first, on a
+         * second thread, each with the whole budget: both run on one thread each, and the second waited for the first
+         * (triptim1, LP: 3.2 + 1.7 s of ordering in a run of 10.7 s; rail01 and rail02 2.7 and 5.9 s more). Its own
+         * analysis' accounting is merged into the caller's after it. The result does not depend on the threads (with one
+         * thread the two run one after the other, with the same budgets). BRISK_NDPAR=0: one after the other as before */
+        const int ndpar = !ndwork && !ndclk && hub2 && flops >= 1e10 && !(getenv("BRISK_NDPAR") && atoi(getenv("BRISK_NDPAR")) == 0);
+        int rsB = 1, *permB = NULL, *plenB = NULL, **patB = NULL; double flopsB = 0, workB = 0; size_t nnzB = 0;
+        int rs = 1;
+        ND_BUDGET_ON(ndcap);
+        if (ndpar) {
+            const int ph0 = g_an_ph; const size_t fc0 = g_an_fillcap; const double fo0 = g_flopcap_own;
+            int bhit = 0, bhito = 0; size_t btot = 0, bamdt = SIZE_MAX, bownt = 0; double bfl = 0, bamdf = 1e300, bownf = 0;
+            const size_t cap1 = (size_t)(1.2 * (double)nnz) + (size_t)m;
+            #pragma omp parallel num_threads(2)
+            {
+                const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
+                if (tid == 0) { nd_set_target(flops); rs = schol_order_nd(m, adj, cap1, &perm2, &plen2, &pat2, &flops2, &nnz2); nd_set_target(0); }
+                if ((nt == 1 && tid == 0) || tid == 1) {
+                    const int other = tid == 1;
+                    int s_ph = 0, s_hit = 0, s_hito = 0; size_t s_tot = 0, s_fc = 0, s_amdt = 0, s_ownt = 0; double s_fl = 0, s_fo = 0, s_amdf = 0, s_ownf = 0;
+                    if (!other) { s_ph = g_an_ph; s_hit = g_an_hit; s_hito = g_an_hit_other; s_tot = g_an_tot; s_fc = g_an_fillcap; s_fl = g_an_fl; s_fo = g_flopcap_own;
+                                  s_amdt = g_an_amd_tot; s_amdf = g_an_amd_fl; s_ownt = g_an_own_tot; s_ownf = g_an_own_fl; }
+                    g_an_ph = ph0; g_an_fillcap = fc0; g_flopcap_own = fo0; g_an_hit = 0; g_an_hit_other = 0; g_an_tot = 0; g_an_fl = 0;
+                    g_an_amd_tot = SIZE_MAX; g_an_amd_fl = 1e300; g_an_own_tot = 0; g_an_own_fl = 0;
+                    const double w0 = nd_work_count();
+                    nd_set_hubs(0); nd_set_deadline(ndcap); nd_set_target(flops);
+                    rsB = schol_order_nd(m, adj, cap1, &permB, &plenB, &patB, &flopsB, &nnzB);
+                    nd_set_hubs(1); nd_set_deadline(0); nd_set_target(0);
+                    workB = nd_work_count() - w0;
+                    bhit = g_an_hit; bhito = g_an_hit_other; btot = g_an_tot; bfl = g_an_fl; bamdt = g_an_amd_tot; bamdf = g_an_amd_fl; bownt = g_an_own_tot; bownf = g_an_own_fl;
+                    if (!other) { g_an_ph = s_ph; g_an_hit = s_hit; g_an_hit_other = s_hito; g_an_tot = s_tot; g_an_fillcap = s_fc; g_an_fl = s_fl; g_flopcap_own = s_fo;
+                                  g_an_amd_tot = s_amdt; g_an_amd_fl = s_amdf; g_an_own_tot = s_ownt; g_an_own_fl = s_ownf; }
+                }
+            }
+            /* (the second trial's accounting merged: as if it had run in this thread) */
+            g_an_hit |= bhit; g_an_hit_other |= bhito;
+            if (btot > g_an_tot) g_an_tot = btot;
+            if (bfl > g_an_fl) g_an_fl = bfl;
+            if (bamdt < g_an_amd_tot) g_an_amd_tot = bamdt;
+            if (bamdf < g_an_amd_fl) g_an_amd_fl = bamdf;
+            if (bownt > g_an_own_tot) g_an_own_tot = bownt;
+            if (bownf > g_an_own_fl) g_an_own_fl = bownf;
+        } else { nd_set_target(flops); rs = schol_order_nd(m, adj, (size_t)(1.2 * (double)nnz) + (size_t)m, &perm2, &plen2, &pat2, &flops2, &nnz2); nd_set_target(0); }
+        const int rs_over = rs != 0 && nd_aborted();      /* (read before the budget is cleared) */
+        ND_BUDGET_OFF();
+        if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; nested dissection %s %.3g flops %zu nnz (%.2fs, work %.3g, budget %.3g)]\n", m, flops, nnz, rs ? "failed/over" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - tm, nd_work_count() - ndw0, ndcap * nd_work_rate());
         const double famd = flops;
         if (rs == 0 && flops2 < 0.9 * flops) {
             for (int j = 0; j < m; j++) free(pat[j]);
@@ -929,13 +1140,27 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
              * equations of set covering the rule puts the rows of many columns last unsearched (rail01: 913 rows over
              * the first four levels; 1.20e10 flops with it, 1.06e10 without, METIS 7.6e9; rail02: 1.29e11, 1.06e11, METIS
              * 9.8e10), for 2.7 and 5.9 s more of ordering. */
-            extern void nd_set_hubs(int on);
-            if (famd >= 1e10 && !(getenv("BRISK_NDHUB2") && atoi(getenv("BRISK_NDHUB2")) == 0)) {
+            /* (23 October 2026, the night: the budget left by the work done, not by the process's CPU clock, which counted
+             * the other threads too) */
+            const double ndleft = ndclk ? ndcap - ((double)clock() / CLOCKS_PER_SEC - ndt0) : ndcap - (nd_work_count() - ndw0) / nd_work_rate();
+            /* (23 October 2026, the SOCP developer) not when the first dissection stopped at a budget of work (the QP
+             * method's): the second runs under the same budget on a harder graph (without the hubs set apart its bisections
+             * take longer) and stops as well; QPLIB_8547 (QP): 15.6 s, then 15 s more for nothing. BRISK_NDHUB2AB=1: tried
+             * even then */
+            const int first_over = rs_over && ndwork && !(getenv("BRISK_NDHUB2AB") && atoi(getenv("BRISK_NDHUB2AB")) == 1);
+            if (ndpar) {     /* (the second trial made above, beside the first) */
+                if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: nested dissection without hubs %s %.3g flops %zu nnz (beside the first; work %.3g)]\n", m, rsB ? "failed/over" : "ok", flopsB, nnzB, workB);
+                if (rsB == 0 && flopsB < (g_nd_used ? 1.0 : 0.9) * flops) {
+                    for (int j = 0; j < m; j++) free(pat[j]);
+                    free(pat); free(plen); free(perm);
+                    perm = permB; plen = plenB; pat = patB; flops = flopsB; nnz = nnzB; g_nd_used = 1;
+                } else if (rsB == 0) { for (int j = 0; j < m; j++) free(patB[j]); free(patB); free(plenB); free(permB); }
+            } else if (famd >= 1e10 && hub2 && (ndwork ? !first_over : ndleft > 0.1)) {
                 perm2 = NULL; plen2 = NULL; pat2 = NULL; flops2 = 0; nnz2 = 0;
                 const double tm2 = (double)clock() / CLOCKS_PER_SEC;
-                nd_set_hubs(0); nd_set_deadline(ndcap);
+                nd_set_hubs(0); ND_BUDGET_ON(ndleft); nd_set_target(famd);
                 const int rs3 = schol_order_nd(m, adj, (size_t)(1.2 * (double)nnz) + (size_t)m, &perm2, &plen2, &pat2, &flops2, &nnz2);
-                nd_set_hubs(1); nd_set_deadline(0);
+                nd_set_hubs(1); ND_BUDGET_OFF(); nd_set_target(0);
                 if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: nested dissection without hubs %s %.3g flops %zu nnz (%.2fs)]\n", m, rs3 ? "failed/over" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - tm2);
                 if (rs3 == 0 && flops2 < (g_nd_used ? 1.0 : 0.9) * flops) {     /* (against the first dissection: fewer flops) */
                     for (int j = 0; j < m; j++) free(pat[j]);
@@ -1001,6 +1226,35 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
          * flops. BRISK_OWNFILL=1: that cap) */
         else if (getenv("BRISK_OWNFILL")) fillcap_own = (size_t)(1.1 * (double)nnz) + (size_t)m;
     }
+    /* (22 October 2026, the SOCP developer) the own orderings work on the explicit elimination graph, and a dense row's
+     * adjacency list is updated at every elimination next to it: their work grows like the sum of the squared degrees of
+     * the dense rows (more than 10 sqrt(m) entries, AMD's own threshold), which their flop cap does not bound. A
+     * portfolio QP's augmented system (101 dense rows of 5,000-10,000 entries, m = 10,201): 9 s of ordering for a
+     * factorization of 3e7 flops. AMD orders dense rows last by itself; the own orderings are skipped when that sum
+     * exceeds 2e8 (a few tenths of a second) and 30 times AMD's flops, more work than the ordering can save over the
+     * factorizations of an interior-point solve (BRISK_OWNDENSE=0: as before) */
+    if (!ord_ok && have_amd) {
+        static int odn = -1; if (odn < 0) { const char *e = getenv("BRISK_OWNDENSE"); odn = !(e && atoi(e) == 0); }
+        const double dth = 10.0 * sqrt((double)m); double wd = 0;
+        for (int i = 0; i < m; i++) if (adj[i].n > dth) wd += (double)adj[i].n * adj[i].n;
+        if (odn && wd > 2e8 && wd > 30.0 * flops) {
+            if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; own skipped (dense rows: %.3g)]\n", m, flops, nnz, wd);
+            ord_ok = 1;
+        }
+    }
+    /* (22 October 2026, the SOCP developer) and when they cannot pay for themselves: kept only with fewer flops than AMD's,
+     * they save at most AMD's flops per factorization, some 50 factorizations of an interior-point solve at 1e10 flops a
+     * second, while their own work grows with the pattern, about a microsecond per row and entry (UBH1, QP: 0.039 s for
+     * m = 12,000 against a factorization of 1.5e5 flops, 15 microseconds). Skipped when 50 x AMD's flops / 1e10 falls below
+     * 1e-6 (m + the pattern's entries) (BRISK_OWNMIN=0: as before) */
+    if (!ord_ok && have_amd) {
+        static int omn = -1; if (omn < 0) { const char *e = getenv("BRISK_OWNMIN"); omn = !(e && atoi(e) == 0); }
+        double na = m; for (int i = 0; i < m; i++) na += adj[i].n;
+        if (omn && 50.0 * flops / 1e10 < 1e-6 * na) {
+            if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; own skipped (it cannot pay for itself)]\n", m, flops, nnz);
+            ord_ok = 1;
+        }
+    }
     if (!ord_ok && have_amd) {
         int *perm2 = NULL, *plen2 = NULL, **pat2 = NULL;
         double flops2 = 0; size_t nnz2 = 0;
@@ -1008,11 +1262,12 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
          * pass AMD's (broyden25: it ran on to 1.4e11 against AMD's 2.7e10). The same choice, sooner. BRISK_OWNCAP=0 off */
         {   static int oc = -1; if (oc < 0) { const char *e = getenv("BRISK_OWNCAP"); oc = !(e && atoi(e) == 0); }
             g_flopcap_own = oc ? flops : 0; }
+        const double t_own0 = (double)clock() / CLOCKS_PER_SEC;
         int rs = schol_order_super(m, adj, fillcap_own, &perm2, &plen2, &pat2, &flops2, &nnz2);
         if (rs == 2 && schol_order(m, adj, fillcap_own, &perm2, &plen2, &pat2, &flops2, &nnz2)) rs = 1;
         else if (rs == 2) rs = 0;
         g_flopcap_own = 0;
-        if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; own %s %.3g flops %zu nnz]\n", m, flops, nnz, rs ? "failed" : "ok", flops2, nnz2);
+        if (getenv("BRISK_AMDBG")) printf("   [ordering m %d: AMD %.3g flops %zu nnz; own %s %.3g flops %zu nnz (%.3f s)]\n", m, flops, nnz, rs ? "failed" : "ok", flops2, nnz2, (double)clock() / CLOCKS_PER_SEC - t_own0);
         if (rs == 0 && flops2 < flops) {
             for (int j = 0; j < m; j++) free(pat[j]);
             free(pat); free(plen); free(perm);
@@ -1042,6 +1297,15 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
 #endif
 ordered:
     if (!ord_ok) return NULL;
+#ifdef HAVE_AMD
+    if (ocache && g_nd_used && perm) {      /* (the order kept for an analysis of the same pattern) */
+        #pragma omp critical(schol_ordcache)
+        {
+            int *c = realloc(g_ordc_P, sizeof(int) * ((size_t)m + 1));
+            if (c) { memcpy(c, perm, sizeof(int) * (size_t)m); g_ordc_P = c; g_ordc_m = m; g_ordc_ned = oned; g_ordc_h = ohash; g_ordc_set = an_settings(); g_ordc_used = g_nd_used; }
+        }
+    }
+#endif
     {
         /* postorder the elimination tree (same fill): a parent then follows its last
          * child, which the relaxed amalgamation below needs; the child with the longest
@@ -1104,7 +1368,7 @@ ordered:
 
     size_t p = 0;
     int maxl = 1; for (int j = 0; j < m; j++) if (plen[j] > maxl) maxl = plen[j];
-    int *stmp = malloc(sizeof(int) * (size_t)maxl);
+    int *stmp = sxm(sizeof(int) * (size_t)maxl);
     for (int j = 0; j < m; j++) {
         S->cp[j] = (int)p;
         /* column j in permuted indices: its clique, mapped and sorted, diagonal first (sc_isort: distinct integers, so
@@ -1163,7 +1427,9 @@ ordered:
         int *ss2 = sx(sizeof(int) * (ns + 1)), n2 = 0;
         int cj0 = S->ss[0], clast = S->ss[0];
         double ctrue = 0;
-        for (int c = S->ss[0]; c < S->ss[1]; c++) ctrue += S->cp[c + 1] - S->cp[c];
+        /* (26 October 2026, the merge for 1.6: an empty system, ns = 0, has no ss[1]: the SOCP solver object's re-solve
+         * of a node whose rows are all eliminated read past the array, found by AddressSanitizer) */
+        if (ns > 0) for (int c = S->ss[0]; c < S->ss[1]; c++) ctrue += S->cp[c + 1] - S->cp[c];
         for (int k = 1; k <= ns; k++) {
             int merged = 0;
             if (k < ns && afrac > 0) {
@@ -1250,12 +1516,13 @@ void schol_free(SChol *S) {
     if (!S) return;
     free(S->perm); free(S->iperm); free(S->cp); free(S->ci); free(S->mcp); free(S->mri); free(S->moff); free(S->mval); free(S->mrq); free(S->mdg); free(S->mrun); free(S->mrp); free(S->t2); free(S->sgn); free(S->sw);
     free(S->acc); free(S->acc2); free(S->head); free(S->next); free(S->mark); free(S->stack); free(S->tinv); free(S->tl);
-    free(S->ss); free(S->snof); free(S->pbase); free(S->prow); free(S->prp); free(S->pnr);
+    free(S->ss); free(S->snof); free(S->pbase); free(S->prow); free(S->prp); free(S->pnr); free(S->dg0);
     if (S->pan != S->pmat) free(S->pan);
     free(S->pmat); free(S->relind); free(S->relidx); free(S->upd); free(S->wrk);
     free(S->snhead); free(S->snnext); free(S->snptr); free(S->hkey); free(S->hval);
     free(S->mv_c); free(S->mv_zo); free(S->mv_z); free(S->mva); free(S->mv_za); free(S->mv2w); free(S->mv_z2); free(S->sch_ptr); free(S->sch_idx);
     free(S->ul_ptr); free(S->ul_j); free(S->ul_p); free(S->ul_a); free(S->spar); free(S->sfd); free(S->swk); free(S->ssub);
+    { extern void schol_part_free(SChol *S_); schol_part_free(S); }
     free(S);
 }
 
@@ -1728,7 +1995,7 @@ static int panel_potrf_dyn(SChol *S, double *Pk, int nr, int w, double **buf, si
     int info = 0;
     if (!(S->dynpiv > 0)) { info = sc_potrf(w, Pk, nr); return info != 0; }
     const size_t nw = (size_t)w * w;
-    if (nw > *cap) { *cap = 2 * nw; free(*buf); *buf = (double *)malloc(sizeof(double) * *cap); }
+    if (nw > *cap) { free(*buf); *buf = (double *)sxgrow(NULL, cap, nw); }
     double *T = *buf;
     for (int c = 0; c < w; c++) memcpy(T + (size_t)c * w + c, Pk + (size_t)c * nr + c, sizeof(double) * (size_t)(w - c));
     info = sc_potrf(w, Pk, nr);
@@ -1828,7 +2095,7 @@ static int signed_chol_blocked(double *P, int ld, int w, const signed char *sg, 
                  * instead of one product for each sign: a pass over the trailing matrix per block step instead of two,
                  * and no product of rank 1 when a block has one row among the columns of a large cone (the dense root of
                  * a sparse-feature SVM: 7,959 columns and 1 row). BRISK_SIGNEDONE=1: on (being measured) */
-                if (!dscr || dscr_n < tn) { free(dscr); dscr = (double *)malloc(sizeof(double) * (size_t)TR_ * TR_ * (size_t)tn); dscr_n = tn; }
+                if (!dscr || dscr_n < tn) { free(dscr); dscr = (double *)sxm(sizeof(double) * (size_t)TR_ * TR_ * (size_t)tn); dscr_n = tn; }
                 #pragma omp parallel for schedule(dynamic, 1) num_threads(tn) if (tn > 1 && nti > 1)
                 for (int q = 0; q < npair; q++) {
                     int ti = 0; while ((ti + 1) * (ti + 2) / 2 <= q) ti++;
@@ -1961,13 +2228,13 @@ static int schol_factor_ll(SChol *S, double shift) {
     const int ns = S->ns;
     S->mval_ok = 0;
     sc_ensure(S);
-    if (S->inplace && S->tinypiv <= 0) {
+    if (S->inplace && (S->tinypiv <= 0 || sc_save_diag0(S))) {
         /* the caller refills the values before every factorization */
         if (S->pan && S->pan != S->pmat) free(S->pan);
         S->pan = S->pmat;
     } else {
         sc_drop_moff(S);
-        if (!S->pan || S->pan == S->pmat) S->pan = malloc(sizeof(double) * (S->pansz ? S->pansz : 1));
+        if (!S->pan || S->pan == S->pmat) S->pan = sxm(sizeof(double) * (S->pansz ? S->pansz : 1));
         if (!S->pan) { fprintf(stderr, "brisk: out of memory (the copy of a sparse factor, %.1f GB)\n", 8.0 * (double)S->pansz / 1e9); exit(1); }
         memcpy(S->pan, S->pmat, sizeof(double) * S->pansz);
     }
@@ -1994,7 +2261,7 @@ static int schol_factor_ll(SChol *S, double shift) {
             if (a > 0 && g_fstat) { g_nupd++; g_updfl += 2.0 * tot * a * wj; if (tot * a < 256) g_nsmall++; }
             if (a > 0) {
                 size_t need = (size_t)tot * a;
-                if (need > S->updcap) { S->updcap = 2 * need; S->upd = realloc(S->upd, sizeof(double) * S->updcap); }
+                if (need > S->updcap) S->upd = sxgrow(S->upd, &S->updcap, need);
                 const double *U = S->pan + S->pbase[j] + p;          /* (tot x wj), ld = nrj */
                 int neg = 0;
                 if (S->sgn) for (int c = 0; c < wj; c++) if (S->sgn[S->ss[j] + c] < 0) { neg = 1; break; }
@@ -2014,7 +2281,7 @@ static int schol_factor_ll(SChol *S, double shift) {
                         /* 4.22: signed source (quasi-definite bordered system): U S U_top' straight
                          * into the panel as well, with the top rows sign-scaled */
                         size_t nw = (size_t)a * wj;
-                        if (nw > S->swcap) { S->swcap = 2 * nw; S->sw = realloc(S->sw, sizeof(double) * S->swcap); }
+                        if (nw > S->swcap) S->sw = sxgrow(S->sw, &S->swcap, nw);
                         for (int c = 0; c < wj; c++) {
                             const double sc = S->sgn[S->ss[j] + c];
                             for (int r = 0; r < a; r++) S->sw[r + (size_t)c * a] = sc * U[r + (size_t)c * nrj];
@@ -2044,7 +2311,7 @@ static int schol_factor_ll(SChol *S, double shift) {
                 else {
                     /* U S U_top': the top a rows scaled by the column signs */
                     size_t nw = (size_t)a * wj;
-                    if (nw > S->swcap) { S->swcap = 2 * nw; S->sw = realloc(S->sw, sizeof(double) * S->swcap); }
+                    if (nw > S->swcap) S->sw = sxgrow(S->sw, &S->swcap, nw);
                     for (int c = 0; c < wj; c++) {
                         const double sc = S->sgn[S->ss[j] + c];
                         for (int r = 0; r < a; r++) S->sw[r + (size_t)c * a] = sc * U[r + (size_t)c * nrj];
@@ -2077,17 +2344,18 @@ static int schol_factor_ll(SChol *S, double shift) {
              * trick for degenerate IPM normal equations): a pivot that has lost all but
              * tinypiv of its original diagonal becomes 1e128, its column of L ~ 0 */
             const double *P0 = S->pmat + S->pbase[k];
+            const int ip0 = S->pan == S->pmat;           /* (in place: the saved diagonals) */
             /* blocked for wide panels; its pivots carry more cancellation noise (blocked
              * sums), so the drop threshold sits 10x higher (at 1e-14 the drop decisions were
              * noise: attr_lorenz_d8_I 36 -> 75 iterations) */
             if (g_tinyloop < 0) g_tinyloop = getenv("BRISK_TINYLOOP") != NULL;
-            if (w > 96 && !g_tinyloop) S->ntiny += chol_tiny_blocked(nr, w, Pk, nr, P0, nr + 1, 10.0 * S->tinypiv);
+            if (w > 96 && !g_tinyloop) S->ntiny += chol_tiny_blocked(nr, w, Pk, nr, ip0 ? S->dg0 + j0 : P0, ip0 ? 1 : nr + 1, 10.0 * S->tinypiv);
             else
             for (int c = 0; c < w; c++) {
                 double *col = Pk + (size_t)c * nr;
                 sc_colupd(col, Pk, nr, 0, c, c, nr);
                 double d = col[c];
-                const double d0 = fabs(P0[(size_t)c * nr + c]);
+                const double d0 = fabs(ip0 ? S->dg0[j0 + c] : P0[(size_t)c * nr + c]);
                 if (!(d > S->tinypiv * d0) || !(d > 0)) { d = 1e128; S->ntiny++; for (int r = c + 1; r < nr; r++) col[r] = 0; }
                 const double l = sqrt(d), il = 1.0 / l;
                 col[c] = l;
@@ -2112,7 +2380,7 @@ static int schol_factor_ll(SChol *S, double shift) {
             if (rest > 0) {
                 /* L11 (lower part of the diagonal block) copied to a square buffer */
                 size_t nw = (size_t)w * w;
-                if (nw > S->swcap) { S->swcap = 2 * nw; S->sw = realloc(S->sw, sizeof(double) * S->swcap); }
+                if (nw > S->swcap) S->sw = sxgrow(S->sw, &S->swcap, nw);
                 double *T = S->sw;
                 for (int c = 0; c < w; c++)
                     for (int r = 0; r < w; r++) T[r + (size_t)c * w] = r < c ? 0.0 : Pk[r + (size_t)c * nr];
@@ -2175,7 +2443,7 @@ static void fscr_ensure(int nt, int m) {
     }
 }
 static double *fscr_buf(double **b, size_t *cap, size_t need) {
-    if (need > *cap) { *cap = 2 * need; *b = realloc(*b, sizeof(double) * *cap); }
+    if (need > *cap) *b = sxgrow(*b, cap, need);
     return *b;
 }
 /* static structure: update lists, supernodal tree, work */
@@ -2216,6 +2484,7 @@ static void sc_build_tree(SChol *S) {
 #define SMALL_CB 256
 #define BATCH_K 512
 static double g_batchd = 0.9;
+static int g_lpsmall = -1;
 static int g_batchw = -1;       /* (18 October 2026, LP/SOCP: the widest source batched, cone solver only; BRISK_BATCHW, 4 as before) */
 static int g_ftime = -1; static double g_ft[6], g_pansz_dbg, g_ftd[2];   /* (g_ftd: thread seconds of fnode_dag's trsm and gemm tasks) */   /* BRISK_FTIME: seconds in the update products, their scatter, the panel factor */
 void schol_ftime_print(void) { if (g_ftime > 0) printf("   [sparse factor: update products %.2fs, scatter %.2fs, panels %.2fs (thread seconds; the task graph: trsm %.2fs, gemm %.2fs); wall: the calls %.2fs, their parallel regions %.2fs, the copy of the values %.2fs; pansz %.3g]\n", g_ft[0], g_ft[1], g_ft[2], g_ftd[0], g_ftd[1], g_ft[3], g_ft[4], g_ft[5], g_pansz_dbg); }
@@ -2278,6 +2547,24 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, int C0, int C1, FScr *w) 
             nbatch++; nbcols += wj;
             continue;
         }
+        /* (25 October 2026, LP) the LP method's factorizations: a source of at most g_lpsmall columns straight into the
+         * target as the cone solver's small sources below (the tile's columns only), without the library's product:
+         * rmatr200-p5's dual form (LP) has 24,750 nodes, most of one or two columns, and each product with beta = 0
+         * zeroed its block (OpenBLAS's dgemm_beta: 17 % of the run's instructions, more than the products' kernel) and
+         * took the library's buffer lock. Each source is still subtracted from the target in turn (the order of the
+         * sources): the cone solver's batches, which sum many sources' products before subtracting them (one product),
+         * were tried for the LP and cost accuracy near the end, where a large update cancels the target and the small
+         * ones summed with it are lost (rail01, rail02, neos-5052403-cygnet, LPs: OPTIMAL -> SOLVED TO REDUCED ACCURACY;
+         * rmatr200-p5's factorizations 0.70 -> 0.46 s). BRISK_LPSMALL (4; 0 = the products as before) */
+        if (S->lpsmall && S->tinypiv > 0 && !(S->dynpiv > 0)) {
+            if (g_lpsmall < 0) { const char *e = getenv("BRISK_LPSMALL"); g_lpsmall = e ? atoi(e) : 4; }
+            if (wj <= g_lpsmall && wj <= 4 && !neg) {
+                if (!small) { small = (int *)fscr_buf(&w->ism, &w->ismcap, 2 * (size_t)(S->ul_ptr[k + 1] - S->ul_ptr[k]) + 2); }
+                small[4 * nsmall] = u; small[4 * nsmall + 1] = q0; small[4 * nsmall + 2] = q1; small[4 * nsmall + 3] = cc0;
+                nsmall++;
+                continue;
+            }
+        }
         if (contig) {
             const double tf0 = g_ftime > 0 ? omp_get_wtime() : 0;
             BL(dgemm_)("N", "T", &nqc, &ac, &wj, &mone, U + q0c, &nrj, V + cc0, &ldv, &DONE, Pk + (size_t)(rwj[cc0] - j0) * nr + r0, &nr);
@@ -2304,7 +2591,7 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, int C0, int C1, FScr *w) 
         const double tf1 = g_ftime > 0 ? omp_get_wtime() : 0;
         /* (sparsechol-dev) the target rows once for all the columns, and two columns per pass: each entry receives the
          * same subtraction as before (the same bits); the scatter read rwj and relind again for every column */
-        if ((size_t)nqc > w->ricap) { w->ricap = 2 * (size_t)nqc; free(w->ri); w->ri = malloc(sizeof(int) * w->ricap); }
+        if ((size_t)nqc > w->ricap) { w->ricap = 2 * (size_t)nqc; free(w->ri); w->ri = sxm(sizeof(int) * w->ricap); }
         int *restrict ri = w->ri;
         for (int q = q0c; q < q1; q++) ri[q - q0c] = relind[rwj[q]];
         int cc = cc0;
@@ -2332,8 +2619,9 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, int C0, int C1, FScr *w) 
          * wide panel was bound by the memory: 4 ns per entry on the dense block of a lasso problem) */
         const int wk = S->ss[k + 1] - j0;
         const int cbw = (double)(R1 - R0) * wk * 8.0 > 1.5e6 ? SMALL_CB : wk;
-        for (int cb0 = 0; cb0 < wk; cb0 += cbw) {
-            const int chi = j0 + (cb0 + cbw < wk ? cb0 + cbw : wk);          /* target columns below chi */
+        /* (the tile's columns [C0, C1): all of them for the cone solver, whose small sources come from untiled calls) */
+        for (int cb0 = C0; cb0 < C1; cb0 += cbw) {
+            const int chi = j0 + (cb0 + cbw < C1 ? cb0 + cbw : C1);          /* target columns below chi */
             for (int t = 0; t < nsmall; t++) {
                 int *e = small + 4 * t;
                 const int u = e[0], q0 = e[1], q1 = e[2];
@@ -2460,15 +2748,16 @@ static int fnode_factor(SChol *S, int k, FScr *wsc, int par) {
     if (S->sgn) for (int c = 0; c < w; c++) if (S->sgn[j0 + c] < 0) { neg = 1; break; }
     if (!neg && S->tinypiv > 0) {
         const double *P0 = S->pmat + S->pbase[k];
+        const int ip0 = S->pan == S->pmat;              /* (in place: the saved diagonals) */
         int nt = 0;
         if (g_tinyloop < 0) g_tinyloop = getenv("BRISK_TINYLOOP") != NULL;
-        if (w > 96 && !g_tinyloop) nt = chol_tiny_blocked(nr, w, Pk, nr, P0, nr + 1, 10.0 * S->tinypiv);
+        if (w > 96 && !g_tinyloop) nt = chol_tiny_blocked(nr, w, Pk, nr, ip0 ? S->dg0 + j0 : P0, ip0 ? 1 : nr + 1, 10.0 * S->tinypiv);
         else
         for (int c = 0; c < w; c++) {
             double *col = Pk + (size_t)c * nr;
             sc_colupd(col, Pk, nr, 0, c, c, nr);
             double d = col[c];
-            const double d0 = fabs(P0[(size_t)c * nr + c]);
+            const double d0 = fabs(ip0 ? S->dg0[j0 + c] : P0[(size_t)c * nr + c]);
             if (!(d > S->tinypiv * d0) || !(d > 0)) { d = 1e128; nt++; for (int r = c + 1; r < nr; r++) col[r] = 0; }
             const double l = sqrt(d), il = 1.0 / l;
             col[c] = l;
@@ -2571,7 +2860,7 @@ static void sc_strsm_w(const char *sd, const char *u, const char *t, const char 
  * (bench/dense_5.12/potrf_bench.c, BRISK_FDRB). Below order 1536 the same tiles run on one
  * thread: the tasks cost more than they share (order 1000: 10.6 ms at four threads, 9.1 at one). */
 static int FD_RB = 512;
-#define FD_PAR_MIN 1536
+static int FD_PAR_MIN = 1536;     /* (BRISK_FDPARMIN, test: the task graph from that order) */
 static void pd_env(void);
 static int fpanel_tiled_ld(double *P, int nr, int w, int ld, int par) {
     int bad = 0;
@@ -3349,6 +3638,7 @@ static void pd_env(void) {
         if ((e = getenv("BRISK_PDCB"))) { PD_CB = atoi(e); pd_cb_fixed = 1; }
         if ((e = getenv("BRISK_FNB"))) { FB_NB = atoi(e); g_fd_fixed = 1; }
         if ((e = getenv("BRISK_FDRB"))) { FD_RB = atoi(e); g_fd_fixed = 1; }
+        if ((e = getenv("BRISK_FDPARMIN"))) FD_PAR_MIN = atoi(e);
         __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
     }
 }
@@ -3633,9 +3923,11 @@ static int fnode_dag(SChol *S, int k, int par) {
         if (S->tinypiv > 0) {
             /* (the LP's tiny-pivot rule, as chol_tiny_blocked: a pivot below 10 tinypiv of its original diagonal becomes
              * 1e128 and its column of L is zero; the original diagonal of the tile from pmat) */
-            const double *D0 = S->pmat + S->pbase[k] + (size_t)r0[c] * nr + r0[c];
-            #pragma omp task if(par) depend(inout: D[0]) firstprivate(D, D0, cb)
-            { const int nt = chol_tiny_blocked(cb, cb, D, nr, D0, nr + 1, 10.0 * S->tinypiv);
+            const int ip0 = S->pan == S->pmat;          /* (in place: the saved diagonals) */
+            const double *D0 = ip0 ? S->dg0 + S->ss[k] + r0[c] : S->pmat + S->pbase[k] + (size_t)r0[c] * nr + r0[c];
+            const int d0s = ip0 ? 1 : nr + 1;
+            #pragma omp task if(par) depend(inout: D[0]) firstprivate(D, D0, cb, d0s)
+            { const int nt = chol_tiny_blocked(cb, cb, D, nr, D0, d0s, 10.0 * S->tinypiv);
               if (nt) {
                 #pragma omp atomic
                 S->ntiny += nt; } }
@@ -3779,7 +4071,7 @@ static int schol_factor_(SChol *S, double shift) {
     const int ns = S->ns;
     S->mval_ok = 0;
     sc_ensure(S);
-    if (S->inplace && S->tinypiv <= 0) {
+    if (S->inplace && (S->tinypiv <= 0 || sc_save_diag0(S))) {
         if (S->pan && S->pan != S->pmat) free(S->pan);
         S->pan = S->pmat;
     } else {
@@ -4233,25 +4525,70 @@ static void tps_fwd_chain(const SChol *S, int k, double *xt, int nr_) {
 static void tps_bwd_unit(const SChol *S, int u, double *xt, int nr_, double *t) {
     for (int k = u; k >= S->sfd[u]; k--) tps_bwd_node(S, k, xt, nr_, t);
 }
-static void tps_bwd_task(const SChol *S, int k, double *xt, int nr_, const char *big, size_t tmax) {
+/* 24 October 2026 (evening): the least work of a task of the threaded solve, in factor entries read per right-hand side.
+ * A task costs about 2 us to schedule; the solve streams about 1.4 entries a nanosecond (snl1_150, SDP: 0.54 ms for the
+ * 341,561 panel entries of both passes on one thread), so 16,384 entries (about 12 us) keep the scheduling near a sixth.
+ * Below it the small subtrees under the large nodes were a task each: about 1,300 tasks a solve on snl1_150, 3.1 ms a
+ * solve on four threads against 0.54 ms on one. Measured on six factors of 78,000 to 1.1 million entries (three runs,
+ * the best): 16,384 the fastest or within 10 % of it on each, against 4,096 to 65,536 (snl1_150 0.075 s of solves on one
+ * thread -> 0.055 s; case588_fr 0.229 -> 0.133 s; case1354_fr 0.958 -> 0.472 s). BRISK_TPSGRAIN: the grain. */
+static double tps_grain(void) { static double g = -1; if (g < 0) { const char *e = getenv("BRISK_TPSGRAIN"); g = e ? atof(e) : 16384.0; } return g; }
+#define TPS_GRAIN tps_grain()
+/* the children at positions [p0, p1) of node k's list that are units (not big), in turn */
+static void tps_bwd_kids(const SChol *S, int p0, int p1, double *xt, int nr_, const char *big, size_t tmax) {
+    double *tt = malloc(sizeof(double) * tmax);
+    for (int p = p0; p < p1; p++) { const int c = S->sch_idx[p]; if (!big[c]) tps_bwd_unit(S, c, xt, nr_, tt); }
+    free(tt);
+}
+static void tps_bwd_task(const SChol *S, int k, double *xt, int nr_, const char *big, size_t tmax, const double *pw) {
     for (;;) {
         double *t = malloc(sizeof(double) * tmax);
         tps_bwd_node(S, k, xt, nr_, t);
         free(t);
-        int next = -1;
+        int next = -1, p0 = -1;
+        double bw = 0;
         for (int u = S->sch_ptr[k]; u < S->sch_ptr[k + 1]; u++) {
             int c = S->sch_idx[u];
-            if (!big[c]) {
-                #pragma omp task firstprivate(c)
-                { double *tt = malloc(sizeof(double) * tmax); tps_bwd_unit(S, c, xt, nr_, tt); free(tt); }
+            if (!big[c]) {                               /* the units among the children: in groups of TPS_GRAIN */
+                if (p0 < 0) p0 = u;
+                bw += (pw[c + 1] - pw[S->sfd[c]]) * nr_;
+                if (bw >= TPS_GRAIN) {
+                    const int a = p0, b = u + 1;
+                    #pragma omp task firstprivate(a, b)
+                    tps_bwd_kids(S, a, b, xt, nr_, big, tmax);
+                    p0 = -1; bw = 0;
+                }
             } else if (next < 0) next = c;
             else {
                 #pragma omp task firstprivate(c)
-                tps_bwd_task(S, c, xt, nr_, big, tmax);
+                tps_bwd_task(S, c, xt, nr_, big, tmax, pw);
+            }
+        }
+        if (p0 >= 0) {                                   /* the last group: here when no big child follows */
+            const int a = p0, b = S->sch_ptr[k + 1];
+            if (next < 0) tps_bwd_kids(S, a, b, xt, nr_, big, tmax);
+            else {
+                #pragma omp task firstprivate(a, b)
+                tps_bwd_kids(S, a, b, xt, nr_, big, tmax);
             }
         }
         if (next < 0) return;
         k = next;
+    }
+}
+/* the units ub[a..b) under big nodes, in turn: each one's update to its parent counted, the parent's chain run by the
+ * task that completes its children */
+static void tps_fwd_units(const SChol *S, const int *ub, int a, int b, double *xt, int nr_) {
+    for (int i = a; i < b; i++) {
+        const int u = ub[i];
+        tps_fwd_unit(S, u, xt, nr_);
+        const int p = S->spar[u];
+        if (p >= 0) { int left;
+            #pragma omp flush
+            #pragma omp atomic capture
+            left = --g_scnt[p];
+            #pragma omp flush
+            if (left == 0) tps_fwd_chain(S, p, xt, nr_); }
     }
 }
 /* B: m x nr_ (column-major, original indexing), solved in place */
@@ -4279,8 +4616,31 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
     for (int k = 0; k < ns; k++) if (S->spar[k] >= 0 && big[S->spar[k]]) g_scnt[S->spar[k]]++;
     static int tdbg = -1; if (tdbg < 0) tdbg = getenv("BRISK_TPSDBG") != NULL;
     double tt0 = tdbg ? omp_get_wtime() : 0, tt1 = 0, tt2 = 0;
-    if (tdbg) { int nbig = 0; for (int k = 0; k < ns; k++) nbig += big[k]; static int once = 0; if (!once++) printf("   [tps: %d big nodes of %d]\n", nbig, ns); }
-    if (nt <= 1 || ns < 64) {
+    long ntk[4] = {0, 0, 0, 0};                         /* (BRISK_TPSDBG: units under big nodes, -, big nodes) */
+    static int tpser = -1; if (tpser < 0) tpser = getenv("BRISK_TPSERIAL") != NULL;
+    /* 24 October 2026 (evening): the threads only when the factor holds two tasks' work (2 TPS_GRAIN) per thread; below
+     * it the parallel regions cost more than they share (acopf_case118, SDP with SOCP: 78,320 panel entries, 0.071 s of
+     * solves on one thread, 0.083 s at the best grain on four; case240_pserc_fr, 171,033: 0.113 and 0.106 s).
+     * BRISK_TPSMIN: the work per thread (entries; 0: always the threads), BRISK_TPSERIAL=1: never. */
+    double pwt = 0;
+    if (nt > 1 && ns >= 64) for (int k = 0; k < ns; k++) pwt += (double)S->pnr[k] * (S->ss[k + 1] - S->ss[k]);
+    static double tpsmin = -1; if (tpsmin < 0) { const char *e = getenv("BRISK_TPSMIN"); tpsmin = e ? atof(e) : 2.0 * TPS_GRAIN; }
+    /* (25 October 2026, the LP developer) the tree's parallelism for the solve: its entries over those of the longest
+     * root-to-leaf path (a bound on the speedup of solving subtrees side by side). Below 1.5 the subtrees are solved in
+     * order and only the large nodes use the threads inside them: the tasks cost more than the little they can overlap
+     * (buildingenergy's dual form, LP: parallelism 1.40, 2,920 large nodes of 12,468; its 320 solves 5.4 s on four threads against 3.1 s in
+     * order; dano3_3 1.06, qap15 1.10, dfl001 1.26, where dfl001's large root nodes keep their threads; rail01 4.3 and
+     * irish-electricity 21.7 keep the subtrees on the threads). BRISK_TPSPAR=x: the threshold (0: always the threads) */
+    if (S->tps_par <= 0) {
+        double *c = calloc((size_t)ns + 1, sizeof(double)), *cm = calloc((size_t)ns + 1, sizeof(double)), tot = 0, crit = 0;
+        for (int k = 0; k < ns; k++) { const double w = S->ss[k + 1] - S->ss[k], e = w * S->pnr[k] - w * (w - 1) / 2; tot += e; c[k] = e + cm[k];
+            if (S->spar[k] >= 0) { if (c[k] > cm[S->spar[k]]) cm[S->spar[k]] = c[k]; } else if (c[k] > crit) crit = c[k]; }
+        Sm->tps_par = crit > 0 ? tot / crit : 1.0;
+        free(c); free(cm);
+    }
+    static double tpspar = -1; if (tpspar < 0) { const char *e = getenv("BRISK_TPSPAR"); tpspar = e ? atof(e) : 1.5; }
+    if (tdbg) { int nbig = 0; for (int k = 0; k < ns; k++) nbig += big[k]; static int once = 0; if (!once++) printf("   [tps: %d big nodes of %d; parallelism %.2f]\n", nbig, ns, S->tps_par); }
+    if (nt <= 1 || ns < 64 || tpser || pwt * nr_ < nt * tpsmin || S->tps_par < tpspar) {
         const int npar = nt > 1 && nr_ == 1;          /* (one right-hand side: the nodes' off-diagonal parts on the threads) */
         for (int k = 0; k < ns; k++) {
             if (!big[k] && (S->spar[k] < 0 || big[S->spar[k]])) tps_fwd_unit(S, k, xt, nr_);
@@ -4294,22 +4654,41 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
         if (tdbg) { tt2 = omp_get_wtime(); static int cnt = 0; if (cnt++ < 3) printf("   [tps serial: fwd %.1f ms bwd %.1f ms]\n", 1e3 * (tt1 - tt0), 1e3 * (tt2 - tt1)); }
         for (int k = 0; k < ns; k++) if (S->spar[k] < 0 && g_ext[k]) { free(g_ext[k]); g_ext[k] = NULL; }
     } else {
+        if (tdbg) { for (int k = 0; k < ns; k++) { if (!big[k] && S->spar[k] >= 0 && big[S->spar[k]]) ntk[0]++; if (big[k]) ntk[2]++; } }
+        /* 24 October 2026: the independent trees below the cut (a root that is not big) go in batches of about the cut's
+         * work, one task each, in both passes: a factor of 30,000 one-column supernodes, each its own tree (sep30000, SDP:
+         * 30,000 blocks of order 2, a diagonal Schur complement), made 60,000 tasks per solve and 0.18 s of scheduling for
+         * microseconds of arithmetic (38 solves, 6.8 s of a 9.4 s run). The trees share no update, so the arithmetic and
+         * its order are those of one task per tree */
+        /* (24 October, evening: the units under big nodes too, in groups of TPS_GRAIN factor entries in postorder) */
+        double *pw = malloc(sizeof(double) * (ns + 1));
+        int *ub = malloc(sizeof(int) * (ns + 1)), nub = 0, u0 = 0;
+        double uw = 0;
+        pw[0] = 0; for (int k = 0; k < ns; k++) pw[k + 1] = pw[k] + (double)S->pnr[k] * (S->ss[k + 1] - S->ss[k]);
         #pragma omp parallel
         #pragma omp single
         {
+            int b0 = -1; double bw = 0;
             for (int k = 0; k < ns; k++) {
-                if (!big[k] && (S->spar[k] < 0 || big[S->spar[k]])) {
-                    int u = k;
-                    #pragma omp task firstprivate(u)
-                    {
-                        tps_fwd_unit(S, u, xt, nr_);
-                        const int p = S->spar[u];
-                        if (p >= 0) { int left;
-                            #pragma omp flush
-                            #pragma omp atomic capture
-                            left = --g_scnt[p];
-                            #pragma omp flush
-                            if (left == 0) tps_fwd_chain(S, p, xt, nr_); }
+                if (!big[k] && S->spar[k] < 0) {                       /* an independent tree: into the batch */
+                    if (b0 < 0) b0 = k;
+                    bw += S->ssub[k];
+                    if (bw >= cut || k == ns - 1) {
+                        const int lo = b0, hi = k;
+                        #pragma omp task firstprivate(lo, hi)
+                        for (int u = lo; u <= hi; u++) if (!big[u] && S->spar[u] < 0) tps_fwd_unit(S, u, xt, nr_);
+                        b0 = -1; bw = 0;
+                    }
+                    continue;
+                }
+                if (!big[k] && big[S->spar[k]]) {                    /* a unit under a big node: into the group */
+                    ub[nub++] = k;
+                    uw += (pw[k + 1] - pw[S->sfd[k]]) * nr_;
+                    if (uw >= TPS_GRAIN) {
+                        const int a = u0, b = nub;
+                        #pragma omp task firstprivate(a, b)
+                        tps_fwd_units(S, ub, a, b, xt, nr_);
+                        u0 = nub; uw = 0;
                     }
                 } else if (big[k] && S->sfd[k] == k) {
                     int kk = k;
@@ -4317,23 +4696,54 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
                     tps_fwd_chain(S, kk, xt, nr_);
                 }
             }
+            if (b0 >= 0) {
+                const int lo = b0, hi = ns - 1;
+                #pragma omp task firstprivate(lo, hi)
+                for (int u = lo; u <= hi; u++) if (!big[u] && S->spar[u] < 0) tps_fwd_unit(S, u, xt, nr_);
+            }
+            if (u0 < nub) {
+                const int a = u0, b = nub;
+                #pragma omp task firstprivate(a, b)
+                tps_fwd_units(S, ub, a, b, xt, nr_);
+            }
         }
         for (int k = 0; k < ns; k++) if (S->spar[k] < 0 && g_ext[k]) { free(g_ext[k]); g_ext[k] = NULL; }
         if (S->sgn) for (int i = 0; i < m; i++) if (S->sgn[i] < 0) for (int r = 0; r < nr_; r++) xt[(size_t)i * nr_ + r] = -xt[(size_t)i * nr_ + r];
+        if (tdbg) tt1 = omp_get_wtime();
         #pragma omp parallel
         #pragma omp single
         {
+            int b0 = -1; double bw = 0;
             for (int k = 0; k < ns; k++) if (S->spar[k] < 0) {
                 int kk = k;
                 if (big[kk]) {
                     #pragma omp task firstprivate(kk)
-                    tps_bwd_task(S, kk, xt, nr_, big, tmax);
-                } else {
-                    #pragma omp task firstprivate(kk)
-                    { double *tt = malloc(sizeof(double) * tmax); tps_bwd_unit(S, kk, xt, nr_, tt); free(tt); }
+                    tps_bwd_task(S, kk, xt, nr_, big, tmax, pw);
+                } else {                                               /* an independent tree: into the batch */
+                    if (b0 < 0) b0 = k;
+                    bw += S->ssub[k];
+                    if (bw >= cut) {
+                        const int lo = b0, hi = k;
+                        #pragma omp task firstprivate(lo, hi)
+                        { double *tt = malloc(sizeof(double) * tmax); for (int u = lo; u <= hi; u++) if (S->spar[u] < 0 && !big[u]) tps_bwd_unit(S, u, xt, nr_, tt); free(tt); }
+                        b0 = -1; bw = 0;
+                    }
                 }
             }
+            if (b0 >= 0) {
+                const int lo = b0, hi = ns - 1;
+                #pragma omp task firstprivate(lo, hi)
+                { double *tt = malloc(sizeof(double) * tmax); for (int u = lo; u <= hi; u++) if (S->spar[u] < 0 && !big[u]) tps_bwd_unit(S, u, xt, nr_, tt); free(tt); }
+            }
         }
+        free(pw); free(ub);
+    }
+    if (tdbg && !(nt <= 1 || ns < 64)) {
+        tt2 = omp_get_wtime(); static int cnt = 0;
+        if (cnt++ < 3) { size_t nz = 0; for (int k = 0; k < ns; k++) nz += (size_t)S->pnr[k] * (S->ss[k + 1] - S->ss[k]);
+            int nroot = 0; for (int k = 0; k < ns; k++) nroot += S->spar[k] < 0;
+            printf("   [tps parallel: fwd %.2f ms bwd %.2f ms; %d supernodes, %d roots, %ld big, %ld units under big nodes, panel entries %zu, rhs %d]\n",
+                   1e3 * (tt1 - tt0), 1e3 * (tt2 - tt1), ns, nroot, ntk[2], ntk[0], nz, nr_); }
     }
     free(big);
     for (int r = 0; r < nr_; r++) for (int i = 0; i < m; i++) B[(size_t)S->perm[i] + (size_t)r * m] = xt[(size_t)i * nr_ + r];
@@ -4422,6 +4832,191 @@ void schol_solve(const SChol *S, double *b, double *work) {
     for (int i = 0; i < m; i++) b[S->perm[i]] = x[i];
 }
 
+
+/* (23 October 2026, the SOCP developer) the solve with one right-hand side by independent subtrees of the supernodal tree. A
+ * supernode's forward step reads its own columns and writes the rows below it, its ancestors; the backward step reads them.
+ * The tree is cut into SP_NTASK-odd subtrees (tasks: a supernode's subtree is the range [sfd, k] in postorder) and a top part
+ * (their ancestors). Forward: the tasks in parallel, each node's update scattered into x for the rows of its own task and
+ * into the task's buffer for the top's rows; the buffers summed into x in task order, then the top's nodes in order.
+ * Backward: the top's nodes in reverse order, then the tasks in parallel. The cut depends only on the tree, the arithmetic of
+ * each node is the sequential solve's, so the bits are the same at any thread count (not the sequential solve's: the top's
+ * rows get their updates summed by tasks). */
+#define SP_NTASK 64
+typedef struct SPart { int ok, ntask, *tlo, *thi, *order, ntop, *top, ntc, *topidx; double *buf; int maxrest, nta; double *tacc; } SPart;
+void schol_part_free(SChol *S) {
+    SPart *P = S->part; if (!P) return;
+    free(P->tlo); free(P->thi); free(P->order); free(P->top); free(P->topidx); free(P->buf); free(P->tacc); free(P); S->part = NULL;
+}
+static void sp_build(SChol *S) {
+    SPart *P = (SPart *)calloc(1, sizeof(SPart)); S->part = P; if (!P) return;
+    const int ns = S->ns, m = S->m;
+    if (ns < 2 * SP_NTASK) return;
+    if (!S->ul_ptr) sc_build_tree(S);
+    double *w = (double *)malloc(sizeof(double) * (size_t)ns), *tw = (double *)malloc(sizeof(double) * (size_t)ns);
+    int *cnt = (int *)calloc((size_t)ns, sizeof(int)), *head = (int *)malloc(sizeof(int) * (size_t)ns), *nxt = (int *)malloc(sizeof(int) * (size_t)ns), *stk = (int *)malloc(sizeof(int) * (size_t)ns);
+    int *istask = (int *)malloc(sizeof(int) * (size_t)ns);
+    unsigned char *istop = (unsigned char *)calloc((size_t)ns, 1);
+    P->tlo = (int *)malloc(sizeof(int) * (size_t)ns); P->thi = (int *)malloc(sizeof(int) * (size_t)ns);
+    double tot = 0; int post = 1;
+    for (int k = 0; k < ns; k++) { const int wk = S->ss[k + 1] - S->ss[k]; w[k] = 2.0 * wk * (double)S->pnr[k] + 1.0; head[k] = -1; istask[k] = -1; }
+    for (int k = 0; k < ns; k++) { cnt[k]++; if (S->spar[k] >= 0) { w[S->spar[k]] += w[k]; cnt[S->spar[k]] += cnt[k]; } }
+    for (int k = 0; k < ns; k++) if (cnt[k] != k - S->sfd[k] + 1) post = 0;       /* (a subtree must be a range of postorder) */
+    for (int k = ns - 1; k >= 0; k--) if (S->spar[k] >= 0) { nxt[k] = head[S->spar[k]]; head[S->spar[k]] = k; }
+    int ns_ = 0; for (int k = 0; k < ns; k++) if (S->spar[k] < 0) { stk[ns_++] = k; tot += w[k]; }
+    const double target = tot / SP_NTASK;
+    int ntask = 0, ntop = 0; double wtop = 0;
+    while (ns_ && post) {
+        const int v = stk[--ns_];
+        if (w[v] <= target) { P->tlo[ntask] = S->sfd[v]; P->thi[ntask] = v; tw[ntask] = w[v]; istask[v] = ntask++; continue; }
+        istop[v] = 1; ntop++; double own = w[v];
+        for (int c = head[v]; c >= 0; c = nxt[c]) { own -= w[c]; stk[ns_++] = c; }
+        wtop += own;
+    }
+    if (post && ntask > 1) {        /* adjacent tasks merged (consecutive ranges of postorder, no top node between them) up to the target */
+        long long *key = (long long *)malloc(sizeof(long long) * (size_t)ntask); int *ord = (int *)malloc(sizeof(int) * (size_t)ntask);
+        for (int a = 0; a < ntask; a++) key[a] = ((long long)P->tlo[a] << 32) | (unsigned)a;
+        qsort(key, (size_t)ntask, sizeof(long long), cmp_ll);
+        for (int a = 0; a < ntask; a++) ord[a] = (int)(key[a] & 0xffffffffLL);
+        free(key);
+        int *lo2 = (int *)malloc(sizeof(int) * (size_t)ntask), *hi2 = (int *)malloc(sizeof(int) * (size_t)ntask); double *w2 = (double *)malloc(sizeof(double) * (size_t)ntask); int n2 = 0;
+        for (int a = 0; a < ntask; a++) {
+            const int t = ord[a];
+            if (n2 > 0 && hi2[n2 - 1] + 1 == P->tlo[t] && w2[n2 - 1] + tw[t] <= target) { hi2[n2 - 1] = P->thi[t]; w2[n2 - 1] += tw[t]; }
+            else { lo2[n2] = P->tlo[t]; hi2[n2] = P->thi[t]; w2[n2] = tw[t]; n2++; }
+        }
+        for (int a = 0; a < n2; a++) { P->tlo[a] = lo2[a]; P->thi[a] = hi2[a]; tw[a] = w2[a]; }
+        ntask = n2; free(ord); free(lo2); free(hi2); free(w2);
+    }
+    if (post && ntask >= 4 && wtop <= 0.5 * tot) {
+        P->top = (int *)malloc(sizeof(int) * (size_t)(ntop + 1)); int t = 0;
+        for (int k = 0; k < ns; k++) if (istop[k]) P->top[t++] = k;
+        P->topidx = (int *)malloc(sizeof(int) * (size_t)m); for (int i = 0; i < m; i++) P->topidx[i] = -1;
+        int ntc = 0; for (int a = 0; a < ntop; a++) { const int k = P->top[a]; for (int j = S->ss[k]; j < S->ss[k + 1]; j++) P->topidx[j] = ntc++; }
+        int maxrest = 1; for (int k = 0; k < ns; k++) { const int r = S->pnr[k] - (S->ss[k + 1] - S->ss[k]); if (r > maxrest) maxrest = r; }
+        P->order = (int *)malloc(sizeof(int) * (size_t)(ntask + 1));
+        for (int a = 0; a < ntask; a++) P->order[a] = a;
+        for (int a = 1; a < ntask; a++) { const int v = P->order[a]; int b = a; while (b > 0 && tw[P->order[b - 1]] < tw[v]) { P->order[b] = P->order[b - 1]; b--; } P->order[b] = v; }
+        P->ntask = ntask; P->ntop = ntop; P->ntc = ntc; P->maxrest = maxrest;
+        P->buf = (double *)malloc(sizeof(double) * ((size_t)ntask * (ntc ? ntc : 1)));
+        P->ok = P->buf != NULL && (double)ntask * ntc <= 5e7;
+    }
+    if (getenv("BRISK_SPARTDBG")) fprintf(stderr, "[the solve by subtrees: %d tasks, %d top supernodes of %d (%d columns), the top's work %.1f %%, postorder %d, %s]\n", ntask, ntop, ns, P->ntc, 100.0 * wtop / fmax(tot, 1), post, P->ok ? "used" : "not used");
+    free(w); free(tw); free(cnt); free(head); free(nxt); free(stk); free(istask); free(istop);
+}
+/* the forward step of supernode k (the sequential solve's arithmetic); the rows of the top go to tb when given */
+static inline void sp_fwd(const SChol *S, int k, double *restrict x, double *restrict t, const int *topidx, double *tb) {
+    const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k], rest = nr - w;
+    const int *rw = S->prow + S->prp[k];
+    const double *restrict Pk = S->pan + S->pbase[k];
+    double *restrict xs = x + j0;
+#define SP_SCAT(r_, v_) do { const int r__ = (r_); if (tb && topidx[r__] >= 0) tb[topidx[r__]] += (v_); else x[r__] -= (v_); } while (0)
+    if ((size_t)w * nr > g_solve_blas) {
+        BL(dtrsv_)("L", "N", "N", &w, Pk, &nr, xs, &IONE);
+        if (rest > 0) {
+            BL(dgemv_)("N", &rest, &w, &DONE, Pk + w, &nr, xs, &IONE, &DZERO, t, &IONE);
+            for (int q = 0; q < rest; q++) SP_SCAT(rw[w + q], t[q]);
+        }
+        return;
+    }
+    if (w == 1) {
+        const double xc = xs[0] / Pk[0];
+        xs[0] = xc;
+        const double *restrict lo = Pk + 1; const int *restrict rwr = rw + 1;
+        for (int q = 0; q < rest; q++) SP_SCAT(rwr[q], lo[q] * xc);
+        return;
+    }
+    for (int q = 0; q < rest; q++) t[q] = 0;
+    for (int c = 0; c < w; c++) {
+        const double *restrict col = Pk + (size_t)c * nr;
+        const double xc = xs[c] / col[c];
+        xs[c] = xc;
+        for (int r = c + 1; r < w; r++) xs[r] -= col[r] * xc;
+    }
+    tps_lmv(t, Pk + w, (size_t)nr, xs, 0, w, rest);
+    for (int q = 0; q < rest; q++) SP_SCAT(rw[w + q], t[q]);
+#undef SP_SCAT
+}
+static inline void sp_bwd(const SChol *S, int k, double *restrict x, double *restrict t) {
+    const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k], rest = nr - w;
+    const int *rw = S->prow + S->prp[k];
+    const double *restrict Pk = S->pan + S->pbase[k];
+    double *restrict xs = x + j0;
+    if (w == 1 && (size_t)nr <= g_solve_blas) {
+        double v = xs[0];
+        const double *restrict lo = Pk + 1; const int *restrict rwr = rw + 1;
+        for (int q = 0; q < rest; q++) v -= lo[q] * x[rwr[q]];
+        xs[0] = v / Pk[0];
+        return;
+    }
+    for (int q = 0; q < rest; q++) t[q] = x[rw[w + q]];
+    if ((size_t)w * nr > g_solve_blas) {
+        double mone = -1.0;
+        if (rest > 0) BL(dgemv_)("T", &rest, &w, &mone, Pk + w, &nr, t, &IONE, &DONE, xs, &IONE);
+        BL(dtrsv_)("L", "T", "N", &w, Pk, &nr, xs, &IONE);
+        return;
+    }
+    for (int c1 = w; c1 > 0; c1 -= 4) {
+        const int c0 = c1 - 4 > 0 ? c1 - 4 : 0;
+        double v[4];
+        tps_ldots(v, Pk + w, (size_t)nr, xs, t, c0, c1, rest);
+        for (int c = c1 - 1; c >= c0; c--) {
+            const double *restrict col = Pk + (size_t)c * nr;
+            double vc = v[c - c0];
+            for (int r = c + 1; r < w; r++) vc -= col[r] * xs[r];
+            xs[c] = vc / col[c];
+        }
+    }
+}
+/* returns 0 when the solve was done here, 1 when the caller is to use another (no cut, or no factor) */
+int schol_solve_part(SChol *S, double *b, double *work, int nt) {
+    if (!S->pan) return 1;
+    if (!g_solve_blas) { const char *e = getenv("BRISK_SOLVEBLAS"); g_solve_blas = e ? (size_t)atol(e) : 4096; }
+    if (!S->part) sp_build(S);
+    SPart *P = S->part;
+    if (!P || !P->ok) return 1;
+    if (nt < 1) nt = 1;
+    if (P->nta < nt) { free(P->tacc); P->tacc = (double *)malloc(sizeof(double) * (size_t)nt * (P->maxrest + 1)); P->nta = P->tacc ? nt : 0; if (!P->tacc) return 1; }
+    const int m = S->m;
+    double *x = work;
+    for (int i = 0; i < m; i++) x[i] = b[S->perm[i]];
+    const int ntc = P->ntc;
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(nt) if (nt > 1)
+    for (int a = 0; a < P->ntask; a++) {
+        const int tk = P->order[a];
+#ifdef _OPENMP
+        const int me = omp_get_thread_num();
+#else
+        const int me = 0;
+#endif
+        double *tb = P->buf + (size_t)tk * ntc, *ta = P->tacc + (size_t)me * (P->maxrest + 1);
+        memset(tb, 0, sizeof(double) * (size_t)ntc);
+        for (int k = P->tlo[tk]; k <= P->thi[tk]; k++) sp_fwd(S, k, x, ta, P->topidx, tb);
+    }
+    for (int a = 0; a < P->ntop; a++) {
+        const int k = P->top[a];
+        for (int j = S->ss[k]; j < S->ss[k + 1]; j++) {      /* (the tasks' updates of this column, in task order) */
+            const int c = P->topidx[j]; double u = 0;
+            for (int tk = 0; tk < P->ntask; tk++) u += P->buf[(size_t)tk * ntc + c];
+            x[j] -= u;
+        }
+    }
+    for (int a = 0; a < P->ntop; a++) sp_fwd(S, P->top[a], x, P->tacc, NULL, NULL);
+    if (S->sgn) for (int i = 0; i < m; i++) if (S->sgn[i] < 0) x[i] = -x[i];
+    for (int a = P->ntop - 1; a >= 0; a--) sp_bwd(S, P->top[a], x, P->tacc);
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(nt) if (nt > 1)
+    for (int a = 0; a < P->ntask; a++) {
+        const int tk = P->order[a];
+#ifdef _OPENMP
+        const int me = omp_get_thread_num();
+#else
+        const int me = 0;
+#endif
+        double *ta = P->tacc + (size_t)me * (P->maxrest + 1);
+        for (int k = P->thi[tk]; k >= P->tlo[tk]; k--) sp_bwd(S, k, x, ta);
+    }
+    for (int i = 0; i < m; i++) b[S->perm[i]] = x[i];
+    return 0;
+}
 
 /* Two right-hand sides at once (b1, b2 in original ordering, overwritten), reading L once:
  * the solves are memory-bound on L (4.22; the paired Schur solves of the embedding were
@@ -5049,6 +5644,43 @@ void schol_lsolve(const SChol *S, double *x) {
         }
     }
 }
+/* (22 October 2026, the dense columns of lpsolve.c) the forward solve L w = P b for a sparse b (original rows bi, values
+ * bv, nb entries): only the supernodes on the paths from b's entries to the roots of the supernodal elimination tree (a
+ * supernode's parent: the supernode of its first row below the diagonal block), in increasing order, a child before its
+ * parent. x: a full-length array of zeros in the permuted ordering that receives w; mark (ns, zeros) and sn (ns): work.
+ * Returns the number of supernodes reached, listed in sn in increasing order (w is zero outside their columns); the
+ * caller clears x on those columns and mark on those supernodes. */
+static int cmp_int_asc(const void *a, const void *b) { const int x = *(const int *)a, y = *(const int *)b; return x < y ? -1 : x > y; }
+int schol_lsolve_sparse(const SChol *S, const int *bi, const double *bv, int nb, double *x, int *sn, char *mark) {
+    int n = 0;
+    for (int t = 0; t < nb; t++) {
+        const int c = S->iperm[bi[t]];
+        x[c] += bv[t];
+        int k = S->snof[c];
+        while (k >= 0 && !mark[k]) {
+            mark[k] = 1; sn[n++] = k;
+            const int w = S->ss[k + 1] - S->ss[k], nr = S->pnr[k];
+            k = nr > w ? S->snof[S->prow[S->prp[k] + w]] : -1;
+        }
+    }
+    qsort(sn, (size_t)n, sizeof(int), cmp_int_asc);
+    for (int t = 0; t < n; t++) {
+        const int k = sn[t];
+        const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k];
+        const int *rw = S->prow + S->prp[k];
+        const double *Pk = S->pan + S->pbase[k];
+        for (int cc = 0; cc < w; cc++) {
+            const double *col = Pk + (size_t)cc * nr;
+            const double xc = x[j0 + cc] / col[cc];
+            x[j0 + cc] = xc;
+            if (xc != 0.0) for (int q = cc + 1; q < nr; q++) x[rw[q]] -= col[q] * xc;
+        }
+    }
+    return n;
+}
+void schol_sn_cols(const SChol *S, int k, int *j0, int *w) { *j0 = S->ss[k]; *w = S->ss[k + 1] - S->ss[k]; }
+void schol_perm_vec(const SChol *S, const double *b, double *x) { for (int i = 0; i < S->m; i++) x[i] = b[S->perm[i]]; }      /* x = P b */
+void schol_unperm_vec(const SChol *S, const double *x, double *b) { for (int i = 0; i < S->m; i++) b[S->perm[i]] = x[i]; }    /* b = P' x */
 void schol_ltsolve(const SChol *S, double *x) {
     for (int k = S->ns - 1; k >= 0; k--) {
         const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k];
@@ -5247,6 +5879,7 @@ long schol_uid(const SChol *S) { return S ? S->uid : 0; }
 const int *schol_perm(const SChol *S) { return S->perm; }      /* perm[new] = old */
 void schol_set_tinypiv(SChol *S, double t) { S->tinypiv = t; S->ntiny = 0; }
 void schol_set_tinydag(SChol *S, int on) { S->tinydag = on; }
+void schol_set_lpsmall(SChol *S, int on) { S->lpsmall = on; }
 void schol_set_dynpiv(SChol *S, double p) { S->dynpiv = p; S->ndyn = 0; }
 int schol_ndyn(const SChol *S) { return S->ndyn; }
 int schol_ntiny(const SChol *S) { return S->ntiny; }

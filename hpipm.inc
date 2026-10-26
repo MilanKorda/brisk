@@ -35,14 +35,18 @@ static void HPN(dot)(size_t n, const HPT *x, const HPT *y, HPT *r) {
 static void HPN(scal)(size_t n, const HPT *a, HPT *x) { for (size_t i = 0; i < n; i++) HP_MUL(EL(x, i), EL(x, i), a); }
 
 /* Cholesky in place, lower triangle, row-major (Crout: dots over contiguous rows); 0 = ok */
-#define HPN_chol(n, A) HPN(cholr)(n, A, 0.0, NULL, NULL, 0, NULL, NULL)
+#define HPN_chol(n, A) HPN(cholr)(n, A, 0.0, NULL, NULL, 0, NULL, NULL, 0.0)
 /* Dependent rows (the Schur complement of a problem with linearly dependent constraints is
  * singular). A row flagged in mask is skipped: its pivot is made huge, which sets that
  * component of every solve to zero. mode 1 (detection, at a well-conditioned point): a pivot
  * below reg times its diagonal entry flags the row. mode 2 (a new precision): a flagged row
  * whose pivot is above reg times its diagonal entry is not dependent after all and loses the
  * flag. reg > 0 without a mask: the plain threshold (BRISK_HPREG). *nskip counts the skips. */
-static int HPN(cholr)(int n, HPT *A, double reg, int *nskip, int *mask, int mode, double *minrat, const int *fstin) {
+/* tend > 0 (24 October 2026, after ISSUES 274): the clock time (wtime) at which the factorization stops, checked once a
+ * block of columns, and on the user's interrupt: it returns -1 then (a failure at pivot j returns j + 1). The Schur
+ * complement's factorization gets the run's limit: on 9,300 constraints one factorization in double-double took about
+ * 40 s, and the time limit, checked once an iteration, was kept to 80 s for 3 s. */
+static int HPN(cholr)(int n, HPT *A, double reg, int *nskip, int *mask, int mode, double *minrat, const int *fstin, double tend) {
     /* above the blocking threshold: HP_KB columns at a time; the rows below the block take
      * their entries of these columns in one visit (the same dots in the same order) */
     const int kb = (double)n * n * sizeof(HPT) > 2000000.0 ? 16 : n;
@@ -67,6 +71,7 @@ static int HPN(cholr)(int n, HPT *A, double reg, int *nskip, int *mask, int mode
     }
 #define HP_FST(i) (fst ? fst[i] : 0)
     for (int j0 = 0; j0 < n; j0 += kb) {
+    if (tend > 0 && j0 > 0 && (brisk_stop_flag || wtime() > tend)) { free(fst); return -1; }
     const int j1 = j0 + kb < n ? j0 + kb : n;
     for (int j = j0; j < j1; j++) {
         HPT *Lj = EL(A, (size_t)j * n);
@@ -930,12 +935,12 @@ static int HPN(ipm)(HPJob *J) {
                 for (int k = 0; k < nb; k++) for (size_t i = 0; i < S->len[k]; i++) HP_NEG(EL(S->T1[k], i), EL(S->Rd[k], i));
                 HPN(addC)(S, S->T1, +1);                               /* C - Rd = A*(y) + Z */
                 ray_d = HPN(normb)(S, S->T1) / dob / (1 + nC);
-                if (ray_d < 1e-8) { if (was_near) rc = 1; else { rc = 4; J->have_iter = 0; } break; }
+                if (ray_d < 1e-8) { if (was_near) rc = 1; else { rc = 4; J->have_iter = 0; J->ray_res = ray_d; } break; }
             }
             if (po < 0) {
                 for (int p = 0; p < m; p++) HP_SUB(EL(S->v2, p), EL(S->b, p), EL(S->rp, p));   /* A(X) */
                 ray_p = HPN(norm)((size_t)m, S->v2) / (-po) / (1 + nb_);
-                if (ray_p < 1e-8) { if (was_near) rc = 1; else { rc = 5; J->have_iter = 0; } break; }
+                if (ray_p < 1e-8) { if (was_near) rc = 1; else { rc = 5; J->have_iter = 0; J->ray_res = ray_p; } break; }
             }
         }
         if (err <= J->tol) { rc = 0; break; }
@@ -1003,8 +1008,8 @@ static int HPN(ipm)(HPJob *J) {
                 /* a level that stops far from a solution along a ray that is improving to
                  * 1e-4 (the steps vanish before the ray reaches the 1e-8 of the test above) */
                 rc = 1;
-                if (!was_near && err > 1e-2 && ray_d < 1e-4 && ray_d <= ray_p) { rc = 4; J->have_iter = 0; }
-                else if (!was_near && err > 1e-2 && ray_p < 1e-4) { rc = 5; J->have_iter = 0; }
+                if (!was_near && err > 1e-2 && ray_d < 1e-4 && ray_d <= ray_p) { rc = 4; J->have_iter = 0; J->ray_res = ray_d; }
+                else if (!was_near && err > 1e-2 && ray_p < 1e-4) { rc = 5; J->have_iter = 0; J->ray_res = ray_p; }
                 break;
             }
         }
@@ -1039,10 +1044,11 @@ static int HPN(ipm)(HPJob *J) {
         const int frozen = cen_done && last_delta < 0.05 && frozen_ok && it > 0 && HP_EPS < 1e-20 && !(J->pivreg > 0)
                            && (double)m * m * m / 3.0 > 12.0 * sn3 && !getenv("BRISK_HPNOFROZEN");
         int nskip = 0, cfail = 0, ndyn = 0;
+        const double tend = J->timelimit > 0 ? J->tstart + J->timelimit : 0.0;   /* the factorization's deadline (above) */
         if (!frozen) {
             HPN(schur)(S);
             if (getenv("BRISK_HPDBG")) { double dmin = 1e300, dmax = 0; for (int p = 0; p < m; p++) { const double d = HP_GETD(EL(S->M, (size_t)p * m + p)); if (d < dmin) dmin = d; if (d > dmax) dmax = d; } printf("       [M diag %.2e .. %.2e]\n", dmin, dmax); }
-            if (!J->dep) cfail = HPN(cholr)(m, S->M, J->pivreg > 0 ? pow(HP_EPS, J->pivreg) : 0.0, &nskip, NULL, 0, &J->minpiv, J->mfst);
+            if (!J->dep) cfail = HPN(cholr)(m, S->M, J->pivreg > 0 ? pow(HP_EPS, J->pivreg) : 0.0, &nskip, NULL, 0, &J->minpiv, J->mfst, tend);
             else {
                 /* the first factorization of a level: at the cold start the dependent rows are
                  * found; a higher precision checks the flags it inherits. With pivreg, rows whose
@@ -1051,17 +1057,17 @@ static int HPN(ipm)(HPJob *J) {
                 if (J->pivreg > 0 && (it > 0 || J->dep_known)) { mk = S->mask; memcpy(mk, J->dep, sizeof(int) * (size_t)m); }
                 if (it == 0 && !(J->pivreg > 0 && J->dep_known)) {
                     double mp = 1e300;
-                    cfail = HPN(cholr)(m, S->M, pow(HP_EPS, J->dep_known ? 0.6 : 0.7), &nskip, J->dep, J->dep_known ? 2 : 1, &mp, J->mfst);
+                    cfail = HPN(cholr)(m, S->M, pow(HP_EPS, J->dep_known ? 0.6 : 0.7), &nskip, J->dep, J->dep_known ? 2 : 1, &mp, J->mfst, tend);
                     if (J->dep_known && mp < pow(HP_EPS, 0.9)) J->nwould++;
-                    J->dep_known = 1;
+                    if (cfail >= 0) J->dep_known = 1;           /* (not after a factorization the time limit stopped half-way) */
                     if (nskip && J->verbose > 1) printf("     %s: %d linearly dependent constraint(s) left out of the Schur complement\n", HPN(name), nskip);
                 } else if (J->pivreg > 0) {
-                    cfail = HPN(cholr)(m, S->M, pow(HP_EPS, J->pivreg), &nskip, mk, 1, NULL, J->mfst);
+                    cfail = HPN(cholr)(m, S->M, pow(HP_EPS, J->pivreg), &nskip, mk, 1, NULL, J->mfst, tend);
                     for (int p = 0; p < m; p++) ndyn += mk[p] && !J->dep[p];
                     J->ndyn += ndyn;
                 } else {
                     double mp = 1e300;
-                    cfail = HPN(cholr)(m, S->M, 0.0, &nskip, J->dep, 0, &mp, J->mfst);
+                    cfail = HPN(cholr)(m, S->M, 0.0, &nskip, J->dep, 0, &mp, J->mfst, tend);
                     if (mp < J->minpiv) J->minpiv = mp;
                     if (mp < pow(HP_EPS, 0.9)) J->nwould++;      /* the skipping variant would differ here */
                 }
@@ -1069,6 +1075,7 @@ static int HPN(ipm)(HPJob *J) {
             if (getenv("BRISK_HPDBG")) printf("       [%d pivots skipped]\n", nskip);
         }
         if (J->deponly) { rc = 9; have_best = 0; break; }          /* only the dependent rows were wanted (hpsolve.c) */
+        if (cfail < 0) { rc = 2; break; }                           /* stopped by the time limit or an interrupt (as at the start) */
         if (cfail) { rc = 1; J->chol_exit = 1; if (J->verbose > 1) printf("     %s: the Schur complement is not positive definite in this precision\n", HPN(name)); break; }
         /* K = X Rd Zi and A(K), unless Rd = 0 */
         const int have_rd = dinf > 100.0 * HP_EPS;

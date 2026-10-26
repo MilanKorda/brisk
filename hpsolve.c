@@ -15,6 +15,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <fenv.h>
+#include <float.h>
 
 struct HPChamp { int have; uint64_t **X, **Z, *y, *pobj, *dobj; double m[5]; };
 #define HP_NANC 6
@@ -37,6 +38,7 @@ typedef struct {
     int chol_exit;                         /* the level ended because the Schur complement was not positive definite in its precision */
     int more, sick_exit;                   /* a higher precision can follow this level; the level handed over an earlier iterate */
     double level_best;                     /* the best error of the last level (best_err is that of the iterate handed over) */
+    double ray_res;                        /* an infeasibility verdict: the relative residual of the iterate's improving direction */
     double accept;                         /* the error at which the level's end counts as reached (no handover below it) */
     double sick;                           /* > 0: a level ends once <X,Z> is below sick * error twice in a row (off) */
     int maxit, verbose;
@@ -792,7 +794,7 @@ int brisk_lammin_ge_mp(int n, const double *M, double need, int bits) {
             if (i == j) { mpx_setd(t, M[i + (size_t)i * n]); mpx_sub(W + ((size_t)i * n + i) * Wm, t, cm); }
             else mpx_setd(W + ((size_t)i * n + j) * Wm, M[i + (size_t)j * n]);
         }
-    const int ok = cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL) == 0;
+    const int ok = cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL, 0.0) == 0;
     free(W);
     mpx_L = L0; mpx_W = W0;
     return ok;
@@ -1066,10 +1068,121 @@ HP_API long long brisk_hp_text(int what, int block, char *buf, long long len) {
  * -prec 500 the tolerance read 0 and the last level iterated 42 times until the errors did too); the floor
  * caps the tolerance at 1e-290, which the log says */
 static double hp_tolf(double v) { return v < 1e-290 ? 1e-290 : v; }
+/* 23 October 2026 (ISSUES 256): an infeasibility verdict of the iterates checked by a certificate on the problem as read
+ * (O, the double data the measures use). The certificate is the solution of the ray problem of the side in question,
+ * solved in double precision and, when that does not certify, in the working precision:
+ *   DUAL INFEASIBLE, an X >= 0 with A(X) = 0 and <C,X> < 0:   min <C,D> over D >= 0 with A(D) = 0 and tr D = 1;
+ *   PRIMAL INFEASIBLE, a y with b'y > 0 and A*(y) <= 0:       max b'y over y with A*(y) <= 0 and -1 <= y_i <= 1
+ *                                                             (the bounds as an LP block; b'y = 1 alone leaves the
+ *                                                             problem unbounded when a strict certificate exists).
+ * Rounded to doubles, the solution is checked by the double solve's own test (ps_infeas_check: the violation of the ray
+ * normalized to <C,X> = -1 or b'y = 1 at most 1e-6). On clique_60_k15_4_4 (SDP, the owner's benchmark) the first problem
+ * has the value 9.1e-8, a weak direction; its double solution still certifies (violation 5.3e-8).
+ * Returns 1 (certified), 0 (not), -1 (not run); *viol the violation. */
+static int g_hp_inray = 0;
+int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, const BriskResult *warm, const Params *par, int kind, int digits, double tol, const char *yfile, const char *xfile, const char *zfile);
+static int hp_ray_check(const PSOrig *O, int dinf, const Params *par, double tleft, int kind, int digits, double *viol, int *prec) {
+    *viol = INFINITY;
+    const int m = O->m, nb = O->nblk;
+    size_t nid = 0;
+    for (int k = 0; k < nb; k++) nid += (size_t)abs(O->bs[k]);
+    const size_t cap = O->nnz + nid + 4 * (size_t)m + 4;
+    int *mat = (int *)malloc(sizeof(int) * cap), *blk = (int *)malloc(sizeof(int) * cap), *ii = (int *)malloc(sizeof(int) * cap), *jj = (int *)malloc(sizeof(int) * cap);
+    double *v = (double *)malloc(sizeof(double) * cap), *c = (double *)calloc((size_t)m + 2, sizeof(double));
+    int *bs = (int *)malloc(sizeof(int) * (size_t)(nb + 2));
+    memcpy(bs, O->bs, sizeof(int) * (size_t)nb);
+    size_t q = 0;
+    /* (the SDPA numbers, 1-based: matrix 0 is F0 = -C, matrix i the constraint i, the objective c = b of the ray problem) */
+    #define HP_PUT(mt, k, i, j, x) do { mat[q] = (mt); blk[q] = (k) + 1; ii[q] = (i) + 1; jj[q] = (j) + 1; v[q] = (x); q++; } while (0)
+    for (size_t e = 0; e < O->nnz; e++) {
+        if (O->v[e] == 0) continue;
+        if (O->con[e] < 0) { if (dinf) HP_PUT(0, O->blk[e], O->ii[e], O->jj[e], -O->v[e]); }
+        else HP_PUT(O->con[e] + 1, O->blk[e], O->ii[e], O->jj[e], O->v[e]);
+    }
+    int nb2 = nb, m2 = m;
+    if (dinf) {
+        for (int k = 0; k < nb; k++) for (int i = 0; i < abs(O->bs[k]); i++) HP_PUT(m + 1, k, i, i, 1.0);
+        m2 = m + 1; c[m] = 1.0;
+    } else {
+        /* the bounds -1 <= y_i <= 1 as an LP block of 2m entries, 1 - y_i and 1 + y_i (F0 = -1 there) */
+        bs[nb] = -2 * m; nb2 = nb + 1;
+        for (int i = 0; i < m; i++) {
+            c[i] = O->b[i];
+            HP_PUT(0, nb, i, i, -1.0); HP_PUT(0, nb, m + i, m + i, -1.0);
+            HP_PUT(i + 1, nb, i, i, 1.0); HP_PUT(i + 1, nb, m + i, m + i, -1.0);
+        }
+    }
+    #undef HP_PUT
+    BriskData d = { m2, nb2, bs, c, q, mat, blk, ii, jj, v };
+    Params p2 = *par;
+    p2.verbose = -1; p2.bound_side = 0; p2.bound_xfile = NULL; p2.bound_yfile = NULL;
+    if (par->timelimit > 0) p2.timelimit = fmax(1.0, tleft);
+    p2.t_start = wtime();          /* (its limit is the time left, from now: brisk_hp_run counts from t_start) */
+    char sum[sizeof g_hpsum]; const size_t sum_n = g_hpsum_n;
+    memcpy(sum, g_hpsum, sizeof sum);
+    /* first in double precision by the default pipeline, as the double solve that warms this solver (most rays are not
+     * weak: in double-double alone the ray problem of infeas_d_3x150_m1500 took 48 s after a verdict of 1.4 s); in the
+     * working precision only when that does not certify, from the double point */
+    int ok = 0; double obj = 0;
+    BriskResult r0;
+    (void)brisk_double_solve_data(&d, &r0);
+    const int have0 = r0.status >= 0 && r0.status != 1 && r0.status != 2 && r0.have_x && r0.X && r0.y;
+    if (have0) ok = ps_infeas_check(O, dinf ? r0.X : NULL, dinf ? NULL : r0.y, dinf ? 2 : 1, &obj, viol, NULL) == 1;
+    *prec = 0;
+    if (!ok) {
+        BriskResult r; memset(&r, 0, sizeof r);
+        g_hp_inray = 1;
+        const int rr = brisk_hp_run(NULL, &d, &r, have0 ? &r0 : NULL, &p2, kind, digits, 0.0, NULL, NULL, NULL);
+        g_hp_inray = 0;
+        *prec = 1;
+        if (r.have_x && (rr == 0 || rr == 10)) ok = ps_infeas_check(O, dinf ? r.X : NULL, dinf ? NULL : r.y, dinf ? 2 : 1, &obj, viol, NULL) == 1;
+        brisk_result_free(&r);
+    }
+    brisk_result_free(&r0);
+    memcpy(g_hpsum, sum, sizeof sum); g_hpsum_n = sum_n;      /* (the Summary is the outer solve's) */
+    free(mat); free(blk); free(ii); free(jj); free(v); free(c); free(bs);
+    return ok;
+}
+
+/* How far the blocks M of J are from positive semidefinite, from their eigenvalues in double precision, over scale:
+ * lo and hi bound max(0, -lambda_min) below and above by the eigenvalues' error, (n + 1) eps |M|_2 for a block of order
+ * n (the rounding of M to doubles and the backward-stable eigensolver; an LP block: its most negative entry, eps |m|).
+ * For comparing two points (24 October 2026, ISSUES 278: the double solution against the result of a solve that ended
+ * short of its tolerance): on control problems |Z| is 1e7 times |C| or more, and the bounds are then 1e-7 apart. */
+static void hp_psd_viol_d(const HPJob *J, uint64_t *const *M, double scale, double *lo, double *hi) {
+    const size_t Wm = (size_t)mpx_W;
+    double vlo = 0, vhi = 0;
+    for (int k = 0; k < J->nblk; k++) {
+        const int n = abs(J->bs[k]);
+        if (J->bs[k] < 0) {
+            for (int i = 0; i < n; i++) { const double z = mpx_getd(M[k] + (size_t)i * Wm); vlo = fmax(vlo, -z - DBL_EPSILON * fabs(z)); vhi = fmax(vhi, -z + DBL_EPSILON * fabs(z)); }
+            continue;
+        }
+        double *A = (double *)malloc(sizeof(double) * (size_t)n * n), *ev = (double *)malloc(sizeof(double) * (size_t)n), wq; int iwq, lw = -1, liw = -1, info = 0;
+        for (size_t i = 0; i < (size_t)n * n; i++) A[i] = mpx_getd(M[k] + i * Wm);
+        BL(dsyevd_)("N", "L", &n, A, &n, ev, &wq, &lw, &iwq, &liw, &info);
+        lw = (int)wq; liw = iwq;
+        double *wk = (double *)malloc(sizeof(double) * (size_t)(lw > 1 ? lw : 1)); int *iw = (int *)malloc(sizeof(int) * (size_t)(liw > 1 ? liw : 1));
+        BL(dsyevd_)("N", "L", &n, A, &n, ev, wk, &lw, iw, &liw, &info);
+        if (info == 0 && n > 0) {
+            const double d = (n + 1) * DBL_EPSILON * fmax(fabs(ev[0]), fabs(ev[n - 1]));
+            vlo = fmax(vlo, -ev[0] - d); vhi = fmax(vhi, -ev[0] + d);
+        } else if (info != 0) vhi = INFINITY;
+        free(wk); free(iw); free(A); free(ev);
+    }
+    *lo = vlo / scale; *hi = vhi / scale;
+}
+
 int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, const BriskResult *warm, const Params *par, int kind, int digits, double tol, const char *yfile, const char *xfile, const char *zfile) {
     HPJob J_, *J = &J_;
     memset(J, 0, sizeof(*J));
-    J->tstart = wtime();
+    const BriskResult *const warm_arg = warm;   /* (the double solution on the problem as read: a candidate for the result) */
+    /* 24 October 2026 (ISSUES 278): the limit counts from the run's start (par->t_start, set before the double solve that
+     * warms this one; main.c), so that the run as a whole keeps it: from this function's own start the method had the
+     * whole limit again after the double solve had used it (-timelimit 3: 3.0 s of double solve, then 6.8 s here). The
+     * totals printed and returned count from it too, the double solve included (until the evening of 24 October they
+     * added its time once more) */
+    J->tstart = par->t_start > 0 ? par->t_start : wtime();
     brisk_threads_busy(0);            /* only the cores that are free (solver.c) */
     const int target_bits = kind == 1 ? 106 : kind == 2 ? 212 : (int)ceil(digits * 3.3219280949) + 8;
     /* the master precision: the target and one guard limb; two more with the presolve, whose
@@ -1299,7 +1412,6 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     int itlev[40];
     for (int l = 0; l < lev0; l++) { tlev[l] = warm ? warm->time : 0; itlev[l] = warm ? warm->iters : 0; }   /* the double solve (default method) */
     double start_err = 1e300, keep_t[40], ext_err = 1e300;
-    const double t_warm = lev0 && warm ? warm->time : 0.0;
     const int it_warm = lev0 && warm ? warm->iters : 0;
     HPJob keep; int have_keep = 0, keep_lev = 0, keep_it[40];
     if (lev0 == 1 && J->method == 0) start_err = hp_start_err;
@@ -1312,6 +1424,10 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
 #define HP_DBG_MEASURE(tag) do { if (getenv("BRISK_HPDBG") && J->have_iter) { const double e0 = J->best_err, p0 = J->best_pinf, d0 = J->best_dinf; hp_measure(J, J->X, J->y, J->Z, J->tol); printf("       [%s: remeasured err %.1e pinf %.1e dinf %.1e (recorded err %.1e pinf %.1e dinf %.1e)]\n", tag, J->best_err, J->best_pinf, J->best_dinf, e0, p0, d0); J->best_err = e0; J->best_pinf = p0; J->best_dinf = d0; } } while (0)
 hp_again:
     for (lev = levs; lev < nl; lev++) {
+        /* 24 October 2026 (ISSUES 278): no level is started after the time limit (or an interrupt): a level's start
+         * converts and measures the point in its precision before its first limit check (about 2 s in double-double on
+         * 9,300 constraints); the run ends as at a level's own limit stop, at the last level that ran */
+        if (lev > levs && ((J->timelimit > 0 && wtime() - J->tstart > J->timelimit) || brisk_stop_flag)) { rc = 2; lev--; break; }
         const double t0 = wtime(); const int it0 = J->iters;
         J->level_tol = lev == nl - 1 ? 0.0 : hp_tolf(ldexp(1.0, -(int)(0.58 * lb[lev])));
         {   /* can a higher precision follow? (the next level, or an extension: see below) */
@@ -1419,7 +1535,8 @@ hp_again:
         tlev[lev] = wtime() - t0; itlev[lev] = J->iters - it0;
         if (rc != 1 || start_fail) break;
     }
-    if (lev0 == 1 && next == 0 && J->method == 0 && (rc == 3 || (rc == 1 && fmin(J->best_err, champ_.have ? champ_.m[4] : 1e300) > start_err)) && !brisk_stop_flag) {
+    if (lev0 == 1 && next == 0 && J->method == 0 && (rc == 3 || (rc == 1 && fmin(J->best_err, champ_.have ? champ_.m[4] : 1e300) > start_err)) && !brisk_stop_flag
+        && !(J->timelimit > 0 && wtime() - J->tstart > J->timelimit)) {     /* (24 October 2026, ISSUES 278: not after the limit) */
         /* the start from the double solution did not work (not positive definite as doubles,
          * or the solve ended worse than it began): the cold start with its own double level */
         if (J->verbose > 1) printf("     the start from the double solution failed (error %.1e): cold start\n", J->best_err);
@@ -1538,7 +1655,7 @@ hp_again:
         J->pobj = (uint64_t *)calloc(Wm, sizeof(uint64_t)); J->dobj = (uint64_t *)calloc(Wm, sizeof(uint64_t));
         J->iters = JR->iters; J->maxit = JR->maxit; J->verbose = JR->verbose; J->method = JR->method; J->tol = JR->tol;
         J->best_pinf = JR->best_pinf; J->best_dinf = JR->best_dinf; J->best_gap = JR->best_gap; J->best_compl = JR->best_compl; J->best_err = JR->best_err;
-        J->have_iter = JR->have_iter;
+        J->have_iter = JR->have_iter; J->ray_res = JR->ray_res;
         if (JR->have_iter) {
             const double red_err = JR->best_err;
             const double accept0 = tol > 0 ? tol : hp_tolf(ldexp(1.0, -(int)(0.60 * final_bits)));
@@ -1574,6 +1691,7 @@ hp_again:
         lr_free(JR); hp_free(JR);
         hp_pre_free(pre, nb_base);
     }
+    double hp_xpsd = 0;     /* (how far X is from positive semidefinite where it was measured: the dual form's slack; ISSUES 281) */
     if (dualized) {
         /* from the dual form back to the problem as read: X = the dual slack of the dual form
          * (formed by the measure above), y = y+ - y-; then the errors on the data as read */
@@ -1590,9 +1708,14 @@ hp_again:
         J->pobj = (uint64_t *)calloc(Wm, sizeof(uint64_t)); J->dobj = (uint64_t *)calloc(Wm, sizeof(uint64_t));
         J->iters = JD->iters; J->maxit = JD->maxit; J->verbose = JD->verbose; J->method = JD->method; J->tol = JD->tol;
         J->best_pinf = JD->best_pinf; J->best_dinf = JD->best_dinf; J->best_gap = JD->best_gap; J->best_compl = JD->best_compl; J->best_err = JD->best_err;
-        J->have_iter = JD->have_iter; J->lr_delta = JD->lr_delta;
+        J->have_iter = JD->have_iter; J->lr_delta = JD->lr_delta; J->ray_res = JD->ray_res;
+        /* 23 October 2026: an infeasibility verdict of the dual form names its own sides: its primal is the dual of the
+         * problem as read and its dual the primal, so the verdict changes sides here (until now PRIMAL INFEASIBLE was
+         * reported for a problem whose dual is infeasible and the other way round, exit codes 11 and 12 swapped) */
+        if (rc == 4 || rc == 5) rc = 9 - rc;
         if (JD->have_iter) {
             const double xpsd = JD->best_dinf;                 /* how far X (the dual form's slack) is from positive semidefinite */
+            hp_xpsd = xpsd;
             if (face_dual) face_dual = 2;                      /* a face reduction in the dual form: X is positive semidefinite on the face of Z only */
             for (int p2 = 0; p2 < m; p2++) mpx_sub(J->y + (size_t)p2 * Wm, JD->X[nb] + (size_t)(2 * p2) * Wm, JD->X[nb] + (size_t)(2 * p2 + 1) * Wm);
             hp_measure(J, J->X, J->y, J->Z, JD->tol);
@@ -1613,7 +1736,7 @@ hp_again:
         HPJob Jf = red_.Jfull;
         Jf.tstart = J->tstart; Jf.iters = J->iters; Jf.maxit = J->maxit; Jf.verbose = J->verbose; Jf.method = J->method; Jf.tol = J->tol;
         Jf.best_pinf = J->best_pinf; Jf.best_dinf = J->best_dinf; Jf.best_gap = J->best_gap; Jf.best_compl = J->best_compl; Jf.best_err = J->best_err;
-        Jf.have_iter = have; Jf.lr_delta = J->lr_delta;
+        Jf.have_iter = have; Jf.lr_delta = J->lr_delta; Jf.ray_res = J->ray_res;
         if (warm3_.X) { for (int k = 0; k < J->nblk; k++) { free(warm3_.X[k]); if (warm3_.Z) free(warm3_.Z[k]); } free(warm3_.X); free(warm3_.Z); free(warm3_.y); memset(&warm3_, 0, sizeof(warm3_)); }
         free(J->dep); J->dep = NULL; lr_free(J); hp_free(J);
         J_ = Jf; J = &J_;
@@ -1644,6 +1767,65 @@ hp_again:
                 return rc2;
             }
             if (rc == 0 && J->best_err > 10.0 * accept) rc = 1;
+        }
+    }
+    /* 24 October 2026 (ISSUES 278): the double solution this solve started from is the result when the solve ended
+     * worse than it (a time limit reached in the first iterations of a level returned the iterate after one iteration,
+     * error 2e3, instead of the double solution, 2.3e-4). Both are measured alike on the problem as read: the residuals
+     * and the gap of hp_measure in the working precision, and how far Z = C - A*(y) and X are from positive
+     * semidefinite by their eigenvalues in double precision, with bounds for the eigenvalues' error (hp_psd_viol_d; a
+     * grid of Cholesky factorizations in the working precision costs seconds on a block of order 250, more than a time
+     * limit may have left; the solve's X is interior only in its own coordinates). The double solution is returned
+     * only when its error's upper bound is below the result's lower bound: on hinf11 (SDPLIB, SDP), where |Z| is about
+     * 1e7 times |C|, the bounds are about 1.5e-7 wide, the two points cannot be told apart, and the result (5.6e-8 by
+     * its own measure) stays. Only when the double
+     * solve's own errors are within ten times the result's (the measures' norms differ), so that a solve that went
+     * past the double solution pays nothing. */
+    double res_double = 0;          /* (> 0: the result is the double solution; the method's own result's error) */
+    if (warm_arg && warm_arg->X && warm_arg->y && (rc == 1 || rc == 2 || rc == 3) && warm_arg->m == J->m
+        && warm_arg->nblk == (split ? sp_.nb0 : J->nblk)) {
+        double werr = 0;
+        for (int e = 1; e <= 6; e++) werr = fmax(werr, fabs(warm_arg->err[e]));
+        if (!J->have_iter || werr < 10.0 * J->best_err) {
+            double nb2 = 0, nc2 = 0;
+            for (int c = 0; c < J->m; c++) { const double bc = mpx_getd(J->b + (size_t)c * Wm); nb2 += bc * bc; }
+            for (int k = 0; k < J->nblk; k++)
+                for (size_t e = J->cptr[k]; e < J->cptr[k + 1]; e++) { const double v = mpx_getd(J->Cv + e * Wm); nc2 += (J->bs[k] > 0 && J->ci[e] != J->cj[e] ? 2 : 1) * v * v; }
+            const double xscale = 1 + sqrt(nb2), zscale = 1 + sqrt(nc2);
+            double **WXd = split ? hp_split_fwd_d(&sp_, J, warm_arg->X) : warm_arg->X;
+            uint64_t **WX2 = hpc_alloc_blocks(J), **WZ2 = hpc_alloc_blocks(J), **Zt = hpc_alloc_blocks(J);
+            uint64_t *Wy2 = (uint64_t *)calloc(((size_t)J->m + 1) * Wm, sizeof(uint64_t));
+            for (int k = 0; k < J->nblk; k++) {
+                const size_t len = J->bs[k] < 0 ? (size_t)(-J->bs[k]) : (size_t)J->bs[k] * J->bs[k];
+                for (size_t i = 0; i < len; i++) mpx_setd(WX2[k] + i * Wm, WXd[k][i]);
+            }
+            for (int p = 0; p < J->m; p++) mpx_setd(Wy2 + (size_t)p * Wm, warm_arg->y[p]);
+            if (split) { for (int k = 0; k < J->nblk; k++) free(WXd[k]); free(WXd); }
+            const double own[5] = { J->best_pinf, J->best_dinf, J->best_gap, J->best_compl, J->best_err };
+            if (!J->pobj) J->pobj = (uint64_t *)calloc(Wm, sizeof(uint64_t));      /* (hp_measure writes them; a solve without a point may not have them) */
+            if (!J->dobj) J->dobj = (uint64_t *)calloc(Wm, sizeof(uint64_t));
+            uint64_t po[MPX_MAXL + 2], dob[MPX_MAXL + 2];
+            mpx_copy(po, J->pobj); mpx_copy(dob, J->dobj);
+            double own_err = INFINITY, lo1, hi1, lo2, hi2;
+            if (J->have_iter) {
+                hp_measure(J, J->X, J->y, Zt, -1.0);
+                hp_psd_viol_d(J, Zt, zscale, &lo1, &hi1); hp_psd_viol_d(J, J->X, xscale, &lo2, &hi2);
+                own_err = fmax(J->best_err, fmax(lo1, lo2));          /* (a lower bound) */
+            }
+            hp_measure(J, WX2, Wy2, WZ2, -1.0);
+            hp_psd_viol_d(J, WZ2, zscale, &lo1, &hi1); hp_psd_viol_d(J, WX2, xscale, &lo2, &hi2);
+            const double w_dinf = hi1, w_err = fmax(J->best_err, fmax(hi1, hi2));   /* (an upper bound) */
+            if (w_err < own_err) {
+                if (J->verbose) printf("high precision: the double solution is returned: its error on the problem as read is %.1e, that of the method's own result %.1e (both relative to the 2-norms of b and C)\n", w_err, own_err);
+                hpc_free_blocks(J->X, J->nblk); hpc_free_blocks(J->Z, J->nblk); free(J->y);
+                J->X = WX2; J->Z = WZ2; J->y = Wy2; WX2 = WZ2 = NULL; Wy2 = NULL;
+                J->best_dinf = w_dinf; J->best_err = w_err; J->have_iter = 1; res_double = own_err; hp_xpsd = hi2;
+                if (rc == 3) rc = 1;
+            } else {
+                J->best_pinf = own[0]; J->best_dinf = own[1]; J->best_gap = own[2]; J->best_compl = own[3]; J->best_err = own[4];
+                mpx_copy(J->pobj, po); mpx_copy(J->dobj, dob);
+            }
+            hpc_free_blocks(WX2, J->nblk); hpc_free_blocks(WZ2, J->nblk); hpc_free_blocks(Zt, J->nblk); free(Wy2);
         }
     }
     /* -bound: the certificate of each side asked for on the problem as read (hpcert.inc),
@@ -1689,18 +1871,66 @@ hp_again:
     }
     for (int a = 0; a < nap; a++) { hpc_free_blocks(ap[a].X, nb_orig); free(ap[a].y); }
     hpc_free_blocks(DirX, nb_orig); free(diry);
+    /* 23 October 2026 (ISSUES 256): an infeasibility verdict checked by the solution of its ray problem (hp_ray_check;
+     * BRISK_HPRAYCHECK=0: not) */
+    int ray_cert = -1, ray_prec = 0; double ray_viol = INFINITY, t_ray = 0;
+    if ((rc == 4 || rc == 5) && !g_hp_inray && !bside && !(getenv("BRISK_HPRAYCHECK") && atoi(getenv("BRISK_HPRAYCHECK")) == 0)) {
+        const double tr0 = wtime();
+        PSOrig *Oc = hp_psorig(J);
+        ray_cert = hp_ray_check(Oc, rc == 5, par, par->timelimit > 0 ? par->timelimit - (tr0 - J->tstart) : 0, kind, digits, &ray_viol, &ray_prec);
+        ps_orig_free(Oc);
+        t_ray = wtime() - tr0;
+    }
     const char *status = rc == 0 ? "OPTIMAL" : rc == 1 ? "PRECISION LIMIT" : rc == 2 ? (brisk_stop_flag ? "INTERRUPTED" : J->iters >= J->maxit ? "ITERATION LIMIT" : "TIME LIMIT")
                        : rc == 4 ? "PRIMAL INFEASIBLE" : rc == 5 ? "DUAL INFEASIBLE" : "FAILED";
+    /* 24 October 2026 (ISSUES 281): the six DIMACS errors of the result, in the working precision, from the measures
+     * above. Those are relative to the 2-norms of b and C; the DIMACS definitions (the standard solver's ps_measure) to
+     * 1 + |b|_1 and 1 + |C|_1, the entrywise sums with the off-diagonal entries twice: the same point read 250 times apart
+     * on a theta function of 250 vertices. Z = C - A*(y) is formed exactly (err3 = 0), its distance from positive
+     * semidefinite is err4 (the measure's shift, resolved to a factor 2), and err2 is X's where it was measured (the dual
+     * form's slack, a returned double solution), else 0 (X is positive definite in the method's coordinates). The
+     * status line and the library's errors (the interfaces' DIMACS errors) are these; until now the library carried
+     * the 2-norm measure under the DIMACS name, Z's semidefiniteness in the dual residual's place. The ladder's own
+     * decisions keep its measure. */
+    double dimacs[7] = { 0 }, dim_max = J->best_err;
+    if (J->have_iter && J->b && J->cptr && rc != 4 && rc != 5) {
+        double nb1 = 0, nb2 = 0, nc1 = 0, nc2 = 0;
+        for (int c = 0; c < J->m; c++) { const double bc = mpx_getd(J->b + (size_t)c * Wm); nb1 += fabs(bc); nb2 += bc * bc; }
+        for (int k = 0; k < J->nblk; k++)
+            for (size_t e = J->cptr[k]; e < J->cptr[k + 1]; e++) {
+                const double v = mpx_getd(J->Cv + e * Wm), w = J->bs[k] > 0 && J->ci[e] != J->cj[e] ? 2.0 : 1.0;
+                nc1 += w * fabs(v); nc2 += w * v * v;
+            }
+        const double rb = (1 + sqrt(nb2)) / (1 + nb1), rcz = (1 + sqrt(nc2)) / (1 + nc1);
+        dimacs[1] = J->best_pinf * rb; dimacs[2] = hp_xpsd * rb; dimacs[3] = 0; dimacs[4] = J->best_dinf * rcz;
+        dimacs[5] = J->best_gap; dimacs[6] = J->best_compl;
+        dim_max = fmax(fmax(dimacs[1], dimacs[2]), fmax(dimacs[4], fmax(fabs(dimacs[5]), fabs(dimacs[6]))));
+    }
     const int nd = (int)(final_bits * 0.30103);
     if (J->verbose) {
         char *s1 = (char *)malloc((size_t)nd + 64), *s2 = (char *)malloc((size_t)nd + 64);
         uint64_t t[MPX_MAXL + 2];
-        printf("status: %s (max rel error %.1e)   iterations: %d\n", status, J->best_err, J->iters + it_warm);
+        printf("status: %s (max rel error %.1e)   iterations: %d\n", status, dim_max, J->iters + it_warm);
+        /* 23 October 2026 (ISSUES 256): the verdict comes from the iterates (they run along an improving direction), not
+         * from a certificate checked on the problem as read, which the double solver gives; said so */
+        if ((rc == 4 || rc == 5) && ray_cert == 1)
+            printf("  certificate: the solution of the ray problem (solved in %s precision, %.2fs) is a ray of the data as read\n"
+                   "  (%s; violation %.1e with %s)\n", ray_prec ? "this" : "double", t_ray, rc == 4 ? "b'y > 0, A'y <= 0" : "<C,X> < 0, A(X) = 0, X >= 0", ray_viol, rc == 4 ? "b'y = 1" : "<C,X> = -1");
+        else if (rc == 4 || rc == 5) {
+            printf("  no certificate: the verdict comes from the iterates, which run along an improving direction");
+            if (J->ray_res > 0) printf(" (relative residual %.1e)", J->ray_res);
+            if (ray_cert == 0 && isinf(ray_viol)) printf(";\n  its ray problem did not end at a solution (%.2fs)\n", t_ray);
+            else if (ray_cert == 0) printf(";\n  the solution of the ray problem (%.2fs) is not a ray of the data as read (violation %.1e with %s): the problem may\n"
+                                           "  be weakly infeasible (no ray exists) or the verdict may be wrong\n", t_ray, ray_viol, rc == 4 ? "b'y = 1" : "<C,X> = -1");
+            else printf("\n");
+        }
         /* 20 October 2026 (the owner): the values to ten significant digits in the log (all of the working precision's
          * digits with -v, verbosity 2 and more) */
         const int ndp = J->verbose > 2 || nd < 10 ? nd : 10;   /* (J->verbose is the verbosity + 1) */
         mpx_neg(t, J->pobj); mpx_to_str(s1, t, ndp);
-        printf("optimal value (SDPA/SDPLIB convention, max <F0,Y>): %s\n", s1);
+        /* (23 October 2026: after an infeasibility verdict there is no optimal value; the values are those of the last point) */
+        if (rc == 4 || rc == 5) printf("the last point's values (no optimal value: the verdict above)\n");
+        else printf("optimal value (SDPA/SDPLIB convention, max <F0,Y>): %s\n", s1);
         mpx_to_str(s1, J->pobj, ndp); mpx_to_str(s2, J->dobj, ndp);
         printf("  primal obj <C,X> = %s\n  dual obj b'y     = %s\n", s1, s2);
         printf("  errors (in the working precision, on the data as read (before presolve)): pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
@@ -1727,7 +1957,7 @@ hp_again:
         } else if (face_dual == 2) printf("  Z lies in the face found by the presolve (dual form); X is positive semidefinite on that face only: the primal of the\n  problem as read is in general not attained; <C,X> is an upper bound of the dual value by weak duality on the face\n");
         else if (face_dual) printf("  X lies in the face found by the presolve; Z = C - A*(y) is positive definite on that face (dinf is measured there:\n  the dual of the problem as read is in general not attained; b'y is a lower bound by weak duality on the face)\n");
         else printf("  X and Z are positive definite (Cholesky in the working precision)\n");
-        printf("time: total %.3fs;", wtime() - J->tstart + t_warm);
+        printf("time: total %.3fs;", wtime() - J->tstart);
         for (int l = 0; l <= lev; l++) { if (lk[l] == 3) printf(" mp%d", lb[l]); else printf(" %s", l == 0 ? "d" : lk[l] == 1 ? "dd" : "qd"); printf(" %d it %.3fs%s", itlev[l], tlev[l], l < lev ? "," : "\n"); }
         for (int sd = 1; sd <= 2; sd++) {
             if (!tried_cert[sd - 1]) continue;
@@ -1774,8 +2004,14 @@ hp_again:
                 else printf("%s%s %d", first ? "" : ", ", l == 0 ? "double precision" : lk[l] == 1 ? "double-double" : "quad-double", itlev[l]);
                 first = 0;
             }
-            printf(")\n  Time:              %.2f s\n", wtime() - J->tstart + t_warm);
+            printf(")\n");
+            if (res_double > 0 && isfinite(res_double)) printf("                     its result is the double-precision solve's (the high-precision method's own ended at %.1e)\n", res_double);
+            else if (res_double > 0) printf("                     its result is the double-precision solve's (the high-precision method ended without a point)\n");
+            printf("  Time:              %.2f s\n", wtime() - J->tstart);
             printf("  Errors:            pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e (on the problem as read, in the working precision)\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
+            if (J->have_iter && rc != 4 && rc != 5)
+                printf("  DIMACS errors:     pinf %.1e  X>=0 %.1e  dinf %.1e  Z>=0 %.1e  gap %.1e  compl %.1e (in the working precision)\n",
+                       dimacs[1], dimacs[2], dimacs[3], dimacs[4], dimacs[5], dimacs[6]);
         }
         free(s1); free(s2);
     }
@@ -1790,7 +2026,7 @@ hp_again:
         Jo_.X = hp_split_back(&sp_, J, J->X); Jo_.Z = hp_split_back(&sp_, J, J->Z);
         if (certX) { uint64_t **cb = hp_split_back(&sp_, J, certX); hpc_free_blocks(certX, J->nblk); certX = cb; }
         Jo_.y = J->y; Jo_.pobj = J->pobj; Jo_.dobj = J->dobj; J->y = NULL; J->pobj = NULL; J->dobj = NULL;
-        Jo_.iters = J->iters; Jo_.maxit = J->maxit; Jo_.have_iter = J->have_iter; Jo_.verbose = J->verbose;
+        Jo_.iters = J->iters; Jo_.maxit = J->maxit; Jo_.have_iter = J->have_iter; Jo_.verbose = J->verbose; Jo_.tstart = J->tstart;
         Jo_.best_pinf = J->best_pinf; Jo_.best_dinf = J->best_dinf; Jo_.best_gap = J->best_gap; Jo_.best_compl = J->best_compl; Jo_.best_err = J->best_err;
         J_.iters = J->iters; J_.maxit = J->maxit;
         free(J->dep); J->dep = NULL;
@@ -1820,8 +2056,9 @@ hp_again:
         snprintf(res->status_str, sizeof(res->status_str), "%s", status);
         res->iters = J->iters + it_warm; res->pobj = mpx_getd(J->pobj); res->dobj = mpx_getd(J->dobj);
         for (int e = 0; e < 7; e++) res->err[e] = 0;
-        res->err[1] = J->best_pinf; res->err[3] = J->best_dinf; res->err[5] = J->best_gap; res->err[6] = J->best_compl;
-        res->time = wtime() - J->tstart + t_warm; res->m = m; res->nblk = nb;
+        if (J->have_iter && rc != 4 && rc != 5) for (int e = 1; e <= 6; e++) res->err[e] = dimacs[e];
+        else { res->err[1] = J->best_pinf; res->err[3] = J->best_dinf; res->err[5] = J->best_gap; res->err[6] = J->best_compl; }
+        res->time = wtime() - J->tstart; res->m = m; res->nblk = nb;
         res->bs = (int *)malloc(sizeof(int) * (size_t)(nb + 1)); memcpy(res->bs, J->bs, sizeof(int) * (size_t)nb);
         res->y = (double *)malloc(sizeof(double) * (size_t)(m + 1));
         for (int p = 0; p < m; p++) res->y[p] = mpx_getd(J->y + (size_t)p * Wm);

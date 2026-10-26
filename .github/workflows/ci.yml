@@ -14,7 +14,7 @@ jobs:
         run: make
       - name: Examples
         run: |
-          for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat; do
+          for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat examples/*.qps; do
             # pop_wood_20 ends with reduced accuracy by design (the facial reduction's duals cannot be
             # rebuilt; the log says so and how to solve without it): make frtest checks that outcome
             [ "$f" = examples/pop_wood_20.dat-s ] && continue
@@ -24,6 +24,8 @@ jobs:
         run: make hpredtest bindtest restoretest advicetest frtest
       - name: C library
         run: make libbrisk capitest
+      - name: QP solver and the readers
+        run: make qptest readertest
       - name: MATLAB's 64-bit-integer BLAS layer (blas64.c) against an ILP64 OpenBLAS
         run: sudo apt-get install -y libopenblas64-dev && make blas64test
       - uses: actions/setup-python@v5

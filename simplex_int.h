@@ -44,7 +44,7 @@ typedef struct {
     int *uord, nord, ordcap;        /* pivot order of U (row ids; -1 deleted) */
     int *uordpos;                   /* per row id: its position in uord */
     int *uz, nuz, uzcap, *uzpos;    /* the pivots of uord whose column is not empty or whose diagonal is not 1 (-1 deleted) */
-    double *udiag;
+    double *udiag, *urecip;          /* (urecip: 1 / udiag, the solves multiply) */
     int *ucs, *ucl, *ucc;           /* column lists: start, length, capacity in (uci, ucv) */
     int *uci; double *ucv; int ucend, ucap;
     int *urs, *url, *urc;           /* row lists in (uri, urv) */
@@ -53,6 +53,8 @@ typedef struct {
     int nr, rcapn;
     int *rpiv, *rstart;             /* rstart[nr] = end */
     int *ridx; double *rval; int rcap;
+    int *rthead, *rtcnt;            /* per row id: the last R entry that reads it (its readers linked newest first), their count */
+    int *rnext, *reta;              /* per R entry: the next older entry reading the same row, its eta (24 October 2026) */
     /* statistics */
     long nnz_l, nnz_u0, nnz_r;      /* entries after the factorization; R entries */
     long nnz_u;                     /* entries of U now (the updates change it) */
@@ -62,14 +64,21 @@ typedef struct {
     /* work */
     int *stack, *wmark, *wlist, nwlist; double *wval;
     int *dfs_pos;
+    unsigned char *dmark;              /* the depth-first searches' marks (one byte a row: the searches' edge scans read them at random) */
     /* density estimates of the results (for the choice between the hypersparse and the sparse solves) */
     double pivthr;                  /* threshold of the partial pivoting (<= 0: 0.1) */
+    double pivcanc;                 /* a pivot below this times its column's largest entry in B is refused (0: none; the
+                                       crossover's start basis, 22 October 2026) */
     long nflops;                    /* work counter (entries touched), for the cost model of refactorization */
+    double hy_e[2]; int hy_p[2];    /* the depth-first searches' edges per hypersparse solve (a running mean), forward and
+                                       backward, and the solves until the next trial (sxlu_ftran, sxlu_btran; 24 October 2026) */
+    long nedges;                    /* the edges the solves' depth-first searches examined (not in nflops: a separate count for the
+                                       choice of the steepest-edge weights' solve, ftran2) */
 } SxLU;
 
 /* the scratch space of a solve: one per solve that runs at the same time as another (the factorization's own, F->stack
  * and the others above, serves the solves called without one) */
-typedef struct { int m; int *stack, *wmark, *wlist, *dfs_pos; long nflops; } SxWs;
+typedef struct { int m; int *stack, *wmark, *wlist, *dfs_pos; unsigned char *dmark; long nflops, nedges; } SxWs;
 void sxws_init(SxWs *W, int m);
 void sxws_free(SxWs *W);
 
@@ -79,6 +88,7 @@ void sxws_free(SxWs *W);
  * their place have been put in var[]. Returns the number replaced (0: a regular basis). */
 int  sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const double *Ax, int *var, int *out);
 void sxlu_free(SxLU *F);
+void sxlu_copy(SxLU *dst, const SxLU *src);   /* a copy with its updates (dst freed first) */
 /* B x = rhs in place (rhs indexed by rows; on return x indexed by positions = rows).
  * spike != NULL: the partial result after L and R is saved there (for the update) */
 void sxlu_ftran(SxLU *F, SxVec *x, double expdens, SxVec *spike);
@@ -90,6 +100,7 @@ void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike);
 int  sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat, int npat);
 /* B' y = rhs in place; upart != NULL: the partial result after U' is saved there (for the update) */
 void sxlu_btran(SxLU *F, SxVec *y, double expdens, SxVec *upart);
+void sxlu_btran_upart(SxLU *F, SxVec *y, double expdens, SxVec *upart);
 /* replace the column in position r by the entering column whose spike (from sxlu_ftran) and the
  * partial btran of e_r (upart) are given; alpha = (B^{-1} a_q)_r. Returns 0, or 1 if the update is
  * numerically doubtful (refactorize). */

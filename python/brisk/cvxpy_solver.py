@@ -569,3 +569,67 @@ class BRISK(ConicSolver):
         if not np.isfinite(bz) or bz >= 0:
             return None
         return z / -bz
+
+
+# ---- (22 October 2026) the QP method for CVXPY's QPs ------------------------------------------------------------------
+from cvxpy.reductions.solvers.qp_solvers.qp_solver import QpSolver   # noqa: E402
+from cvxpy.reductions.solvers import utilities as _qp_utilities      # noqa: E402
+
+
+class BRISK_QP(QpSolver):
+    """BRISK's QP solver for CVXPY's quadratic programs (a quadratic objective, linear constraints):
+    prob.solve(solver=brisk.BRISK_QP()). CVXPY hands it  min 1/2 x'Px + q'x  s.t.  A x = b,  F x <= g,  lb <= x <= ub;
+    by default BRISK's active-set method for a small QP with P positive definite and its interior-point method otherwise
+    (the QP solver's own choice), the active-set method with active_set=True, the interior-point method with
+    active_set=False. Other options as on the
+    command line for a QP file (tol, maxit, timelimit, threads) as keywords; options=[...] for raw strings. The duals
+    follow CVXPY's convention (P x + q + A'y + F'z = 0, z >= 0): the negatives of BRISK's."""
+
+    MIP_CAPABLE = False
+    BOUNDED_VARIABLES = True
+    STATUS = {0: s.OPTIMAL, 5: s.OPTIMAL_INACCURATE, 1: s.INFEASIBLE, 2: s.UNBOUNDED, 3: s.USER_LIMIT, 6: s.USER_LIMIT,
+              4: s.SOLVER_ERROR}
+
+    def name(self):
+        return "BRISK_QP"
+
+    def import_solver(self):
+        _core.load_library()
+
+    def cite(self, data):
+        return "@misc{brisk, title = {{BRISK}}, note = {version " + _core.version() + "}}"
+
+    def solve_via_data(self, data, warm_start, verbose, solver_opts, solver_cache=None):
+        opts = dict(solver_opts or {})
+        raw = opts.pop("options", None)
+        aset = opts.pop("active_set", None)            # (None: the solver's choice; True / False: that method)
+        opts.pop("use_quad_obj", None)
+        n = int(data["n_var"])
+        A = sp.vstack([sp.csr_matrix(data[s.A]), sp.csr_matrix(data[s.F])]).tocsc()
+        b, g = np.asarray(data[s.B], float).ravel(), np.asarray(data[s.G], float).ravel()
+        lo = np.concatenate([b, np.full(g.size, -np.inf)])
+        hi = np.concatenate([b, g])
+        lb = data.get(s.LOWER_BOUNDS)
+        ub = data.get(s.UPPER_BOUNDS)
+        argv = _core.options_to_argv(opts) + _core.options_to_argv(raw) + ([] if aset is None else ["-qpas"] if aset else ["-qpipm"])
+        try:
+            res = _core.solve_qp(sp.csc_matrix(data[s.P]) if data[s.P] is not None else None, np.asarray(data[s.Q], float).ravel(),
+                                 A if A.shape[0] else None, lo, hi,
+                                 None if lb is None else np.asarray(lb, float), None if ub is None else np.asarray(ub, float),
+                                 options=argv, verbose=verbose, _caller="cvxpy")
+        except RuntimeError as e:
+            raise SolverError(str(e)) from e
+        return {"res": res, "n_eq": int(data["n_eq"])}
+
+    def invert(self, solution, inverse_data):
+        res, ne = solution["res"], solution["n_eq"]
+        status = self.STATUS.get(res.status, s.SOLVER_ERROR)
+        attr = {s.NUM_ITERS: res.iterations, s.EXTRA_STATS: res}
+        if status in s.SOLUTION_PRESENT:
+            y = -np.asarray(res.y, float)
+            dual = {}
+            dual.update(_qp_utilities.get_dual_values(y[:ne], _qp_utilities.extract_dual_value, inverse_data[self.EQ_CONSTR]))
+            dual.update(_qp_utilities.get_dual_values(y[ne:], _qp_utilities.extract_dual_value, inverse_data[self.NEQ_CONSTR]))
+            return Solution(status, float(res.obj) + inverse_data[s.OFFSET], {inverse_data[self.VAR_ID]: np.asarray(res.x, float)},
+                            dual, attr)
+        return failure_solution(status, attr)

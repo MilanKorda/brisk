@@ -34,6 +34,15 @@ typedef struct {
     int deterministic;          /* method 0 with two free threads or more: 1 = the choice of the method by counted work
                                    (the same result on every run and at every thread count); 0 = the race by the clock:
                                    the interior-point method beside the simplex method, the first to end optimal wins */
+    const struct SxOrig *orig;  /* (internal, set by simplex_solve for its routes: the problem as read and the presolve's
+                                   maps, for the interior-point method's second attempt; callers leave it NULL) */
+    int given_perturb;          /* (internal, the sifting on rows: a given basis that is dual feasible is solved with the
+                                   costs perturbed, as from the slack basis, instead of the dual method's phase 2 alone) */
+    int dual_race;              /* (internal: dual_route as one of the race's two simplex routes, the direct one beside it) */
+    int in_dual;                /* (internal: the interior-point route on the dual of a tall problem; dual_route then runs
+                                   the interior-point method and the crossover on the dual, which is not dualized again) */
+    int ipm_kcorr;              /* the interior-point method's centrality correctors per iteration, plus one (0: chosen
+                                   from the cost of a factorization against a solve; k + 1: k, the command line's -lpcorr k) */
 } SimplexOpts;
 
 /* basis status of a column or row */
@@ -78,4 +87,11 @@ int simplex_solve(const LpProb *L, const SimplexOpts *o, double *x, double *ax, 
  * solver, which gives one). */
 int simplex_solve_sedumi(const SedumiProb *P, const SimplexOpts *o, double *x, double *y, double *z, double *pobj, double *dobj,
                          SimplexInfo *info);
+/* (24 October 2026) the LP interior-point method on the problem the simplex method's presolve left (main.c's route of
+ * -lpmethod 1) declines when the problem as read is clearly cheaper, as the interior-point route of the simplex method
+ * does: a context for LpIpmOpts.analyzed (sx_asread_cb), whether it declined, and its release */
+void *sx_asread_new(const LpProb *asread, const LpProb *presolved, int verbose);
+int sx_asread_cb(void *ctx, double flops);
+int sx_asread_declined(const void *ctx);
+void sx_asread_free(void *ctx);
 #endif

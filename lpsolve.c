@@ -34,11 +34,14 @@
 
 typedef struct SChol SChol;
 SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap);
+int    schol_amd_estimate(int m, const int *deg, int *const *nbr, double *flops_out, double *nnz_out);
+int    schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatile double *cap, double *flops_out, double *nnz_out);
 void   schol_free(SChol *S);
 double *schol_values(SChol *S);
 size_t schol_offset(const SChol *S, size_t r, size_t c);
 void   schol_set_tinypiv(SChol *S, double t);
 void   schol_set_tinydag(SChol *S, int on);
+void   schol_set_lpsmall(SChol *S, int on);
 int    schol_factor(SChol *S, double shift);
 void   schol_solve(const SChol *S, double *b, double *work);
 size_t schol_nnz(const SChol *S);
@@ -67,6 +70,15 @@ typedef struct {
     int nd, *dcol; char *isd;          /* dense columns */
     SChol *sc; int *Mp, *Mi; size_t *Mo;   /* the lower pattern of A_s A_s' by columns: rows Mi >= the column, offsets Mo */
     double *V, *G, *gw;                /* dense columns: V = M_s^-1 A_d (m x nd), G = Theta_d^-1 + A_d' V = L L' */
+    /* (22 October 2026) the rows the dense columns alone cover: their diagonal (from the dense columns) put into the
+     * factored matrix and taken out again as the last nE columns of the correction, which is then indefinite: V has
+     * nd + nE columns, G = C^-1 + U' V with U = [A_d, e_E], C = diag(Theta_d, -Edel), factored by Bunch-Kaufman */
+    int nE, *Erow, *Gpiv; double *Edel, *Gwork, *Glam; int lGwork; int dbg_prec;
+    /* (22 October 2026) W = L^-1 P U, sparse (the forward solves of U's columns reach few supernodes), by columns:
+     * G = C^-1 + W'W, and a solve P' L^-T (L^-1 P r - W G^-1 W' L^-1 P r): one solve and two passes over W. xw (m,
+     * zeros), wmark (supernodes, zeros), wsn: the sparse solves' work */
+    int *Wp, *Wi, Wcap; double *Wx, *xw; char *wmark; int *wsn;
+    int nthw; double **xw_t; char **wmark_t; int **wsn_t;   /* (23 October 2026) per-thread work of the dense columns' solves */
     double *Vw;                        /* (22 October 2026) the work of the solve of V's columns at once (m x nd) */
     double *theta;
     double *w1, *w2, *w3, *w4, *wn, *acc; long nref; double worst;   /* work: m, m, m, n, m */
@@ -79,7 +91,7 @@ typedef struct {
     double pdrel, *dreg;               /* (the same night, BRISK_LPPDREL=eps, an experiment) with the regularization on, the dual
                                           part also eps M_ii per row, scaled to the matrix: dreg[i] at each factorization */
     double tinyth;                   /* the tiny-pivot threshold of the factorizations */
-    long nfact, nsolve, ncg; int ntiny;
+    long nfact, nsolve, ncg, nprec; int ntiny;
     double t_fact, t_solve, t_asm, t_dense;
     double **acc_t; int nacc_t;          /* 17 October 2026: per-thread accumulators of the assembly */
     int *Fp, *Fj; double *Fx;          /* 18 October 2026: all of A by rows (columns ascending), for A x on the threads */
@@ -87,6 +99,7 @@ typedef struct {
     int est;                           /* ne_setup for a cost estimate only (AMD, no offsets) */
     double dthr;                       /* > 0: the length above which a column is dense (the cost-based choice, ne_dense_choice) */
     double est_budget, est_lb; long est_w;   /* the estimate's budget; its lower bound on the flops when it is exceeded */
+    const volatile double *est_cap;         /* (may be NULL) a cap on the estimate's AMD count, lowered while it runs */
     double *vpart;                     /* (the partial sums of the O(n) passes, one per chunk of LPV_CH columns) */
     double *wa;                        /* the affine direction while the weighted corrector is chosen (4 n + m) */
 } LpS;
@@ -117,6 +130,7 @@ static void At_mul(const LpS *S, const double *y, double *x) {          /* x = A
  * bits at any thread count; the sums run over fixed chunks of LPV_CH columns whose partial sums are added in order, so
  * they too are the same at any thread count (and below LPV_MIN columns everything is as before). BRISK_LPVPAR=0: one
  * thread (the chunked sums kept). */
+#define LP_NDMAX 2048       /* the most columns kept apart from the factor when the cost model chooses them */
 #define LPV_MIN 100000
 #define LPV_CH 16384
 static int lpv_par(const LpS *S) {
@@ -202,49 +216,139 @@ static int ne_factor(LpS *S) {
      * reached 5e-6, then the primal residual grew and the method gave up after 40 iterations. At 1e-16 (the rounding
      * level of a pivot of order one) 17 iterations, 0.9 s; the other 141 LPs of the sets the same status lines and
      * iterations within one. ISSUES 226.) */
+    /* the rows the dense columns alone cover: their diagonal in A Theta A' (sum over the dense columns of theta a^2), or 1
+     * when it is zero, put into the factored matrix (taken out again by the correction) */
+    if (S->nE > 0) {
+        for (int k = 0; k < S->nE; k++) S->Edel[k] = 0.0;
+        for (int d = 0; d < S->nd; d++) { const int j = S->dcol[d];
+            for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const int i = S->Ai[p];
+                /* (Erow ascending: a binary search) */
+                int lo = 0, hi = S->nE - 1; while (lo < hi) { const int mid = (lo + hi) / 2; if (S->Erow[mid] < i) lo = mid + 1; else hi = mid; }
+                if (S->Erow[lo] == i) S->Edel[lo] += S->theta[j] * S->Ax[p] * S->Ax[p]; } }
+        for (int k = 0; k < S->nE; k++) { if (!(S->Edel[k] > 0)) S->Edel[k] = 1.0; pm[S->Mo[S->Mp[S->Erow[k]]]] += S->Edel[k]; }
+    }
     S->t_asm += lp_time() - t0;
     schol_set_tinypiv(S->sc, S->tinyth > 0 ? S->tinyth : 1e-16);
     /* 18 October 2026 (LP/SOCP): the large nodes by the tile task graph of sparsechol.c (fnode_dag), the tiny-pivot rule
      * in its diagonal tiles; it was skipped with tiny pivots (BRISK_LPTDAG=0: as before) */
     { static int tdag = -1; if (tdag < 0) { const char *e = getenv("BRISK_LPTDAG"); tdag = !(e && atoi(e) == 0); } schol_set_tinydag(S->sc, tdag); }
+    /* (26 October 2026, the merge for 1.6) the LP method's small sources straight into the target (sparsechol.c,
+     * BRISK_LPSMALL): a mode of its own, since the tiny-pivot rule is also used by the SDP solver and the QP method,
+     * whose factorizations must keep their rounding */
+    schol_set_lpsmall(S->sc, 1);
     /* 17 October 2026: the factorization by the tree code of sparsechol.c on the threads, the solves
-     * sequential. The left-looking code (schol_set_solve_seq) was 25-30 % faster at one thread in 5.7; with
+     * sequential (23 October 2026: on the threads too for large factors, below). The left-looking code (schol_set_solve_seq) was 25-30 % faster at one thread in 5.7; with
      * the kernels of since the two are even at one thread (Kennington 13.3 against 13.0 s) and the tree code
      * uses the threads (four: 11.8 s; pds-20 5.1 -> 3.6 s), with the same results at any thread count; its
      * solves stay slower (osa-60: 1.2 -> 3.3 s if they go with it). BRISK_LPFLL=1: the left-looking code. */
     static int fll = -1; if (fll < 0) fll = getenv("BRISK_LPFLL") != NULL;
     if (!fll) schol_set_solve_seq(0);
     const int bad = schol_factor(S->sc, 0.0);
-    if (!fll) schol_set_solve_seq(1);
+    {   /* (23 October 2026) the solves on the threads too (the tree code's) for a factor of at least 500,000 entries: each
+         * solve is a pass through the factor, 3.1 of opm2-z10-s4's 10 s with 17.8 million entries. Four threads, total
+         * time (LPs): osa-60 1.37 -> 1.21 s, ken-18 2.03 -> 1.76, s100 22.1 -> 19.7, physiciansched3-3 71.1 -> 60.8,
+         * opm2-z10-s4 19.3 -> 18.3; rail01 23.1 -> 24.4, supportcase10 6.7 -> 7.3, pds-20 2.85 -> 2.91 (the regression
+         * that made them sequential, osa-60 1.2 -> 3.3 s, is gone with the tree code's present solves). BRISK_LPSOLVEPAR:
+         * the threshold (0: sequential always) */
+        static double spar = -1; if (spar < 0) { const char *e = getenv("BRISK_LPSOLVEPAR"); spar = e ? atof(e) : 5e5; }
+        if (!fll) schol_set_solve_seq(!(spar > 0 && (double)schol_nnz(S->sc) >= spar));
+    }
     S->ntiny += schol_ntiny(S->sc);
     S->nfact++;
     if (bad) { S->t_fact += lp_time() - t0; return 1; }
     if (S->nd > 0) {
-        const int nd = S->nd;
-        /* (22 October 2026, the night; BRISK_LPVMANY=1, an experiment, off: the columns solved at once, one pass over the
-         * factor for all of them, the same values to rounding; piperout-27 (LP) 1.13 -> 0.97 s, rocII-5-11 (LP) 7.0 -> 5.4 s,
-         * but piperout-08 (LP), at the edge, breaks down with it; IDEAS) */
-        static int vmany = -1; if (vmany < 0) vmany = getenv("BRISK_LPVMANY") && atoi(getenv("BRISK_LPVMANY")) == 1;
-        if (vmany && !S->Vw) S->Vw = xm(sizeof(double) * (size_t)m * nd);
-        for (int d = 0; d < nd; d++) {
-            const int j = S->dcol[d]; double *v = S->V + (size_t)d * m;
-            for (int i = 0; i < m; i++) v[i] = 0;
-            for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) v[S->Ai[p]] = S->Ax[p];
-            if (!vmany) schol_solve(S->sc, v, S->w3);
-        }
-        if (vmany) schol_solve_many(S->sc, S->V, nd, S->Vw);
-        for (int d = 0; d < nd; d++) {
-            const double *v = S->V + (size_t)d * m;
-            for (int e = 0; e <= d; e++) {
-                const int j = S->dcol[e]; double s = 0;
-                for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) s += S->Ax[p] * v[S->Ai[p]];
-                S->G[d + (size_t)e * nd] = s; S->G[e + (size_t)d * nd] = s;
+        /* the correction (the Sherman-Morrison-Woodbury formula) over U = [A_d, e_E], C = diag(Theta_d, -Edel):
+         * G = C^-1 + U' M~^-1 U, its column a from v = M~^-1 u_a (kept in V, or one work vector), its lower part */
+        const int nd = S->nd, nE = S->nE, nt = nd + nE;
+        const double tg0 = lp_time();
+        /* W's columns: the sparse forward solves of U's columns. (23 October 2026) On the threads when there are several
+         * columns: each column's solve into a buffer of its own (the same arithmetic on any thread: the same W at any
+         * thread count), then the buffers in column order; on ex9 (LP; 94 dense columns, W 497,151 entries) the solves
+         * took 0.5-0.75 s of each factorization one after another */
+        int nw = 0; S->Wp[0] = 0;
+        int one_i = 0; double one_v = 1.0;
+        int nthw = 1;
+#ifdef _OPENMP
+        if (nt >= 8 && !omp_in_parallel()) nthw = omp_get_max_threads();
+        if (nthw > nt) nthw = nt;
+#endif
+        if (nthw > 1) {
+            const int nsup = schol_nsuper(S->sc);
+            if (S->nthw < nthw) {
+                for (int t = 0; t < S->nthw; t++) { free(S->xw_t[t]); free(S->wmark_t[t]); free(S->wsn_t[t]); }
+                free(S->xw_t); free(S->wmark_t); free(S->wsn_t);
+                S->xw_t = xm(sizeof(double *) * nthw); S->wmark_t = xm(sizeof(char *) * nthw); S->wsn_t = xm(sizeof(int *) * nthw);
+                for (int t = 0; t < nthw; t++) { S->xw_t[t] = xz(sizeof(double) * ((size_t)m + 1)); S->wmark_t[t] = xz((size_t)nsup + 1); S->wsn_t[t] = xm(sizeof(int) * ((size_t)nsup + 1)); }
+                S->nthw = nthw;
             }
-            S->G[d + (size_t)d * nd] += 1.0 / S->theta[S->dcol[d]];
+            int **ci = xm(sizeof(int *) * nt); double **cv = xm(sizeof(double *) * nt); int *cn = xz(sizeof(int) * (nt + 1));
+            #pragma omp parallel for num_threads(nthw) schedule(dynamic, 1)
+            for (int a = 0; a < nt; a++) {
+#ifdef _OPENMP
+                const int tid = omp_get_thread_num();
+#else
+                const int tid = 0;
+#endif
+                double *xw = S->xw_t[tid]; char *wmk = S->wmark_t[tid]; int *wsn = S->wsn_t[tid];
+                int oi = 0; const double ov = 1.0; int ns_r;
+                if (a < nd) { const int j = S->dcol[a]; ns_r = schol_lsolve_sparse(S->sc, S->Ai + S->Ap[j], S->Ax + S->Ap[j], S->Ap[j + 1] - S->Ap[j], xw, wsn, wmk); }
+                else { oi = S->Erow[a - nd]; ns_r = schol_lsolve_sparse(S->sc, &oi, &ov, 1, xw, wsn, wmk); }
+                long cap = 0; for (int t = 0; t < ns_r; t++) { int j0, w; schol_sn_cols(S->sc, wsn[t], &j0, &w); cap += w; }
+                int *ii = xm(sizeof(int) * ((size_t)cap + 1)); double *vv = xm(sizeof(double) * ((size_t)cap + 1)); int c = 0;
+                for (int t = 0; t < ns_r; t++) {
+                    int j0, w; schol_sn_cols(S->sc, wsn[t], &j0, &w);
+                    for (int q = j0; q < j0 + w; q++) { if (xw[q] != 0.0) { ii[c] = q; vv[c] = xw[q]; c++; } xw[q] = 0.0; }
+                    wmk[wsn[t]] = 0;
+                }
+                ci[a] = ii; cv[a] = vv; cn[a] = c;
+            }
+            long tot = 0; for (int a = 0; a < nt; a++) tot += cn[a];
+            if (tot > S->Wcap) { S->Wcap = (int)(tot + 1024); S->Wi = realloc(S->Wi, sizeof(int) * (size_t)S->Wcap); S->Wx = realloc(S->Wx, sizeof(double) * (size_t)S->Wcap); }
+            for (int a = 0; a < nt; a++) {
+                memcpy(S->Wi + nw, ci[a], sizeof(int) * (size_t)cn[a]); memcpy(S->Wx + nw, cv[a], sizeof(double) * (size_t)cn[a]);
+                nw += cn[a]; S->Wp[a + 1] = nw; free(ci[a]); free(cv[a]);
+            }
+            free(ci); free(cv); free(cn);
+        } else
+        for (int a = 0; a < nt; a++) {
+            int ns_r;
+            if (a < nd) { const int j = S->dcol[a]; ns_r = schol_lsolve_sparse(S->sc, S->Ai + S->Ap[j], S->Ax + S->Ap[j], S->Ap[j + 1] - S->Ap[j], S->xw, S->wsn, S->wmark); }
+            else { one_i = S->Erow[a - nd]; ns_r = schol_lsolve_sparse(S->sc, &one_i, &one_v, 1, S->xw, S->wsn, S->wmark); }
+            for (int t = 0; t < ns_r; t++) {
+                int j0, w; schol_sn_cols(S->sc, S->wsn[t], &j0, &w);
+                if (nw + w > S->Wcap) { S->Wcap = 2 * S->Wcap + w; S->Wi = realloc(S->Wi, sizeof(int) * (size_t)S->Wcap); S->Wx = realloc(S->Wx, sizeof(double) * (size_t)S->Wcap); }
+                for (int c = j0; c < j0 + w; c++) { if (S->xw[c] != 0.0) { S->Wi[nw] = c; S->Wx[nw] = S->xw[c]; nw++; } S->xw[c] = 0.0; }
+                S->wmark[S->wsn[t]] = 0;
+            }
+            S->Wp[a + 1] = nw;
         }
+        /* G = C^-1 + W'W (lower part): column a of W scattered, the dots with the later columns */
+        for (int a = 0; a < nt; a++) {
+            for (int p = S->Wp[a]; p < S->Wp[a + 1]; p++) S->xw[S->Wi[p]] = S->Wx[p];
+            for (int b = a; b < nt; b++) { double s = 0; for (int p = S->Wp[b]; p < S->Wp[b + 1]; p++) s += S->Wx[p] * S->xw[S->Wi[p]]; S->G[b + (size_t)a * nt] = s; }
+            for (int p = S->Wp[a]; p < S->Wp[a + 1]; p++) S->xw[S->Wi[p]] = 0.0;
+            const double ci = a < nd ? 1.0 / S->theta[S->dcol[a]] : -1.0 / S->Edel[a - nd];
+            if (nE) S->Glam[nt + a] = 1.0 / sqrt(fabs(ci) + S->G[a + (size_t)a * nt]);    /* (the scaling of G for its eigenvalues) */
+            S->G[a + (size_t)a * nt] += ci;
+        }
+        if (nE) for (int a = 0; a < nt; a++) for (int b = a; b < nt; b++) S->G[b + (size_t)a * nt] *= S->Glam[nt + a] * S->Glam[nt + b];
+        if (getenv("BRISK_LPDBG") && S->nfact <= 2) printf("     [dense correction: %d columns, W %d entries (%.1f per column of %d rows), %.3fs]\n", nt, nw, (double)nw / nt, m, lp_time() - tg0);
         int info = 0;
-        BL(dpotrf_)("L", &nd, S->G, &nd, &info);
+        /* with rows of no sparse entry the dense columns alone cover them, and when they are more than those columns the
+         * normal equations are singular (lp_densecols: 139 such rows, 20 columns; the joined factorization replaces the
+         * tiny pivots, here G is singular): G by its eigenvalues, the directions of eigenvalues below 1e-12 of the
+         * largest dropped. For consistent equations (b in the range of A) any solution z of G z = h gives a solution of
+         * the normal equations: M (M_s^-1 r - M_s^-1 U z) = r + U C (h - G z) with M = M_s + U C U' (22 October 2026) */
+        if (nE == 0) BL(dpotrf_)("L", &nt, S->G, &nt, &info);
+        else BL(dsyev_)("V", "L", &nt, S->G, &nt, S->Glam, S->Gwork, &S->lGwork, &info);
         if (info) { S->t_fact += lp_time() - t0; return 1; }
+        if (getenv("BRISK_LPDBG") && S->nfact <= 3) S->dbg_prec = 1;
+        if (nE && getenv("BRISK_LPDBG") && S->nfact <= 3) {
+            double lmax = 0; for (int a = 0; a < nt; a++) lmax = fmax(lmax, fabs(S->Glam[a]));
+            int nz = 0, nneg = 0; for (int a = 0; a < nt; a++) { if (fabs(S->Glam[a]) <= 1e-12 * lmax) nz++; else if (S->Glam[a] < 0) nneg++; }
+            printf("     [G: eigenvalues %.1e .. %.1e (largest |.| %.1e), %d dropped, %d negative; sparse factor: %d tiny pivots]\n", S->Glam[0], S->Glam[nt - 1], lmax, nz, nneg, schol_ntiny(S->sc));
+        }
+
     }
     S->t_fact += lp_time() - t0;
     return 0;
@@ -252,24 +356,54 @@ static int ne_factor(LpS *S) {
 /* z = P^-1 r: the factored sparse part and the dense columns by the Woodbury formula */
 static void ne_prec(LpS *S, const double *r, double *z) {
     const int m = S->m;
-    memcpy(z, r, sizeof(double) * (size_t)m);
-    schol_solve(S->sc, z, S->w3);
-    if (S->nd > 0) {
-        const int nd = S->nd, one = 1; int info = 0;
-        for (int d = 0; d < nd; d++) {
-            const int j = S->dcol[d]; double s = 0;
-            for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) s += S->Ax[p] * z[S->Ai[p]];
-            S->gw[d] = s;
-        }
-        BL(dpotrs_)("L", &nd, &one, S->G, &nd, S->gw, &nd, &info);
-        for (int d = 0; d < nd; d++) { const double g = S->gw[d]; const double *v = S->V + (size_t)d * m; if (g != 0.0) for (int i = 0; i < m; i++) z[i] -= g * v[i]; }
+    S->nprec++;
+    if (S->nd == 0) { memcpy(z, r, sizeof(double) * (size_t)m); schol_solve(S->sc, z, S->w3); return; }
+    /* the dense columns: z = P' L^-T (x - W G^-1 W' x), x = L^-1 P r */
+    const int nd = S->nd, nt = nd + S->nE, one = 1; int info = 0;
+    double *x = S->w3;
+    schol_perm_vec(S->sc, r, x);
+    schol_lsolve(S->sc, x);
+    for (int a = 0; a < nt; a++) { double s = 0; for (int p = S->Wp[a]; p < S->Wp[a + 1]; p++) s += S->Wx[p] * x[S->Wi[p]]; S->gw[a] = s; }
+    if (S->nE == 0) BL(dpotrs_)("L", &nt, &one, S->G, &nt, S->gw, &nt, &info);
+    else {      /* G = D^-1 Gs D^-1 (D the scaling, Glam[nt..]), Gs = V diag(lambda) V': z = D V diag(1 / lambda, 0 below 1e-12 of the largest) V' D h */
+        const double *sc = S->Glam + nt;
+        double lmax = 0; for (int a = 0; a < nt; a++) lmax = fmax(lmax, fabs(S->Glam[a]));
+        double *t = S->Gwork;
+        for (int b = 0; b < nt; b++) S->gw[b] *= sc[b];
+        for (int a = 0; a < nt; a++) { double v = 0; const double *va = S->G + (size_t)a * nt; for (int b = 0; b < nt; b++) v += va[b] * S->gw[b]; t[a] = fabs(S->Glam[a]) > 1e-12 * lmax ? v / S->Glam[a] : 0.0; }
+        for (int b = 0; b < nt; b++) S->gw[b] = 0;
+        for (int a = 0; a < nt; a++) { const double ta = t[a]; if (ta != 0.0) { const double *va = S->G + (size_t)a * nt; for (int b = 0; b < nt; b++) S->gw[b] += ta * va[b]; } }
+        for (int b = 0; b < nt; b++) S->gw[b] *= sc[b];
     }
+    for (int a = 0; a < nt; a++) { const double g = S->gw[a]; if (g != 0.0) for (int p = S->Wp[a]; p < S->Wp[a + 1]; p++) x[S->Wi[p]] -= g * S->Wx[p]; }
+    schol_ltsolve(S->sc, x);
+    schol_unperm_vec(S->sc, x, z);
 }
 /* (A Theta A') x = r: the preconditioner, then CG on the true matrix until the residual is below
  * rtol |r| (at most maxcg steps); returns the relative residual */
 static double ne_cg(LpS *S, double *x, double nr, double rn, double rtol, int maxcg);
+static void M_mul(LpS *S, const double *x, double *y);
 static double ne_solve(LpS *S, const double *r, double *x, double rtol, int maxcg) {
     const double t0 = lp_time();
+    if (S->dbg_prec) {      /* (debugging) the preconditioner on a consistent right-hand side M y, y random */
+        S->dbg_prec = 0;
+        const int mm = S->m; double *yy = xm(sizeof(double) * mm), *rr = xm(sizeof(double) * mm), *zz = xm(sizeof(double) * mm), *qq = xm(sizeof(double) * mm);
+        unsigned sd = 7; for (int i = 0; i < mm; i++) { sd = sd * 1103515245u + 12345u; yy[i] = ((sd >> 16) & 1023) / 512.0 - 1; }
+        M_mul(S, yy, rr); ne_prec(S, rr, zz); M_mul(S, zz, qq);
+        double e = 0, nn = 0, eE = 0; for (int i = 0; i < mm; i++) { e += (qq[i] - rr[i]) * (qq[i] - rr[i]); nn += rr[i] * rr[i]; }
+        for (int k = 0; k < S->nE; k++) { const int i = S->Erow[k]; eE += (qq[i] - rr[i]) * (qq[i] - rr[i]); }
+        printf("     [preconditioner on M y: relative residual %.1e (in the rows of no sparse entry %.1e)]\n", sqrt(e / nn), sqrt(eE / nn));
+        {   /* the sparse part alone: M_s y = A_s Theta A_s' y + Edel y_E + reg y, solved by the factor */
+            memset(rr, 0, sizeof(double) * mm);
+            for (int j = 0; j < S->n; j++) { if (S->isd && S->isd[j]) continue; double t = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) t += S->Ax[p] * yy[S->Ai[p]]; t *= S->theta[j]; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) rr[S->Ai[p]] += t * S->Ax[p]; }
+            for (int k = 0; k < S->nE; k++) rr[S->Erow[k]] += S->Edel[k] * yy[S->Erow[k]];
+            for (int i = 0; i < mm; i++) rr[i] += S->reg * yy[i];
+            memcpy(zz, rr, sizeof(double) * mm); schol_solve(S->sc, zz, S->w3);
+            double e2 = 0, n2 = 0; for (int i = 0; i < mm; i++) { e2 += (zz[i] - yy[i]) * (zz[i] - yy[i]); n2 += yy[i] * yy[i]; }
+            printf("     [the sparse factor on M_s y: relative error %.1e; %d dense columns flagged]\n", sqrt(e2 / n2), S->isd ? 1 : 0);
+        }
+        free(yy); free(rr); free(zz); free(qq);
+    }
     const int m = S->m;
     double *res = S->pr, *q = S->pq;
     const double nr = sqrt(dot(m, r, r));
@@ -321,7 +455,7 @@ static void lps_free(LpS *S) {
     free(S->Fp); free(S->Fj); free(S->Fx);
     free(S->Ap); free(S->Ai); free(S->Ax); free(S->Rp); free(S->Rj); free(S->Rq); free(S->Rx); free(S->b); free(S->c); free(S->u); free(S->bd); free(S->fr);
     free(S->rs); free(S->cs); free(S->dcol); free(S->isd); if (S->sc) schol_free(S->sc); free(S->Mp); free(S->Mi); free(S->Mo);
-    free(S->V); free(S->Vw); free(S->G); free(S->gw); free(S->dreg); free(S->theta); free(S->w1); free(S->w2); free(S->w4); free(S->w3); free(S->wn); free(S->acc); if (S->acc_t) { for (int t = 0; t < S->nacc_t; t++) free(S->acc_t[t]); free(S->acc_t); }
+    free(S->V); free(S->Vw); free(S->G); free(S->gw); free(S->Wp); free(S->Wi); free(S->Wx); free(S->xw); free(S->wmark); free(S->wsn); free(S->Erow); free(S->Edel); free(S->Gpiv); free(S->Gwork); free(S->Glam); free(S->dreg); free(S->theta); free(S->w1); free(S->w2); free(S->w4); free(S->w3); free(S->wn); free(S->acc); if (S->acc_t) { for (int t = 0; t < S->nacc_t; t++) free(S->acc_t[t]); free(S->acc_t); }
     free(S->pr); free(S->pz); free(S->pp); free(S->pq);
     free(S->Md); free(S->Wd); free(S->scol); free(S->wa); free(S->vpart);
 }
@@ -340,10 +474,20 @@ static size_t lp_fillcap(void) {
 }
 /* the dense columns, the sparse columns by rows, the pattern of A_s A_s' and its analysis
  * (again, without dense columns, when the Woodbury correction loses its accuracy); 0: done */
-static double ne_dense_choice(int m, int n, const int *Ap, const int *Ai, const double *Ax, int verbose, double budget);
+typedef struct { double flops, lnz; int nd, ok; double dthr, dnz; } LpNeCost;
+static double ne_dense_choice(int m, int n, const int *Ap, const int *Ai, const double *Ax, int verbose, double budget, LpNeCost *out);
+static double ne_iter_cost_of(const LpS *S);   /* (an iteration's cost by ne_iter_cost on S's analysis) */
 static int ne_setup(LpS *S, int usedense) {
     const int m = S->m, n = S->n, nz = S->Ap[n];
+    /* (25 October 2026) an estimate under a shared cap (the dense-column choice): its value now as the budget of the checks
+     * on the pattern below (the bounds w^2 / m and the pattern's growth), which come before AMD's own stop at the cap:
+     * savsched1's dual form (LP), the default rule's pattern alone took most of 46 s */
+    if (S->est && S->est_cap && *S->est_cap > 0 && (S->est_budget <= 0 || *S->est_cap < S->est_budget)) S->est_budget = *S->est_cap;
     free(S->Rp); free(S->Rj); free(S->Rq); free(S->Rx); free(S->Mp); free(S->Mi); free(S->Mo); free(S->V); free(S->Vw); free(S->G); free(S->gw);
+    free(S->Erow); free(S->Edel); free(S->Gpiv); free(S->Gwork); free(S->Glam); S->Erow = S->Gpiv = NULL; S->Edel = S->Gwork = S->Glam = NULL; S->nE = 0; S->lGwork = 0;
+    for (int t = 0; t < S->nthw; t++) { free(S->xw_t[t]); free(S->wmark_t[t]); free(S->wsn_t[t]); }
+    free(S->xw_t); free(S->wmark_t); free(S->wsn_t); S->xw_t = NULL; S->wmark_t = NULL; S->wsn_t = NULL; S->nthw = 0;
+    free(S->Wp); free(S->Wi); free(S->Wx); free(S->xw); free(S->wmark); free(S->wsn); S->Wp = S->Wi = S->wsn = NULL; S->Wx = S->xw = NULL; S->wmark = NULL; S->Wcap = 0;
     S->Rp = S->Rj = S->Rq = S->Mp = S->Mi = NULL; S->Rx = S->V = S->Vw = S->G = S->gw = NULL; S->Mo = NULL;
     if (S->sc) { schol_free(S->sc); S->sc = NULL; }
     if (!S->isd) { S->isd = xz(n + 1); S->dcol = xm(sizeof(int) * (n + 1)); }
@@ -354,12 +498,12 @@ static int ne_setup(LpS *S, int usedense) {
         const double thr = S->dthr > 0 ? S->dthr : fmax(fmax(50.0, 10.0 * avg), 0.1 * m);
         int nd = 0;
         for (int j = 0; j < n; j++) if (S->Ap[j + 1] - S->Ap[j] > thr) nd++;
-        if (nd > 0 && nd <= 400 && nd < n / 4) { for (int j = 0; j < n; j++) if (S->Ap[j + 1] - S->Ap[j] > thr) { S->isd[j] = 1; S->dcol[S->nd++] = j; } }
+        if (nd > 0 && nd <= (S->dthr > 0 ? LP_NDMAX : 400) && nd < n / 4) { for (int j = 0; j < n; j++) if (S->Ap[j + 1] - S->Ap[j] > thr) { S->isd[j] = 1; S->dcol[S->nd++] = j; } }
     }
-    /* (22 October 2026, the night) an estimate against a budget: the dense columns' Schur complement alone, 2 nd^2 m flops an
-     * iteration (ne_iter_cost), above it: no pattern, no analysis (neos-4532248-waihi's primal form, 290 columns over
-     * 42,907 rows, 7.2e9 against a budget of 1.6e9: 2.2 s of analyses) */
-    if (S->est && S->est_budget > 0 && 2.0 * S->nd * (double)S->nd * m > S->est_budget) { S->est_lb = 2.0 * S->nd * (double)S->nd * m; S->est_w = 0; return 0; }
+    /* (22 October 2026, the night) an estimate against a budget: the dense columns' part of an iteration alone, at least
+     * nd (2 m) for their solves (ne_iter_cost; 2 nd^2 m before the afternoon),
+     * above it: no pattern, no analysis (neos-4532248-waihi's primal form, 290 columns over 42,907 rows) */
+    if (S->est && S->est_budget > 0 && 2.0 * S->nd * (double)m > S->est_budget) { S->est_lb = 2.0 * S->nd * (double)m; S->est_w = 0; return 0; }
     /* ... and the clique of the longest sparse column: its L rows are a clique of A_s A_s', whose factorization in any
      * order costs at least 1^2 + ... + (L-1)^2 flops */
     if (S->est && S->est_budget > 0) {
@@ -372,6 +516,15 @@ static int ne_setup(LpS *S, int usedense) {
     int nzs = 0;
     for (int j = 0; j < n; j++) if (!S->isd[j]) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { S->Rp[S->Ai[p] + 2]++; nzs++; }
     for (int i = 0; i < m; i++) S->Rp[i + 2] += S->Rp[i + 1];
+    /* the rows the dense columns alone cover: no entry of the factored matrix A_s Theta A_s' (a zero pivot, which the
+     * factorization would replace and the correction could not undo: neos-4763324-toguru, the row of the 231 dense
+     * columns y, residual 1.7 at the first iteration) */
+    if (S->nd > 0 && !S->est) {
+        int ne0 = 0; for (int i = 0; i < m; i++) ne0 += S->Rp[i + 2] == S->Rp[i + 1];
+        if (ne0 > 0) { S->Erow = xm(sizeof(int) * (size_t)ne0); S->Edel = xm(sizeof(double) * (size_t)ne0);
+            for (int i = 0; i < m; i++) if (S->Rp[i + 2] == S->Rp[i + 1]) S->Erow[S->nE++] = i; }
+        if (getenv("BRISK_LPDBG")) printf("   [dense columns apart: %d rows with no entry left]\n", ne0);
+    }
     S->Rj = xm(sizeof(int) * (nzs + 1)); S->Rq = xm(sizeof(int) * (nzs + 1)); S->Rx = xm(sizeof(double) * (nzs + 1));
     for (int j = 0; j < n; j++) if (!S->isd[j]) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const int q = S->Rp[S->Ai[p] + 1]++; S->Rj[q] = j; S->Rq[q] = p; S->Rx[q] = S->Ax[p]; }
     /* 18 October 2026 (LP/SOCP): the assembly by dsyrk when it is cheaper: the scattered assembly costs
@@ -419,6 +572,24 @@ static int ne_setup(LpS *S, int usedense) {
     int *pool = xm(sizeof(int) * (2 * (w - m) + 1));
     { long o = 0; for (int i = 0; i < m; i++) { nbr[i] = pool + o; o += deg[i]; deg[i] = 0; } }
     for (int i = 0; i < m; i++) for (int e = S->Mp[i] + 1; e < S->Mp[i + 1]; e++) { const int k = Mi[e]; nbr[i][deg[i]++] = k; nbr[k][deg[k]++] = i; }
+    /* (23 October 2026) an estimate: AMD's own counts of the factor's entries and flops in its order (schol_amd_estimate),
+     * without the symbolic factorization, the supernodes and the pattern's offsets, which the estimate does not use; no
+     * global setting is touched, so the dense-column choice runs its candidates' estimates on the threads. Before, each
+     * estimate ran the analysis of a factorization: the candidates took 11.6 s of physiciansched3-3 (LP), 2.1 s of rail01,
+     * 1.1 s of sing44, whose interior-point method takes 1.3 s. BRISK_LPESTAMD=0: the analysis as before */
+    {
+        static int estamd = -1; if (estamd < 0) { const char *e = getenv("BRISK_LPESTAMD"); estamd = !(e && atoi(e) == 0); }
+        double efl = 0, enz = 0;
+        /* (25 October 2026) AMD stops once its count passes the cap (the budget, or the dense-column choice's shared cap):
+         * the count so far is then a lower bound, as the budget's other exits give one */
+        volatile double capb = S->est_budget > 0 ? S->est_budget : 0;
+        const volatile double *cap = S->est_cap ? S->est_cap : S->est_budget > 0 ? &capb : NULL;
+        if (S->est && estamd && schol_amd_estimate_cap(m, deg, nbr, cap, &efl, &enz) != 1) {
+            free(deg); free(nbr); free(pool);
+            S->est_lb = efl; S->est_w = (long)enz;
+            return 0;
+        }
+    }
     if (getenv("BRISK_LPDUMP")) {          /* (experiments: the pattern of the normal equations, one row "i: neighbours") */
         FILE *fd = fopen(getenv("BRISK_LPDUMP"), "w");
         if (fd) { fprintf(fd, "%d\n", m); for (int i = 0; i < m; i++) { for (int e = 0; e < deg[i]; e++) fprintf(fd, "%d ", nbr[i][e]); fprintf(fd, "\n"); } fclose(fd); }
@@ -458,7 +629,11 @@ static int ne_setup(LpS *S, int usedense) {
         S->Mo[e] = schol_offset(S->sc, (size_t)Mi[e], (size_t)i);
         if (S->Mo[e] == (size_t)-1) return 1;
     }
-    if (S->nd) { S->V = xm(sizeof(double) * (size_t)m * S->nd); S->G = xm(sizeof(double) * (size_t)S->nd * S->nd); S->gw = xm(sizeof(double) * (S->nd + 1)); }
+    if (S->nd) { const size_t nt = (size_t)S->nd + S->nE;
+        S->G = xm(sizeof(double) * nt * nt); S->gw = xm(sizeof(double) * (nt + 1));
+        S->Wp = xm(sizeof(int) * (nt + 1)); S->Wcap = (int)(4 * nt + 1024); S->Wi = xm(sizeof(int) * (size_t)S->Wcap); S->Wx = xm(sizeof(double) * (size_t)S->Wcap);
+        S->xw = xz(sizeof(double) * ((size_t)m + 1)); S->wmark = xz((size_t)schol_nsuper(S->sc) + 1); S->wsn = xm(sizeof(int) * ((size_t)schol_nsuper(S->sc) + 1));
+        if (S->nE) { S->Gpiv = xm(sizeof(int) * (nt + 1)); S->lGwork = (int)(64 * nt + 64); S->Gwork = xm(sizeof(double) * (size_t)S->lGwork); S->Glam = xm(sizeof(double) * (2 * nt + 1)); } }
     if (S->dasm && !S->est) {
         S->scol = xm(sizeof(int) * (S->nsc + 1));
         int k = 0; for (int j = 0; j < n; j++) if (!S->isd[j]) S->scol[k++] = j;
@@ -650,10 +825,13 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
         }
     }
     /* the normal equations (free variables enter with the weight of a proximal term) */
-    if (!getenv("BRISK_LPNODENSE")) S->dthr = opt->dthr > 0 ? opt->dthr : opt->dthr < 0 ? 0.0 : ne_dense_choice(m, n, S->Ap, S->Ai, S->Ax, verbose, 0.0);
+    if (!getenv("BRISK_LPNODENSE")) S->dthr = opt->dthr > 0 ? opt->dthr : opt->dthr < 0 ? 0.0 : ne_dense_choice(m, n, S->Ap, S->Ai, S->Ax, verbose, 0.0, NULL);
     if (ne_setup(S, getenv("BRISK_LPNODENSE") ? 0 : 1)) { lps_free(S); info->status = 4; snprintf(info->why, sizeof info->why, "the factor of the normal equations does not fit"); return 4; }
     SChol *F = S->sc;
     info->lnz = (long)schol_nnz(F); info->ndense = S->nd;
+    if (opt->analyzed) {
+        if (opt->analyzed(opt->analyzed_ctx, ne_iter_cost_of(S))) { lps_free(S); info->status = 6; snprintf(info->why, sizeof info->why, "declined"); return 6; }
+    }
     S->theta = xm(sizeof(double) * (n + 1));
     S->w1 = xm(sizeof(double) * (m + 1)); S->w2 = xm(sizeof(double) * (m + 1)); S->w4 = xm(sizeof(double) * (m + 1)); S->w3 = xm(sizeof(double) * (2 * (size_t)m + 2)); S->wn = xm(sizeof(double) * (n + 1)); S->acc = xz(sizeof(double) * (m + 1));
     S->pr = xm(sizeof(double) * (m + 1)); S->pz = xm(sizeof(double) * (m + 1)); S->pp = xm(sizeof(double) * (m + 1)); S->pq = xm(sizeof(double) * (m + 1));
@@ -680,6 +858,9 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
     int kcorr;
     { const double ff = schol_flops(F) + (double)S->nd * 2.0 * (double)schol_nnz(F), fs = 4.0 * (double)schol_nnz(F) + 4.0 * nz;
       const double ratio = ff / fmax(fs, 1.0);
+      /* (24 October 2026, the night: 3 above a flop ratio of 150 and none below was tried: dfl001 and qap15 gained a fifth in
+       * the method, but s250r10 (LP) 9.2 -> 47.1 s and irish-electricity 14.4 -> 20.2 s in all, their points worse for the
+       * crossover; TRICKS 8) */
       double t3 = 50, t2 = 30, t1 = 10;
       if (getenv("BRISK_LPCORRT")) sscanf(getenv("BRISK_LPCORRT"), "%lf,%lf,%lf", &t3, &t2, &t1);
       kcorr = ratio > t3 ? 3 : ratio > t2 ? 2 : ratio > t1 ? 1 : 0;
@@ -688,7 +869,7 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
         printf("BRISK LP interior-point solver: %d rows, %d columns (%d with upper bounds), %d nonzeros; normal equations: nnz(L) = %ld, %.2e flops, %d dense column%s; %d corrector%s\n",
                m, n, nbd, nz, info->lnz, schol_flops(F), S->nd, S->nd == 1 ? "" : "s", kcorr, kcorr == 1 ? "" : "s");
 #ifdef _OPENMP
-    if (verbose > 0) printf("Number of threads: %d (the factorizations and, on large problems, the products with A; the rest is sequential)\n", omp_in_parallel() ? 1 : omp_get_max_threads());
+    if (verbose > 0) printf("Number of threads: %d (the factorizations and, on large problems, the solves and the products with A; the rest is sequential)\n", omp_in_parallel() ? 1 : omp_get_max_threads());
 #else
     if (verbose > 0) printf("Number of threads: 1\n");
 #endif
@@ -701,6 +882,10 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
     const double tph2 = lp_time(); double tph3 = tph2;
     /* ---- starting point (Mehrotra's, with the bounds): least-norm x and least-squares y */
     for (int j = 0; j < n; j++) S->theta[j] = S->bd[j] ? 0.5 : 1.0;      /* (free columns: 1, the least-norm start) */
+    /* (23 October 2026) the best iterate (the least of the three errors), returned when the method stops without reaching
+     * its tolerance: on cygnet (LP) the normal equations broke down at errors of 4e-8, the steps went to zero and 23 more
+     * iterations left a primal infeasibility of 3.3e-4, which is what the method returned */
+    double bsave = 1e300, blast = 1e300, bv[6] = { 0 }; double *xb = NULL, *sb = NULL, *zb = NULL, *wb = NULL, *yb = NULL;
     if (ne_factor(S)) { status = 4; snprintf(info->why, sizeof info->why, "the first factorization failed"); goto done; }
     {
         for (int j = 0; j < n; j++) x[j] = S->bd[j] ? 0.5 * S->u[j] : 0.0;
@@ -743,9 +928,10 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
         }
     }
     const double nb0 = nrminf(m, b0), nc0 = nrminf(n, c0);
-    double mu0 = -1, best = 1e300; int nstall = 0, nsafe = 0;
+    double mu0 = -1, best = 1e300, err0 = -1; int nstall = 0, nsafe = 0;
     const int steprule = getenv("BRISK_LPSTEP") ? atoi(getenv("BRISK_LPSTEP")) : 1;
     const double frth = getenv("BRISK_LPFREETH") ? atof(getenv("BRISK_LPFREETH")) : 1e6;
+    double frw = frth;     /* (the free columns' weight now: raised at a stall, below) */
     if (verbose > 1) printf("  it      pobj             dobj         pinf     dinf     gap      mu      alp_p alp_d sigma  cg  solres tiny\n");
     tph3 = lp_time();
     int ncomp0 = 0; for (int j = 0; j < n; j++) if (!S->fr[j]) ncomp0 += 1 + (S->bd[j] != 0);
@@ -795,6 +981,12 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
         }
         if (!isfinite(pobj) || !isfinite(dobj) || !isfinite(mu) || !isfinite(ep) || !isfinite(ed)) { status = 4; snprintf(info->why, sizeof info->why, "not finite"); break; }
         if (err <= tol) { status = 0; break; }
+        blast = err;
+        if (err < bsave && isfinite(err)) {
+            if (!xb) { xb = xm(sizeof(double) * (n + 1)); sb = xm(sizeof(double) * (n + 1)); zb = xm(sizeof(double) * (n + 1)); wb = xm(sizeof(double) * (n + 1)); yb = xm(sizeof(double) * (m + 1)); }
+            memcpy(xb, x, sizeof(double) * n); memcpy(sb, s, sizeof(double) * n); memcpy(zb, z, sizeof(double) * n); memcpy(wb, w, sizeof(double) * n); memcpy(yb, y, sizeof(double) * m);
+            bsave = err; bv[0] = pobj; bv[1] = dobj; bv[2] = e_p; bv[3] = e_d; bv[4] = e_g; bv[5] = it;
+        }
         if (it >= maxit) { status = 3; snprintf(info->why, sizeof info->why, "iteration limit"); break; }
         if (opt->timelimit > 0 && lp_time() - t0 > opt->timelimit) { status = 6; break; }
         /* 18 October 2026 (LP/SOCP): a factorization that would end past the time limit is not started (its time from
@@ -806,15 +998,36 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
         }
         if (opt->stop && *opt->stop) { status = 6; break; }
         /* divergence or stall: the caller's homogeneous model decides (infeasible or unbounded problems) */
+        if (err0 < 0) err0 = err;
         if (err < 0.9 * best) { best = err; nstall = 0; } else nstall++;
+        /* (24 October 2026) a stall with free columns: their weight (the proximal term's 1 / rho) a hundred times larger,
+         * up to 1e12, and the stall's count restarted. The proximal term leaves each step a dual residual of about
+         * rho |dx_free| on the free columns; where those keep moving it floors the residual (atlanta-ip, LP, on its dual
+         * form with 6,126 free y: the gap at 6e-3 and the dual residual at 3e-8 for 25 iterations, then "no progress";
+         * with the weight 1e8 from the start 39 iterations). A larger weight from the start, or one following the other
+         * columns', cost elsewhere (opm2-z10-s4 13.8 -> 22.2 s, physiciansched3-3 37 -> 243 s): runs that progress keep
+         * 1e6. BRISK_LPFREESTALL=0: off */
+        { static int fst = -1; if (fst < 0) { const char *e_ = getenv("BRISK_LPFREESTALL"); fst = e_ ? atoi(e_) : 2; }
+          /* (the same afternoon) only a stall after the error has fallen a hundredfold from its first value: in the
+           * opening iterations the error can stand still while the gap grows, nothing floored (rmatr200-p5, LP: the rule
+           * fired at iterations 4 and 9, 53 -> 71 iterations, the race 4.2 -> 5.6 s; with the condition 4.45 s; the 28 LPs
+           * the interior-point method wins 4.397 -> 4.352 s, the same objectives); and, as a last try, a stall about to
+           * end the run (20 iterations of the 25 that stop it: atlanta-ip, LP, on its dual form stopped at iteration 29
+           * without it). BRISK_LPFREESTALL=1: at any stall, as before; 0: off */
+          if (fst && nfree > 0 && nstall >= 4 && frw < 1e12 && (fst != 2 || best <= 1e-2 * err0 || nstall >= 20)) { frw = fmin(100.0 * frw, 1e12); nstall = 0;
+              if (verbose > 1) printf("     (no progress with free columns: their weight %.0e from here)\n", frw); } }
         if (!isfinite(err) || !isfinite(mu)) { status = 4; snprintf(info->why, sizeof info->why, "not finite"); break; }
-        if (nstall >= 25 || mu > 1e12 * fmax(mu0, 1.0) || nrminf(n, x) > 1e14 || nrminf(m, y) > 1e14) { status = 4; snprintf(info->why, sizeof info->why, "%s", nstall >= 25 ? "no progress in 25 iterations" : "the iterates diverge"); break; }
+        /* (23 October 2026) within a hundred times the tolerance five iterations without progress are a stall: what is left
+         * there is a step or two, and a breakdown of the normal equations there (cygnet: steps of zero from iteration 20)
+         * does not mend itself */
+        const int nst = best <= 100 * tol ? 5 : 25;
+        if (nstall >= nst || mu > 1e12 * fmax(mu0, 1.0) || nrminf(n, x) > 1e14 || nrminf(m, y) > 1e14) { status = 4; snprintf(info->why, sizeof info->why, nstall >= nst ? "no progress in %d iterations" : "the iterates diverge", nst); break; }
         /* ---- factorization */
         double thmax = 0;
         #pragma omp parallel for schedule(static) reduction(max:thmax) if (lpv_par(S))
         for (int j = 0; j < n; j++) if (!S->fr[j]) { S->theta[j] = 1.0 / (z[j] / x[j] + (S->bd[j] ? w[j] / s[j] : 0.0) + S->pdreg); if (S->theta[j] > thmax) thmax = S->theta[j]; }
         /* free variables: a proximal term rho |dx|^2 / 2, Theta = 1 / rho (the Newton step of the regularized problem) */
-        { const double thf = getenv("BRISK_LPFREEREL") ? fmin(fmax(frth, atof(getenv("BRISK_LPFREEREL")) * thmax), 1e12) : frth; for (int j = 0; j < nfree; j++) S->theta[j] = thf; }
+        { const double thf = getenv("BRISK_LPFREEREL") ? fmin(fmax(frw, atof(getenv("BRISK_LPFREEREL")) * thmax), 1e12) : frw; for (int j = 0; j < nfree; j++) S->theta[j] = thf; }
         {   int fb = ne_factor(S);
             /* (replaced pivots count only in the end phase, the relative gap below pdgap (BRISK_LPPDGAP, 0: always): before
              * it they come from dependent rows, which the replacement handles (trento1 from iteration 4, the gap at 1);
@@ -835,7 +1048,15 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
             }
             if (fb) { status = 4; snprintf(info->why, sizeof info->why, "factorization failed"); break; }
         }
-        const double rtol = 1e-10; const int maxcg = getenv("BRISK_LPCG") ? atoi(getenv("BRISK_LPCG")) : 30;
+        /* (23 October 2026) the solves' relative residual 1e-2 times the relative gap, between 1e-10 and 1e-6: early, where the
+         * gap is large, an inexact direction costs nothing (each iteration's residuals are recomputed) and saves the
+         * refinement's solves (sing44, LP: 10 solves an iteration, 0.85 s of solves against 0.42 of factorizations). LPs,
+         * four threads, total time: s100 24.2 -> 19.2 s, triptim1 19.4 -> 16.9, opm2-z10-s4 23.1 -> 20.4, sing44 3.2 -> 2.8,
+         * dfl001 2.7 -> 2.2; irish-electricity 13.3 -> 15.2 (its crossover: 3,072 simplex iterations instead of 363), qap15
+         * 6.3 -> 6.7. With 1 times the gap qap15's method ended short. BRISK_LPRTOLF=f: the factor (0: 1e-10 always) */
+        static double rtolf = -1; if (rtolf < 0) { const char *e_ = getenv("BRISK_LPRTOLF"); rtolf = e_ ? atof(e_) : 1e-2; }
+        const double rtol = rtolf > 0 ? fmax(1e-10, fmin(1e-6, rtolf * info->gap)) : 1e-10;
+        const int maxcg = getenv("BRISK_LPCG") ? atoi(getenv("BRISK_LPCG")) : 30;
         const long cg0 = S->ncg;
         /* ---- predictor */
         LPV_FOR for (int j = 0; j < n; j++) { rxz[j] = S->fr[j] ? 0.0 : -x[j] * z[j]; rsw[j] = S->bd[j] ? -s[j] * w[j] : 0.0; }
@@ -1104,8 +1325,14 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
                 ap = bp; ad = bdl; nsafe++; sigma = sigc;
             } else if (safe == 1) sigma = sigc;          /* (as before: sigma raised even when the centering step was not taken) */
         } }
-        /* ---- Gondzio's centrality correctors */
-        for (int k = 0; k < kcorr; k++) {
+        /* ---- Gondzio's centrality correctors. (24 October 2026) where the cost ratio allows none, a blocked step (below 0.1)
+         * still gets them: the blocking component sits at gamma_f times the mean product (Mehrotra's step rule puts it
+         * there), the next direction drives it to its bound again, and the steps stay near zero for several iterations;
+         * the correctors lift such outliers (buildingenergy, LP: 12 of 55 iterations with steps of 0.001-0.03, no
+         * correctors by the cost ratio). BRISK_LPCORRBLK=k: their number there (0: none) */
+        static int corrblk = -1; if (corrblk < 0) { const char *e_ = getenv("BRISK_LPCORRBLK"); corrblk = e_ ? atoi(e_) : 2; }
+        const int kc_it = kcorr == 0 && fmin(ap, ad) < 0.1 ? corrblk : kcorr;
+        for (int k = 0; k < kc_it; k++) {
             const double a1 = fmin(1.0, ap), a2 = fmin(1.0, ad);
             if (a1 >= 0.999 && a2 >= 0.999) break;
             const double tp = fmin(1.0, 1.08 * a1 + 0.08), td = fmin(1.0, 1.08 * a2 + 0.08);
@@ -1189,6 +1416,13 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
 done:
     if (getenv("BRISK_LPDBG")) printf("   [LP: the assembly of the normal equations %.3fs of the factorizations' time]\n", S->t_asm);
     if (getenv("BRISK_LPDBG")) printf("   [LP phases: copy %.3fs, scaling %.3fs, pattern and analysis %.3fs, start %.3fs, iterations %.3fs (factorizations %.3fs, solves %.3fs)]\n", tph0 - t0, tph1 - tph0, tph2 - tph1, tph3 - tph2, lp_time() - tph3, S->t_fact, S->t_solve);
+    if (getenv("BRISK_LPDBG")) printf("   [LP solves: %ld factorizations, %ld directions, %ld solves with the factor (%ld in CG, %ld refinements), %d correctors taken]\n", S->nfact, S->nsolve, S->nprec, S->ncg, S->nref, info->ncorr);
+    if ((status == 3 || status == 4) && xb && bsave < blast) {
+        memcpy(x, xb, sizeof(double) * n); memcpy(s, sb, sizeof(double) * n); memcpy(z, zb, sizeof(double) * n); memcpy(w, wb, sizeof(double) * n); memcpy(y, yb, sizeof(double) * m);
+        info->pobj = bv[0]; info->dobj = bv[1]; info->pinf = bv[2]; info->dinf = bv[3]; info->gap = bv[4];
+        if (verbose > 1) printf("  the best iterate returned (iteration %d, errors %.1e)\n", (int)bv[5], bsave);
+    }
+    free(xb); free(sb); free(zb); free(wb); free(yb);
     info->status = status; info->iters = it; info->time = lp_time() - t0;
     info->nfact = S->nfact; info->nsolve = S->nsolve; info->ncg = S->ncg; info->ntiny = S->ntiny; info->t_fact = S->t_fact; info->t_solve = S->t_solve;
     /* the solution of the problem as given */
@@ -1212,21 +1446,40 @@ done:
  * are equality rows of the dual). The primal point is recovered from the dual's multipliers: x_j = -ytilde_j
  * for j in R, and the singleton columns from the multipliers of the bounds of y_i, a_ij x_j = -(zl_i - wu_i)
  * (sign +1) or +zl_i (y_i reflected); a singleton column whose bound is not the tightest one on its y_i is 0. */
-typedef struct { double flops, lnz; int nd, ok; double dthr; } LpNeCost;
+static double ne_dense_nnz(const LpS *T) { double s = 0; for (int d = 0; d < T->nd; d++) s += T->Ap[T->dcol[d] + 1] - T->Ap[T->dcol[d]]; return s; }
 static void ne_cost(int m, int n, const int *Ap, const int *Ai, const double *Ax, LpNeCost *C, double budget) {
-    LpS T; memset(&T, 0, sizeof T); T.m = m; T.n = n; T.est = 1; T.est_budget = budget; T.dthr = ne_dense_choice(m, n, Ap, Ai, Ax, 0, budget);
+    /* (24 October 2026) the dense-column choice's own estimate of the form it chose, when it made one: the same analysis
+     * (the same threshold and budget; a chosen candidate was below its budget, so its estimate is exact) was made
+     * again here (irish-electricity, LP: 0.38 s of the default rule's analysis repeated). BRISK_LPNECHOICE=0: again */
+    LpNeCost Ch; Ch.ok = -1;
+    const double thr = ne_dense_choice(m, n, Ap, Ai, Ax, 0, budget, &Ch);
+    if (Ch.ok >= 0 && !(getenv("BRISK_LPNECHOICE") && atoi(getenv("BRISK_LPNECHOICE")) == 0)) { *C = Ch; C->dthr = thr; return; }
+    LpS T; memset(&T, 0, sizeof T); T.m = m; T.n = n; T.est = 1; T.est_budget = budget; T.dthr = thr;
     C->dthr = T.dthr;
     T.Ap = (int *)Ap; T.Ai = (int *)Ai; T.Ax = (double *)Ax;
     C->ok = ne_setup(&T, 1) == 0;
+    C->dnz = ne_dense_nnz(&T);
     if (C->ok && T.est_lb > 0) { C->flops = T.est_lb; C->lnz = (double)T.est_w; C->nd = T.nd; T.Ap = NULL; T.Ai = NULL; T.Ax = NULL; lps_free(&T); return; }
     C->flops = C->ok ? schol_flops(T.sc) : 1e300; C->lnz = C->ok ? (double)schol_nnz(T.sc) : 1e300; C->nd = T.nd;
     T.Ap = NULL; T.Ai = NULL; T.Ax = NULL;
     lps_free(&T);
 }
 /* the cost of one iteration in flops: a factorization (with the dense columns' solves and Schur complement)
- * and about ten solves and products with A (the predictor, the corrector, the correctors, the refinement) */
+ * and about ten solves and products with A (the predictor, the corrector, the correctors, the refinement).
+ * (22 October 2026: the dense columns as ne_factor and ne_prec treat them: V = M_s^-1 A_d, nd solves of 4 lnz + 2 m;
+ * G = Theta_d^-1 + A_d' V, nd dot products over the dense columns' entries, 2 nd dnz; its Cholesky nd^3 / 3; each solve
+ * V' r and V g, 4 nd m. The term was 2 nd^2 m, the cost of A_d' V as if A_d were dense: neos-4763324-toguru's dual
+ * form (53,824 rows, 232 columns of 231 entries apart) was priced at 2.4e10 flops an iteration against the primal's
+ * 3.4e9, where Gurobi's barrier takes that dual form with a factor of 3e7 operations) */
 static double ne_iter_cost(const LpNeCost *C, int m, long nnz) {
-    return C->flops + C->nd * (4.0 * C->lnz + 2.0 * C->nd * m) + 10.0 * (4.0 * C->lnz + 4.0 * (double)nnz + 4.0 * C->nd * m);
+    const double nd = C->nd;
+    /* (each solve's correction: a pass over V or a second solve, whichever is cheaper, as ne_setup chooses) */
+    const double corr = nd > 0 ? fmin(4.0 * nd * m, 4.0 * C->lnz + 2.0 * C->dnz) : 0.0;
+    return C->flops + nd * (4.0 * C->lnz + 2.0 * m) + 2.0 * nd * C->dnz + nd * nd * nd / 3.0 + 10.0 * (4.0 * C->lnz + 4.0 * (double)nnz + corr);
+}
+static double ne_iter_cost_of(const LpS *S) {
+    LpNeCost C; C.dthr = S->dthr; C.dnz = ne_dense_nnz(S); C.flops = schol_flops(S->sc); C.lnz = (double)schol_nnz(S->sc); C.nd = S->nd; C.ok = 1;
+    return ne_iter_cost(&C, S->m, S->Ap[S->n]);
 }
 /* 21 October 2026 (the night): which columns are dense, by cost. The default rule takes a column as dense when it is
  * longer than 10 times the mean, 50 entries and a tenth of the rows; the last bound keeps semi-dense columns in the
@@ -1240,29 +1493,117 @@ static double ne_iter_cost(const LpNeCost *C, int m, long nnz) {
  * a form against the other form's cost; 0: none) both analyses stop at it, a choice above it costing "more than the
  * budget" (22 October 2026, the night: sorrell3 folded, the analysis of its primal form with the 271 columns apart, 4.3e9
  * flops against the dual form's 9e6, took 3.8 s of its 4.5 s). */
-static void ne_cost_thr(int m, int n, const int *Ap, const int *Ai, const double *Ax, LpNeCost *C, double budget, double thr);
-static double ne_dense_choice(int m, int n, const int *Ap, const int *Ai, const double *Ax, int verbose, double budget) {
+static void ne_cost_thr(int m, int n, const int *Ap, const int *Ai, const double *Ax, LpNeCost *C, double budget, double thr, const volatile double *cap);
+static int cmp_int_desc(const void *a, const void *b) { const int x = *(const int *)a, y = *(const int *)b; return x > y ? -1 : x < y; }
+static double ne_dense_choice(int m, int n, const int *Ap, const int *Ai, const double *Ax, int verbose, double budget, LpNeCost *out) {
     const char *e = getenv("BRISK_LPDENSE2"); if ((e && atoi(e) == 0) || m < 500 || n < 1) return 0;
     const long nz = Ap[n];
     const double avg = (double)nz / n, thr0 = fmax(fmax(50.0, 10.0 * avg), 0.1 * m), thr1 = fmax(50.0, 10.0 * avg);
-    int n0 = 0, n1 = 0;
-    for (int j = 0; j < n; j++) { const int l = Ap[j + 1] - Ap[j]; if (l > thr0) n0++; if (l > thr1) n1++; }
-    if (n1 == n0 || n1 > 400 || n1 >= n / 4) return 0;
-    LpNeCost C0, C1;
-    ne_cost_thr(m, n, Ap, Ai, Ax, &C1, budget, thr1);
-    if (!C1.ok && budget <= 0) return 0;
-    const double c1 = C1.ok ? ne_iter_cost(&C1, m, nz) : 1e300;
-    /* (above the budget the looser choice cannot make this form the cheaper one, and the default rule matters only if it
-     * is below the budget: the decisions are those of the analyses without the budget) */
-    ne_cost_thr(m, n, Ap, Ai, Ax, &C0, budget > 0 && c1 > budget ? budget : 1.0 / 0.7 * c1, 0.0);
-    const double c0 = C0.ok ? ne_iter_cost(&C0, m, nz) : 1e300;
-    if (verbose > 0 || getenv("BRISK_LPDBG")) printf("LP dense columns: %d longer than %.0f entries apart: an iteration %.2e flops; %d by the default rule: %.2e%s\n", n1, thr1, c1, n0, c0, c1 <= 0.7 * c0 ? " (the former taken)" : "");
-    return c1 <= 0.7 * c0 ? thr1 : 0;
+    int n0 = 0;
+    for (int j = 0; j < n; j++) if (Ap[j + 1] - Ap[j] > thr0) n0++;
+    /* (22 October 2026) the candidates: the columns longer than thr1 (as before), and the K longest for K = 32, 64, ...
+     * up to LP_NDMAX and a quarter of the columns, each as the threshold "longer than the (K+1)-th longest", columns of
+     * at least 3 times the mean length and 10 entries; the cheapest by ne_iter_cost (analyses against a budget: the
+     * best so far), taken when it costs at most 0.7 of the default rule's. The cap of 400 dense columns and the single
+     * looser threshold missed atlanta-ip (LP): 627 columns of 51 to 1,071 entries, none apart, a factor of 3.1e10 flops
+     * against Gurobi's 2.2e9 with 237 apart */
+    int *len = xm(sizeof(int) * (size_t)(n + 1));
+    for (int j = 0; j < n; j++) len[j] = Ap[j + 1] - Ap[j];
+    qsort(len, (size_t)n, sizeof(int), cmp_int_desc);
+    double cand[16]; int nc = 0;
+    { int n1 = 0; for (int j = 0; j < n; j++) if (len[j] > thr1) n1++;
+      if (n1 > n0 && n1 <= LP_NDMAX && n1 < n / 4) cand[nc++] = thr1; }
+    for (int K = 32; K <= LP_NDMAX && K < n / 4 && nc < 16; K *= 2) {
+        const double t = len[K];                     /* columns longer than the (K+1)-th: at most K of them */
+        if (t < fmax(10.0, 3.0 * avg) || len[0] <= t) break;
+        int cnt = 0; while (cnt < n && len[cnt] > t) cnt++;
+        if (cnt <= n0) continue;
+        int dup = 0; for (int c = 0; c < nc; c++) dup |= cand[c] == t;
+        if (!dup) cand[nc++] = t;
+    }
+    free(len);
+    if (nc == 0) return 0;
+    const double tdc0 = lp_time();
+    LpNeCost C0;
+    /* (25 October 2026) the default rule's estimate on the threads together with the candidates', each against the outer
+     * budget only, when the threads are there: each candidate keeps more columns apart than the default rule, so its
+     * pattern is part of the default rule's and its ordering costs no more; the choice is the same (a candidate taken was
+     * below 0.7 of the default rule's cost, so its estimate was exact either way). Before, the default rule's estimate
+     * came first, alone, for the candidates' budget: rmatr200-p5's dual form (LP), 0.41 s for one candidate. BRISK_LPDCPAR=0:
+     * first */
+    static int dcpar = -1; if (dcpar < 0) { const char *e_ = getenv("BRISK_LPDCPAR"); dcpar = !(e_ && atoi(e_) == 0); }
+    int c0par = 0;
+#ifdef _OPENMP
+    if (dcpar && !omp_in_parallel() && omp_get_max_threads() > 1) c0par = 1;
+#endif
+    /* (one thread: the default rule's estimate first, for the candidates' budget; with the shared caps below, last, under
+     * the best candidate's cost / 0.7: the candidates keep more columns apart and cost less to estimate) */
+    static int dccap0 = -1; if (dccap0 < 0) { const char *e_ = getenv("BRISK_LPDCCAP"); dccap0 = !(e_ && atoi(e_) == 0); }
+    if (dcpar && dccap0) c0par = 1;
+    if (!c0par) ne_cost_thr(m, n, Ap, Ai, Ax, &C0, budget, 0.0, NULL);
+    double c0 = !c0par ? (C0.ok ? ne_iter_cost(&C0, m, nz) : 1e300) : 1e300;
+    double best = 1e300, bthr = 0; int bnd = 0, bi = -1;
+    /* (23 October 2026) the candidates' estimates on the threads, each against the same budget (0.7 of the default rule's
+     * cost; before, also the best so far, which only cut short estimates that lose anyway), the cheapest taken in the
+     * candidates' order: the same choice at any thread count. Not when the pattern of A A' may be large (a bound of
+     * 4e7 entries over the threads: each estimate holds its pattern and AMD's work) */
+    LpNeCost Cc[17]; double cc[17];
+    int npar = 1, ntask = nc + c0par;      /* (the default rule's estimate as the last task) */
+#ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        double pb = m; for (int j = 0; j < n; j++) { const double l = Ap[j + 1] - Ap[j]; pb += 0.5 * l * (l - 1); }
+        npar = omp_get_max_threads(); if (npar > ntask) npar = ntask;
+        while (npar > 1 && (double)npar * pb > 4e7) npar--;
+    }
+#endif
+    if (c0par && npar <= 1 && !dccap0) {    /* (one thread, no shared caps: the default rule's estimate first) */
+        c0par = 0; ntask = nc;
+        ne_cost_thr(m, n, Ap, Ai, Ax, &C0, budget, 0.0, NULL);
+        c0 = C0.ok ? ne_iter_cost(&C0, m, nz) : 1e300;
+    }
+    double bud = c0par ? (budget > 0 ? budget : 0) : 0.7 * c0; if (!c0par && budget > 0) bud = fmin(bud, budget); if (bud >= 1e299) bud = 0;
+    /* (25 October 2026) shared caps, lowered as the estimates end: a candidate is chosen only below every other candidate
+     * and 0.7 of the default rule's cost, the default rule only below the best candidate / 0.7, so an AMD count that
+     * passes its cap stops (an estimate's flops are at most its iteration's cost; a stopped estimate's lower bound is
+     * above the cap, so it is not chosen, as its exact value would not be). The choice is the same, whatever ends first;
+     * only the costs printed for the losers are then lower bounds. savsched1's dual form (LP): the default rule's
+     * estimate counted 4.8e14 flops in 48 s after the best candidate had shown 5.6e10. BRISK_LPDCCAP=0: no shared caps */
+    static int dccap = -1; if (dccap < 0) { const char *e_ = getenv("BRISK_LPDCCAP"); dccap = !(e_ && atoi(e_) == 0); }
+    volatile double cap0 = budget > 0 ? budget : 0, capc = bud;
+    #pragma omp parallel for num_threads(npar) schedule(dynamic, 1) if (npar > 1)
+    for (int k = 0; k < ntask; k++) {
+        const int c = npar > 1 ? ntask - 1 - k : k;   /* (on the threads the default rule's first: it may take the longest) */
+        if (c == nc) {
+            ne_cost_thr(m, n, Ap, Ai, Ax, &C0, budget, 0.0, dccap ? &cap0 : NULL);
+            if (dccap && C0.ok) {
+                const double v = 0.7 * ne_iter_cost(&C0, m, nz);
+                #pragma omp critical(lp_dccap)
+                { if (capc <= 0 || v < capc) capc = v; }
+            }
+            continue;
+        }
+        ne_cost_thr(m, n, Ap, Ai, Ax, &Cc[c], bud, cand[c], dccap ? &capc : NULL);
+        cc[c] = Cc[c].ok ? ne_iter_cost(&Cc[c], m, nz) : 1e300;
+        if (dccap && cc[c] < 1e299) {
+            #pragma omp critical(lp_dccap)
+            { if (capc <= 0 || cc[c] < capc) capc = cc[c];
+              const double v0 = cc[c] / 0.7; if (cap0 <= 0 || v0 < cap0) cap0 = v0; }
+        }
+    }
+    if (c0par) c0 = C0.ok ? ne_iter_cost(&C0, m, nz) : 1e300;
+    for (int c = 0; c < nc; c++) {
+        if (getenv("BRISK_LPDBG") && atoi(getenv("BRISK_LPDBG")) > 1) printf("   [dense candidate: longer than %.0f, %d columns, an iteration %.2e flops (budget %.2e)]\n", cand[c], Cc[c].nd, cc[c], bud);
+        if (cc[c] < best) { best = cc[c]; bthr = cand[c]; bnd = Cc[c].nd; bi = c; }
+    }
+    if (verbose > 0 || getenv("BRISK_LPDBG")) printf("LP dense columns: %d candidates, the best %d columns longer than %.0f entries apart: an iteration %.2e flops; %d by the default rule: %.2e%s (%.2f s)\n", nc, bnd, bthr, best, n0, c0, best <= 0.7 * c0 ? " (the former taken)" : "", lp_time() - tdc0);
+    if (out) *out = best <= 0.7 * c0 ? Cc[bi] : C0;     /* (the estimate of the choice, for ne_cost) */
+    return best <= 0.7 * c0 ? bthr : 0;
 }
-static void ne_cost_thr(int m, int n, const int *Ap, const int *Ai, const double *Ax, LpNeCost *C, double budget, double thr) {
-    LpS T; memset(&T, 0, sizeof T); T.m = m; T.n = n; T.est = 1; T.est_budget = budget; T.dthr = thr;
+static void ne_cost_thr(int m, int n, const int *Ap, const int *Ai, const double *Ax, LpNeCost *C, double budget, double thr, const volatile double *cap) {
+    LpS T; memset(&T, 0, sizeof T); T.m = m; T.n = n; T.est = 1; T.est_budget = budget; T.dthr = thr; T.est_cap = cap;
     T.Ap = (int *)Ap; T.Ai = (int *)Ai; T.Ax = (double *)Ax;
     C->ok = ne_setup(&T, 1) == 0;
+    C->dnz = ne_dense_nnz(&T);
     if (C->ok && T.est_lb > 0) { C->flops = T.est_lb; C->lnz = (double)T.est_w; C->nd = T.nd; T.Ap = NULL; T.Ai = NULL; T.Ax = NULL; lps_free(&T); return; }
     C->flops = C->ok ? schol_flops(T.sc) : 1e300; C->lnz = C->ok ? (double)schol_nnz(T.sc) : 1e300; C->nd = T.nd;
     T.Ap = NULL; T.Ai = NULL; T.Ax = NULL;
@@ -1274,12 +1615,30 @@ static void sort_cols(int n, const int *Ap, int *Ai, double *Ax) {
         for (int p = a + 1; p < e; p++) { const int r = Ai[p]; const double v = Ax[p]; int q = p - 1; while (q >= a && Ai[q] > r) { Ai[q + 1] = Ai[q]; Ax[q + 1] = Ax[q]; q--; } Ai[q + 1] = r; Ax[q + 1] = v; }
     }
 }
+double lpipm_iter_flops(int m, int n, const int *Ap, const int *Ai, const double *Ax, double budget) {
+    if (m <= 0 || n <= 0) return 0;
+    const long nz = Ap[n];
+    int *Ai1 = xm(sizeof(int) * (nz + 1)); double *Ax1 = xm(sizeof(double) * (nz + 1));
+    memcpy(Ai1, Ai, sizeof(int) * nz); memcpy(Ax1, Ax, sizeof(double) * nz); sort_cols(n, Ap, Ai1, Ax1);
+    LpS T; memset(&T, 0, sizeof T); T.m = m; T.n = n;
+    T.Ap = (int *)Ap; T.Ai = Ai1; T.Ax = Ax1;
+    T.dthr = ne_dense_choice(m, n, Ap, Ai1, Ax1, 0, budget > 0 ? budget : 0.0, NULL);
+    double c = 1e300;
+    /* (with a budget: the analysis stops once the factorization's flops pass it; the form then costs "more than it") */
+    if (budget > 0) schol_set_flopcap(budget);
+    const int ok = ne_setup(&T, 1) == 0 && T.sc;
+    if (budget > 0) schol_set_flopcap(0);
+    if (ok) c = ne_iter_cost_of(&T);
+    T.Ap = NULL; T.Ai = NULL; T.Ax = NULL; lps_free(&T); free(Ai1); free(Ax1);
+    return c;
+}
 /* (22 October 2026, the night) *dthr_p: when the primal form is kept by the cost model, its dense-column choice (> 0 the
  * threshold, < 0 the default rule; 0 not made), for the caller's solve of the primal (LpIpmOpts.dthr): the primal is
  * kept only below its budget, where its estimate is exact */
 static int lp_dual_solve(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
                          const LpIpmOpts *opt, double *xout, double *yout, double *zout, LpIpmInfo *info, double *dthr_p) {
     if (dthr_p) *dthr_p = 0;
+    const double tds0 = lp_time();
     const char *e = getenv("BRISK_LPDUAL"); const int mode = e ? atoi(e) : 2;      /* 0: never, 1: always, 2: by the cost model */
     if (mode == 0 || m < 1 || n < 1) return -1;
     const double BIG = 1e29;
@@ -1341,7 +1700,9 @@ static int lp_dual_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
          * (a sparse quantile regression 30,000 x 501: the primal's analysis took 22-55 s for a solve of 0.27 s); and its
          * ordering is not made when its pattern alone shows that it costs more (ne_setup's budget) */
         LpNeCost P, D;
+        const double tds1 = lp_time();
         ne_cost(m2, n2, Bp, Bi, Bx, &D, 0.0);
+        const double tds2 = lp_time();
         cd = ne_iter_cost(&D, m2, nz2); dthr_d = D.dthr > 0 ? D.dthr : -1.0;
         double lbp = 0;
         {   const double avg = (double)nnz / fmax(n, 1), thr = fmax(fmax(50.0, 10.0 * avg), 0.1 * m);
@@ -1356,6 +1717,7 @@ static int lp_dual_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
             ne_cost(m, n, Ap, Ai1, Ax1, &P, D.ok ? 2.0 * cd : 0.0); free(Ai1); free(Ax1);
             cp = ne_iter_cost(&P, m, nnz);
         }
+        if (getenv("BRISK_LPDBG")) printf("   [the forms' costs: the dual built %.3fs, its estimate %.3fs, the primal's %.3fs]\n", tds1 - tds0, tds2 - tds1, lp_time() - tds2);
         /* the dual when it costs at most half: the primal is the form the method is tuned on, and its free
          * variables (the dual's free y) enter both as a proximal term */
         choose = D.ok && cd <= 0.5 * cp;
@@ -1761,7 +2123,7 @@ static int lp_sift_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
     double *rc = xm(sizeof(double) * ((size_t)n + 1)), *ys = xz(sizeof(double) * ((size_t)m + 1));
     int *neg = xm(sizeof(int) * ((size_t)n + 1)), *col = xm(sizeof(int) * ((size_t)n + 1));
     double *xs = NULL;
-    int st = -1, rounds = 0, its = 0, done = 0; long nfact = 0, nsolve = 0, ncg = 0; double tfact = 0, tsolve = 0;
+    int st = -1, rounds = 0, its = 0, done = 0, prev_nneg = 0; long nfact = 0, nsolve = 0, ncg = 0; double tfact = 0, tsolve = 0;
     while (!done) {
         rounds++;
         if (nw > n / 3 || rounds > 12) break;           /* (the working set no longer small: the whole LP) */
@@ -1780,6 +2142,7 @@ static int lp_sift_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
         free(xs); xs = xz(sizeof(double) * ((size_t)ns + 1));
         double *zs = xz(sizeof(double) * ((size_t)ns + 1));
         LpIpmOpts o2 = *opt; o2.verbose = opt->verbose > 1 ? 1 : 0; o2.tol = 0.1 * tol;
+        o2.analyzed = NULL;     /* (24 October 2026: a restricted problem's iteration is no measure for the caller's choice of form) */
         int s2 = 1;
         if (opt->timelimit > 0) o2.timelimit = opt->timelimit - (lp_time() - t0);
         LpIpmInfo i2; memset(&i2, 0, sizeof i2);
@@ -1803,6 +2166,13 @@ static int lp_sift_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
         if (opt->verbose > 1)
             printf("sifting: round %d, %d of %d columns, %d iterations, objective %.10e, elastic part %.1e, %d reduced costs negative (least %.1e), %.2fs\n",
                    rounds, nw, n, i2.iters, i2.pobj, el, nneg, rmin, lp_time() - t0);
+        /* (24 October 2026) a round that prices out at least as many columns as the one before has not converged and will
+         * not: the whole LP (supportcase19, LP: 37,219, 173,249, 162,598 columns priced out with the elastic part above zero,
+         * four rounds and 23.6 s before the whole LP was solved; the transportation LPs 720, 6, 0). BRISK_LPSIFTCONV=0: as
+         * before (the working set past a third of the columns, or 12 rounds) */
+        { static int conv = -1; if (conv < 0) { const char *e_ = getenv("BRISK_LPSIFTCONV"); conv = !(e_ && atoi(e_) == 0); }
+          if (conv && nneg > 0 && rounds >= 2 && nneg >= prev_nneg) break;
+          prev_nneg = nneg; }
         if (nneg == 0) {
             if (el > 0.1 * tol * (1.0 + bmax)) break;       /* (infeasible, or duals beyond M: the whole LP) */
             for (int j = 0; j < n; j++) xout[j] = 0.0;

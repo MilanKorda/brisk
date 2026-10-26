@@ -159,7 +159,12 @@ static dd dd_dot(size_t n, const dd *x, const dd *y) {
 /* (21 October 2026) the eigenvalue step only where the bisection costs real time: 28 double-double Cholesky factorizations
  * of n^3/3 a call are about 1 s at n = 500; below, the bisection's path is kept (roa_vdp_inner_d14_K, a block of order 148:
  * the eigenvalue step moved its endgame from 9.0e-5 to 1.05e-4 and into a re-solve, 24.6 -> 34.6 s) */
-#define DD_EIG_N 512
+/* 22 October 2026: from order 64 (was 512): the bound from the eigenvalues costs about 11 n^3 (a Cholesky, two triangular
+ * solves and the smallest eigenvalue in double, one double-double Cholesky to confirm) against 28 double-double Cholesky
+ * factorizations (about 190 n^3) for the bisection; shmup3's four blocks of order 450, the endgame forced: the steps
+ * 6.1 -> 1.2 s, the endgame 17.0 -> 7.9 s, the same iterates; on the seven files of the full benchmark whose endgame ran
+ * on blocks of order 64 to 511 the same statuses and values (REPORT_5.22). The bisection stays the fallback. */
+#define DD_EIG_N 64
 static void dd_gemm(int n, const dd *A, const dd *B, dd *C) {
     memset(C, 0, sizeof(dd) * (size_t)n * n);
     #pragma omp parallel for schedule(static) if (n >= DD_PAR_N)
@@ -721,10 +726,19 @@ static int dsp_factor(DSp *S, const dd *M) {
         const int n = S->m; dd *L = S->LD;
         S->flops = (double)n * n * n / 6.0;
         memset(L, 0, sizeof(dd) * (size_t)n * n);
-        /* the blocked factor from n = 1024 (below it the column code with its SIMD axpy is the faster one:
-         * SDPLIB's endgames +11 % with the blocked one everywhere; above, the trailing dgemms dominate and
-         * scale with the threads: an m = 6,034 factor 77 -> 40 s at one thread); BRISK_DDBLK=<n> sets it */
-        static int blk_from = -1; if (blk_from < 0) { const char *e = getenv("BRISK_DDBLK"); blk_from = e ? atoi(e) : 1024; }
+        /* the blocked factor from an order that falls with the threads (below it the column code with its SIMD axpy is
+         * the faster one; above, the trailing dgemms dominate and scale with the threads: an m = 6,034 factor 77 -> 40 s
+         * at one thread). 23 October 2026: the order from the cost of the two: the column code c1 m^3 on one thread, the
+         * blocked one c2 m^3 / T for its trailing products on T threads and c3 m^2 for its splits and panels, so they meet
+         * at m* = c3 / (c1 - c2 / T); with the measured m* = 1024 at one thread (SDPLIB's endgames +11 % with the blocked
+         * one everywhere) and 512 at four (the 107 benchmark files with an endgame, SDP: the factorizations 8.40 -> 5.00 s,
+         * identical results on 106, qap10 2.58 -> 1.11 s), m* = 768 / (1.75 - 1 / T). BRISK_DDBLK=<n> sets it */
+        static int blk_env = -2; if (blk_env == -2) { const char *e = getenv("BRISK_DDBLK"); blk_env = e ? atoi(e) : -1; }
+        int nthr_f = 1;
+#ifdef _OPENMP
+        nthr_f = omp_get_max_threads(); if (nthr_f < 1) nthr_f = 1;
+#endif
+        const int blk_from = blk_env >= 0 ? blk_env : (int)(768.0 / (1.75 - 1.0 / nthr_f) + 0.5);
         if (blk_from > 0 && n >= blk_from) {
             for (int j = 0; j < n; j++) memcpy(L + (size_t)j * n + j, M + (size_t)j * n + j, sizeof(dd) * (size_t)(n - j));
             return ddp_potrf(n, L, M, &S->ndep);
@@ -1000,7 +1014,7 @@ static int dd_solve_b(const Problem *P, DBlk *b, int nb, const DSp *SP, int nf, 
     return ok ? pass : -1;
 }
 int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Params *par,
-               int maxit, double tol, int verbose, brisk_dd_measure meas, void *mctx) {
+               int maxit, double tol, int verbose, brisk_dd_measure meas, void *mctx, double bar) {
     const int m = P->m, nb = P->nblk;
     const double t_start = dd_now(), t_limit = par->dd_time;
     DBlk *b = calloc(nb, sizeof(DBlk));
@@ -1057,6 +1071,7 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
     double **Xc = malloc(sizeof(double *) * nb), **Zc = malloc(sizeof(double *) * nb), *yc = malloc(sizeof(double) * (m + 1));
     for (int k = 0; k < nb; k++) { Xc[k] = malloc(sizeof(double) * b[k].len); Zc[k] = malloc(sizeof(double) * b[k].len); }
     double best_d = 1e300, sd0 = 1e300; int nostall_d = 0, improved_d = 0;
+    double *brest = calloc((size_t)maxit + maxit / 2 + 4, sizeof(double)); double best_r = 1e300;   /* the best measure without the primal residual, step by step */
     double last_ap = 0, last_ad = 0;   /* the last corrector step's lengths (printed) */
     /* BRISK_DDDIAG (14 October): sigma, mu_aff/mu and the block (and LP entry) that bounds each step, with its
      * smallest eigenvalues: the creeping of the endgame on blocks heading for a face was diagnosed with it
@@ -1187,7 +1202,9 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
                 Xc[prs[f].blk][prs[f].ip] = v > 0 ? v : 0.0; Xc[prs[f].blk][prs[f].im] = v < 0 ? -v : 0.0;
             }
             for (int i = 0; i < m; i++) yc[i] = dd_d(yv[i]);
-            const double sd = meas(mctx, Xc, Zc, yc); sd_it = sd;
+            double rest = 1e300; const double sd = meas(mctx, Xc, Zc, yc, &rest); sd_it = sd;
+            if (rest < best_r) best_r = rest;
+            if (it <= maxit + maxit / 2 + 2) brest[it] = best_r;
             if (verbose > 1) printf("      (the double-precision measure of this iterate: %.2e)\n", sd);
             if (it == 0) sd0 = sd;
             if (sd < best_d * (1 - 1e-12)) { best_d = sd; keep = 1; nostall_d = 0; if (sd < sd0) improved_d = 1; }
@@ -1212,6 +1229,19 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
          * the start of a run that reached 5.8e-5 on hinf12 before the rule; the stall rule below ends it otherwise) */
         if (meas && it == 1 && sd0 < 1e300 && sd_it > 10.0 * sd0) { if (verbose > 0) printf("   dd endgame: the first step worsens the double-precision measure (%.1e from %.1e): stopping\n", sd_it, sd0); break; }
         if (meas && nostall_d >= 3 && it >= 3) { if (verbose > 1) printf("   dd endgame: the double-precision measure stopped improving: stopping\n"); used = 1; break; }
+        /* 23 October 2026: the result is kept only if, polished, it beats the polished iterate (bar). The endgame stops
+         * when its own progress cannot get there within its budget: from the tenth step (the first steps recentre after
+         * the start's shift, and many runs that end accepted gain little in them), the rate of its best measure without
+         * the primal residual over the last four steps, applied over the steps the budget still allows, ends above ten
+         * times the bar (the full benchmark: 22 of 100 endgames rejected, 33-41 steps creeping at 0.95 a step on Kocvara's
+         * moment problems; the accepted ones that run long gain 0.7 a step) */
+        if (meas && bar > 0 && it >= 10 && it <= maxit + maxit / 2 + 2 && brest[it] > bar && brest[it - 4] > 0 && !ENV_ON("BRISK_DDNOPROJ")) {
+            double r = pow(brest[it] / brest[it - 4], 0.25); if (!(r < 1)) r = 1;
+            const double proj = brest[it] * pow(r, (double)(maxit - it));
+            /* (a tenth of the way short is not evidence: the runs that end accepted speed up after their first steps;
+             * hinf11, SDPLIB: 2.50e-6 projected against 2.49e-6 at the tenth step, accepted at 1.5e-7 after 40) */
+            if (proj > 10.0 * bar) { if (verbose > 0) printf("   dd endgame: at its rate (%.2f a step) the measure would end at %.1e, more than ten times the polished iterate's %.1e: stopping\n", r, proj, bar); break; }
+        }
         if (!meas && score < tol) { used = 1; break; }
         /* 5.9: at the end of the budget, up to half as many iterations more while each one halves
          * the score (the budget ended runs that were three iterations from the tolerance) */
@@ -1367,7 +1397,7 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
     #undef DDPH
     for (int k = 0; k < nb; k++) { free(Xc[k]); free(Zc[k]); }
     free(Xc); free(Zc); free(yc);
-    free(b); free(M); free(rp); free(rhs); free(dy); free(yv);
+    free(brest); free(b); free(M); free(rp); free(rhs); free(dy); free(yv);
     free(QRF.G); free(QRF.D); free(QRF.Lq);
     free(a0); free(hv); free(qv); free(col);
     if (meas) improved = improved_d;

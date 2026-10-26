@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <time.h>
 
 static const int IONE_ = 1;
@@ -45,6 +46,14 @@ static double ps_now(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + 1e-9 * ts.tv_nsec;
 }
+/* 24 October 2026 (ISSUES 284): the time the run has left when the postsolve starts (main.c sets it before each call;
+ * INFINITY: no limit). Past it the optional work is skipped: the recovery of the duals of the constraints the facial
+ * reduction removed (each of its passes measures lambda_min of the original blocks: 288 s on pglib_opf_case13659_pegase,
+ * SDP, blocks of order 8,185 and 27,317, after a solve stopped at iteration 0 by a 3 s limit) and the projection of X onto
+ * A(X) = b. The mapping back and the errors' measure still run. */
+static double g_ps_deadline = 0;
+void postsolve_set_time_left(double left) { g_ps_deadline = left < INFINITY ? ps_now() + left : 0; }
+static int ps_late(void) { return g_ps_deadline > 0 && ps_now() > g_ps_deadline; }
 
 /* ------------------------------------------------------------------ basis */
 static void basis_free(PSBasis *T) {
@@ -199,6 +208,7 @@ void ps_free(Postsolve *ps) {
     for (int q = 0; q < ps->nch; q++) { free(ps->ch[q].cptr); free(ps->ch[q].cv); free(ps->ch[q].par); }
     if (ps->mom) ps_moment_free(ps->mom);
     free(ps->ch);
+    free(ps->comb_ptr); free(ps->comb_i); free(ps->comb_w);
     free(ps);
 }
 
@@ -419,6 +429,93 @@ static int ps_lammin_sparse(int n, const double *M, double delta, double *out) {
     return rc;
 }
 
+/* ---- 23 October 2026: X of a block with arrow data held as its cone vector (brisk.h, xc_index). A second-order cone
+ * read from a SeDuMi file (K.q) is written as a semidefinite block with arrow data and solved as a cone; its dense
+ * completion, of order up to 17,012 on the owner's dg3d family (SDP with SOCP), made every pass of the postsolve, the
+ * measures and the result a pass over n^2 entries (dg3d_1000: 92 s of postsolve in 300 s, 9.2 GB). Where nothing maps
+ * the block (main.c decides), it stays a vector of n entries from the solve to the output. */
+int g_xcone_accept = 0;
+int *g_xcone_res = NULL;
+static double xc_nrm2c(int n, const double *x) {
+    /* |x_1..x_{n-1}| by compensated summation (the completion's trace reads it: see xc_complete) */
+    double s2 = 0, s2c = 0;
+    for (int i = 1; i < n; i++) { const double y = x[i] * x[i], t = s2 + y; s2c += fabs(s2) >= fabs(y) ? (s2 - t) + y : (y - t) + s2; s2 = t; }
+    return sqrt(s2 + s2c);
+}
+void xc_complete(int n, int h, const double *x, double *X) {
+    /* (22 October 2026: |xb|^2 compensated. The lower block's trace f |xb|^2 must be x_0 / 2 to working accuracy, since
+     * <A, X> and the SeDuMi x_0 = tr X read it: on a ray of norm 1e18 (dg3d_1000) the plain sum's error was 3e6 in A(X)) */
+    const double nb = xc_nrm2c(n, x);
+    const size_t hh = (size_t)h;
+    if (!(nb > 0)) {
+        memset(X, 0, sizeof(double) * (size_t)n * n);
+        X[hh + hh * n] = 0.5 * x[0];
+        for (int t = 1; t < n; t++) { const size_t o = (size_t)xc_index(h, t); X[hh + o * n] = X[o + hh * n] = 0.5 * x[t]; X[o + o * n] = 0.5 * x[0] / (n - 1); }
+        return;
+    }
+    const double f = 0.5 * x[0] / (nb * nb);
+    X[hh + hh * n] = 0.5 * x[0];
+    for (int t = 1; t < n; t++) X[(size_t)xc_index(h, t) + hh * n] = 0.5 * x[t];
+    #pragma omp parallel for schedule(static) if (n >= 512)
+    for (int t = 1; t < n; t++) {
+        const size_t o = (size_t)xc_index(h, t);
+        double *c = X + o * n;
+        c[hh] = 0.5 * x[t];
+        for (int r = 1; r < n; r++) c[xc_index(h, r)] = f * x[r] * x[t];
+    }
+}
+void xc_of_dense(int n, int h, const double *X, double *x) {
+    double tr = 0, trc = 0;      /* (compensated: the completion's diagonal holds x_0 / 2 at the hub and n - 1 small terms) */
+    for (int i = 0; i < n; i++) { const double v = X[(size_t)i * n + i], t = tr + v; trc += fabs(tr) >= fabs(v) ? (tr - t) + v : (v - t) + tr; tr = t; }
+    x[0] = tr + trc;
+    for (int t = 1; t < n; t++) x[t] = 2.0 * X[(size_t)xc_index(h, t) + (size_t)h * n];
+}
+/* the completion's eigenvalues are (x_0 +- |xb|) / 2 and 0 */
+double xc_lammin_x(int n, const double *x) { return fmin(0.0, 0.5 * (x[0] - xc_nrm2c(n, x))); }
+/* Z = Arw(z): eigenvalues z_0 +- |zb| and z_0 */
+static double xc_lammin_z(int n, const double *z) { return fmin(0.0, z[0] - xc_nrm2c(n, z)); }
+int xc_expand(const PSOrig *O, double **Xo, int *xc) {
+    if (!xc || !Xo) return 0;
+    for (int o = 0; o < O->nblk; o++) {
+        if (xc[o] < 0 || !Xo[o]) continue;
+        const int n = O->bs[o];
+        double *D = malloc(sizeof(double) * ((size_t)n * n + 1));
+        if (!D) return 1;
+        xc_complete(n, xc[o], Xo[o], D);
+        free(Xo[o]); Xo[o] = D; xc[o] = -1;
+    }
+    return 0;
+}
+int ps_arrow_hub(const PSOrig *O, int o, const int *kept) {
+    const int n = O->bs[o];
+    if (n < 2) return -1;
+    /* per matrix (C and each row): its diagonal value and how many diagonal entries it has; the hub candidates are the
+     * indices in every off-diagonal entry (the test of solver.c's arrow_hub, on the triplets of the data as read) */
+    double *dv = malloc(sizeof(double) * ((size_t)O->m + 2)); int *nd = calloc((size_t)O->m + 2, sizeof(int));
+    int c1 = -1, c2 = -1, offd = 0, ok = dv && nd;
+    for (size_t q = 0; q < O->nnz && ok; q++) {
+        if (O->blk[q] != o) continue;
+        const int r = O->con[q] + 1, i = O->ii[q], j = O->jj[q];
+        if (r > 0 && kept && !kept[r - 1]) continue;
+        const double v = O->v[q];
+        if (i == j) {
+            if (nd[r] == 0) dv[r] = v;
+            else if (!(fabs(v - dv[r]) <= 1e-14 * fabs(dv[r]))) ok = 0;
+            nd[r]++;
+            continue;
+        }
+        offd++;
+        if (c1 < 0 && c2 < 0) { c1 = i; c2 = j; continue; }
+        if (c1 >= 0 && c1 != i && c1 != j) c1 = -1;
+        if (c2 >= 0 && c2 != i && c2 != j) c2 = -1;
+        if (c1 < 0 && c2 < 0) ok = 0;
+    }
+    for (int r = 0; r <= O->m && ok; r++) if (nd[r] != 0 && nd[r] != n) ok = 0;
+    free(dv); free(nd);
+    if (!ok || !offd) return -1;
+    return c1 >= 0 ? c1 : c2;
+}
+
 static double g_lam_cap = INFINITY;   /* largest shift the ladder may report (absolute) */
 static double lammin_eig(int n, const double *M, double *work);
 /* 5.16: lambda_min in closed form for the two matrices a second-order cone read as a semidefinite
@@ -433,7 +530,7 @@ static double lammin_eig(int n, const double *M, double *work);
  *    entry) of the other block from the rank-one form moves the eigenvalues by at most n e; accepted
  *    when n e <= delta, and subtracted. */
 static int ps_lammin_arrow(int n, const double *M, double delta, double *lam) {
-    if (n < 64 || !(delta > 0)) return 0;
+    if (n < 64 || delta < 0) return 0;   /* (22 October 2026: delta = 0 too, for the completion: see below) */
     /* arrow: the hub is the one column with two or more off-diagonal entries */
     int h = -1;
     for (int j = 0; j < n; j++) {
@@ -454,7 +551,8 @@ static int ps_lammin_arrow(int n, const double *M, double delta, double *lam) {
         if (ok) {
             double dmin = M[0], dmax = M[0], nb = 0;
             for (int i = 0; i < n; i++) { const double d = M[i + (size_t)i * n]; dmin = fmin(dmin, d); dmax = fmax(dmax, d); if (i != h) nb += ch[i] * ch[i]; }
-            if (dmax - dmin <= delta) { *lam = fmin(0.0, dmin - sqrt(nb)); return 1; }
+            if (dmax - dmin <= delta && delta > 0) { *lam = fmin(0.0, dmin - sqrt(nb)); return 1; }
+            if (dmax == dmin) { *lam = fmin(0.0, dmin - sqrt(nb)); return 1; }    /* (exact: delta = 0 asks no more) */
             return 0;
         }
     }
@@ -467,13 +565,22 @@ static int ps_lammin_arrow(int n, const double *M, double delta, double *lam) {
     for (int i = 0; i < n; i++) if (i != hc) nb2 += b[i] * b[i];
     if (!(nb2 > 0)) return 0;
     const double g = dmx / nb2;
-    double e = 0;
+    /* 22 October 2026: the deviation E of the other block from g b b' bounds the eigenvalues' change by ||E||_2 <=
+     * ||E||_F, summed here; the old bound n max|E_ij| is n times larger for deviations of rounding size, and on a ray
+     * of norm 1e18 (dg3d_1000, SDP with SOCP, one cone of dimension 17,012) it rejected the closed form, so the measures
+     * fell to dense Cholesky factorizations of order 17,012 (the postsolve 89 s of a 292 s run). Accepted when the bound
+     * is at most delta, or of rounding size (64 eps of the block's trace) when delta = 0 asks for the value itself */
+    const double fcap = delta > 0 ? delta : 64.0 * DBL_EPSILON * fabs(dmx);
+    double f2 = 0;
     for (int j = 0; j < n; j++) {
         if (j == hc) continue;
         const double *c = M + (size_t)j * n, gb = g * b[j];
-        for (int i = 0; i < n; i++) { if (i == hc) continue; const double d = fabs(c[i] - gb * b[i]); if (d > e) { e = d; if ((double)n * e > delta) return 0; } }
+        for (int i = 0; i < n; i++) { if (i == hc) continue; const double d = c[i] - gb * b[i]; f2 += d * d; }
+        if (f2 > fcap * fcap) return 0;
     }
-    *lam = fmin(0.0, dmx - sqrt(nb2)) - (double)n * e;
+    const double ef = sqrt(f2) + 4.0 * DBL_EPSILON * fabs(dmx);    /* (and the rounding of g and of the closed form) */
+    if (ef > fcap && delta > 0) return 0;
+    *lam = fmin(0.0, dmx - sqrt(nb2)) - ef;
     return 1;
 }
 double ps_lammin_tol(int n, const double *M, double *work, double delta) {
@@ -661,6 +768,18 @@ typedef struct {            /* entries of the original data grouped by constrain
     size_t *ptr;            /* m + 2 offsets: constraint -1 (C) first */
     size_t *ord;
 } ConIndex;
+/* 23 October 2026: the entries of the constraint a record removed, each with its weight: one constraint of the file
+ * (weight 1), or a combination of the file's constraints that the presolve added (lifted_faces, con = -2 - j: the
+ * table of the postsolve being undone, g_ps_comb, set by recover_pass) */
+static const Postsolve *g_ps_comb = NULL;
+#define REC_ENTRIES_BEGIN(CIx, r, q, wq) \
+    { const int c0_ = (r)->con, j_ = (r)->con <= -2 ? -2 - (r)->con : -1; \
+      const int n_ = c0_ >= 0 ? 1 : (j_ >= 0 && g_ps_comb && j_ < g_ps_comb->ncomb ? g_ps_comb->comb_ptr[j_ + 1] - g_ps_comb->comb_ptr[j_] : 0); \
+      for (int u_ = 0; u_ < n_; u_++) { \
+        const int ci_ = c0_ >= 0 ? c0_ : g_ps_comb->comb_i[g_ps_comb->comb_ptr[j_] + u_]; \
+        const double wq = c0_ >= 0 ? 1.0 : g_ps_comb->comb_w[g_ps_comb->comb_ptr[j_] + u_]; \
+        for (size_t e_ = (CIx)->ptr[ci_ + 1]; e_ < (CIx)->ptr[ci_ + 2]; e_++) { const size_t q = (CIx)->ord[e_];
+#define REC_ENTRIES_END }}}
 static void conindex_build(const PSOrig *O, ConIndex *X) {
     int m = O->m;
     X->ptr = pcalloc(m + 3, sizeof(size_t));
@@ -891,16 +1010,15 @@ static double part_t_sparse(const PSOrig *O, const ConIndex *CI, const PSRecord 
         }
         free(x); free(wk);
     }
-    for (size_t e = CI->ptr[r->con + 1]; e < CI->ptr[r->con + 2]; e++) {
-        size_t q = CI->ord[e];
+    REC_ENTRIES_BEGIN(CI, r, q, wq)
         if (O->blk[q] != s->o) continue;
         const int i = O->ii[q], j = O->jj[q];
         if (role[i] != 2 || role[j] != 2) continue;
-        const double v = r->sgn * O->v[q];
+        const double v = r->sgn * wq * O->v[q];
         const int a = jpos[i], b = jpos[j];
         if (i == j) Aw[a + (size_t)a * kw] += v;
         else { const int lo = a < b ? a : b, hi = a < b ? b : a; Aw[hi + (size_t)lo * kw] += v; if (a == b) Aw[a + (size_t)a * kw] += v; }
-    }
+    REC_ENTRIES_END
     {
         double *wk = pmalloc(sizeof(double) * ((size_t)kw * kw + 1));
         for (int b = 0; b < kw; b++) for (int a = 0; a < b; a++) Aw[a + (size_t)b * kw] = Aw[b + (size_t)a * kw];
@@ -1003,11 +1121,10 @@ static double part_t_sdp(const PSOrig *O, const ConIndex *CI, const PSRecord *r,
     free(Zp);
     /* Aw = sgn (TW)' A_r (TW) over the entries of A_r in this block */
     double *Aw = pcalloc((size_t)kw * kw + 1, sizeof(double));
-    for (size_t e = CI->ptr[r->con + 1]; e < CI->ptr[r->con + 2]; e++) {
-        size_t q = CI->ord[e];
+    REC_ENTRIES_BEGIN(CI, r, q, wq)
         if (O->blk[q] != pp->blk) continue;
         const int i = O->ii[q], j = O->jj[q];
-        const double v = r->sgn * O->v[q];
+        const double v = r->sgn * wq * O->v[q];
         for (int b = 0; b < kw; b++) {
             const double tib = TW[i + (size_t)b * no], tjb = TW[j + (size_t)b * no];
             for (int a = b; a < kw; a++) {
@@ -1015,7 +1132,7 @@ static double part_t_sdp(const PSOrig *O, const ConIndex *CI, const PSRecord *r,
                 Aw[a + (size_t)b * kw] += (i == j) ? v * tia * tib : v * (tia * tjb + tja * tib);
             }
         }
-    }
+    REC_ENTRIES_END
     free(TW);
     double t = 0;
     /* S = G' Zn^{-1} G - H */
@@ -1075,6 +1192,7 @@ out:
 static int recover_pass(const Postsolve *ps, const PSOrig *O, const ConIndex *CIp, double *yo, double **Zo,
                         double mf, int *rec, int *unrec, PSSpX *sp) {
     const ConIndex CI = *CIp;
+    g_ps_comb = ps;
     for (int ri = ps->nrec - 1; ri >= 0; ri--) {
         const PSRecord *r = &ps->rec[ri];
         if (r->np == 0) continue;
@@ -1099,10 +1217,9 @@ static int recover_pass(const Postsolve *ps, const PSOrig *O, const ConIndex *CI
                     int var = T->identity ? pp->J[b] : (T->nz[pp->J[b]] ? T->idx[pp->J[b]][0] : -1);
                     if (var < 0) continue;
                     double a = 0;
-                    for (size_t e = CI.ptr[r->con + 1]; e < CI.ptr[r->con + 2]; e++) {
-                        size_t qq = CI.ord[e];
-                        if (O->blk[qq] == o && O->ii[qq] == var) a += r->sgn * O->v[qq];
-                    }
+                    REC_ENTRIES_BEGIN(&CI, r, qq, wq)
+                        if (O->blk[qq] == o && O->ii[qq] == var) a += r->sgn * wq * O->v[qq];
+                    REC_ENTRIES_END
                     if (a > 0) t = fmax(t, -Zo[o][var] / a);
                     scale = fmax(scale, fabs(Zo[o][var]) / (a > 0 ? a : 1));
                 }
@@ -1128,15 +1245,16 @@ static int recover_pass(const Postsolve *ps, const PSOrig *O, const ConIndex *CI
          * cannot be repaired this way; give up early instead of producing 1e300s */
         if (!(tu < 1e12 * (1.0 + O->nC1))) return 1;
         double dy = -r->sgn * tu;
-        yo[r->con] += dy;
-        for (size_t e = CI.ptr[r->con + 1]; e < CI.ptr[r->con + 2]; e++) {
-            size_t q = CI.ord[e];
+        if (r->con >= 0) yo[r->con] += dy;
+        else if (r->con <= -2 && -2 - r->con < ps->ncomb)   /* a combination the presolve added: its weights on the file's rows */
+            for (int u = ps->comb_ptr[-2 - r->con]; u < ps->comb_ptr[-1 - r->con]; u++) yo[ps->comb_i[u]] += dy * ps->comb_w[u];
+        REC_ENTRIES_BEGIN(&CI, r, q, wq)
             const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
-            const double c = -dy * O->v[q];
+            const double c = -dy * wq * O->v[q];
             if (sp && o == sp->o) { sp->zs[sp->qe[q]] += c; continue; }
             if (O->bs[o] < 0) Zo[o][i] += c;
             else { Zo[o][i + (size_t)j * no] += c; if (i != j) Zo[o][j + (size_t)i * no] += c; }
-        }
+        REC_ENTRIES_END
         (*rec)++;
         if (!sp && getenv("BRISK_PSDEBUG") && r->np == 1 && r->parts[0].kind != PS_LP) {
             const PSPart *pp = &r->parts[0];
@@ -1187,7 +1305,9 @@ static int cmp_pqkey(const void *a, const void *b) {
     const PQKey *x = a, *y = b;
     return x->key < y->key ? -1 : x->key > y->key ? 1 : 0;
 }
-static void ps_project_x(const PSOrig *O, double **Xo, const double *yo, int verbose, const PSSpX *sp) {
+static void ps_project_x(const PSOrig *O, double **Xo, const double *yo, int verbose, const PSSpX *sp,
+                         const PSChordal *spch, const int *spsel, double **spXc, int spncl,
+                         const double *clam_o, const PSChordal *const *cch_o, int *const *csel_o) {
     const int mo = O->m;
     size_t na = 0;
     for (size_t q = 0; q < O->nnz; q++) if (O->con[q] >= 0) na++;
@@ -1203,6 +1323,8 @@ static void ps_project_x(const PSOrig *O, double **Xo, const double *yo, int ver
     for (size_t t = 0; t < na; t++) { if (t == 0 || K[t].key != K[t - 1].key) ne++; eid[t] = ne - 1; qs[t] = K[t].q; }
     int *eq = pmalloc(sizeof(int) * (ne + 1));           /* a representative triplet per entry */
     for (size_t t = 0; t < na; t++) eq[eid[t]] = qs[t];
+    uint64_t *ekey = pmalloc(sizeof(uint64_t) * (ne + 1));   /* the entries' keys, increasing (the measure below) */
+    for (size_t t = 0; t < na; t++) ekey[eid[t]] = K[t].key;
     free(K);
     /* weights: 2 for off-diagonal SDP entries */
     double *cw = pmalloc(sizeof(double) * (ne + 1));
@@ -1344,8 +1466,124 @@ projected:
     dn = sqrt(dn);
     /* accept: the residual drops tenfold, and the norm (a bound on the change of
      * lambda_min(X)) is well below the part of the gap measure it removes */
+    /* 24 October 2026 (ISSUES 273): the correction is kept when it lowers the largest of the errors it changes, measured
+     * as the final measure measures them (DIMACS errors 1, 2, 5 and 6; y and Z = C - A'y stay): the residual, lambda_min
+     * of every block and clique it touches (ps_lammin_tol, the sparse block on its cliques), the gap and the
+     * complementarity, <X, C - A'y> = <C,X> - b'y + y'r with r = b - A(X). The test before (kept as the fallback when
+     * nothing can be measured, BRISK_PROJBOUND=1 always) compared the norm of the correction, a bound on the change of
+     * lambda_min that the spread of the correction over many blocks makes loose, with the complementarity it removes in
+     * the units of ||b||_1 instead of those of the objective: on the AC power flows in the moment form it rejected 18 of
+     * 24 corrections, among them acopf_case793_goc's (SDP with SOCP; the residual 4.0e-8 -> 1.7e-9, the norm 2.1e-3,
+     * y'r 2.5e-5), which leaves the complementarity at 1.0e-6 on the problem as read. */
     const double gain = fabs(yr) / (1.0 + fabs(O->nb1));
-    const int ok = rn <= 0.1 * r0 && dn < 0.3 * fmax(gain, r0) && r0 <= 1e-4 * (1.0 + fabs(O->nb1));   /* a polish, not a repair */
+    int ok = rn <= 0.1 * r0 && dn < 0.3 * fmax(gain, r0) && r0 <= 1e-4 * (1.0 + fabs(O->nb1));   /* a polish, not a repair */
+    double m0 = -1, m1 = -1;
+    if (!ok && rn < r0 && r0 > 0 && r0 <= 1e-4 * (1.0 + fabs(O->nb1)) && !getenv("BRISK_PROJBOUND")) {
+        const double dtol = 1e-12 * (1.0 + O->nb1);
+        double pobj = 0, dpo = 0, dobj = 0, yr1 = 0;
+        for (size_t q = 0; q < O->nnz; q++) {
+            if (O->con[q] >= 0) continue;
+            const int o = O->blk[q], no = abs(O->bs[o]), i = O->ii[q], j = O->jj[q];
+            const double w2 = (O->bs[o] > 0 && i != j) ? 2.0 : 1.0;
+            const double x = sp && o == sp->o ? (sp->qe[q] >= 0 ? sp->xs[sp->qe[q]] : 0.0) : O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
+            pobj += w2 * O->v[q] * x;
+            const uint64_t key = ((uint64_t)o << 42) | ((uint64_t)i << 21) | (uint64_t)j;
+            int lo = 0, hi = ne - 1, e = -1;
+            while (lo <= hi) { const int mid = (lo + hi) >> 1; if (ekey[mid] < key) lo = mid + 1; else if (ekey[mid] > key) hi = mid - 1; else { e = mid; break; } }
+            if (e >= 0) dpo += w2 * O->v[q] * de[e];
+        }
+        /* the residual after the correction, b - A(X + dX), from dX itself (res is not it on every path: the direct
+         * passes leave the last pass's, and the copy before the jump past the CG overwrites it) */
+        double *r1 = pmalloc(sizeof(double) * (mo + 1)), rn1 = 0;
+        memcpy(r1, r, sizeof(double) * mo);
+        for (size_t t = 0; t < na; t++) r1[O->con[qs[t]]] -= cw[eid[t]] * O->v[qs[t]] * de[eid[t]];
+        for (int i = 0; i < mo; i++) { dobj += O->b[i] * yo[i]; yr1 += yo[i] * r1[i]; rn1 += r1[i] * r1[i]; }
+        rn1 = sqrt(rn1); free(r1);
+        const double po1 = pobj + dpo;
+        const double den0 = 1 + fabs(pobj + O->obj_off) + fabs(dobj + O->obj_off), den1 = 1 + fabs(po1 + O->obj_off) + fabs(dobj + O->obj_off);
+        /* lambda_min of what the correction touches, before and after */
+        double lam0 = INFINITY, lam1 = INFINITY;
+        char *tb = pcalloc((size_t)O->nblk + 1, 1);
+        for (int e = 0; e < ne; e++) if (de[e] != 0) {
+            const int q = eq[e], o = O->blk[q];
+            if (O->bs[o] < 0) { const double x = Xo[o][O->ii[q]]; lam0 = fmin(lam0, x); lam1 = fmin(lam1, x + de[e]); }
+            else tb[o] = 1;
+        }
+        for (int o = 0; o < O->nblk && m0 != -2; o++) {
+            if (!tb[o] || (sp && o == sp->o)) continue;
+            const int no = O->bs[o];
+            /* 24 October 2026 (ISSUES 275): a block the final measure takes on its cliques (the sparse measure is on and
+             * the block was decomposed: X is not completed outside its cliques) is measured on its cliques here too; its
+             * whole matrix gave lambda_min -14 on pglib_opf_case588_sdet (SDP), the same before and after, which decided
+             * the test. Without a clique basis (not a selection) the final measure keeps the value of the reduced
+             * problem, and the change cannot be measured: the bound test decides. */
+            const int oncl = sp && clam_o && clam_o[o] == clam_o[o];
+            if (oncl && !(cch_o && cch_o[o])) { m0 = -2; break; }
+            double *M = pmalloc(sizeof(double) * ((size_t)no * no + 1));
+            memcpy(M, Xo[o], sizeof(double) * (size_t)no * no);
+            for (int e = 0; e < ne; e++) {
+                const int q = eq[e];
+                if (O->blk[q] != o || de[e] == 0) continue;
+                const int i = O->ii[q], j = O->jj[q];
+                M[i + (size_t)j * no] += de[e]; if (i != j) M[j + (size_t)i * no] += de[e];
+            }
+            if (oncl) {
+                const PSChordal *ch = cch_o[o]; const int *sel = csel_o[o];
+                int cm = 1; for (int t = 0; t < ch->ncl; t++) { const int c = ch->cptr[t + 1] - ch->cptr[t]; if (c > cm) cm = c; }
+                double *G0 = pmalloc(sizeof(double) * ((size_t)cm * cm + 1)), *G1 = pmalloc(sizeof(double) * ((size_t)cm * cm + 1)), *wk = pmalloc(sizeof(double) * ((size_t)cm * cm + 1));
+                for (int t = 0; t < ch->ncl; t++) {
+                    const int c = ch->cptr[t + 1] - ch->cptr[t]; const int *cv = ch->cv + ch->cptr[t];
+                    int touched = 0;
+                    for (int b = 0; b < c; b++)
+                        for (int a = 0; a < c; a++) {
+                            const size_t ix = (size_t)sel[cv[a]] + (size_t)sel[cv[b]] * no;
+                            G0[a + (size_t)b * c] = Xo[o][ix]; G1[a + (size_t)b * c] = M[ix];
+                            if (M[ix] != Xo[o][ix]) touched = 1;
+                        }
+                    if (touched) { lam0 = fmin(lam0, ps_lammin_tol(c, G0, wk, dtol)); lam1 = fmin(lam1, ps_lammin_tol(c, G1, wk, dtol)); }
+                }
+                free(G0); free(G1); free(wk);
+            } else {
+                double *wk = pmalloc(sizeof(double) * ((size_t)no * no + 1));
+                lam0 = fmin(lam0, ps_lammin_tol(no, Xo[o], wk, dtol));
+                lam1 = fmin(lam1, ps_lammin_tol(no, M, wk, dtol));
+                free(wk);
+            }
+            free(M);
+        }
+        if (sp && sp->o >= 0 && tb[sp->o]) {
+            if (!spch || !spsel || !spXc) m0 = -2;            /* the sparse block without its cliques: not measured */
+            else {
+                double *dsp = pcalloc((size_t)sp->ne + 1, sizeof(double));
+                for (int e = 0; e < ne; e++) { const int q = eq[e]; if (O->blk[q] == sp->o && sp->qe[q] >= 0) dsp[sp->qe[q]] += de[e]; }
+                const uint64_t n0 = (uint64_t)sp->n0;
+                for (int t = 0; t < spncl; t++) {
+                    const int c = spch->cptr[t + 1] - spch->cptr[t];
+                    const int *cv = spch->cv + spch->cptr[t];
+                    double *G = pmalloc(sizeof(double) * ((size_t)c * c + 1)), *wk = pmalloc(sizeof(double) * ((size_t)c * c + 1));
+                    memcpy(G, spXc[t], sizeof(double) * (size_t)c * c);
+                    int touched = 0;
+                    for (int b = 0; b < c; b++)
+                        for (int a = 0; a < c; a++) {
+                            int i = spsel[cv[a]], j = spsel[cv[b]];
+                            if (i > j) { const int tt = i; i = j; j = tt; }
+                            const int p = spx_find(sp, (uint64_t)i * n0 + (uint64_t)j);
+                            if (p >= 0 && dsp[p] != 0) { G[a + (size_t)b * c] = sp->xs[p] + dsp[p]; touched = 1; }
+                        }
+                    if (touched) { lam0 = fmin(lam0, ps_lammin_tol(c, spXc[t], wk, dtol)); lam1 = fmin(lam1, ps_lammin_tol(c, G, wk, dtol)); }
+                    free(G); free(wk);
+                }
+                free(dsp);
+            }
+        }
+        free(tb);
+        if (m0 != -2) {
+            const double nb = 1.0 + O->nb1;
+            m0 = fmax(fmax(r0 / nb, lam0 < 0 ? -lam0 / nb : 0.0), fmax(fabs(pobj - dobj) / den0, fabs(pobj - dobj + yr) / den0));
+            m1 = fmax(fmax(rn1 / nb, lam1 < 0 ? -lam1 / nb : 0.0), fmax(fabs(po1 - dobj) / den1, fabs(po1 - dobj + yr1) / den1));
+            ok = m1 < m0;
+        }
+    }
     if (ok)
         for (int e = 0; e < ne; e++) {
             const int q = eq[e], o = O->blk[q], no = abs(O->bs[o]), i = O->ii[q], j = O->jj[q];
@@ -1354,10 +1592,12 @@ projected:
             else { Xo[o][i + (size_t)j * no] += de[e]; if (i != j) Xo[o][j + (size_t)i * no] += de[e]; }
         }
     if (verbose >= 2 || getenv("BRISK_PSTIME"))
-        printf("postsolve: X projection onto A(X) = b: |r| %.2e -> %.2e (%d %s), |dX| %.2e, y'r %.2e: %s\n",
-               r0, rn, it, direct ? "direct passes" : "CG", dn, yr, ok ? "applied" : "rejected");
+        printf("postsolve: X projection onto A(X) = b: |r| %.2e -> %.2e (%d %s), |dX| %.2e, y'r %.2e%s: %s\n",
+               r0, rn, it, direct ? "direct passes" : "CG", dn, yr, m1 >= 0 ? (m1 < m0 ? ", the errors it changes lower" : ", the errors it changes not lower") : "",
+               ok ? "applied" : "rejected");
+    if ((verbose >= 2 || getenv("BRISK_PSTIME")) && m1 >= 0) printf("   [projection: the largest error it changes %.2e -> %.2e]\n", m0, m1);
 #undef KMV
-    free(eid); free(qs); free(eq); free(cw); free(tw); free(xe); free(r); free(u); free(p); free(z); free(Kp); free(dg); free(de); free(res);
+    free(eid); free(qs); free(eq); free(ekey); free(cw); free(tw); free(xe); free(r); free(u); free(p); free(z); free(Kp); free(dg); free(de); free(res);
 }
 
 /* The removed duals through complementarity with the primal (ISSUES 93). The reduced solve
@@ -1631,13 +1871,45 @@ static double ps_fix_apply(const PSFix *F, const double *yin, double *yout, int 
 
 /* ------------------------------------------------------------------ main entry */
 static inline size_t bsize(int bs) { return bs > 0 ? (size_t)bs * bs : (size_t)(-bs); }
+/* 23 October 2026: Z of the problem as read with its cone-vector blocks (zc[o] the hub; brisk.h, xc_index): the length
+ * of block o, a data entry's term added (the arrow's entries: the hub's diagonal is z_0, (h, i_t) is z_t; the other
+ * diagonal entries repeat z_0's data and are skipped), and lambda_min */
+static inline size_t ps_zlen(const PSOrig *O, const int *zc, int o) { return zc && zc[o] >= 0 ? (size_t)O->bs[o] : bsize(O->bs[o]); }
+static inline void ps_zadd(const PSOrig *O, const int *zc, double **Z, size_t q, double coef) {
+    const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+    if (O->bs[o] < 0) Z[o][i] += coef;
+    else if (zc && zc[o] >= 0) { const int h = zc[o]; if (i == j) { if (i == h) Z[o][0] += coef; } else { const int u = i == h ? j : i; Z[o][u < h ? u + 1 : u] += coef; } }
+    else { Z[o][i + (size_t)j * no] += coef; if (i != j) Z[o][j + (size_t)i * no] += coef; }
+}
+static inline double ps_zlam(const PSOrig *O, const int *zc, double *const *Z, int o, double *work, double delta) {
+    const int no = abs(O->bs[o]);
+    if (O->bs[o] < 0) { double v = 0; for (int i = 0; i < no; i++) v = fmin(v, Z[o][i]); return v; }
+    if (zc && zc[o] >= 0) return xc_lammin_z(no, Z[o]);
+    return ps_lammin_tol(no, Z[o], work, delta);
+}
 
 int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yred,
-              double ***Xo_out, double *yo, PSResult *res, int verbose) {
+              double ***Xo_out, double *yo, PSResult *res, int verbose, const int *xc_red, int *xc_o) {
     const double t0 = ps_now();
     const Postsolve *ps = P->ps;
     const int nbo = O->nblk, mo = O->m;
     memset(res, 0, sizeof(*res));
+    /* 23 October 2026: blocks of Xred held as cone vectors (xc_red, brisk.h). A chordal or moment-form conversion maps
+     * blocks into others: there they are completed first (main.c does not ask for vectors then; this is the safety net) */
+    if (xc_o) for (int o = 0; o < nbo; o++) xc_o[o] = -1;
+    double **Xred_d = NULL;
+    if (xc_red && Xred && ps && (ps->mom || (ps->chordal && ps->nch > 0))) {
+        Xred_d = pmalloc(sizeof(double *) * (P->nblk + 1));
+        for (int k = 0; k < P->nblk; k++) {
+            Xred_d[k] = Xred[k];
+            if (xc_red[k] < 0) continue;
+            const int n = P->blk[k].n;
+            Xred_d[k] = pmalloc(sizeof(double) * ((size_t)n * n + 1));
+            xc_complete(n, xc_red[k], Xred[k], Xred_d[k]);
+        }
+        Xred = Xred_d;
+    }
+    const int *xc_r = Xred_d ? NULL : xc_red;
     /* sparse mode for a large moment-form chordal block (see PSSpX) */
     PSSpX spx; memset(&spx, 0, sizeof(spx)); spx.o = -1;
     double *clam_k = NULL, *clam_o = NULL;   /* 4.42: lambda_min over the cliques of a completed decomposed block (by current / original block), NAN: none */
@@ -1648,6 +1920,9 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
     /* ---- y */
     for (int i = 0; i < mo; i++) yo[i] = 0;
     for (int i = 0; i < P->m; i++) if (P->orig[i] >= 0) yo[P->orig[i]] = yred[i];
+    /* (23 October 2026) a combination the presolve added and the facial reduction did not remove: its dual on the file's rows */
+    if (ps) for (int i = 0; i < P->m; i++) if (P->orig[i] <= -2 && -2 - P->orig[i] < ps->ncomb)
+        for (int u = ps->comb_ptr[-2 - P->orig[i]]; u < ps->comb_ptr[-1 - P->orig[i]]; u++) yo[ps->comb_i[u]] += yred[i] * ps->comb_w[u];
     /* ---- X */
     /* chordal conversions are undone first: the clique blocks are replaced by the
      * positive semidefinite completion of the converted block, at its old position */
@@ -1826,16 +2101,30 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         for (int o = 0; o < nbo; o++) {
             const int bs = O->bs[o], no = abs(bs);
             if (o == spx.o) { Xo[o] = pcalloc(2, sizeof(double)); continue; }
-            Xo[o] = pcalloc(bsize(bs) + 1, sizeof(double));
             int k = cur[o];
-            if (k < 0) continue;                         /* block removed entirely: X = 0 */
             const PSBasis *T = &ps->basis[o];
+            double *Xkd = NULL;                          /* a cone vector's completion, when the block is mapped */
+            if (k >= 0 && xc_r && xc_r[k] >= 0) {
+                if (T->identity && bs > 0 && nsz[k] == no) {
+                    /* 23 October 2026: the block as read, held as its cone vector */
+                    Xo[o] = pcalloc((size_t)no + 1, sizeof(double));
+                    memcpy(Xo[o], Xl[k], sizeof(double) * (size_t)no);
+                    if (xc_o) xc_o[o] = xc_r[k];
+                    else { double *D = pcalloc(bsize(bs) + 1, sizeof(double)); xc_complete(no, xc_r[k], Xo[o], D); free(Xo[o]); Xo[o] = D; }
+                    continue;
+                }
+                Xkd = pmalloc(sizeof(double) * ((size_t)nsz[k] * nsz[k] + 1));
+                xc_complete(nsz[k], xc_r[k], Xl[k], Xkd);
+            }
+            Xo[o] = pcalloc(bsize(bs) + 1, sizeof(double));
+            if (k < 0) continue;                         /* block removed entirely: X = 0 */
             const int nc = nsz[k];
-            const double *Xk = Xl[k];
-            if (T->identity) { memcpy(Xo[o], Xk, sizeof(double) * bsize(bs)); continue; }
+            const double *Xk = Xkd ? Xkd : Xl[k];
+            if (T->identity) { memcpy(Xo[o], Xk, sizeof(double) * bsize(bs)); free(Xkd); continue; }
             if (bs < 0) {                                /* LP: selection */
                 for (int c = 0; c < nc; c++)
                     for (int e = 0; e < T->nz[c]; e++) Xo[o][T->idx[c][e]] += T->val[c][e] * Xk[c];
+                free(Xkd);
                 continue;
             }
             /* Y = T Xk (no x nc), Xo = Y T' */
@@ -1853,7 +2142,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                     const double *src = Y + (size_t)a * no;
                     for (int i = 0; i < no; i++) dst[i] += v * src[i];
                 }
-            free(Y);
+            free(Y); free(Xkd);
         }
         free(cur);
         res->have_x = 1;
@@ -1891,43 +2180,40 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         }
         res->have_x = 1;
     }
-    if (Xo && ps && ps->mom && !getenv("BRISK_NOPROJ")) ps_project_x(O, Xo, yo, verbose, spx.o >= 0 ? &spx : NULL);   /* 4.22: default (direct solve) */
-    if (spx.o >= 0) {
-        /* the projected values back into the cliques */
-        const uint64_t n0 = (uint64_t)spx.n0;
-        for (int t = 0; t < spncl; t++) {
-            const int c = spch->cptr[t + 1] - spch->cptr[t];
-            const int *cv = spch->cv + spch->cptr[t];
-            for (int b = 0; b < c; b++)
-                for (int a = 0; a < c; a++) {
-                    int i = spsel[cv[a]], j = spsel[cv[b]];
-                    if (i > j) { const int tt = i; i = j; j = tt; }
-                    const int e = spx_find(&spx, (uint64_t)i * n0 + (uint64_t)j);
-                    if (e >= 0) spXc[t][a + (size_t)b * c] = spx.xs[e];
-                }
+    if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: X mapped]\n", ps_now() - t0);
+    /* ---- Z = C - A'y (full storage; 23 October 2026: a cone-vector block of X has Z as its cone vector, zc, unless a
+     * constraint removed by the presolve has data in the block: the recovery passes add its terms to Z there) */
+    int *zc = NULL;
+    if (xc_o && Xo) {
+        for (int o = 0; o < nbo; o++) if (xc_o[o] >= 0) {
+            if (!zc) { zc = pmalloc(sizeof(int) * (nbo + 1)); for (int q = 0; q < nbo; q++) zc[q] = -1; }
+            zc[o] = xc_o[o];
+        }
+        if (zc && P->m < mo) {
+            char *kept = pcalloc((size_t)mo + 1, 1);
+            for (int i = 0; i < P->m; i++) if (P->orig[i] >= 0) kept[P->orig[i]] = 1;
+            for (size_t q = 0; q < O->nnz; q++) if (O->con[q] >= 0 && !kept[O->con[q]] && zc[O->blk[q]] >= 0) zc[O->blk[q]] = -1;
+            free(kept);
         }
     }
-    if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: X mapped]\n", ps_now() - t0);
-    /* ---- Z = C - A'y (full storage) */
     double **Zo = pmalloc(sizeof(double *) * (nbo + 1));
-    for (int o = 0; o < nbo; o++) Zo[o] = pcalloc(o == spx.o ? 2 : bsize(O->bs[o]) + 1, sizeof(double));
+    for (int o = 0; o < nbo; o++) Zo[o] = pcalloc(o == spx.o ? 2 : ps_zlen(O, zc, o) + 1, sizeof(double));
     for (size_t q = 0; q < O->nnz; q++) {
-        const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+        const int o = O->blk[q];
         const double coef = O->con[q] < 0 ? O->v[q] : -yo[O->con[q]] * O->v[q];
         if (coef == 0) continue;
         if (o == spx.o) { spx.zs[spx.qe[q]] += coef; continue; }
-        if (O->bs[o] < 0) Zo[o][i] += coef;
-        else {
-            Zo[o][i + (size_t)j * no] += coef;
-            if (i != j) Zo[o][j + (size_t)i * no] += coef;
-        }
+        ps_zadd(O, zc, Zo, q, coef);
     }
     if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: Z formed]\n", ps_now() - t0);
     /* ---- dual recovery for constraints removed by facial reduction. The back-off margin
      * matters on deep chains (a slack left on the boundary of one level is amplified by the
      * next), and the best value is problem dependent; the passes are cheap next to the solve,
      * so a few margins are tried and the most dual-feasible result kept. */
-    if (ps && ps->nrec > 0 && spx.o >= 0) {
+    if (ps && ps->nrec > 0 && ps_late()) {
+        res->unrecovered = ps->nrec; res->late = 1;
+        if (verbose >= 0) printf("postsolve: the time limit is reached: the duals of the %d constraint(s) the presolve removed are not recovered\n", ps->nrec);
+    } else if (ps && ps->nrec > 0 && spx.o >= 0) {
         /* sparse mode: the recovery passes of the dense path, the sparse block's slack on
          * its data pattern (diagonal-type reductions; others are left unrecovered) */
         size_t mx = 1;
@@ -1963,6 +2249,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 int brec = 0, bunrec = ps->nrec;
                 double prevlz = -1;
                 for (int k = 0; k < 4; k++) {
+                    if (k > 0 && ps_late()) { res->late = 1; break; }   /* (ISSUES 284: the best margin so far) */
                     if (k > 0) {
                         memcpy(yo, y0, sizeof(double) * mo);
                         memcpy(spx.zs, zs0, sizeof(double) * spx.ne);
@@ -1976,7 +2263,9 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                     if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yo));
                     if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: recovery margin %g: lambda_min(Z) %.2e (%d recovered, %d not)\n", margins[k], lz, rc, un);
                     if (k == 0 && fabs(-lz - best) <= 1e-3 * best) break;
-                    if (k > 0 && fabs(-lz - prevlz) <= 1e-3 * fmax(prevlz, 1e-300)) break;
+                    /* (23 October 2026: not after a pass that diverged, prevlz = inf, where inf <= 1e-3 inf held and
+                     * the search stopped before the next margin's result was kept; ISSUES 259) */
+                    if (k > 0 && isfinite(prevlz) && fabs(-lz - prevlz) <= 1e-3 * fmax(prevlz, 1e-300)) break;
                     prevlz = -lz;
                     if (-lz < best) { best = -lz; brec = rc; bunrec = un; memcpy(ybest, yo, sizeof(double) * mo); }
                     if (best <= 1e-10 * (1.0 + O->nC1)) break;
@@ -2012,23 +2301,19 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             const char *me = getenv("BRISK_PSMARGIN");
             const int nm = me ? 1 : (int)(sizeof(margins) / sizeof(margins[0]));
             size_t maxn2 = 1;
-            for (int o = 0; o < nbo; o++) if (bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+            for (int o = 0; o < nbo; o++) if (!(zc && zc[o] >= 0) && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
             double *wk = pmalloc(sizeof(double) * maxn2);
             double *y0 = pmalloc(sizeof(double) * (mo + 1)), *ybest = pmalloc(sizeof(double) * (mo + 1));
             double **Z0 = pmalloc(sizeof(double *) * (nbo + 1));
             for (int o = 0; o < nbo; o++) {
-                Z0[o] = pmalloc(sizeof(double) * (bsize(O->bs[o]) + 1));
-                memcpy(Z0[o], Zo[o], sizeof(double) * bsize(O->bs[o]));
+                Z0[o] = pmalloc(sizeof(double) * (ps_zlen(O, zc, o) + 1));
+                memcpy(Z0[o], Zo[o], sizeof(double) * ps_zlen(O, zc, o));
             }
             memcpy(y0, yo, sizeof(double) * mo);
             /* candidate 0: the removed constraints' duals left at zero, which is often
              * already dual feasible (then nothing is to be recovered) */
             double best = 0;
-            for (int o = 0; o < nbo; o++) {
-                const int no = abs(O->bs[o]);
-                if (O->bs[o] < 0) { for (int i = 0; i < no; i++) best = fmin(best, Zo[o][i]); }
-                else best = fmin(best, ps_lammin_tol(no, Zo[o], wk, 1e-12 * (1.0 + O->nC1)));
-            }
+            for (int o = 0; o < nbo; o++) best = fmin(best, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
             best = best == best ? -best : INFINITY;
             if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: lambda_min with the removed duals at zero]\n", ps_now() - t0);
             double best0 = best;
@@ -2050,26 +2335,26 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             memcpy(ybr, y0, sizeof(double) * mo);
             const int maxround = getenv("BRISK_PSROUNDS") ? atoi(getenv("BRISK_PSROUNDS")) : 2;
             for (int round = 0; round < maxround; round++) {
+            if (round >= 1 && ps_late()) { res->late = 1; break; }   /* (ISSUES 284) */
             if (round >= 1) {
                 if (!(best > 1e-9 * (1.0 + O->nC1)) || !Xo || !g_ps_fr_correct) break;
-                if (round == 1) { if (ps_fix_setup(&fix, O, Xo, ps, verbose)) break; have_fix = 1; }
+                if (round == 1) {
+                    /* (the correction reads X densely: cone-vector blocks are completed for it; Z keeps its form) */
+                    if (xc_expand(O, Xo, xc_o)) break;
+                    if (ps_fix_setup(&fix, O, Xo, ps, verbose)) break;
+                    have_fix = 1;
+                }
                 double dn = 0;
                 ps_fix_apply(&fix, ybr, y0, verbose, &dn);
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: dual correction round %d]\n", ps_now() - t0, round);
-                for (int o = 0; o < nbo; o++) memset(Z0[o], 0, sizeof(double) * bsize(O->bs[o]));
+                for (int o = 0; o < nbo; o++) memset(Z0[o], 0, sizeof(double) * ps_zlen(O, zc, o));
                 for (size_t q = 0; q < O->nnz; q++) {
-                    const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
                     const double coef = O->con[q] < 0 ? O->v[q] : -y0[O->con[q]] * O->v[q];
                     if (coef == 0) continue;
-                    if (O->bs[o] < 0) Z0[o][i] += coef;
-                    else { Z0[o][i + (size_t)j * no] += coef; if (i != j) Z0[o][j + (size_t)i * no] += coef; }
+                    ps_zadd(O, zc, Z0, q, coef);
                 }
                 double lb = 0;
-                for (int o = 0; o < nbo; o++) {
-                    const int no = abs(O->bs[o]);
-                    if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lb = fmin(lb, Z0[o][i]); }
-                    else lb = fmin(lb, ps_lammin_tol(no, Z0[o], wk, 1e-12 * (1.0 + O->nC1)));
-                }
+                for (int o = 0; o < nbo; o++) lb = fmin(lb, ps_zlam(O, zc, Z0, o, wk, 1e-12 * (1.0 + O->nC1)));
                 best0 = lb == lb ? -lb : INFINITY;
                 if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: corrected base (round %d): lambda_min(Z) %.2e, |dy| %.2e\n", round, -best0, dn);
                 if (best0 < best) { best = best0; brec = 0; bunrec = 0; bround = round; memcpy(ybest, y0, sizeof(double) * mo); }
@@ -2077,19 +2362,17 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             }
             bestr = INFINITY;   /* the round's best pass result; a diverging chain leaves its partial lift as the next base */
             for (int k = 0; k < nm && best > 1e-9 * (1.0 + O->nC1); k++) {
+                if ((k > 0 || round > 0) && ps_late()) { res->late = 1; break; }   /* (ISSUES 284: the best so far) */
                 if (k > 0 || round > 0) {
                     memcpy(yo, y0, sizeof(double) * mo);
-                    for (int o = 0; o < nbo; o++) memcpy(Zo[o], Z0[o], sizeof(double) * bsize(O->bs[o]));
+                    for (int o = 0; o < nbo; o++) memcpy(Zo[o], Z0[o], sizeof(double) * ps_zlen(O, zc, o));
                 }
                 int rc = 0, un = 0;
                 double lz = 0;
                 if (recover_pass(ps, O, &CI, yo, Zo, me ? atof(me) : margins[k], &rc, &un, NULL)) { lz = -INFINITY; if (round >= 1 && bestr == INFINITY) memcpy(ybr, yo, sizeof(double) * mo); }
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: recovery pass]\n", ps_now() - t0);
-                if (lz == 0) for (int o = 0; o < nbo; o++) {   /* (4.22: was skipped under BRISK_PSTIME) */
-                    const int no = abs(O->bs[o]);
-                    if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lz = fmin(lz, Zo[o][i]); }
-                    else lz = fmin(lz, ps_lammin_tol(no, Zo[o], wk, 1e-12 * (1.0 + O->nC1)));
-                }
+                if (lz == 0) for (int o = 0; o < nbo; o++)   /* (4.22: was skipped under BRISK_PSTIME) */
+                    lz = fmin(lz, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
                 if (!(lz == lz)) lz = -INFINITY;
                 if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yo));
                 if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: recovery margin %g: lambda_min(Z) %.2e\n", me ? atof(me) : margins[k], lz);
@@ -2099,7 +2382,10 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 if (k == 0 && fabs(-lz - best0) <= 1e-3 * best0) { if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: recovery does not change lambda_min, stopped\n"); break; }
                 /* 4.20: a margin that changes nothing (case1888_rte: -6.62e-7 for all four,
                  * 10 s per pass) ends the search */
-                if (k > 0 && fabs(-lz - prevlz) <= 1e-3 * fmax(prevlz, 1e-300)) { if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: margin does not change lambda_min, stopped\n"); break; }
+                /* 23 October 2026 (ISSUES 259): only after a pass that ended finite. After a diverging pass (margin 1 on
+                 * acopf_case118, SDP with SOCP) prevlz is inf and inf <= 1e-3 inf held: the search stopped before the
+                 * next margin's result (-1.8e-6 against -2.1e-4) was kept */
+                if (k > 0 && isfinite(prevlz) && fabs(-lz - prevlz) <= 1e-3 * fmax(prevlz, 1e-300)) { if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: margin does not change lambda_min, stopped\n"); break; }
                 prevlz = -lz;
                 if (-lz < bestr) { bestr = -lz; memcpy(ybr, yo, sizeof(double) * mo); }
                 if (-lz < best) {
@@ -2115,13 +2401,11 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             if (bround >= 1 && (verbose >= 2 || getenv("BRISK_PSTIME"))) printf("postsolve: the corrected lift is kept (round %d): lambda_min(Z) %.2e\n", bround, -best);
             memcpy(yo, ybest, sizeof(double) * mo);
             /* rebuild Z from the kept y */
-            for (int o = 0; o < nbo; o++) memset(Zo[o], 0, sizeof(double) * bsize(O->bs[o]));
+            for (int o = 0; o < nbo; o++) memset(Zo[o], 0, sizeof(double) * ps_zlen(O, zc, o));
             for (size_t q = 0; q < O->nnz; q++) {
-                const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
                 const double coef = O->con[q] < 0 ? O->v[q] : -yo[O->con[q]] * O->v[q];
                 if (coef == 0) continue;
-                if (O->bs[o] < 0) Zo[o][i] += coef;
-                else { Zo[o][i + (size_t)j * no] += coef; if (i != j) Zo[o][j + (size_t)i * no] += coef; }
+                ps_zadd(O, zc, Zo, q, coef);
             }
             res->recovered = brec; res->unrecovered = bunrec;
             for (int o = 0; o < nbo; o++) free(Z0[o]);
@@ -2130,19 +2414,53 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         }
     }
     if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: dual recovery]\n", ps_now() - t0);
+    /* 24 October 2026 (ISSUES 275): the projection of X onto A(X) = b after the recovery of the duals of the constraints
+     * the facial reduction removed, so that it is judged on the y that is returned: before it, b'y lacked their terms,
+     * and the gap the projection measured was that of a point never returned (7.1 on pglib_opf_case588_sdet, SDP, one
+     * constraint removed, before and after the correction alike). The recovery reads X only in its correction rounds
+     * on the dense path (ps_fix_setup), which now read X as the solve left it. */
+    if (Xo && ps && ps->mom && !getenv("BRISK_NOPROJ") && !ps_late())   /* 4.22: default (direct solve); ISSUES 284 */
+        ps_project_x(O, Xo, yo, verbose, spx.o >= 0 ? &spx : NULL, spch, spsel, spXc, spncl, clam_o, (const PSChordal *const *)cch_o, csel_o);
+    if (spx.o >= 0) {
+        /* the projected values back into the cliques */
+        const uint64_t n0 = (uint64_t)spx.n0;
+        for (int t = 0; t < spncl; t++) {
+            const int c = spch->cptr[t + 1] - spch->cptr[t];
+            const int *cv = spch->cv + spch->cptr[t];
+            for (int b = 0; b < c; b++)
+                for (int a = 0; a < c; a++) {
+                    int i = spsel[cv[a]], j = spsel[cv[b]];
+                    if (i > j) { const int tt = i; i = j; j = tt; }
+                    const int e = spx_find(&spx, (uint64_t)i * n0 + (uint64_t)j);
+                    if (e >= 0) spXc[t][a + (size_t)b * c] = spx.xs[e];
+                }
+        }
+    }
     /* ---- errors in the original problem */
+    /* (23 October 2026: a cone-vector block of X whose Z is held densely is completed: <X, Z> reads every entry) */
+    if (xc_o && Xo) for (int o = 0; o < nbo; o++) if (xc_o[o] >= 0 && !(zc && zc[o] >= 0)) {
+        const int no = O->bs[o];
+        double *D = pmalloc(sizeof(double) * ((size_t)no * no + 1));
+        xc_complete(no, xc_o[o], Xo[o], D); free(Xo[o]); Xo[o] = D; xc_o[o] = -1;
+    }
     double *rp = pcalloc(mo + 1, sizeof(double));
     double pobj = 0, dobj = 0, xz = 0, lamx = 0, lamz = 0;
     for (int i = 0; i < mo; i++) dobj += O->b[i] * yo[i];
     size_t maxn2 = 1;
-    for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && o != spx.o && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+    for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && o != spx.o && bsize(O->bs[o]) > maxn2 && !(zc && zc[o] >= 0 && Xo && xc_o && xc_o[o] >= 0)) maxn2 = bsize(O->bs[o]);
     for (int t = 0; t < spncl; t++) { const size_t c = (size_t)(spch->cptr[t + 1] - spch->cptr[t]); if (c * c > maxn2) maxn2 = c * c; }
     double *work = pmalloc(sizeof(double) * maxn2);
+    if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: the errors' measure begins]\n", ps_now() - t0);
     for (int o = 0; o < nbo; o++) {
         const int no = abs(O->bs[o]);
         if (o == spx.o) {
             double v = 0;
-            if (spx_lammin(&spx, spx.zs, 1e-12 * (1.0 + O->nC1), &v)) {
+            /* (ISSUES 284: past the time limit not measured: on a point far from Z >= 0 every one of the up to 14 shifted
+             * factorizations fails, 57 s on the block of order 27,317 of pglib_opf_case13659_pegase at its starting point) */
+            if (ps_late()) {
+                if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (the time limit is reached)\n", o + 1);
+                v = -INFINITY; res->late = 1;
+            } else if (spx_lammin(&spx, spx.zs, 1e-12 * (1.0 + O->nC1), &v)) {
                 if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (sparse factorization failed)\n", o + 1);
                 v = -INFINITY;
             }
@@ -2151,13 +2469,29 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         }
         if (O->bs[o] < 0) {
             for (int i = 0; i < no; i++) lamz = fmin(lamz, Zo[o][i]);
-        } else { double lz_ = ps_lammin_tol(no, Zo[o], work, 1e-12 * (1.0 + O->nC1)); if (ENV_ON("BRISK_LZDBG")) { printf("   [block %d n %d lammin(Z) %.3e]\n", o, no, lz_); if (no <= 6) for (int i = 0; i < no; i++) { for (int j = 0; j < no; j++) printf(" %.6e", Zo[o][i + (size_t)j * no]); printf("\n"); } } lamz = fmin(lamz, lz_); }
+        } else if (zc && zc[o] >= 0) lamz = fmin(lamz, ps_zlam(O, zc, Zo, o, work, 0.0));
+        else if (no > 500 && ps_late()) {   /* (ISSUES 284: past the time limit a large block is not measured; on a point far
+                                              * from Z >= 0 the Cholesky ladder fails nine times and the eigenvalues follow) */
+            if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (the time limit is reached)\n", o + 1);
+            lamz = -INFINITY; res->late = 1;
+        }
+        else { double lz_ = ps_lammin_tol(no, Zo[o], work, 1e-12 * (1.0 + O->nC1)); if (ENV_ON("BRISK_LZDBG")) { printf("   [block %d n %d lammin(Z) %.3e]\n", o, no, lz_); if (no <= 6) for (int i = 0; i < no; i++) { for (int j = 0; j < no; j++) printf(" %.6e", Zo[o][i + (size_t)j * no]); printf("\n"); } } lamz = fmin(lamz, lz_); }
     }
+    if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: lambda_min(Z) measured]\n", ps_now() - t0);
     if (Xo) {
         for (size_t q = 0; q < O->nnz; q++) {
             const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
-            const double x = o == spx.o ? spx.xs[spx.qe[q]] : O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
-            const double c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
+            double c;
+            if (xc_o && xc_o[o] >= 0) {
+                /* a cone-vector block (its data are arrow matrices, main.c): <A, X> = a_0 x_0 + sum_t a_t x_t, the hub's
+                 * diagonal entry standing for the whole diagonal */
+                const int h = xc_o[o];
+                if (i == j) c = i == h ? O->v[q] * Xo[o][0] : 0.0;
+                else { const int u = i == h ? j : i; c = O->v[q] * Xo[o][u < h ? u + 1 : u]; }
+            } else {
+                const double x = o == spx.o ? spx.xs[spx.qe[q]] : O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
+                c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
+            }
             if (O->con[q] < 0) pobj += c; else rp[O->con[q]] += c;
         }
         if (spx.o >= 0) {
@@ -2171,6 +2505,22 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         for (int o = 0; o < nbo; o++) {
             if (o == spx.o) continue;
             const int no = abs(O->bs[o]);
+            if (xc_o && xc_o[o] >= 0) {
+                /* both cone vectors (above): <X, Z> = x'z */
+                for (int t = 0; t < no; t++) xz += Xo[o][t] * Zo[o][t];
+                lamx = fmin(lamx, xc_lammin_x(no, Xo[o]));
+                continue;
+            }
+            if (zc && zc[o] >= 0) {
+                /* X dense (completed for the correction above), Z = Arw(z): <X, Z> = z_0 tr X + 2 sum_t z_t X_{h, i_t} */
+                const int h = zc[o];
+                double tr = 0;
+                for (int i = 0; i < no; i++) tr += Xo[o][i + (size_t)i * no];
+                xz += Zo[o][0] * tr;
+                for (int t = 1; t < no; t++) xz += 2.0 * Zo[o][t] * Xo[o][(size_t)xc_index(h, t) + (size_t)h * no];
+                lamx = fmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
+                continue;
+            }
             const size_t len = bsize(O->bs[o]);
             for (size_t q = 0; q < len; q++) xz += Xo[o][q] * Zo[o][q];
             if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamx = fmin(lamx, Xo[o][i]); }
@@ -2194,8 +2544,10 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 lamx = fmin(lamx, clam_o[o]);
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve: block %d (n %d) measured on its cliques: lambda_min %.3e]\n", o, no, clam_o[o]);
             }
+            else if (no > 500 && ps_late()) { lamx = -INFINITY; res->late = 1; }   /* (ISSUES 284, as for Z above) */
             else lamx = fmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
         }
+        if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: <C,X>, A(X), <X,Z> and lambda_min(X) measured]\n", ps_now() - t0);
         double r2 = 0;
         for (int i = 0; i < mo; i++) {
             double v = rp[i] - O->b[i];
@@ -2242,6 +2594,8 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         if (spx.F) schol_free(spx.F);
         free(spx.off); free(spx.doff);
     }
+    if (Xred_d) { for (int k = 0; k < P->nblk; k++) if (xc_red[k] >= 0) free(Xred_d[k]); free(Xred_d); }
+    free(zc);
     res->t = ps_now() - t0;
     *Xo_out = Xo;
     return 0;
@@ -2252,42 +2606,60 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
 /* 5.8 (a user's report): is the returned point a certificate of the infeasibility verdict on
  * the data as read?  Primal infeasible: a Farkas ray y with b'y > 0 and A'y <= 0; dual
  * infeasible: X >= 0 with A(X) = 0 and <C,X> < 0.  Returns 1 (verified), 0 (not: the verdict
- * rests on the presolve, e.g. a face found by the facial reduction, or the problem is weakly
- * infeasible and no ray exists), -1 (no point to check).  The scaled measures are returned for
- * the log: obj = b'y or <C,X> with the ray scaled to unit norm, viol = the violation of the cone
- * (and of A(X) = 0) relative to the ray's norm. */
-int ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol) {
+ * rests on the presolve, e.g. a face found by the facial reduction, the problem is weakly
+ * infeasible and no ray exists, or the verdict is wrong), -1 (no point to check).  The measures
+ * returned for the log: obj = b'y or <C,X> with the ray scaled to unit norm, viol = the violation
+ * of the certificate normalized to b'y = 1 or <C,X> = -1.
+ * 22 October 2026 (the full benchmark: dg3d_1000, SDP with SOCP, reported DUAL INFEASIBLE "with
+ * a certificate" on a ray whose descent is small against its norm, -4.8e-11 of |X| |C|): the violations
+ * were measured relative to the ray's norm, so such a ray passed even with |A(X)| of 1e-7 |X|. A ray
+ * proves nothing unless its descent dominates its residual: with <C,X'> = -1, a dual y feasible
+ * for C - A'y >= 0 needs <y, A(X')> <= -1, so the ray excludes only the y with |y| < 1/|A(X')|
+ * (likewise a Farkas y normalized to b'y' = 1 excludes only the X with tr X < 1/lambda_max(A'y')).
+ * The violations are therefore measured after the normalization of the certificate's objective to
+ * one, absolutely, as MOSEK states its certificates: accepted when at most 1e-6. */
+int ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol, const int *xc) {
     const int nbo = O->nblk, mo = O->m;
     *obj = 0; *viol = 0;
+    /* 23 October 2026: xc, the cone-vector blocks of Xo (brisk.h; their data are arrow matrices): A'y there is held as its
+     * cone vector as well (ps_zadd) */
     if (status == 1) {
         if (!yo) return -1;
         double ny = 0; for (int i = 0; i < mo; i++) ny += yo[i] * yo[i];
         ny = sqrt(ny); if (!(ny > 0)) return 0;
         double **W = pmalloc(sizeof(double *) * (nbo + 1));
-        for (int o = 0; o < nbo; o++) W[o] = pcalloc(bsize(O->bs[o]) + 1, sizeof(double));
+        for (int o = 0; o < nbo; o++) W[o] = pcalloc(ps_zlen(O, xc, o) + 1, sizeof(double));
         double nw = 0;
         for (size_t q = 0; q < O->nnz; q++) {
             if (O->con[q] < 0) continue;
-            const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
             const double coef = -yo[O->con[q]] / ny * O->v[q];      /* -A'y, scaled */
             if (coef == 0) continue;
-            if (O->bs[o] < 0) W[o][i] += coef;
-            else { W[o][i + (size_t)j * no] += coef; if (i != j) W[o][j + (size_t)i * no] += coef; }
+            ps_zadd(O, xc, W, q, coef);
         }
         size_t maxn2 = 1;
-        for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+        for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && !(xc && xc[o] >= 0) && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
         double *work = pmalloc(sizeof(double) * maxn2);
         double lam = 0;
         for (int o = 0; o < nbo; o++) {
-            const int no = abs(O->bs[o]); const size_t len = bsize(O->bs[o]);
+            const int no = abs(O->bs[o]);
+            if (xc && xc[o] >= 0) {     /* |Arw(w)|_F^2 = n w_0^2 + 2 |wb|^2 */
+                nw += (double)no * W[o][0] * W[o][0];
+                for (int t = 1; t < no; t++) nw += 2.0 * W[o][t] * W[o][t];
+                lam = fmin(lam, ps_zlam(O, xc, W, o, work, 0.0));
+                continue;
+            }
+            const size_t len = bsize(O->bs[o]);
             for (size_t q = 0; q < len; q++) nw += W[o][q] * W[o][q];
             if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lam = fmin(lam, W[o][i]); }
             else lam = fmin(lam, ps_lammin_tol(no, W[o], work, 0.0));
         }
         nw = sqrt(nw);
-        double by = 0; for (int i = 0; i < mo; i++) by += O->b[i] * yo[i];
+        double by = 0, byc = 0;   /* (compensated, as below) */
+        for (int i = 0; i < mo; i++) { const double x = O->b[i] * yo[i], t = by + x; byc += fabs(by) >= fabs(x) ? (by - t) + x : (x - t) + by; by = t; }
+        by += byc;
         *obj = by / ny / (1.0 + O->nb1);
-        *viol = fmax(0.0, -lam) / fmax(nw, 1e-300);
+        /* W = -A'y / |y|: its negative part, for y normalized to b'y = 1 (|y| / b'y times it) */
+        *viol = by > 0 ? fmax(0.0, -lam) * ny / by : INFINITY;
         free(work);
         for (int o = 0; o < nbo; o++) free(W[o]);
         free(W);
@@ -2297,27 +2669,48 @@ int ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, 
         if (!Xo) return -1;
         double nx = 0, lam = 0, cx = 0;
         size_t maxn2 = 1;
-        for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+        for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && !(xc && xc[o] >= 0) && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
         double *work = pmalloc(sizeof(double) * maxn2);
         for (int o = 0; o < nbo; o++) {
             const int no = abs(O->bs[o]); const size_t len = bsize(O->bs[o]);
+            if (xc && xc[o] >= 0) {     /* the completion: |X|_F^2 = (x_0^2 + |xb|^2) / 2 */
+                double s2 = Xo[o][0] * Xo[o][0];
+                for (int t = 1; t < no; t++) s2 += Xo[o][t] * Xo[o][t];
+                nx += 0.5 * s2;
+                lam = fmin(lam, xc_lammin_x(no, Xo[o]));
+                continue;
+            }
             for (size_t q = 0; q < len; q++) nx += Xo[o][q] * Xo[o][q];
             if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lam = fmin(lam, Xo[o][i]); }
             else lam = fmin(lam, ps_lammin_tol(no, Xo[o], work, 0.0));
         }
         free(work);
         nx = sqrt(nx); if (!(nx > 0)) return 0;
-        double *rp = pcalloc(mo + 1, sizeof(double));
+        /* 22 October 2026: compensated sums (Neumaier). A ray's entries are large (1e18 on dg3d_1000, SDP with SOCP) and
+         * A(X) = 0 is a sum of terms that cancel: the plain sums left a rounding error of 3.4e6 in |A(X)|, 3.5e-6 of the
+         * descent <C,X>, where the ray itself, read as written, gives 1.2e-8 */
+        double *rp = pcalloc(mo + 1, sizeof(double)), *rpc = pcalloc(mo + 1, sizeof(double)), cxc = 0;
+        #define PS_NSUM(s_, c_, x_) do { const double x__ = (x_), t__ = (s_) + x__; (c_) += fabs(s_) >= fabs(x__) ? ((s_) - t__) + x__ : (x__ - t__) + (s_); (s_) = t__; } while (0)
         for (size_t q = 0; q < O->nnz; q++) {
             const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
-            const double x = O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
-            const double c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
-            if (O->con[q] < 0) cx += c; else rp[O->con[q]] += c;
+            double c;
+            if (xc && xc[o] >= 0) {     /* <A, X> = a_0 x_0 + sum_t a_t x_t (as in postsolve) */
+                const int h = xc[o];
+                if (i == j) { if (i != h) continue; c = O->v[q] * Xo[o][0]; }
+                else { const int u = i == h ? j : i; c = O->v[q] * Xo[o][u < h ? u + 1 : u]; }
+            } else {
+                const double x = O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
+                c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
+            }
+            if (O->con[q] < 0) PS_NSUM(cx, cxc, c); else PS_NSUM(rp[O->con[q]], rpc[O->con[q]], c);
         }
-        double r2 = 0; for (int i = 0; i < mo; i++) r2 += rp[i] * rp[i];
-        free(rp);
+        #undef PS_NSUM
+        cx += cxc;
+        double r2 = 0; for (int i = 0; i < mo; i++) { const double r = rp[i] + rpc[i]; r2 += r * r; }
+        free(rp); free(rpc);
         *obj = cx / nx / (1.0 + O->nC1);
-        *viol = fmax(sqrt(r2) / nx / (1.0 + O->nC1), fmax(0.0, -lam) / nx);
+        /* the ray normalized to <C,X> = -1: |A(X)| and the negative part of X, absolutely */
+        *viol = cx < 0 ? fmax(sqrt(r2), fmax(0.0, -lam)) / -cx : INFINITY;
         return (cx < 0 && *viol <= 1e-6) ? 1 : 0;
     }
     return -1;

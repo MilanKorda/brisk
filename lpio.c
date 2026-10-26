@@ -33,32 +33,91 @@
 #include <math.h>
 #include <ctype.h>
 #include "lpio.h"
+#include "fastnum.h"
 
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP reader)\n"); exit(1); } return p; }
 static void *xz(size_t n) { void *p = calloc(1, n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP reader)\n"); exit(1); } return p; }
 
 /* ---- names ---- */
-typedef struct { char **key; int *val; int cap, n; } Hash;
+/* (25 October 2026) each slot keeps its key's hash beside the key and the value: a probe reads one slot and compares the
+ * hashes before the strings (neos-3402454-bohle, LP: 14.7 million lookups among 2.9 million row names took 2.5 s of the
+ * reading with keys, values and hashes in three arrays, one cache miss each) */
+/* (25 October 2026, later) a key of at most 8 bytes is kept in the slot itself, its bytes packed into w (zero padded),
+ * so that a probe reads no string; a longer key keeps its pointer in w and the top bit of h marks it. Slots of 16 bytes
+ * (were 24, with every comparison through the key's pointer: a second cache miss per lookup). MIPLIB's names are mostly
+ * of at most 8 characters (neos-3402294-bobin, LP: 591,076 rows of 5 to 7) */
+typedef struct { unsigned long long w; unsigned h; int val; } HSlot;
+typedef struct { HSlot *t; int cap, n; } Hash;
+#define H_LONG 0x80000000u
 static unsigned long hstr(const char *s) { unsigned long h = 1469598103934665603UL; while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211UL; } return h; }
-static void h_init(Hash *H, int cap) { H->cap = 16; while (H->cap < 2 * cap) H->cap *= 2; H->key = xz(sizeof(char *) * H->cap); H->val = xm(sizeof(int) * H->cap); H->n = 0; }
+/* the slot's form of key k: 1 and the packed bytes when it has at most 8, else 0 */
+static int h_pack(const char *k, unsigned long long *w) {
+    unsigned long long v = 0; int i = 0;
+    for (; i < 8 && k[i]; i++) v |= (unsigned long long)(unsigned char)k[i] << (8 * i);
+    if (k[i]) return 0;
+    *w = v; return 1;
+}
+static void h_init(Hash *H, int cap) { H->cap = 16; while (H->cap < 2 * cap) H->cap *= 2; H->t = xz(sizeof(HSlot) * H->cap); H->n = 0; }
 static void h_grow(Hash *H);
-static void h_put(Hash *H, char *k, int v) {
+static void h_put_slot(Hash *H, unsigned long long w, unsigned h, int v, unsigned long hi) {
     if (2 * (H->n + 1) > H->cap) h_grow(H);
-    unsigned long i = hstr(k) & (H->cap - 1);
-    while (H->key[i]) i = (i + 1) & (H->cap - 1);
-    H->key[i] = k; H->val[i] = v; H->n++;
+    unsigned long i = hi & (H->cap - 1);
+    while (H->t[i].w) i = (i + 1) & (H->cap - 1);
+    H->t[i].w = w; H->t[i].h = h; H->t[i].val = v; H->n++;
+}
+/* the slot's hash: the key's hash's low 31 bits (its index in the table is taken from the full hash, kept by the
+ * caller of h_put_slot; on growth the slot's 31 bits index the new table, enough for 2^31 slots) */
+static void h_put(Hash *H, char *k, int v) {
+    const unsigned long hv = hstr(k); unsigned long long w;
+    const unsigned h = (unsigned)(hv & 0x7fffffffu);
+    if (h_pack(k, &w)) h_put_slot(H, w, h, v, h);
+    else h_put_slot(H, (unsigned long long)(size_t)k, h | H_LONG, v, h);
 }
 static void h_grow(Hash *H) {
-    Hash G; G.cap = 2 * H->cap; G.key = xz(sizeof(char *) * G.cap); G.val = xm(sizeof(int) * G.cap); G.n = 0;
-    for (int i = 0; i < H->cap; i++) if (H->key[i]) h_put(&G, H->key[i], H->val[i]);
-    free(H->key); free(H->val); *H = G;
+    Hash G; G.cap = 2 * H->cap; G.t = xz(sizeof(HSlot) * G.cap); G.n = 0;
+    for (int i = 0; i < H->cap; i++) if (H->t[i].w) h_put_slot(&G, H->t[i].w, H->t[i].h, H->t[i].val, H->t[i].h & ~H_LONG);
+    free(H->t); *H = G;
 }
 static int h_get(const Hash *H, const char *k) {
-    unsigned long i = hstr(k) & (H->cap - 1);
-    while (H->key[i]) { if (!strcmp(H->key[i], k)) return H->val[i]; i = (i + 1) & (H->cap - 1); }
+    const unsigned h = (unsigned)(hstr(k) & 0x7fffffffu); unsigned long long w;
+    unsigned long i = h & (H->cap - 1);
+    if (h_pack(k, &w)) {
+        while (H->t[i].w) { if (H->t[i].h == h && H->t[i].w == w) return H->t[i].val; i = (i + 1) & (H->cap - 1); }
+    } else {
+        while (H->t[i].w) { if (H->t[i].h == (h | H_LONG) && !strcmp((const char *)(size_t)H->t[i].w, k)) return H->t[i].val; i = (i + 1) & (H->cap - 1); }
+    }
     return -1;
 }
-static void h_free(Hash *H) { free(H->key); free(H->val); }
+static void h_free(Hash *H) { free(H->t); }
+
+/* (25 October 2026) a number of the MPS file: decimal digits, a point and an exponent read directly when the digits fit in
+ * 53 bits and the power of ten is at most 22 (Clinger's fast path: the product or quotient of two exact doubles, rounded
+ * once, is the correctly rounded value strtod returns); anything else by atof, as before. The same bits as atof on every
+ * file of the LP sets (BRISK_READSUM) */
+static double mps_num(const char *s) {
+    static const double p10[23] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+    const char *p = s; int neg = 0;
+    if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+    unsigned long long mant = 0; int nd = 0, e10 = 0, any = 0;
+    while (*p >= '0' && *p <= '9') { any = 1; if (mant || *p != '0') { if (nd >= 19) return atof(s); mant = mant * 10 + (unsigned)(*p - '0'); nd++; } p++; }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') { any = 1; if (mant || *p != '0') { if (nd >= 19) return atof(s); mant = mant * 10 + (unsigned)(*p - '0'); nd++; } e10--; p++; }
+    }
+    if (!any) return atof(s);
+    if (*p == 'e' || *p == 'E') {
+        p++; int eneg = 0, ex = 0, ed = 0;
+        if (*p == '-') { eneg = 1; p++; } else if (*p == '+') p++;
+        while (*p >= '0' && *p <= '9') { if (ex < 10000) ex = ex * 10 + (*p - '0'); ed++; p++; }
+        if (!ed) return atof(s);
+        e10 += eneg ? -ex : ex;
+    }
+    if (*p) return atof(s);
+    if (mant > (1ULL << 53) || e10 < -22 || e10 > 22) return atof(s);
+    double v = (double)mant;
+    v = e10 >= 0 ? v * p10[e10] : v / p10[-e10];
+    return neg ? -v : v;
+}
 
 int lp_is_mps(const char *fname) {
     const size_t l = strlen(fname);
@@ -120,27 +179,53 @@ static int split_fixed(char *line, char **tok, int sec) {
     for (int k = 2; k < 4; k++) if (f[k]) tok[n++] = f[k];
     return n;
 }
-static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, int fixed);
+static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, int fixed, signed char **isint);
+/* (25 October 2026) BRISK_READSUM=1: a checksum of the problem as read (every number's bits and every name), printed
+ * to compare two readers on the same files */
+static void lp_readsum(const LpProb *L) {
+    unsigned long long h = 1469598103934665603ULL;
+#define RS_MIX(p, nb) do { const unsigned char *q_ = (const unsigned char *)(p); for (size_t k_ = 0; k_ < (size_t)(nb); k_++) { h ^= q_[k_]; h *= 1099511628211ULL; } } while (0)
+    RS_MIX(&L->m, sizeof L->m); RS_MIX(&L->n, sizeof L->n); RS_MIX(&L->maxim, sizeof L->maxim); RS_MIX(&L->c0, sizeof L->c0);
+    RS_MIX(L->Ap, sizeof(int) * (size_t)(L->n + 1)); RS_MIX(L->Ai, sizeof(int) * (size_t)L->Ap[L->n]); RS_MIX(L->Ax, sizeof(double) * (size_t)L->Ap[L->n]);
+    RS_MIX(L->c, sizeof(double) * (size_t)L->n); RS_MIX(L->l, sizeof(double) * (size_t)L->n); RS_MIX(L->u, sizeof(double) * (size_t)L->n);
+    RS_MIX(L->rl, sizeof(double) * (size_t)L->m); RS_MIX(L->ru, sizeof(double) * (size_t)L->m);
+    for (int i = 0; i < L->m; i++) RS_MIX(L->rname[i], strlen(L->rname[i]) + 1);
+    for (int j = 0; j < L->n; j++) RS_MIX(L->cname[j], strlen(L->cname[j]) + 1);
+#undef RS_MIX
+    printf("readsum %016llx m %d n %d nz %d\n", h, L->m, L->n, L->Ap[L->n]);
+}
 int lp_read_mps(const char *fname, LpProb *L, char *msg, size_t nmsg) {
-    const int rc = lp_read_mps_(fname, L, msg, nmsg, 0);
-    if (rc == 3) return lp_read_mps_(fname, L, msg, nmsg, 1);      /* names with blanks: the fixed format */
+    int rc = lp_read_mps_(fname, L, msg, nmsg, 0, NULL);
+    if (rc == 3) rc = lp_read_mps_(fname, L, msg, nmsg, 1, NULL);      /* names with blanks: the fixed format */
+    if (rc == 0 && getenv("BRISK_READSUM")) lp_readsum(L);
     return rc;
 }
-static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, int fixed) {
+/* (22 October 2026, the MIP developer) the mixed-integer program of an MPS file (lpio.h): the same reading, and the
+ * integer columns in the same pass (the markers and the bounds BV, LI, UI); an integer column of a marker section with
+ * no bound in the BOUNDS section is binary, [0, 1], as MIPLIB 2017's solution checker and Gurobi read it */
+int lp_read_mps_mip(const char *fname, LpProb *L, signed char **isint, char *msg, size_t nmsg) {
+    *isint = NULL;
+    const int rc = lp_read_mps_(fname, L, msg, nmsg, 0, isint);
+    if (rc == 3) return lp_read_mps_(fname, L, msg, nmsg, 1, isint);
+    return rc;
+}
+static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, int fixed, signed char **isint) {
     memset(L, 0, sizeof(*L));
     FILE *f = fopen(fname, "r");
     if (!f) { snprintf(msg, nmsg, "cannot open %s", fname); return 1; }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
     enum { S_NONE, S_ROWS, S_COLS, S_RHS, S_RANGES, S_BOUNDS, S_OBJSENSE, S_SKIP } sec = S_NONE;
     int mcap = 1024, m = 0, objrow = -1;          /* rows in file order, including N rows (type 'N') */
     char *rtype = xm(mcap); char **rn = xm(sizeof(char *) * mcap);
     Hash HR, HC; h_init(&HR, 1024); h_init(&HC, 1024);
     int ncap = 1024, n = 0; char **cn = xm(sizeof(char *) * ncap); long *cp = xm(sizeof(long) * (ncap + 1));
+    signed char *ci = isint ? xz((size_t)ncap) : NULL; int inint = 0;     /* the integer columns (isint != NULL) */
     long zcap = 1 << 16, nz = 0; int *zi = xm(sizeof(int) * zcap); double *zv = xm(sizeof(double) * zcap);
     double *rhs = NULL, *rng = NULL, *lo = NULL, *up = NULL; char *hasrng = NULL, *bset = NULL;
     char cur[256] = "";
     char *line = NULL; size_t lcap = 0; long lineno = 0;
     char *tok[8];
-    int rc = 0;
+    int rc = 0, ended = 0;
     while (getline(&line, &lcap, f) >= 0) {
         lineno++;
         if (line[0] == '*' || line[0] == '\n' || line[0] == '\r') continue;
@@ -161,10 +246,19 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             else if (!strcmp(tok[0], "RANGES")) sec = S_RANGES;
             else if (!strcmp(tok[0], "BOUNDS")) sec = S_BOUNDS;
             else if (!strcmp(tok[0], "OBJSENSE")) { sec = S_OBJSENSE; if (nt > 1 && (tok[1][0] == 'M' || tok[1][0] == 'm') && (tok[1][1] == 'A' || tok[1][1] == 'a')) L->maxim = 1; }
-            else if (!strcmp(tok[0], "ENDATA")) break;
+            else if (!strcmp(tok[0], "ENDATA")) { ended = 1; break; }
             else sec = S_SKIP;            /* OBJSENSE variants, QSECTION etc.: skipped */
             if (!strcmp(tok[0], "QSECTION") || !strcmp(tok[0], "QUADOBJ") || !strcmp(tok[0], "QMATRIX") || !strcmp(tok[0], "QCMATRIX")) {
                 snprintf(msg, nmsg, "%s: a quadratic section (%s): not a linear program", fname, tok[0]); rc = 1; break;
+            }
+            /* (25 October 2026, the MIP developer) constraints that are not rows: skipping them would solve another problem
+             * (MIPLIB 2017's problems with indicator constraints were read as if every indicator row always held, and
+             * reported infeasible) */
+            if (!strcmp(tok[0], "INDICATORS") || !strcmp(tok[0], "SOS") || !strcmp(tok[0], "GENCONS") || !strcmp(tok[0], "PWLOBJ")) {
+                snprintf(msg, nmsg, "%s: a section of constraints that are not linear rows (%s: %s), which BRISK does not support",
+                         fname, tok[0], !strcmp(tok[0], "INDICATORS") ? "indicator constraints" : !strcmp(tok[0], "SOS") ? "special ordered sets" :
+                         !strcmp(tok[0], "GENCONS") ? "general constraints" : "a piecewise-linear objective");
+                rc = 1; break;
             }
             continue;
         }
@@ -183,18 +277,25 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             if (rtype[m] == 'N' && objrow < 0) objrow = m;
             m++;
         } else if (sec == S_COLS) {
-            if (nt >= 3 && !strcmp(tok[1], "'MARKER'")) continue;
+            if (nt >= 3 && !strcmp(tok[1], "'MARKER'")) {
+                if (strstr(tok[2], "INTORG")) inint = 1; else if (strstr(tok[2], "INTEND")) inint = 0;
+                continue;
+            }
             if (nt < 3 || (nt % 2) == 0) { snprintf(msg, nmsg, "%s, line %ld: a column line is: column row value [row value]", fname, lineno); rc = 1; break; }
             if (strcmp(cur, tok[0])) {
                 if (h_get(&HC, tok[0]) >= 0) { snprintf(msg, nmsg, "%s, line %ld: the entries of column %s are not contiguous", fname, lineno, tok[0]); rc = 1; break; }
-                if (n == ncap) { ncap *= 2; cn = realloc(cn, sizeof(char *) * ncap); cp = realloc(cp, sizeof(long) * (ncap + 1)); }
+                if (n == ncap) {
+                    ncap *= 2; cn = realloc(cn, sizeof(char *) * ncap); cp = realloc(cp, sizeof(long) * (ncap + 1));
+                    if (ci) { ci = realloc(ci, (size_t)ncap); memset(ci + n, 0, (size_t)(ncap - n)); }
+                }
+                if (ci) ci[n] = (signed char)inint;
                 cn[n] = strdup(tok[0]); h_put(&HC, cn[n], n); cp[n] = nz; n++;
                 snprintf(cur, sizeof cur, "%s", tok[0]);
             }
             for (int t = 1; t + 1 < nt; t += 2) {
                 const int r = h_get(&HR, tok[t]);
                 if (r < 0) { snprintf(msg, nmsg, "%s, line %ld: unknown row %s", fname, lineno, tok[t]); rc = 1; break; }
-                const double v = atof(tok[t + 1]);
+                const double v = mps_num(tok[t + 1]);
                 if (v == 0.0) continue;
                 if (nz == zcap) { zcap *= 2; zi = realloc(zi, sizeof(int) * zcap); zv = realloc(zv, sizeof(double) * zcap); }
                 zi[nz] = r; zv[nz] = v; nz++;
@@ -205,7 +306,7 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             for (int t = (nt % 2); t + 1 < nt; t += 2) {
                 const int r = h_get(&HR, tok[t]);
                 if (r < 0) { snprintf(msg, nmsg, "%s, line %ld: unknown row %s", fname, lineno, tok[t]); rc = 1; break; }
-                if (sec == S_RHS) rhs[r] = atof(tok[t + 1]); else { rng[r] = atof(tok[t + 1]); hasrng[r] = 1; }
+                if (sec == S_RHS) rhs[r] = mps_num(tok[t + 1]); else { rng[r] = mps_num(tok[t + 1]); hasrng[r] = 1; }
             }
             if (rc) break;
         } else if (sec == S_BOUNDS) {
@@ -217,7 +318,8 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             if (ic >= nt || (!noval && ic + 1 >= nt)) { snprintf(msg, nmsg, "%s, line %ld: incomplete bound", fname, lineno); rc = 1; break; }
             const int j = h_get(&HC, tok[ic]);
             if (j < 0) { snprintf(msg, nmsg, "%s, line %ld: unknown column %s", fname, lineno, tok[ic]); rc = 1; break; }
-            const double v = noval ? 0.0 : atof(tok[ic + 1]);
+            const double v = noval ? 0.0 : mps_num(tok[ic + 1]);
+            if (ci && (!strcmp(ty, "BV") || !strcmp(ty, "LI") || !strcmp(ty, "UI"))) ci[j] = 1;
             if (!strcmp(ty, "UP") || !strcmp(ty, "UI")) { up[j] = v; if (v < 0 && !(bset[j] & 1) && lo[j] == 0.0) lo[j] = -LP_INF; bset[j] |= 2; }
             else if (!strcmp(ty, "LO") || !strcmp(ty, "LI")) { lo[j] = v; bset[j] |= 1; }
             else if (!strcmp(ty, "FX")) { lo[j] = up[j] = v; bset[j] |= 3; }
@@ -229,6 +331,9 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
         }
     }
     free(line); fclose(f);
+    /* (24 October 2026) a file that ends before ENDATA is an error: cut at a line boundary it would be read as a smaller
+     * problem (the QPS and CBF readers likewise) */
+    if (!rc && !ended) { snprintf(msg, nmsg, "%s: the file ends before ENDATA (cut short?)", fname); rc = 1; }
     if (!rc && (m == 0 || n == 0)) { snprintf(msg, nmsg, "%s: no rows or no columns (not an MPS file?)", fname); rc = 1; }
     if (!rc && !rhs) {       /* no section after COLUMNS */
         rhs = xz(sizeof(double) * (m + 1)); rng = xz(sizeof(double) * (m + 1)); hasrng = xz(m + 1);
@@ -241,6 +346,7 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
         int *rmap = xm(sizeof(int) * (m + 1)), mc = 0;
         for (int i = 0; i < m; i++) rmap[i] = rtype[i] == 'N' ? -1 : mc++;
         L->m = mc; L->n = n;
+        if (ci) for (int j = 0; j < n; j++) if (ci[j] && !bset[j]) up[j] = 1;     /* an integer column without bounds: binary */
         L->c = xz(sizeof(double) * (n + 1)); L->l = lo; L->u = up; lo = up = NULL;
         L->rl = xm(sizeof(double) * (mc + 1)); L->ru = xm(sizeof(double) * (mc + 1));
         L->rname = xm(sizeof(char *) * (mc + 1));
@@ -275,7 +381,8 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
     }
     free(rtype); free(rn); free(cn); free(cp); free(zi); free(zv); free(rhs); free(rng); free(hasrng); free(lo); free(up); free(bset);
     h_free(&HR); h_free(&HC);
-    if (rc) lp_free(L);
+    if (rc) { lp_free(L); free(ci); ci = NULL; }
+    if (isint) *isint = ci;
     return rc;
 }
 
@@ -733,6 +840,62 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             for (int p = A2p[j]; p < A2p[j + 1]; p++) { const int i = A2i[p]; if (!ra[i] || v == 0.0) continue; if (rl[i] > -LP_INF) rl[i] -= A2x[p] * v; if (ru[i] < LP_INF) ru[i] -= A2x[p] * v; }
             c0 += c[j] * v; ca[j] = 0; xfix[j] = v; nfixed++;
         }
+    /* ---- bounds far larger than the bounds the rows imply tightened to those (the interior-point method's form, at
+     * every level of the presolve). The standard form shifts a column to its bound; a bound far from every feasible point (triptim1's
+     * objective sum, x >= -9,999,999, while the rows keep it in [0, 204]) then gives values and an objective constant of
+     * 1e7 against an optimum of 22.87, and the method stalled at a relative gap of 0.15 (22 October 2026; 26 iterations
+     * with the implied bound). Each implied bound comes from one row and the bounds of its other columns as they were
+     * before this step, so each follows from the rows and all hold together (unlike dropping implied bounds, where
+     * x + y = 1, 0 <= x, y <= 1 lets either go but not both); no bound is added where there is none. */
+    int ntight = 0;
+    if (bform && status == 0 && !getenv("BRISK_LPNOTIGHT")) {
+        double *amn = xz(sizeof(double) * (m + 1)), *amx = xz(sizeof(double) * (m + 1)), *asc = xz(sizeof(double) * (m + 1));
+        int *imn = xz(sizeof(int) * (m + 1)), *imx = xz(sizeof(int) * (m + 1));
+        for (int j = 0; j < n; j++) {
+            if (!ca[j]) continue;
+            for (int p = A2p[j]; p < A2p[j + 1]; p++) {
+                const int i = A2i[p]; if (!ra[i]) continue;
+                const double a = A2x[p], bl = a > 0 ? l[j] : u[j], bu = a > 0 ? u[j] : l[j];
+                if (fabs(bl) >= LP_INF) imn[i]++; else { amn[i] += a * bl; asc[i] = fmax(asc[i], fabs(a * bl)); }
+                if (fabs(bu) >= LP_INF) imx[i]++; else { amx[i] += a * bu; asc[i] = fmax(asc[i], fabs(a * bu)); }
+            }
+        }
+        double *l2 = xm(sizeof(double) * (n + 1)), *u2 = xm(sizeof(double) * (n + 1));
+        memcpy(l2, l, sizeof(double) * n); memcpy(u2, u, sizeof(double) * n);
+        for (int j = 0; j < n; j++) {
+            if (!ca[j] || (l[j] <= -LP_INF && u[j] >= LP_INF)) continue;
+            double lo = -LP_INF, hi = LP_INF;
+            for (int p = A2p[j]; p < A2p[j + 1]; p++) {
+                const int i = A2i[p]; if (!ra[i]) continue;
+                const double a = A2x[p], bl = a > 0 ? l[j] : u[j], bu = a > 0 ? u[j] : l[j];
+                const int il = fabs(bl) >= LP_INF, iu = fabs(bu) >= LP_INF;
+                /* a x_j <= ru - (the least of the others), a x_j >= rl - (the most of the others); a margin for the
+                 * rounding of the sums */
+                const double tol = 1e-9 * (1.0 + asc[i] + fmax(rl[i] > -LP_INF ? fabs(rl[i]) : 0, ru[i] < LP_INF ? fabs(ru[i]) : 0)) / fabs(a);
+                if (ru[i] < LP_INF && imn[i] - il == 0) {
+                    const double v = (ru[i] - (amn[i] - (il ? 0 : a * bl))) / a;
+                    if (a > 0) hi = fmin(hi, v + tol); else lo = fmax(lo, v - tol);
+                }
+                if (rl[i] > -LP_INF && imx[i] - iu == 0) {
+                    const double v = (rl[i] - (amx[i] - (iu ? 0 : a * bu))) / a;
+                    if (a > 0) lo = fmax(lo, v - tol); else hi = fmin(hi, v + tol);
+                }
+            }
+            /* only a bound whose size exceeds that of the implied one by three orders of magnitude: what harms is the
+             * size the shift brings into the right-hand side (the method's relative accuracy then cannot resolve the
+             * problem's own numbers); a tightening of a bound of the problem's own scale cuts the box instead, and on
+             * greenbea (LP; lower bounds 0 -> 29 to 258, likely active at the optimum) it cost the accuracy of the
+             * result on the problem as read (a row violated by 1.2e-6 of its activity, above the limit of 1e-6) */
+            if (l[j] > -LP_INF && lo > l[j] && fabs(l[j]) > 1e3 * (1.0 + fabs(lo)) && lo < u[j] && lo < hi) { l2[j] = lo; ntight++;
+                if (getenv("BRISK_LPDBG")) printf("   [tightened: column %d lower %.6g -> %.6g (upper %.6g)]\n", j, l[j], lo, u[j]); }
+            if (u[j] < LP_INF && hi < u[j] && fabs(u[j]) > 1e3 * (1.0 + fabs(hi)) && hi > l[j] && hi > lo) { u2[j] = hi; ntight++;
+                if (getenv("BRISK_LPDBG")) printf("   [tightened: column %d upper %.6g -> %.6g (lower %.6g)]\n", j, u[j], hi, l[j]); }
+            if (l2[j] >= u2[j]) { l2[j] = l[j]; u2[j] = u[j]; }
+        }
+        memcpy(l, l2, sizeof(double) * n); memcpy(u, u2, sizeof(double) * n);
+        free(l2); free(u2); free(amn); free(amx); free(asc); free(imn); free(imx);
+        if (ntight && verbose > 0) printf("presolve: %d bounds far beyond the bounds the rows imply tightened to those\n", ntight);
+    }
     M->status = status;
     M->ckind = xm(sizeof(int) * (n + 1)); M->cpos = xm(sizeof(int) * (n + 1)); M->cval = xz(sizeof(double) * (n + 1));
     M->rpos = xm(sizeof(int) * (m + 1)); M->rsgn = xm(sizeof(int) * (m + 1));
@@ -874,9 +1037,18 @@ void lp_errors(const LpProb *L, const double *x, double *ebound, double *erow) {
         if (L->u[j] < LP_INF) eb = fmax(eb, (x[j] - L->u[j]) / (1.0 + fabs(L->u[j])));
         for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { ax[L->Ai[p]] += L->Ax[p] * x[j]; an[L->Ai[p]] += fabs(L->Ax[p] * x[j]); }
     }
+    int iw = -1;
     for (int i = 0; i < m; i++) {
+        const double e0 = er;
         if (L->rl[i] > -LP_INF) er = fmax(er, (L->rl[i] - ax[i]) / (1.0 + fabs(L->rl[i])));
         if (L->ru[i] < LP_INF) er = fmax(er, (ax[i] - L->ru[i]) / (1.0 + fabs(L->ru[i])));
+        if (er > e0) iw = i;
+    }
+    if (iw >= 0 && er > 1e-6 && getenv("BRISK_LPDBG")) {     /* (debugging: the worst row and its entries) */
+        printf("   [worst row %d: [%.6g, %.6g], activity %.6g; entries:", iw, L->rl[iw], L->ru[iw], ax[iw]);
+        int c = 0;
+        for (int j = 0; j < n && c < 12; j++) for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) if (L->Ai[p] == iw) { printf(" %d:%.3g*%.6g[%.3g,%.3g]", j, L->Ax[p], x[j], L->l[j], L->u[j]); c++; }
+        printf("]\n");
     }
     free(ax); free(an);
     *ebound = eb > 0 ? eb : 0; *erow = er > 0 ? er : 0;
@@ -907,6 +1079,19 @@ int cbf_is_file(const char *fname) {
     const size_t l = strlen(fname);
     return (l > 4 && !strcmp(fname + l - 4, ".cbf")) || (l > 7 && !strcmp(fname + l - 7, ".cbf.gz"));
 }
+/* (23 October 2026, the SOCP developer) numbers of the CBF's coordinate lists without sscanf or strtod where it is exact:
+ * an integer by its digits; a decimal number with at most 19 significant digits, a mantissa M <= 2^53 and a decimal
+ * exponent e with |e| <= 22 is M * 10^e or M / 10^-e, one correctly rounded operation on two exact operands (Clinger's
+ * fast path), so the same double as strtod's; any other form goes to strtod. 2013_firL1 (SOCP): 40 million lines. */
+static long fast_long(const char *p, char **end) {
+    while (*p == ' ' || *p == '\t') p++;
+    const char *st = p;
+    int neg = 0; if (*p == '-' || *p == '+') { neg = *p == '-'; p++; }
+    if (*p < '0' || *p > '9') return strtol(st, end, 10);
+    long v = 0; int nd = 0;
+    while (*p >= '0' && *p <= '9') { v = 10 * v + (*p - '0'); p++; if (++nd > 18) return strtol(st, end, 10); }
+    *end = (char *)p; return neg ? -v : v;
+}
 static int cone_code(const char *s) {
     if (!strcmp(s, "F")) return 0;
     if (!strcmp(s, "L+")) return 1;
@@ -916,8 +1101,18 @@ static int cone_code(const char *s) {
     if (!strcmp(s, "QR")) return 5;
     return -1;
 }
+/* (22 October 2026, the SOCP developer) cbf_read_ex: also the SeDuMi columns of the integer variables (intcol, -1 for a
+ * variable without a column) and their signs (intsgn: -1 for an L- variable, negated in the SeDuMi form), for a
+ * branch and bound over the relaxation; both NULL: as cbf_read */
+int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, char *msg, size_t nmsg);
 int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, char *msg, size_t nmsg) {
+    return cbf_read_ex(fname, S, c0_out, maxim_out, nint_out, NULL, NULL, msg, nmsg);
+}
+int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, char *msg, size_t nmsg) {
     memset(S, 0, sizeof(*S)); *c0_out = 0; *maxim_out = 0; *nint_out = 0;
+    int *intv = NULL; int nintv = 0;
+    if (intcol) *intcol = NULL;
+    if (intsgn) *intsgn = NULL;
     const size_t fl = strlen(fname);
     const int gz = fl > 3 && !strcmp(fname + fl - 3, ".gz");
     FILE *f;
@@ -934,7 +1129,9 @@ int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, i
     char *line = NULL; size_t lcap = 0; int rc = 0;
     char key[64];
 #define NEXTLINE() (getline(&line, &lcap, f) >= 0)
-#define SKIPLINE() do { if (getline(&line, &lcap, f) < 0) line[0] = 0; } while (0)
+    /* a counted section or a keyword's value line that the file does not hold is an error (24 October 2026: a CBLIB file
+     * joined from its parts while the disk was full was read cut short and solved as another problem, "dual infeasible") */
+#define SKIPLINE() do { if (getline(&line, &lcap, f) < 0) { line[0] = 0; if (!rc) { snprintf(msg, nmsg, "%s: the file ends inside section %s (cut short?)", fname, key); rc = 1; } } } while (0)
     while (!rc && NEXTLINE()) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
         if (sscanf(line, "%63s", key) != 1) continue;
@@ -955,25 +1152,29 @@ int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, i
             if (isv) { nvar = n; nvg = ng; vgk = gk; vgd = gd; cobj = xz(sizeof(double) * (n + 1)); }
             else { ncon = n; ncg = ng; cgk = gk; cgd = gd; bcon = xz(sizeof(double) * (n + 1)); }
         }
-        else if (!strcmp(key, "INT")) { int k = 0; SKIPLINE(); sscanf(line, "%d", &k); *nint_out = k; for (int t = 0; t < k; t++) SKIPLINE(); }
+        else if (!strcmp(key, "INT")) {
+            int k = 0; SKIPLINE(); sscanf(line, "%d", &k); *nint_out = k;
+            if (intcol) { free(intv); intv = xm(sizeof(int) * (k + 1)); nintv = 0; }
+            for (int t = 0; t < k && !rc; t++) { SKIPLINE(); int j; if (intv && sscanf(line, "%d", &j) == 1) intv[nintv++] = j; }
+        }
         else if (!strcmp(key, "OBJACOORD")) {
             long k = 0; SKIPLINE(); sscanf(line, "%ld", &k);
-            for (long t = 0; t < k; t++) { int j; double v; SKIPLINE(); if (sscanf(line, "%d %lf", &j, &v) == 2 && cobj && j >= 0 && j < nvar) cobj[j] += v; }
+            for (long t = 0; t < k && !rc; t++) { SKIPLINE(); char *e1 = line, *e2 = line; const long j = fast_long(line, &e1); const double v = fast_strtod(e1, &e2); if (e1 != line && e2 != e1 && cobj && j >= 0 && j < nvar) cobj[j] += v; }
         }
         else if (!strcmp(key, "OBJBCOORD")) { SKIPLINE(); sscanf(line, "%lf", &c0); }
         else if (!strcmp(key, "ACOORD")) {
             long k = 0; SKIPLINE(); sscanf(line, "%ld", &k);
             ai = xm(sizeof(int) * (k + 1)); aj = xm(sizeof(int) * (k + 1)); av = xm(sizeof(double) * (k + 1));
-            for (long t = 0; t < k; t++) {
-                SKIPLINE();
-                char *e; const long i = strtol(line, &e, 10); const long j = strtol(e, &e, 10); const double v = strtod(e, NULL);
+            for (long t = 0; t < k && !rc; t++) {
+                SKIPLINE(); if (rc) break;
+                char *e; const long i = fast_long(line, &e); const long j = fast_long(e, &e); const double v = fast_strtod(e, NULL);
                 if (i < 0 || i >= ncon || j < 0 || j >= nvar) { snprintf(msg, nmsg, "%s: ACOORD index out of range", fname); rc = 1; break; }
                 ai[nza] = (int)i; aj[nza] = (int)j; av[nza] = v; nza++;
             }
         }
         else if (!strcmp(key, "BCOORD")) {
             long k = 0; SKIPLINE(); sscanf(line, "%ld", &k);
-            for (long t = 0; t < k; t++) { int i; double v; SKIPLINE(); if (sscanf(line, "%d %lf", &i, &v) == 2 && bcon && i >= 0 && i < ncon) bcon[i] += v; }
+            for (long t = 0; t < k && !rc; t++) { SKIPLINE(); char *e1 = line, *e2 = line; const long i = fast_long(line, &e1); const double v = fast_strtod(e1, &e2); if (e1 != line && e2 != e1 && bcon && i >= 0 && i < ncon) bcon[i] += v; }
         }
         else if (!strcmp(key, "PSDVAR") || !strcmp(key, "PSDCON") || !strcmp(key, "FCOORD") || !strcmp(key, "HCOORD") || !strcmp(key, "DCOORD") || !strcmp(key, "OBJFCOORD")
                  || !strcmp(key, "POWCONES") || !strcmp(key, "POW*CONES")) {
@@ -984,7 +1185,10 @@ int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, i
 #undef NEXTLINE
 #undef SKIPLINE
     free(line);
-    if (gz) pclose(f); else fclose(f);
+    if (gz) {   /* gzip's exit status: a damaged or truncated archive is an error, not the part that could be read */
+        const int st = pclose(f);
+        if (!rc && st != 0) { snprintf(msg, nmsg, "%s: the decompression failed (gzip -dc: the file is damaged or cut short)", fname); rc = 1; }
+    } else fclose(f);
     if (!rc && nvar == 0) { snprintf(msg, nmsg, "%s: no variables (not a CBF file?)", fname); rc = 1; }
     if (!rc) {
         /* columns of the SeDuMi form: [free | nonnegative | Q cones | QR cones]; var j -> column vcol[j] (or -1), sign vsg[j] */
@@ -1034,9 +1238,18 @@ int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, i
               a = e;
           }
           S->Ap[n] = w; }
+        if (intcol && intv) {
+            *intcol = xm(sizeof(int) * (nintv + 1)); if (intsgn) *intsgn = xm(nintv + 1);
+            for (int t = 0; t < nintv; t++) {
+                const int j = intv[t];
+                (*intcol)[t] = (j >= 0 && j < nvar) ? vcol[j] : -1;
+                if (intsgn) (*intsgn)[t] = (j >= 0 && j < nvar && vk[j] == 2) ? -1 : 1;
+            }
+            *nint_out = nintv;
+        }
         free(cnt); free(nx); free(vk); free(ck); free(vcol); free(ccol); free(crow);
         *c0_out = c0;
     }
-    free(vgk); free(vgd); free(cgk); free(cgd); free(ai); free(aj); free(av); free(cobj); free(bcon);
+    free(vgk); free(vgd); free(cgk); free(cgd); free(ai); free(aj); free(av); free(cobj); free(bcon); free(intv);
     return rc;
 }

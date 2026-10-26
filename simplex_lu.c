@@ -20,6 +20,7 @@
  * checked against u_rr * alpha_rq (the determinant identity). */
 #include "simplex_int.h"
 #include <math.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@
 #define SX_PIVTOL 1e-11        /* absolute pivot tolerance of the factorization */
 #define SX_DENSE_MIN 48        /* the dense kernel: at least this many active rows and columns ... */
 #define SX_DENSE_FRAC 0.7      /* ... and this fraction of their entries nonzero */
+#define SX_DENSE_FRAC_BLK 0.3  /* (the fraction with the blocked dense kernel, dense_kernel_blocked) */
 
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); } return p; }
 static void *xcalloc(size_t n, size_t s) { void *p = calloc(n ? n : 1, s ? s : 1); if (!p) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); } return p; }
@@ -40,6 +42,7 @@ void sxv_init(SxVec *v, int n) {
     v->val = xcalloc((size_t)n + 1, sizeof(double));
     v->mark = xcalloc((size_t)n + 1, 1);
 }
+static void sxv_prune(SxVec *v);
 void sxv_free(SxVec *v) { free(v->idx); free(v->val); free(v->mark); memset(v, 0, sizeof *v); }
 void sxv_clear(SxVec *v) {
     if (v->cnt >= 0 && v->cnt < v->n / 8) for (int k = 0; k < v->cnt; k++) v->val[v->idx[k]] = 0;
@@ -47,13 +50,13 @@ void sxv_clear(SxVec *v) {
     v->cnt = 0;
 }
 void sxv_reindex(SxVec *v) {
+    /* (24 October 2026, the night) without a branch per entry (each index written, the count advanced by whether its entry
+     * is nonzero), then the tiny entries dropped from the list: the same list (as the pricing's listing pass, simplex.c) */
     int c = 0;
-    for (int i = 0; i < v->n; i++) {
-        if (v->val[i] == 0) continue;
-        if (fabs(v->val[i]) < SX_TINY) { v->val[i] = 0; continue; }
-        v->idx[c++] = i;
-    }
+    const int n = v->n; int *restrict ix = v->idx; const double *restrict val = v->val;
+    for (int i = 0; i < n; i++) { ix[c] = i; c += val[i] != 0; }
     v->cnt = c;
+    sxv_prune(v);
 }
 void sxv_copy(SxVec *dst, const SxVec *src) {
     sxv_clear(dst);
@@ -75,10 +78,14 @@ static void sxv_prune(SxVec *v) {
 typedef struct {
     int m;
     int *cs, *cl, *cc, *ci; double *cv; int cend, ccap;     /* columns (basis positions): rows and values */
-    int *rs, *rl, *rc, *ri; int rend, rcap;                 /* rows: positions (pattern) */
+    int *rs, *rl, *rc, *ri; int rend, rcap;                 /* rows: positions (pattern); rl: the active entries' count */
+    int *rp;                                                /* (24 October 2026) the pattern's length: entries of inactive columns stay until the row is compacted */
     int *chead, *cnext, *cprev, *rhead, *rnext, *rprev;     /* count lists */
     double *cmax;                                           /* largest |entry| of a column, < 0: stale */
     char *cact, *ract;
+    double ptol;                                            /* the absolute pivot tolerance */
+    double *cmax0, canc;                                    /* largest |entry| of each column in B; a pivot below canc times it is refused */
+    int nrej; long nrejnz;                                  /* columns dropped by the search (no acceptable pivot) and their entries */
 } Act;
 
 static void lst_ins(int *head, int *next, int *prev, int k, int j) { next[j] = head[k]; prev[j] = -1; if (head[k] >= 0) prev[head[k]] = j; head[k] = j; }
@@ -116,17 +123,24 @@ static void row_compact(Act *A, int extra) {
     int *ni = xmalloc(sizeof(int) * cap);
     int e = 0;
     for (int i = 0; i < A->m; i++) {
-        if (!A->ract[i]) { A->rs[i] = 0; A->rc[i] = 0; continue; }
-        memcpy(ni + e, A->ri + A->rs[i], sizeof(int) * A->rl[i]);
-        A->rs[i] = e; A->rc[i] = A->rl[i] + 2; e += A->rc[i];
+        if (!A->ract[i]) { A->rs[i] = 0; A->rc[i] = 0; A->rp[i] = 0; continue; }
+        int k = 0;
+        for (int p = A->rs[i]; p < A->rs[i] + A->rp[i]; p++) if (A->cact[A->ri[p]]) ni[e + k++] = A->ri[p];
+        A->rp[i] = k; A->rs[i] = e; A->rc[i] = k + 2; e += A->rc[i];
     }
     free(A->ri); A->ri = ni; A->rend = e; A->rcap = (int)cap;
 }
 static void row_reserve(Act *A, int i, int need) {
-    if (A->rl[i] + need <= A->rc[i]) return;
-    const int nc = 2 * (A->rl[i] + need) + 4;
+    if (A->rp[i] + need <= A->rc[i]) return;
+    if (A->rp[i] > A->rl[i]) {      /* the entries of inactive columns out first, in place */
+        int k = A->rs[i];
+        for (int p = A->rs[i]; p < A->rs[i] + A->rp[i]; p++) if (A->cact[A->ri[p]]) A->ri[k++] = A->ri[p];
+        A->rp[i] = k - A->rs[i];
+        if (A->rp[i] + need <= A->rc[i]) return;
+    }
+    const int nc = 2 * (A->rp[i] + need) + 4;
     if ((long)A->rend + nc > A->rcap) row_compact(A, nc);
-    memmove(A->ri + A->rend, A->ri + A->rs[i], sizeof(int) * A->rl[i]);
+    memmove(A->ri + A->rend, A->ri + A->rs[i], sizeof(int) * A->rp[i]);
     A->rs[i] = A->rend; A->rc[i] = nc; A->rend += nc;
 }
 static double col_max(Act *A, int j) {
@@ -140,37 +154,72 @@ static int col_find(const Act *A, int j, int i) {
     for (int p = s; p < e; p++) if (A->ci[p] == i) return p;
     return -1;
 }
-static void row_remove(Act *A, int i, int j) {   /* position j out of row i's pattern */
-    const int s = A->rs[i], e = s + A->rl[i];
-    for (int p = s; p < e; p++) if (A->ri[p] == j) { A->ri[p] = A->ri[e - 1]; A->rl[i]--; return; }
+/* column j (made inactive by the caller, for good) out of row i: by its count only, the entry staying in the pattern until
+ * the row is compacted, and the readers skipping inactive columns (24 October 2026: the search of the row for j was half of
+ * square41's time, LP, rows of thousands of entries after its dense columns; BRISK_SXLULAZY=0: the search) */
+/* (25 October 2026) BRISK_SXLU1PASS=0: the column updates in three passes as before (the same factors either way) */
+static int lu_onepass(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXLU1PASS"); c = !(e && atoi(e) == 0); } return c; }
+static int lu_lazy(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXLULAZY"); c = !(e && atoi(e) == 0); } return c; }
+static void row_remove(Act *A, int i, int j) {
+    if (lu_lazy()) { A->rl[i]--; return; }
+    const int s = A->rs[i], e = s + A->rp[i];
+    for (int p = s; p < e; p++) if (A->ri[p] == j) { A->ri[p] = A->ri[e - 1]; A->rl[i]--; A->rp[i]--; return; }
 }
 
 /* Markowitz search: returns 1 and (r, c) or 0 when no acceptable pivot remains */
 static int find_pivot(Act *A, double u, int *pr, int *pc) {
     long best = -1; double bestv = 0; int br = -1, bc = -1, nsearch = 0;
     const int lim = 4;
+    /* (23 October 2026) at most 8 rows of a count examined without an acceptable entry (all of them below the threshold of
+     * their column), then the next count: on a singular or nearly singular basis such rows stay in the lists and were
+     * searched again at every pivot, each entry with a search of its column (chromaticindex1024-7, LP: the crossover's
+     * start basis, 12,451 columns replaced, 121 million column maxima, 6.7 s; with the cap 0.8 s, the problem 8.9 -> 2.7
+     * s; chromaticindex512-7 2.2 -> 1.1 s; the dual simplex method on dfl001, pilot87, sing44 the same). A column always
+     * has an acceptable entry (its largest), so the search still ends. BRISK_SXLUROWLIM: the cap (0: none) */
+    static int rowlim = -1; if (rowlim < 0) { const char *e = getenv("BRISK_SXLUROWLIM"); rowlim = e ? atoi(e) : 8; }
     for (int k = 1; k <= A->m; k++) {
-        for (int j = A->chead[k]; j >= 0; j = A->cnext[j]) {
+        for (int j = A->chead[k], jn; j >= 0; j = jn) {
+            jn = A->cnext[j];
             const double cm = col_max(A, j);
             const int s = A->cs[j], e = s + A->cl[j];
+            if (cm < A->ptol || cm < A->canc * A->cmax0[j]) {
+                /* (22 October 2026) no entry can ever be its pivot (eliminations only shrink what is left of it): out of
+                 * the active matrix at once; a logical takes its position at the end. Left in, it was searched again at
+                 * every pivot: qap15's crossover start (1,781 such columns of 6,330) took 0.9 s to factorize */
+                lst_del(A->chead, A->cnext, A->cprev, A->cl[j], j);
+                for (int p = s; p < e; p++) {
+                    const int i = A->ci[p];
+                    lst_del(A->rhead, A->rnext, A->rprev, A->rl[i], i);
+                    row_remove(A, i, j);
+                    lst_ins(A->rhead, A->rnext, A->rprev, A->rl[i], i);
+                }
+                A->nrej++; A->nrejnz += A->cl[j];
+                A->cact[j] = 0; A->cl[j] = 0;
+                continue;
+            }
             for (int p = s; p < e; p++) {
                 const double a = fabs(A->cv[p]);
-                if (a < u * cm || a < SX_PIVTOL) continue;
+                if (a < u * cm || a < A->ptol || a < A->canc * A->cmax0[j]) continue;
                 const long mer = (long)(k - 1) * (A->rl[A->ci[p]] - 1);
                 if (best < 0 || mer < best || (mer == best && a > bestv)) { best = mer; bestv = a; br = A->ci[p]; bc = j; }
             }
             if (best >= 0 && (best <= (long)(k - 1) * (k - 1) || ++nsearch >= lim)) goto done;
         }
+        int nfail = 0;
         for (int i = A->rhead[k]; i >= 0; i = A->rnext[i]) {
-            const int s = A->rs[i], e = s + A->rl[i];
+            const int s = A->rs[i], e = s + A->rp[i];
+            int ok = 0;
             for (int p = s; p < e; p++) {
                 const int j = A->ri[p];
+                if (!A->cact[j]) continue;
                 const int q = col_find(A, j, i);
                 const double a = fabs(A->cv[q]);
-                if (a < u * col_max(A, j) || a < SX_PIVTOL) continue;
+                if (a < u * col_max(A, j) || a < A->ptol || a < A->canc * A->cmax0[j]) continue;
+                ok = 1;
                 const long mer = (long)(k - 1) * (A->cl[j] - 1);
                 if (best < 0 || mer < best || (mer == best && a > bestv)) { best = mer; bestv = a; br = i; bc = j; }
             }
+            if (!ok && rowlim > 0 && ++nfail >= rowlim) break;
             if (best >= 0 && (best <= (long)k * (k - 1) || ++nsearch >= lim)) goto done;
         }
         if (best >= 0 && best <= (long)k * k) goto done;
@@ -192,12 +241,38 @@ static void l_add(SxLU *F, int i, double v) {   /* to the column being built: ls
     F->lidx[p] = i; F->lval[p] = v;
 }
 
+/* (22 October 2026) a copy of a factorization with its updates (lpmodel.c: the state before a trial of bound changes,
+ * restored without a new factorization); dst's arrays are freed first */
+static void *dup_arr(const void *p, size_t bytes) { if (!p) return NULL; void *q = xmalloc(bytes); memcpy(q, p, bytes); return q; }
+void sxlu_copy(SxLU *dst, const SxLU *src) {
+    sxlu_free(dst);
+    *dst = *src;
+    const size_t m = (size_t)src->m, I = sizeof(int), D = sizeof(double);
+    dst->stack = dup_arr(src->stack, I * (2 * m + 2)); dst->wmark = dup_arr(src->wmark, I * (m + 1)); dst->wlist = dup_arr(src->wlist, I * (m + 1));
+    dst->wval = dup_arr(src->wval, D * (m + 1)); dst->dfs_pos = dup_arr(src->dfs_pos, I * (m + 1)); dst->dmark = dup_arr(src->dmark, m + 1);
+    dst->lpos = dup_arr(src->lpos, I * (m + 1)); dst->lcs_row = dup_arr(src->lcs_row, I * (m + 1)); dst->lcl_row = dup_arr(src->lcl_row, I * (m + 1));
+    dst->lrstart = dup_arr(src->lrstart, I * (m + 2)); dst->lrlen = dup_arr(src->lrlen, I * (m + 1)); dst->lrorder = dup_arr(src->lrorder, I * (m + 1));
+    dst->lrow = dup_arr(src->lrow, I * (m + 1)); dst->lstart = dup_arr(src->lstart, I * (m + 2));
+    dst->uordpos = dup_arr(src->uordpos, I * (m + 1)); dst->udiag = dup_arr(src->udiag, D * (m + 1)); dst->urecip = dup_arr(src->urecip, D * (m + 1)); dst->uzpos = dup_arr(src->uzpos, I * (m + 1));
+    dst->ucs = dup_arr(src->ucs, I * (m + 1)); dst->ucl = dup_arr(src->ucl, I * (m + 1)); dst->ucc = dup_arr(src->ucc, I * (m + 1));
+    dst->urs = dup_arr(src->urs, I * (m + 1)); dst->url = dup_arr(src->url, I * (m + 1)); dst->urc = dup_arr(src->urc, I * (m + 1));
+    dst->lidx = dup_arr(src->lidx, I * (size_t)src->lcap); dst->lval = dup_arr(src->lval, D * (size_t)src->lcap);
+    const size_t nlz = src->lstart ? (size_t)src->lstart[src->nl] + 1 : 0;
+    dst->lridx = dup_arr(src->lridx, I * nlz); dst->lrval = dup_arr(src->lrval, D * nlz);
+    dst->uord = dup_arr(src->uord, I * (size_t)src->ordcap); dst->uz = dup_arr(src->uz, I * (size_t)src->uzcap);
+    dst->uci = dup_arr(src->uci, I * (size_t)src->ucap); dst->ucv = dup_arr(src->ucv, D * (size_t)src->ucap);
+    dst->uri = dup_arr(src->uri, I * (size_t)src->urcap); dst->urv = dup_arr(src->urv, D * (size_t)src->urcap);
+    dst->rpiv = dup_arr(src->rpiv, I * (size_t)src->rcapn); dst->rstart = dup_arr(src->rstart, I * ((size_t)src->rcapn + 1));
+    dst->ridx = dup_arr(src->ridx, I * (size_t)src->rcap); dst->rval = dup_arr(src->rval, D * (size_t)src->rcap);
+    dst->rthead = dup_arr(src->rthead, I * (m + 1)); dst->rtcnt = dup_arr(src->rtcnt, I * (m + 1));
+    dst->rnext = dup_arr(src->rnext, I * (size_t)src->rcap); dst->reta = dup_arr(src->reta, I * (size_t)src->rcap);
+}
 void sxlu_free(SxLU *F) {
     free(F->lrow); free(F->lstart); free(F->lidx); free(F->lval); free(F->lrstart); free(F->lridx); free(F->lrval); free(F->lpos);
-    free(F->uord); free(F->uordpos); free(F->uz); free(F->uzpos); free(F->udiag); free(F->ucs); free(F->ucl); free(F->ucc); free(F->uci); free(F->ucv);
+    free(F->uord); free(F->uordpos); free(F->uz); free(F->uzpos); free(F->udiag); free(F->urecip); free(F->ucs); free(F->ucl); free(F->ucc); free(F->uci); free(F->ucv);
     free(F->urs); free(F->url); free(F->urc); free(F->uri); free(F->urv);
-    free(F->rpiv); free(F->rstart); free(F->ridx); free(F->rval);
-    free(F->stack); free(F->wmark); free(F->wlist); free(F->wval); free(F->dfs_pos);
+    free(F->rpiv); free(F->rstart); free(F->ridx); free(F->rval); free(F->rthead); free(F->rtcnt); free(F->rnext); free(F->reta);
+    free(F->stack); free(F->wmark); free(F->wlist); free(F->wval); free(F->dfs_pos); free(F->dmark);
     free(F->lcs_row); free(F->lcl_row); free(F->lrorder); free(F->lrlen);
     memset(F, 0, sizeof *F);
 }
@@ -206,8 +281,81 @@ void sxlu_free(SxLU *F) {
  * LU with partial pivoting, column by column; the pivots, the L columns and the U entries are recorded as in the
  * sparse elimination. A column without an entry above the absolute pivot tolerance is left (its position gets a
  * logical at the end, as in the sparse case). */
+/* (25 October 2026) the dense kernel by blocks: LU with partial pivoting (the largest entry of the column, as below) on a
+ * column-major copy, panels of SX_DENSE_NB columns factored column by column, then the block row by a triangular solve
+ * and the trailing block by one product. The pivots, the L columns (the multipliers) and the U rows are recorded as by
+ * the column kernel. Square active matrices only, and every pivot must pass the column kernel's tests (the absolute
+ * tolerance, the cancellation test); otherwise 0 is returned and the column kernel factorizes, skipping the columns
+ * without a pivot as before. The column kernel's rank-one updates of a row-major array cost n^3/3 multiply-adds without
+ * blocking: 31 ms for qap15's active matrix of 638 (LP, the crossover), which kept the switch to it late. */
+#ifndef BLAS_PREFIX
+#define BLAS_PREFIX
+#endif
+#define SXL_CAT2(a, b) a##b
+#define SXL_CAT(a, b) SXL_CAT2(a, b)
+#define SXL_BL(name) SXL_CAT(BLAS_PREFIX, name)
+void SXL_BL(dgemm_)(const char *, const char *, const int *, const int *, const int *, const double *, const double *, const int *,
+                    const double *, const int *, const double *, double *, const int *);
+void SXL_BL(dtrsm_)(const char *, const char *, const char *, const char *, const int *, const int *, const double *, const double *,
+                    const int *, double *, const int *);
+#define SX_DENSE_NB 48
+/* BRISK_SXDENSEBLK=0: the column kernel only, and the switch at SX_DENSE_FRAC */
+static int dense_blk_on(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXDENSEBLK"); c = !(e && atoi(e) == 0); } return c; }
+static int dense_kernel_blocked(SxLU *F, Act *A, Trip *T, int *rowof, int *prow, int *pcol, double *pval, int *np) {
+    const int m = A->m;
+    int n = 0, nc = 0;
+    for (int i = 0; i < m; i++) n += A->ract[i] != 0;
+    for (int j = 0; j < m; j++) nc += A->cact[j] != 0;
+    if (n != nc || n == 0) return 0;
+    int *rid = xmalloc(sizeof(int) * (n + 1)), *cid = xmalloc(sizeof(int) * (n + 1)), *rmap = xmalloc(sizeof(int) * (m + 1)), *perm = xmalloc(sizeof(int) * (n + 1));
+    int k = 0;
+    for (int i = 0; i < m; i++) { rmap[i] = -1; if (A->ract[i]) { rmap[i] = k; rid[k++] = i; } }
+    k = 0; for (int j = 0; j < m; j++) if (A->cact[j]) cid[k++] = j;
+    double *D = xcalloc((size_t)n * n, sizeof(double));
+    #define DE(i, j) D[(size_t)(j) * n + (i)]
+    for (int jj = 0; jj < n; jj++) { const int j = cid[jj]; for (int p = A->cs[j]; p < A->cs[j] + A->cl[j]; p++) DE(rmap[A->ci[p]], jj) = A->cv[p]; }
+    for (int i = 0; i < n; i++) perm[i] = i;
+    int ok = 1;
+    const double mone = -1.0, one = 1.0;
+    for (int k0 = 0; k0 < n && ok; k0 += SX_DENSE_NB) {
+        const int kb = n - k0 < SX_DENSE_NB ? n - k0 : SX_DENSE_NB, k1 = k0 + kb;
+        for (int j = k0; j < k1; j++) {
+            int pr = -1; double best = 0;
+            for (int i = j; i < n; i++) { const double a = fabs(DE(i, j)); if (a > best) { best = a; pr = i; } }
+            if (pr < 0 || best < A->ptol || best < A->canc * A->cmax0[cid[j]]) { ok = 0; break; }
+            if (pr != j) { for (int c = 0; c < n; c++) { const double t = DE(j, c); DE(j, c) = DE(pr, c); DE(pr, c) = t; } const int t = perm[j]; perm[j] = perm[pr]; perm[pr] = t; }
+            const double rp = 1.0 / DE(j, j);
+            for (int i = j + 1; i < n; i++) DE(i, j) *= rp;
+            for (int c = j + 1; c < k1; c++) { const double ujc = DE(j, c); if (ujc != 0) for (int i = j + 1; i < n; i++) DE(i, c) -= DE(i, j) * ujc; }
+        }
+        if (!ok || k1 >= n) break;
+        const int nr2 = n - k1;
+        SXL_BL(dtrsm_)("L", "L", "N", "U", &kb, &nr2, &one, &DE(k0, k0), &n, &DE(k0, k1), &n);
+        SXL_BL(dgemm_)("N", "N", &nr2, &nr2, &kb, &mone, &DE(k1, k0), &n, &DE(k0, k1), &n, &one, &DE(k1, k1), &n);
+    }
+    if (!ok) { free(rid); free(cid); free(rmap); free(perm); free(D); return 0; }
+    for (int kk = 0; kk < n; kk++) {
+        const int r = rid[perm[kk]], c = cid[kk];
+        const double piv = DE(kk, kk);
+        int nl = 0;
+        for (int i = kk + 1; i < n; i++) if (DE(i, kk) != 0) nl++;
+        if (nl) {
+            F->lrow[F->nl] = r; F->lstart[F->nl + 1] = F->lstart[F->nl];
+            for (int i = kk + 1; i < n; i++) if (DE(i, kk) != 0) l_add(F, rid[perm[i]], DE(i, kk));
+            F->nl++;
+        }
+        for (int jj = kk + 1; jj < n; jj++) if (DE(kk, jj) != 0) trip_add(T, r, cid[jj], DE(kk, jj));
+        F->factor_work += (double)(n - kk - 1) * (n - kk);
+        A->ract[r] = 0; A->cact[c] = 0;
+        rowof[c] = r; prow[*np] = r; pcol[*np] = c; pval[*np] = piv; (*np)++;
+    }
+    #undef DE
+    free(rid); free(cid); free(rmap); free(perm); free(D);
+    return 1;
+}
 static void dense_kernel(SxLU *F, Act *A, Trip *T, double u, int *rowof, int *prow, int *pcol, double *pval, int *np) {
     (void)u;
+    if (dense_blk_on() && dense_kernel_blocked(F, A, T, rowof, prow, pcol, pval, np)) return;
     const int m = A->m;
     int nr = 0, nc = 0;
     int *rid = xmalloc(sizeof(int) * (m + 1)), *cid = xmalloc(sizeof(int) * (m + 1)), *rmap = xmalloc(sizeof(int) * (m + 1));
@@ -221,7 +369,7 @@ static void dense_kernel(SxLU *F, Act *A, Trip *T, double u, int *rowof, int *pr
     for (int jj = 0; jj < nc && nleft > 0; jj++) {
         int kb = -1; double best = 0;
         for (int k = 0; k < nleft; k++) { const double a = fabs(D[(size_t)left[k] * nc + jj]); if (a > best) { best = a; kb = k; } }
-        if (kb < 0 || best < SX_PIVTOL) continue;
+        if (kb < 0 || best < A->ptol || best < A->canc * A->cmax0[cid[jj]]) continue;
         const int ii = left[kb]; left[kb] = left[--nleft];
         const double *prw = D + (size_t)ii * nc;
         const double piv = prw[jj];
@@ -248,17 +396,54 @@ static void dense_kernel(SxLU *F, Act *A, Trip *T, double u, int *rowof, int *pr
     free(rid); free(cid); free(rmap); free(D); free(left); free(lr); free(lv);
 }
 
+/* the columns set aside at the start of the elimination (positions defj) back into the active matrix: each column is
+ * taken from A without its entries in the rows of logicals and singletons (in U already), updated by the L columns of the
+ * elimination in their order (x_i -= l_ik x_r for the pivot row r of L column k); its entry in an eliminated row r is
+ * then its U entry, those in the rows still active its active column */
+static void defer_back(SxLU *F, Act *A, Trip *T, int m, const int *Ap, const int *Ai, const double *Ax, const int *var,
+                       const char *rdone, const int *defj, int ndef, int *nca, long *nzact) {
+    double *x = xcalloc((size_t)m + 1, sizeof(double));
+    for (int t = 0; t < ndef; t++) {
+        const int j = defj[t], v = var[j];
+        for (int p = Ap[v]; p < Ap[v + 1]; p++) if (Ax[p] != 0 && !rdone[Ai[p]]) x[Ai[p]] = Ax[p];
+        for (int k = 0; k < F->nl; k++) {
+            const double xr = x[F->lrow[k]];
+            if (xr == 0) continue;
+            for (int q = F->lstart[k]; q < F->lstart[k + 1]; q++) x[F->lidx[q]] -= F->lval[q] * xr;
+        }
+        F->factor_work += m + F->lstart[F->nl];
+        int cnt = 0;
+        for (int i = 0; i < m; i++) if (x[i] != 0 && A->ract[i]) cnt++;
+        A->cl[j] = 0; col_reserve(A, j, cnt);
+        for (int i = 0; i < m; i++) {
+            if (x[i] == 0) continue;
+            if (A->ract[i]) {
+                const int q = A->cs[j] + A->cl[j]++;
+                A->ci[q] = i; A->cv[q] = x[i];
+                lst_del(A->rhead, A->rnext, A->rprev, A->rl[i], i);
+                row_reserve(A, i, 1); A->ri[A->rs[i] + A->rp[i]++] = j; A->rl[i]++;
+                lst_ins(A->rhead, A->rnext, A->rprev, A->rl[i], i);
+            } else if (!rdone[i]) trip_add(T, i, j, x[i]);
+            x[i] = 0;
+        }
+        A->cact[j] = 1; A->cmax[j] = -1;
+        lst_ins(A->chead, A->cnext, A->cprev, A->cl[j], j);
+        (*nca)++; *nzact += A->cl[j];
+    }
+    free(x);
+}
 int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const double *Ax, int *var, int *out) {
-    if (F->m != m) { sxlu_free(F); F->m = m; }
-    const double u = F->pivthr > 0 ? F->pivthr : 0.1;
+    if (F->m != m) { const double pt = F->pivthr, pc = F->pivcanc; sxlu_free(F); F->m = m; F->pivthr = pt; F->pivcanc = pc; }   /* (the settings kept) */
+    const double u = F->pivthr > 0 ? F->pivthr : 0.1, ptol = SX_PIVTOL;
     /* work arrays kept between factorizations */
     if (!F->stack) {
         F->stack = xmalloc(sizeof(int) * (2 * (size_t)m + 2)); F->wmark = xcalloc((size_t)m + 1, sizeof(int));
         F->wlist = xmalloc(sizeof(int) * ((size_t)m + 1)); F->wval = xcalloc((size_t)m + 1, sizeof(double)); F->dfs_pos = xmalloc(sizeof(int) * ((size_t)m + 1));
+        F->dmark = xcalloc((size_t)m + 1, 1);
         F->lpos = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lcs_row = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lcl_row = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->lrstart = xmalloc(sizeof(int) * ((size_t)m + 2)); F->lrlen = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lrorder = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->lrow = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lstart = xmalloc(sizeof(int) * ((size_t)m + 2));
-        F->uordpos = xmalloc(sizeof(int) * ((size_t)m + 1)); F->udiag = xmalloc(sizeof(double) * ((size_t)m + 1));
+        F->uordpos = xmalloc(sizeof(int) * ((size_t)m + 1)); F->udiag = xmalloc(sizeof(double) * ((size_t)m + 1)); F->urecip = xmalloc(sizeof(double) * ((size_t)m + 1));
         F->ucs = xmalloc(sizeof(int) * ((size_t)m + 1)); F->ucl = xmalloc(sizeof(int) * ((size_t)m + 1)); F->ucc = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->urs = xmalloc(sizeof(int) * ((size_t)m + 1)); F->url = xmalloc(sizeof(int) * ((size_t)m + 1)); F->urc = xmalloc(sizeof(int) * ((size_t)m + 1));
     }
@@ -301,7 +486,8 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
             const int v = var[j];
             int i = -1; double a = 0;
             for (int p = Ap[v]; p < Ap[v + 1]; p++) if (Ax[p] != 0 && !rdone[Ai[p]]) { i = Ai[p]; a = Ax[p]; break; }
-            if (i < 0 || fabs(a) < SX_PIVTOL) continue;    /* (left to the elimination) */
+            if (i < 0 || fabs(a) < ptol) continue;    /* (left to the elimination) */
+            if (F->pivcanc > 0) { double cm = 0; for (int p = Ap[v]; p < Ap[v + 1]; p++) cm = fmax(cm, fabs(Ax[p])); if (fabs(a) < F->pivcanc * cm) continue; }
             for (int p = Ap[v]; p < Ap[v + 1]; p++) if (Ax[p] != 0 && Ai[p] != i) trip_add(&T, Ai[p], j, Ax[p]);
             rdone[i] = 1; rowof[j] = i; prow[np] = i; pcol[np] = j; pval[np] = a; np++;
             for (int p = rptr[i]; p < rptr[i + 1]; p++) { const int k = rj[p]; if (rowof[k] < 0 && --cnt[k] == 1) stk[nst++] = k; }
@@ -309,13 +495,13 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         free(cnt); free(rptr); free(stk); free(rj); free(fill);
     }
     /* 2. the active matrix: structural columns, entries in rows not yet pivoted */
-    Act A; memset(&A, 0, sizeof A); A.m = m;
+    Act A; memset(&A, 0, sizeof A); A.m = m; A.ptol = ptol; A.canc = F->pivcanc; A.cmax0 = xcalloc(m, sizeof(double));
     long nzs = 0;
     for (int j = 0; j < m; j++) if (var[j] < n) nzs += Ap[var[j] + 1] - Ap[var[j]];
     A.ccap = (int)(2 * nzs + 4 * (long)m + 16); A.ci = xmalloc(sizeof(int) * A.ccap); A.cv = xmalloc(sizeof(double) * A.ccap);
     A.rcap = A.ccap; A.ri = xmalloc(sizeof(int) * A.rcap);
     A.cs = xmalloc(sizeof(int) * m); A.cl = xcalloc(m, sizeof(int)); A.cc = xcalloc(m, sizeof(int));
-    A.rs = xmalloc(sizeof(int) * m); A.rl = xcalloc(m, sizeof(int)); A.rc = xcalloc(m, sizeof(int));
+    A.rs = xmalloc(sizeof(int) * m); A.rl = xcalloc(m, sizeof(int)); A.rc = xcalloc(m, sizeof(int)); A.rp = xcalloc(m, sizeof(int));
     A.chead = xmalloc(sizeof(int) * (m + 1)); A.cnext = xmalloc(sizeof(int) * m); A.cprev = xmalloc(sizeof(int) * m);
     A.rhead = xmalloc(sizeof(int) * (m + 1)); A.rnext = xmalloc(sizeof(int) * m); A.rprev = xmalloc(sizeof(int) * m);
     A.cmax = xmalloc(sizeof(double) * m); A.cact = xcalloc(m, 1); A.ract = xcalloc(m, 1);
@@ -323,6 +509,7 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
     int e = 0;
     for (int j = 0; j < m; j++) {
         A.cs[j] = e; A.cmax[j] = -1;
+        if (var[j] < n) for (int p = Ap[var[j]]; p < Ap[var[j] + 1]; p++) A.cmax0[j] = fmax(A.cmax0[j], fabs(Ax[p]));
         if (rowof[j] >= 0) continue;
         if (var[j] >= n) { /* a duplicate logical: an empty active column */ A.cact[j] = 1; A.cc[j] = 2; e += 2; continue; }
         A.cact[j] = 1;
@@ -336,27 +523,66 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         A.cc[j] = A.cl[j] + 2; e += 2;
     }
     A.cend = e;
+    /* 2b. long columns set aside (22 October 2026): every pivot whose row meets a column updates it, at a cost of the
+     * column's length, so a column of length L costs about L^2 over the elimination; set aside, it is brought back once
+     * the other columns are pivoted, at the cost of one pass over L (sxlu_defer_back). A column whose L^2 exceeds the
+     * active rows and entries is set aside: on lp_densecols_small (20 dense columns of 10,000 rows) the factorizations
+     * took 1.2 s each, the searches and scatters of the dense columns at every pivot */
+    int ndef = 0, *defj = NULL;
+    {
+        long nza = 0; int nr0 = 0;
+        for (int j = 0; j < m; j++) if (A.cact[j]) nza += A.cl[j];
+        for (int i = 0; i < m; i++) nr0 += !rdone[i];
+        for (int j = 0; j < m; j++) {
+            if (!A.cact[j] || var[j] >= n || A.cl[j] < SX_DENSE_MIN) continue;
+            if ((double)A.cl[j] * A.cl[j] <= (double)nr0 + (double)nza) continue;
+            if (!defj) defj = xmalloc(sizeof(int) * m);
+            defj[ndef++] = j; A.cact[j] = 0;
+            for (int p = A.cs[j]; p < A.cs[j] + A.cl[j]; p++) A.rl[A.ci[p]]--;
+            A.cl[j] = 0;
+        }
+    }
     e = 0;
     for (int i = 0; i < m; i++) { A.rs[i] = e; if (!rdone[i]) { A.ract[i] = 1; A.rc[i] = A.rl[i] + 2; e += A.rc[i]; } A.rl[i] = 0; }
     A.rend = e;
     for (int j = 0; j < m; j++) if (A.cact[j]) for (int p = A.cs[j]; p < A.cs[j] + A.cl[j]; p++) { const int i = A.ci[p]; A.ri[A.rs[i] + A.rl[i]++] = j; }
+    for (int i = 0; i < m; i++) A.rp[i] = A.rl[i];
     for (int j = 0; j < m; j++) if (A.cact[j]) lst_ins(A.chead, A.cnext, A.cprev, A.cl[j], j);
     for (int i = 0; i < m; i++) if (A.ract[i]) lst_ins(A.rhead, A.rnext, A.rprev, A.rl[i], i);
     /* 3. elimination */
     int *wpos = F->wmark;          /* row -> position in the column being updated (+1; 0 none) */
     int *lrows = F->wlist; double *lmul = F->wval; int *ucols = F->lrorder;   /* (lrorder is rebuilt after the elimination) */
+    /* (25 October 2026) the column updates in one pass over each column (lu_onepass): wpos holds the pivot column's rows
+     * (k + 1 for lrows[k]) for the whole pivot step, umk marks the rows of the column met, upos the positions to update */
+    const int onepass = lu_onepass();
+    char *umk = onepass ? xcalloc(m + 1, 1) : NULL; int *upos = onepass ? xmalloc(sizeof(int) * (m + 1)) : NULL;
     int r, c;
     /* the entries, rows and columns of the active matrix, for the switch to the dense kernel */
     long nzact = 0; int nca = 0, nra = 0;
     for (int j = 0; j < m; j++) if (A.cact[j]) { nca++; nzact += A.cl[j]; }
     for (int i = 0; i < m; i++) nra += A.ract[i];
     for (;;) {
-        static double dfrac = -1; if (dfrac < 0) dfrac = getenv("SXDENSE") ? atof(getenv("SXDENSE")) : SX_DENSE_FRAC;   /* (experiments) */
+        /* (25 October 2026) with the blocked dense kernel the switch at 30 % instead of 70 %: a blocked step costs about a tenth
+         * of a sparse elimination step per multiply-add, and the sparse work falls with the square of the density, so the
+         * two meet near sqrt(0.1); pilot87's crossover (LP) 1.12 -> 0.84 s at 20 %, qap15's 4.62 -> 4.48 s */
+        /* (the dense array at most 25 million entries, 200 MB, three times the active entries at 30 %; above, as before) */
+        const char *de = getenv("SXDENSE"); const double dfrac = de ? atof(de) : dense_blk_on() && (double)nca * nra <= 2.5e7 ? SX_DENSE_FRAC_BLK : SX_DENSE_FRAC;   /* (experiments; read each time: no static, ISSUES 422) */
         if (nca >= SX_DENSE_MIN && nra >= SX_DENSE_MIN && (double)nzact >= dfrac * (double)nca * nra) {
-            dense_kernel(F, &A, &T, u, rowof, prow, pcol, pval, &np);
+            if (ndef) { defer_back(F, &A, &T, m, Ap, Ai, Ax, var, rdone, defj, ndef, &nca, &nzact); ndef = 0; }
+            { const double td = (double)clock() / CLOCKS_PER_SEC;
+              dense_kernel(F, &A, &T, u, rowof, prow, pcol, pval, &np);
+              if (getenv("SXDBG") && atoi(getenv("SXDBG")) > 1) printf("    [dense kernel: %d x %d active, %.3f s]\n", nra, nca, (double)clock() / CLOCKS_PER_SEC - td); }
             break;
         }
-        if (!find_pivot(&A, u, &r, &c)) break;
+        const int fp = find_pivot(&A, u, &r, &c);
+        nca -= A.nrej; nzact -= A.nrejnz; A.nrej = 0; A.nrejnz = 0;
+        if (!fp) {
+            if (ndef) {     /* the columns set aside come back, updated by L, for the rest of the elimination */
+                defer_back(F, &A, &T, m, Ap, Ai, Ax, var, rdone, defj, ndef, &nca, &nzact);
+                ndef = 0; continue;
+            }
+            break;
+        }
         nca--; nra--; nzact -= A.cl[c];
         const int pp = col_find(&A, c, r);
         const double piv = A.cv[pp];
@@ -379,7 +605,40 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         }
         /* U row and the update of the columns of row r (its pattern copied: compactions move the row file) */
         int nur = 0;
-        for (int p = A.rs[r]; p < A.rs[r] + A.rl[r]; p++) if (A.ri[p] != c) ucols[nur++] = A.ri[p];
+        for (int p = A.rs[r]; p < A.rs[r] + A.rp[r]; p++) if (A.ri[p] != c && A.cact[A.ri[p]]) ucols[nur++] = A.ri[p];
+        if (onepass) {
+            /* (25 October 2026) each column of row r in one pass: its entry in row r found and its entries in the pivot
+             * column's rows collected together; then those updated, the row-r entry removed (the last entry in its
+             * place), the fill appended in the order of the pivot column. The same entries, values and order as the
+             * three passes before (the search for row r, the positions scattered, cleared again), so the same factors:
+             * on pilot87 (LP) the three passes over long columns were 2.0e9 of the crossover's 5.5e9 instructions */
+            for (int k = 0; k < nlr; k++) wpos[lrows[k]] = k + 1;
+            for (int t0 = 0; t0 < nur; t0++) {
+                const int j = ucols[t0];
+                lst_del(A.chead, A.cnext, A.cprev, A.cl[j], j);
+                const int s = A.cs[j], e = s + A.cl[j];
+                int q = -1, nu = 0;
+                for (int t = s; t < e; t++) { const int i = A.ci[t]; if (i == r) q = t; else if (wpos[i]) { upos[nu++] = t; umk[i] = 1; } }
+                const double urv = A.cv[q];
+                for (int z = 0; z < nu; z++) { const int t = upos[z]; A.cv[t] -= lmul[wpos[A.ci[t]] - 1] * urv; }
+                A.ci[q] = A.ci[e - 1]; A.cv[q] = A.cv[e - 1]; A.cl[j]--; nzact--;
+                trip_add(&T, r, j, urv);
+                F->factor_work += nlr;
+                if (nlr > nu) {
+                    col_reserve(&A, j, nlr - nu);
+                    for (int k = 0; k < nlr; k++) {
+                        const int i = lrows[k];
+                        if (umk[i]) { umk[i] = 0; continue; }
+                        const int t = A.cs[j] + A.cl[j]++; nzact++;
+                        A.ci[t] = i; A.cv[t] = -(lmul[k] * urv);
+                        row_reserve(&A, i, 1); A.ri[A.rs[i] + A.rp[i]++] = j; A.rl[i]++;
+                    }
+                } else for (int k = 0; k < nlr; k++) umk[lrows[k]] = 0;
+                A.cmax[j] = -1;
+                lst_ins(A.chead, A.cnext, A.cprev, A.cl[j], j);
+            }
+            for (int k = 0; k < nlr; k++) wpos[lrows[k]] = 0;
+        } else
         for (int t0 = 0; t0 < nur; t0++) {
             const int j = ucols[t0];
             lst_del(A.chead, A.cnext, A.cprev, A.cl[j], j);
@@ -399,7 +658,7 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
                     else {
                         const int t = A.cs[j] + A.cl[j]++; nzact++;
                         A.ci[t] = i; A.cv[t] = -d;
-                        row_reserve(&A, i, 1); A.ri[A.rs[i] + A.rl[i]++] = j;
+                        row_reserve(&A, i, 1); A.ri[A.rs[i] + A.rp[i]++] = j; A.rl[i]++;
                     }
                 }
                 for (int t = A.cs[j]; t < A.cs[j] + A.cl[j]; t++) wpos[A.ci[t]] = 0;
@@ -451,7 +710,7 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
     /* 6. U: the order, the diagonal, columns and rows keyed by the pivot rows */
     if (F->ordcap < 2 * m + 16) { F->ordcap = 2 * m + 16; F->uord = xrealloc(F->uord, sizeof(int) * F->ordcap); }
     F->nord = np;
-    for (int k = 0; k < np; k++) { F->uord[k] = prow[k]; F->uordpos[prow[k]] = k; F->udiag[prow[k]] = pval[k]; }
+    for (int k = 0; k < np; k++) { F->uord[k] = prow[k]; F->uordpos[prow[k]] = k; F->udiag[prow[k]] = pval[k]; F->urecip[prow[k]] = 1.0 / pval[k]; }
     int nu = 0;
     {
         /* drop the entries of replaced positions; translate positions to their pivot rows */
@@ -499,24 +758,46 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
     if (!F->rstart) { F->rcapn = 256; F->rpiv = xmalloc(sizeof(int) * F->rcapn); F->rstart = xmalloc(sizeof(int) * (F->rcapn + 1)); }
     F->rstart[0] = 0;
     if (!F->ridx) { F->rcap = 4 * m + 1024; F->ridx = xmalloc(sizeof(int) * F->rcap); F->rval = xmalloc(sizeof(double) * F->rcap); }
+    if (!F->rnext) { F->rnext = xmalloc(sizeof(int) * F->rcap); F->reta = xmalloc(sizeof(int) * F->rcap); }
+    if (!F->rthead) { F->rthead = xmalloc(sizeof(int) * ((size_t)m + 1)); F->rtcnt = xmalloc(sizeof(int) * ((size_t)m + 1)); }
+    for (int i = 0; i < m; i++) { F->rthead[i] = -1; F->rtcnt[i] = 0; }
     for (int i = 0; i < m; i++) F->wmark[i] = 0;
     free(T.r); free(T.j); free(T.v);
-    free(A.cs); free(A.cl); free(A.cc); free(A.ci); free(A.cv); free(A.rs); free(A.rl); free(A.rc); free(A.ri);
-    free(A.chead); free(A.cnext); free(A.cprev); free(A.rhead); free(A.rnext); free(A.rprev); free(A.cmax); free(A.cact); free(A.ract);
-    free(prow); free(pcol); free(pval); free(rowof); free(rdone); free(repl);
+    free(A.cs); free(A.cl); free(A.cc); free(A.ci); free(A.cv); free(A.rs); free(A.rl); free(A.rc); free(A.rp); free(A.ri);
+    free(A.chead); free(A.cnext); free(A.cprev); free(A.rhead); free(A.rnext); free(A.rprev); free(A.cmax); free(A.cmax0); free(defj); free(A.cact); free(A.ract);
+    free(prow); free(pcol); free(pval); free(rowof); free(rdone); free(repl); free(umk); free(upos);
     return nout;
 }
 
 /* ---------------------------------------------------------------- solves */
+/* the density below which a solve is hypersparse (a depth-first search for the reach, then the work on it alone); the
+ * switch BRISK_SXHYPER: an experiment (23 October 2026) */
+/* (read once: called for every solve, its getenv was 3 % of ken-18's instructions, LP, 24 October 2026) */
+static double hyper_thr(void) { static double t = -1; if (t < 0) { const char *e = getenv("BRISK_SXHYPER"); t = e ? atof(e) : 0.1; } return t; }
+/* (24 October 2026, the night) the hypersparse solve costs its searches' edges, the sweep a pass over the pivots (the
+ * columns of L, the pivots of U with work, the rows); the numeric work is the same. A direction whose recent hypersparse
+ * solves examined more edges than a quarter of that pass sweeps instead, with a hypersparse trial every 32 solves (to
+ * follow the basis). Only the solves with the factorization's own scratch space (one at a time, so the same choice on
+ * every run). sing44 (LP): the searches were more than half the dual method's time. BRISK_SXHYCOST=0: the density
+ * threshold alone */
+static int hy_cost_on(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXHYCOST"); c = !(e && atoi(e) == 0); } return c; }
+static int hy_allow(SxLU *F, int d) {
+    if (!hy_cost_on()) return 1;
+    const double pass = (double)F->nl + F->nuz + F->m;
+    if (F->hy_e[d] <= 0.25 * pass) return 1;
+    if (--F->hy_p[d] <= 0) { F->hy_p[d] = 32; return 1; }
+    return 0;
+}
+static void hy_note(SxLU *F, int d, long edges) { F->hy_e[d] = F->hy_e[d] > 0 ? 0.9 * F->hy_e[d] + 0.1 * (double)edges : (double)edges + 1e-9; }
 /* depth-first search from the nonzeros of x over the graph (start/len/adj keyed by row id); the reached
  * rows in postorder in F->wlist (count returned); F->wmark used and cleared by the caller */
 static int dfs(SxWs *W, const SxVec *x, const int *start, const int *len, const int *adj) {
-    int *mark = W->wmark, *stk = W->stack, *pos = W->dfs_pos, *outl = W->wlist;
-    int nout = 0;
+    unsigned char *mark = W->dmark; int *stk = W->stack, *pos = W->dfs_pos, *outl = W->wlist;
+    int nout = 0; long ed = 0;
     for (int k = 0; k < x->cnt; k++) {
         const int r0 = x->idx[k];
         if (mark[r0]) continue;
-        int top = 0; stk[0] = r0; pos[0] = 0; mark[r0] = 1;
+        int top = 0; stk[0] = r0; pos[0] = 0; mark[r0] = 1; ed += len[r0];
         while (top >= 0) {
             const int r = stk[top];
             const int s = start[r], l = len[r];
@@ -525,21 +806,22 @@ static int dfs(SxWs *W, const SxVec *x, const int *start, const int *len, const 
             if (p < l) {
                 const int nx = adj[s + p];
                 pos[top] = p + 1;
-                mark[nx] = 1; top++; stk[top] = nx; pos[top] = 0;
+                mark[nx] = 1; top++; stk[top] = nx; pos[top] = 0; ed += len[nx];
             } else { outl[nout++] = r; top--; }
         }
     }
+    W->nedges += ed;
     return nout;
 }
-static void unmark(SxWs *W, int nout) { for (int k = 0; k < nout; k++) W->wmark[W->wlist[k]] = 0; }
+static void unmark(SxWs *W, int nout) { for (int k = 0; k < nout; k++) W->dmark[W->wlist[k]] = 0; }
 /* the factorization's own scratch space, as a workspace */
-static SxWs own_ws(SxLU *F) { SxWs W; W.m = F->m; W.stack = F->stack; W.wmark = F->wmark; W.wlist = F->wlist; W.dfs_pos = F->dfs_pos; W.nflops = 0; return W; }
+static SxWs own_ws(SxLU *F) { SxWs W; W.m = F->m; W.stack = F->stack; W.wmark = F->wmark; W.wlist = F->wlist; W.dfs_pos = F->dfs_pos; W.dmark = F->dmark; W.nflops = 0; W.nedges = 0; return W; }
 void sxws_init(SxWs *W, int m) {
     W->m = m; W->stack = malloc(sizeof(int) * (2 * (size_t)m + 2)); W->wmark = calloc((size_t)m + 1, sizeof(int));
-    W->wlist = malloc(sizeof(int) * ((size_t)m + 1)); W->dfs_pos = malloc(sizeof(int) * ((size_t)m + 1)); W->nflops = 0;
-    if (!W->stack || !W->wmark || !W->wlist || !W->dfs_pos) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); }
+    W->wlist = malloc(sizeof(int) * ((size_t)m + 1)); W->dfs_pos = malloc(sizeof(int) * ((size_t)m + 1)); W->dmark = calloc((size_t)m + 1, 1); W->nflops = 0; W->nedges = 0;
+    if (!W->stack || !W->wmark || !W->wlist || !W->dfs_pos || !W->dmark) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); }
 }
-void sxws_free(SxWs *W) { free(W->stack); free(W->wmark); free(W->wlist); free(W->dfs_pos); memset(W, 0, sizeof *W); }
+void sxws_free(SxWs *W) { free(W->stack); free(W->wmark); free(W->wlist); free(W->dfs_pos); free(W->dmark); memset(W, 0, sizeof *W); }
 
 /* the forward solve keeps its list of nonzeros as it goes when the pivots of U with work are fewer than half the rows
  * (a basis mostly of logicals: a pass over all rows to find the nonzeros would cost more than the solve); otherwise
@@ -589,9 +871,55 @@ static void ftran_l(SxLU *F, SxWs *W, SxVec *x, int hyper) {
         W->nflops += F->nl;
     }
 }
-/* x <- R_k ... R_1 x */
+/* x <- R_k ... R_1 x. (24 October 2026, the night) With a sparse x, only the etas that read its nonzeros: from each
+ * nonzero's list of readers, in the order of the etas (a heap), an eta that makes a new nonzero bringing in that row's later
+ * readers; the others would add zero. The same etas with a nonzero sum, in the same order, so the same bits. The pass over
+ * every eta was 45 microseconds a solve on lp_beckmann_300's crossover (LP, a basis of 90,000 rows), 12 % of ken-18's dual
+ * method. Used when the readers of x's nonzeros are fewer than a quarter of the file's entries; the heap in W->stack, the
+ * marks in W->dmark, the etas taken in W->wlist (all free between the solves with L and with U; at most m etas). */
+static void ftran_r_hyper(SxLU *F, SxWs *W, SxVec *x) {
+    double *v = x->val;
+    int *heap = W->stack, *took = W->wlist, nh = 0, nt = 0;
+    unsigned char *seen = W->dmark;
+    long work = 0;
+#define RH_PUSH(e0) do { int q_ = nh++; const int e_ = (e0); while (q_ > 0 && heap[(q_ - 1) / 2] > e_) { heap[q_] = heap[(q_ - 1) / 2]; q_ = (q_ - 1) / 2; } heap[q_] = e_; } while (0)
+    const int c0 = x->cnt;
+    for (int k = 0; k < c0; k++) {
+        const int i = x->idx[k];
+        for (int p = F->rthead[i]; p >= 0; p = F->rnext[p]) { const int e = F->reta[p]; work++; if (!seen[e]) { seen[e] = 1; RH_PUSH(e); } }
+    }
+    while (nh > 0) {
+        const int e = heap[0];
+        {   /* pop */
+            const int last = heap[--nh]; int q = 0;
+            for (;;) { int c = 2 * q + 1; if (c >= nh) break; if (c + 1 < nh && heap[c + 1] < heap[c]) c++; if (heap[c] >= last) break; heap[q] = heap[c]; q = c; }
+            if (nh > 0) heap[q] = last;
+        }
+        took[nt++] = e;
+        double s = 0;
+        for (int p = F->rstart[e]; p < F->rstart[e + 1]; p++) s += F->rval[p] * v[F->ridx[p]];
+        work += F->rstart[e + 1] - F->rstart[e];
+        if (s != 0) {
+            const int r = F->rpiv[e];
+            if (v[r] == 0) {
+                x->idx[x->cnt++] = r;
+                for (int p = F->rthead[r]; p >= 0 && F->reta[p] > e; p = F->rnext[p]) { const int e2 = F->reta[p]; work++; if (!seen[e2]) { seen[e2] = 1; RH_PUSH(e2); } }
+            }
+            v[r] -= s;
+            if (v[r] == 0) v[r] = 1e-300;   /* keeps the index valid; pruned at the end */
+        }
+    }
+#undef RH_PUSH
+    for (int k = 0; k < nt; k++) seen[took[k]] = 0;
+    W->nflops += work;
+}
 static void ftran_r(SxLU *F, SxWs *W, SxVec *x) {
     double *v = x->val;
+    if (x->cnt >= 0 && F->nr <= F->m && F->rthead) {
+        long est = 0; const long tot = F->rstart[F->nr];
+        for (int k = 0; k < x->cnt && 4 * est < tot; k++) est += F->rtcnt[x->idx[k]];
+        if (4 * est < tot) { ftran_r_hyper(F, W, x); return; }
+    }
     for (int e = 0; e < F->nr; e++) {
         double s = 0;
         for (int p = F->rstart[e]; p < F->rstart[e + 1]; p++) s += F->rval[p] * v[F->ridx[p]];
@@ -605,14 +933,14 @@ static void ftran_r(SxLU *F, SxWs *W, SxVec *x) {
     W->nflops += F->rstart[F->nr];
 }
 /* x <- U^{-1} x */
-static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper) {
+static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper, int track) {
     double *v = x->val;
     if (hyper) {
         const int nr = dfs(W, x, F->ucs, F->ucl, F->uci);
         for (int k = nr - 1; k >= 0; k--) {
             const int r = W->wlist[k];
             if (v[r] == 0) continue;
-            const double xr = v[r] / F->udiag[r];
+            const double xr = v[r] * F->urecip[r];
             v[r] = xr;
             W->nflops += F->ucl[r];
             for (int p = F->ucs[r]; p < F->ucs[r] + F->ucl[r]; p++) v[F->uci[p]] -= F->ucv[p] * xr;
@@ -620,13 +948,13 @@ static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper) {
         for (int k = 0; k < nr; k++) x->idx[k] = W->wlist[k];
         x->cnt = nr; unmark(W, nr); sxv_prune(x);
         W->nflops += nr;
-    } else if (TRACK(F) && x->cnt >= 0) {
+    } else if (track && TRACK(F) && x->cnt >= 0) {
         /* the pivots with an empty column and a unit diagonal (the logicals) change nothing: only the others (uz) */
         int *idx = x->idx, cnt = x->cnt;
         for (int k = F->nuz - 1; k >= 0; k--) {
             const int r = F->uz[k];
             if (r < 0 || v[r] == 0) continue;
-            const double xr = v[r] / F->udiag[r];
+            const double xr = v[r] * F->urecip[r];
             v[r] = xr;
             W->nflops += F->ucl[r];
             for (int p = F->ucs[r]; p < F->ucs[r] + F->ucl[r]; p++) {
@@ -642,7 +970,7 @@ static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper) {
         for (int k = F->nuz - 1; k >= 0; k--) {
             const int r = F->uz[k];
             if (r < 0 || v[r] == 0) continue;
-            const double xr = v[r] / F->udiag[r];
+            const double xr = v[r] * F->urecip[r];
             v[r] = xr;
             W->nflops += F->ucl[r];
             for (int p = F->ucs[r]; p < F->ucs[r] + F->ucl[r]; p++) v[F->uci[p]] -= F->ucv[p] * xr;
@@ -654,7 +982,10 @@ static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper) {
 void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike) {
     const int m = F->m;
     if (x->cnt < 0) sxv_reindex(x);
-    const int hyper = x->cnt < 0.1 * m && expdens < 0.1;
+    const double ht = hyper_thr();
+    const int own = W->stack == F->stack;
+    const int hyper = x->cnt < ht * m && expdens < ht && (!own || hy_allow(F, 0));
+    const long e0 = W->nedges;
     ftran_l(F, W, x, hyper);
     if (x->cnt >= 0) sxv_prune(x);
     if (F->nr && x->cnt < 0) sxv_reindex(x);
@@ -662,29 +993,32 @@ void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike) {
     if (x->cnt < 0) sxv_reindex(x);
     else sxv_prune(x);
     if (spike) sxv_copy(spike, x);
-    ftran_u(F, W, x, hyper && x->cnt < 0.1 * m);
+    /* (22 October 2026) the result's nonzeros tracked during the solve only when it is expected sparse; a dense one (the
+     * entering columns of lp_setcover_5k, LP: 59 % of the rows) takes the plain loop and one pass to list it */
+    ftran_u(F, W, x, hyper && x->cnt < ht * m, expdens < 0.3);
+    if (own && hyper) hy_note(F, 0, W->nedges - e0);
 }
 
 void sxlu_ftran(SxLU *F, SxVec *x, double expdens, SxVec *spike) {
     SxWs W = own_ws(F);
     sxlu_ftran_ws(F, &W, x, expdens, spike);
-    F->nflops += W.nflops;
+    F->nflops += W.nflops; F->nedges += W.nedges;
 }
 /* a depth-first search that can be advanced by steps (sxlu_ftran_part runs two at the same pace) */
 typedef struct {
     const int *start, *len, *adj, *seed;
     int nseed, k, top, nout;
-    int *mark, *stk, *pos, *out;
+    unsigned char *mark; int *stk, *pos, *out;
     long edges;
 } Dfs;
 static void dfs_init(Dfs *D, SxWs *W, const int *start, const int *len, const int *adj, const int *seed, int nseed) {
     D->start = start; D->len = len; D->adj = adj; D->seed = seed; D->nseed = nseed; D->k = 0; D->top = -1; D->nout = 0;
-    D->mark = W->wmark; D->stk = W->stack; D->pos = W->dfs_pos; D->out = W->wlist; D->edges = 0;
+    D->mark = W->dmark; D->stk = W->stack; D->pos = W->dfs_pos; D->out = W->wlist; D->edges = 0;
 }
 /* advances by about `steps` entries examined; returns 1 when the search is complete (the reached nodes in postorder in
  * out[0..nout-1]) */
 static int dfs_step(Dfs *D, long steps) {
-    int *mark = D->mark, *stk = D->stk, *pos = D->pos;
+    unsigned char *mark = D->mark; int *stk = D->stk, *pos = D->pos;
     const int *adj = D->adj;
     long budget = D->edges + steps;
     for (;;) {
@@ -728,7 +1062,7 @@ int sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat,
     const int m = F->m;
     double *v = x->val;
     if (x->cnt < 0) sxv_reindex(x);
-    const int hyper = x->cnt < 0.1 * m && expdens < 0.1;
+    const double ht = hyper_thr(); const int hyper = x->cnt < ht * m && expdens < ht;
     ftran_l(F, W, x, hyper);
     if (x->cnt >= 0) sxv_prune(x);
     if (F->nr && x->cnt < 0) sxv_reindex(x);
@@ -738,7 +1072,7 @@ int sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat,
     Dfs A, B;       /* A: the rows the wanted positions depend on; B: the reach of y's nonzeros (the full solve) */
     dfs_init(&A, W, F->urs, F->url, F->uri, pat, npat);
     int full = 0;
-    if (x->cnt >= 0 && x->cnt < 0.1 * m) {
+    if (x->cnt >= 0 && x->cnt < ht * m) {
         dfs_init(&B, W2, F->ucs, F->ucl, F->uci, x->idx, x->cnt);
         for (;;) {
             if (dfs_step(&A, 256)) { dfs_unmark(&B); break; }
@@ -754,7 +1088,7 @@ int sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat,
         for (int k = nr - 1; k >= 0; k--) {
             const int r = B.out[k];
             if (v[r] == 0) continue;
-            const double xr = v[r] / F->udiag[r];
+            const double xr = v[r] * F->urecip[r];
             v[r] = xr;
             fl += F->ucl[r];
             for (int p = F->ucs[r]; p < F->ucs[r] + F->ucl[r]; p++) v[F->uci[p]] -= F->ucv[p] * xr;
@@ -771,7 +1105,7 @@ int sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat,
             const int e = F->urs[r] + F->url[r];
             for (int p = F->urs[r]; p < e; p++) sum -= F->urv[p] * v[F->uri[p]];
             fl += F->url[r];
-            v[r] = sum / F->udiag[r];
+            v[r] = sum * F->urecip[r];
         }
         /* the other entries of y out (the marks of the search tell the computed ones) */
         if (x->cnt >= 0) { for (int k = 0; k < x->cnt; k++) { const int i = x->idx[k]; if (!A.mark[i]) v[i] = 0; } }
@@ -780,7 +1114,7 @@ int sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat,
         x->cnt = nr;
         W->nflops += fl;
     }
-    F->nflops += W0.nflops;
+    F->nflops += W0.nflops; F->nedges += W0.nedges;
     return nlr;
 }
 
@@ -792,7 +1126,7 @@ static void btran_u(SxLU *F, SxWs *W, SxVec *y, int hyper) {
         for (int k = nr - 1; k >= 0; k--) {
             const int r = W->wlist[k];
             if (v[r] == 0) continue;
-            const double yr = v[r] / F->udiag[r];
+            const double yr = v[r] * F->urecip[r];
             v[r] = yr;
             W->nflops += F->url[r];
             for (int p = F->urs[r]; p < F->urs[r] + F->url[r]; p++) v[F->uri[p]] -= F->urv[p] * yr;
@@ -804,7 +1138,7 @@ static void btran_u(SxLU *F, SxWs *W, SxVec *y, int hyper) {
         for (int k = 0; k < F->nord; k++) {
             const int r = F->uord[k];
             if (r < 0 || v[r] == 0) continue;
-            const double yr = v[r] / F->udiag[r];
+            const double yr = v[r] * F->urecip[r];
             v[r] = yr;
             W->nflops += F->url[r];
             for (int p = F->urs[r]; p < F->urs[r] + F->url[r]; p++) v[F->uri[p]] -= F->urv[p] * yr;
@@ -859,13 +1193,26 @@ void sxlu_btran(SxLU *F, SxVec *y, double expdens, SxVec *upart) {
     SxWs W0 = own_ws(F), *W = &W0;
     const int m = F->m;
     if (y->cnt < 0) sxv_reindex(y);
-    const int hyper = y->cnt < 0.1 * m && expdens < 0.1;
+    const double ht = hyper_thr(); const int hyper = y->cnt < ht * m && expdens < ht && hy_allow(F, 1);
     btran_u(F, W, y, hyper);
     if (upart) sxv_copy(upart, y);
     if (F->nr) btran_r(F, W, y);
     if (y->cnt >= 0) sxv_prune(y);
-    btran_l(F, W, y, hyper && y->cnt >= 0 && y->cnt < 0.1 * m);
-    F->nflops += W0.nflops;
+    btran_l(F, W, y, hyper && y->cnt >= 0 && y->cnt < ht * m);
+    if (hyper) hy_note(F, 1, W0.nedges);
+    F->nflops += W0.nflops; F->nedges += W0.nedges;
+}
+
+/* only the part of y <- B^{-T} y that the Forrest-Tomlin update needs (the solve with U^T, copied to upart), when the
+ * whole row of B^{-1} is not wanted (the crossover's primal pushes); y is left partly solved */
+void sxlu_btran_upart(SxLU *F, SxVec *y, double expdens, SxVec *upart) {
+    SxWs W0 = own_ws(F), *W = &W0;
+    const int m = F->m;
+    if (y->cnt < 0) sxv_reindex(y);
+    const double ht = hyper_thr(); const int hyper = y->cnt < ht * m && expdens < ht;
+    btran_u(F, W, y, hyper);
+    sxv_copy(upart, y);
+    F->nflops += W0.nflops; F->nedges += W0.nedges;
 }
 
 /* ---------------------------------------------------------------- the Forrest-Tomlin update */
@@ -907,7 +1254,8 @@ int sxlu_update(SxLU *F, int r, SxVec *spike, SxVec *upart, double alpha) {
     if (upart->cnt < 0) sxv_reindex(upart);
     if (spike->cnt < 0) sxv_reindex(spike);
     int p0 = F->rstart[F->nr];
-    if (p0 + upart->cnt + 1 > F->rcap) { F->rcap = 2 * (p0 + upart->cnt) + 1024; F->ridx = xrealloc(F->ridx, sizeof(int) * F->rcap); F->rval = xrealloc(F->rval, sizeof(double) * F->rcap); }
+    if (p0 + upart->cnt + 1 > F->rcap) { F->rcap = 2 * (p0 + upart->cnt) + 1024; F->ridx = xrealloc(F->ridx, sizeof(int) * F->rcap); F->rval = xrealloc(F->rval, sizeof(double) * F->rcap);
+        F->rnext = xrealloc(F->rnext, sizeof(int) * F->rcap); F->reta = xrealloc(F->reta, sizeof(int) * F->rcap); }
     double newd = spike->val[r];
     int p = p0;
     for (int k = 0; k < upart->cnt; k++) {
@@ -916,7 +1264,7 @@ int sxlu_update(SxLU *F, int r, SxVec *spike, SxVec *upart, double alpha) {
         const double z = upart->val[j];
         if (fabs(z) < SX_TINY) continue;
         const double eta = -urr * z;
-        F->ridx[p] = j; F->rval[p] = eta; p++;
+        F->ridx[p] = j; F->rval[p] = eta; F->reta[p] = F->nr; F->rnext[p] = F->rthead[j]; F->rthead[j] = p; F->rtcnt[j]++; p++;
         newd -= eta * spike->val[j];
     }
     F->rpiv[F->nr] = r; F->rstart[F->nr + 1] = p; F->nr++;
@@ -943,7 +1291,7 @@ int sxlu_update(SxLU *F, int r, SxVec *spike, SxVec *upart, double alpha) {
         F->uci[q] = i; F->ucv[q] = s;
         urow_add(F, i, r, s);
     }
-    F->udiag[r] = newd;
+    F->udiag[r] = newd; F->urecip[r] = 1.0 / newd;
     F->nnz_u += F->ucl[r];
     /* the order: r moves to the end */
     F->uord[F->uordpos[r]] = -1;

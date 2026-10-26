@@ -17,8 +17,10 @@ fi
 # 0. the static check (every BL(name) has its BW(name); ISSUES 87): no compiler, no library
 tools/blas64_check.sh || exit 1
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
-# the sources of the MEX file (matlab/build_brisk_mex.m: names, amd/*.c), without the MEX gateway
-SRC=$(sed -n "/^names = {/,/};/p" matlab/build_brisk_mex.m | grep -o "'[a-z0-9_]*\.c'" | tr -d "'")
+# the sources of the MEX file (the Makefile's SRC line, which matlab/build_brisk_mex.m reads since 25 October 2026; amd/*.c),
+# without the MEX gateway
+SRC=$(grep -m1 '^SRC *=' Makefile | sed 's/^SRC *= *//' | tr ' ' '\n' | grep '\.c$')
+[ -n "$SRC" ] || { echo "blas64_test: no SRC line in the Makefile"; exit 1; }
 F="-O2 -fopenmp -std=gnu11 -ffp-contract=off -DHAVE_AMD -DNDEBUG -DBLAS_PREFIX=bk_ -DBLAS64_INT=ptrdiff_t"
 for f in $SRC amd/*.c; do
   X=""; [ "$f" = boundcert.c ] && X="-frounding-math -fno-fast-math"

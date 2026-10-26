@@ -39,6 +39,14 @@ static Int clear_flag (Int wflg, Int wbig, Int W [ ], Int n)
 /* === AMD_2 =============================================================== */
 /* ========================================================================= */
 
+/* (BRISK, 25 October 2026) a cap on the factorization's work, counted as the elimination proceeds (multiply-subtract pairs
+ * for LU plus twice the entries of L): when the calling thread's brisk_amd_cap points to a positive value and the count
+ * passes it, AMD_2 returns at once with brisk_amd_capped set and Info holding the counts so far; the ordering is then not
+ * to be used. The value may be lowered by another thread while the ordering runs (lpsolve.c, the dense-column choice:
+ * an estimate stops once another one has shown that it cannot be chosen). */
+__thread const volatile double *brisk_amd_cap = NULL;
+__thread int brisk_amd_capped = 0;
+
 GLOBAL void AMD_2
 (
     Int n,		/* A is n-by-n, where n > 0 */
@@ -1539,6 +1547,13 @@ GLOBAL void AMD_2
 
 	    /* number of multiply-subtract pairs for LDL' */
 	    nms_ldl += (s + lnzme)/2 ;
+	}
+	if (Info != (double *) NULL && brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lu + 2.0 * lnz > *brisk_amd_cap)
+	{
+	    brisk_amd_capped = 1 ;
+	    Info [AMD_LNZ] = lnz ;
+	    Info [AMD_NMULTSUBS_LU] = nms_lu ;
+	    return ;
 	}
 
 #ifndef NDEBUG

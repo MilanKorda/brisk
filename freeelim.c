@@ -57,6 +57,11 @@ static void row_push(Row *R, uint64_t k, double v) {
 }
 static void row_sort(Row *R) {                  /* sort and merge duplicates */
     if (R->n < 2) return;
+    {   /* 23 October 2026: rows and columns built in key order (constraints and blocks in order) need neither; a
+         * D-optimal design's 2,650 rows of 12,000 entries were sorted one by one */
+        int q = 1; while (q < R->n && R->e[q - 1].k < R->e[q].k) q++;
+        if (q == R->n) return;
+    }
     qsort(R->e, R->n, sizeof(RE), cmp_re);
     int w = 0;
     for (int q = 0; q < R->n; q++) {
@@ -179,6 +184,10 @@ int free_pairs_detect(const Problem *P, FreePair **out) {
         const int n = B->n;
         Row *col = fx(sizeof(Row) * n);
         double *c = fx(sizeof(double) * n);
+        /* 23 October 2026: the columns sized by a count first and filled in place (they were grown by doubling, entry by
+         * entry; a D-optimal design's 12,000 columns of 800 entries: 0.59 s for the detection, called twice) */
+        for (int t = 0; t < B->ncon; t++) for (int q = 0; q < B->A[t].nnz; q++) col[B->A[t].row[q]].cap++;
+        for (int p = 0; p < n; p++) if (col[p].cap) col[p].e = fx(sizeof(RE) * col[p].cap);
         for (int t = 0; t < B->ncon; t++)
             for (int q = 0; q < B->A[t].nnz; q++) row_push(&col[B->A[t].row[q]], (uint64_t)B->con[t], B->A[t].val[q]);
         for (int q = 0; q < B->C.nnz; q++) c[B->C.row[q]] += B->C.val[q];
@@ -266,6 +275,52 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
             static int bc_env = -1; if (bc_env < 0) { const char *e = getenv("BRISK_FEBYCOST"); bc_env = !(e && atoi(e) == 0); }
             if (bc_env && !g_fe_cheaponly && npr <= m) bycost = 1;
             else { cheap = 1; maxfill = 4.0; }
+        }
+    }
+    /* 22 October 2026: the fill-free mode eliminates a pair only through a row whose Markowitz product (live entries - 1)
+     * (column count - 1) is at most maxfill, among the rows within the pivot tolerance of its column; when no pair has
+     * such a row in the data as read, the loop below eliminates nothing and the problem is only rebuilt as it was. One
+     * pass over the entries tells (aopt_90, the owner's benchmark, SDP: 2.5 s of rows built and rebuilt for its one free
+     * variable after the cost model had rejected the full elimination). BRISK_FEPRE=0: the full build always */
+    if (cheap && !(getenv("BRISK_FEPRE") && atoi(getenv("BRISK_FEPRE")) == 0)) {
+        const double g_fepiv_pre = getenv("BRISK_FEPIV") ? atof(getenv("BRISK_FEPIV")) : 0.1;   /* the loop's pivot tolerance */
+        int *rlen = calloc((size_t)m + 1, sizeof(int)), *slot = NULL, *soff = calloc((size_t)nb + 1, sizeof(int));
+        for (int k = 0; k < nb; k++) soff[k + 1] = soff[k] + (P->blk[k].type == BLK_LP ? P->blk[k].n : 0);
+        slot = malloc(sizeof(int) * ((size_t)soff[nb] + 1));
+        for (int q = 0; q < soff[nb]; q++) slot[q] = 0;                       /* 0: not a pair's slot; f + 1: '+'; -(f + 1): '-' */
+        for (int f = 0; f < npr; f++) { slot[soff[pr[f].blk] + pr[f].ip] = f + 1; slot[soff[pr[f].blk] + pr[f].im] = -(f + 1); }
+        int *cn0 = calloc((size_t)npr + 1, sizeof(int)); double *amx = calloc((size_t)npr + 1, sizeof(double));
+        for (int k = 0; k < nb; k++) {
+            const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP;
+            for (int t = 0; t < B->ncon; t++) {
+                const SpSym *S = &B->A[t]; const int r = B->con[t];
+                for (int q = 0; q < S->nnz; q++) {
+                    if (S->val[q] == 0) continue;
+                    const int sl = lp ? slot[soff[k] + S->row[q]] : 0;
+                    if (sl < 0) continue;
+                    rlen[r]++;
+                    if (sl > 0) { cn0[sl - 1]++; amx[sl - 1] = fmax(amx[sl - 1], fabs(S->val[q])); }
+                }
+            }
+        }
+        int any = 0;
+        for (int k = 0; k < nb && !any; k++) {
+            const Block *B = &P->blk[k]; if (B->type != BLK_LP) continue;
+            for (int t = 0; t < B->ncon && !any; t++) {
+                const SpSym *S = &B->A[t]; const int r = B->con[t];
+                for (int q = 0; q < S->nnz; q++) {
+                    const int sl = slot[soff[k] + S->row[q]];
+                    if (sl <= 0 || S->val[q] == 0) continue;
+                    const int f = sl - 1;
+                    if (fabs(S->val[q]) < g_fepiv_pre * amx[f]) continue;
+                    if ((double)(rlen[r] - 1) * (cn0[f] - 1) <= maxfill) { any = 1; break; }
+                }
+            }
+        }
+        free(rlen); free(slot); free(soff); free(cn0); free(amx);
+        if (!any) {
+            if (verbose) printf("presolve: %d free variable(s) (split pairs): none can be eliminated without fill; kept\n", npr);
+            free(pr); return NULL;
         }
     }
     /* ---- rows (and the objective as row m) over entry keys; pairs by their '+' key */
@@ -456,27 +511,61 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         S->row = P->orig ? P->orig[S->row] : S->row;
         for (int q = 0; q < S->nc; q++) S->ce[q] = P->orig ? P->orig[S->ce[q]] : S->ce[q];
     }
-    size_t nt = 0, ct = 1024;
+    /* 23 October 2026: the triplets in the order the rebuild sorts them into, (block, constraint, i, j) with the objective
+     * (constraint -1) first in each block: block by block, each row's segment of the block in key order (a cursor per
+     * row; keys have the block in their top bits), a skipped pair's '-' slot merged into its segment by a sort of the
+     * segment (keys within a row are distinct, so the order is that of the stable sort the rebuild made of the rows as
+     * written before). The arrays sized by a count. A D-optimal design's 18.8 million entries: 3.5 s of sorting and the
+     * arrays' doubling gone. */
+    size_t nt = 0, ct = 1;
+    for (int r = 0; r <= m; r++) {
+        if (r < m && newof[r] < 0) continue;
+        for (int q = 0; q < R[r].n; q++) { const int g = freeof(R[r].e[q].k); if (g >= 0 && elim[g]) continue; ct += g >= 0 ? 2 : 1; }
+    }
     int *tc = malloc(sizeof(int) * ct), *tb = malloc(sizeof(int) * ct), *ti = malloc(sizeof(int) * ct), *tj = malloc(sizeof(int) * ct);
     double *tv = malloc(sizeof(double) * ct);
+    if (!tc || !tb || !ti || !tj || !tv) { fprintf(stderr, "brisk: out of memory\n"); exit(1); }
 #define tput(con_, key_, v_, neg_) do { \
-        if (nt == ct) { ct *= 2; tc = realloc(tc, sizeof(int) * ct); tb = realloc(tb, sizeof(int) * ct); ti = realloc(ti, sizeof(int) * ct); tj = realloc(tj, sizeof(int) * ct); tv = realloc(tv, sizeof(double) * ct); } \
         uint64_t k_ = (key_); int bk_ = KB(k_), i_ = KI(k_), j_ = KJ(k_); double v2_ = (v_); \
         if (neg_) { int g_ = freeof(k_); i_ = j_ = pr[g_].im; v2_ = -v2_; } \
         tc[nt] = (con_); tb[nt] = bk_; ti[nt] = i_; tj[nt] = j_; tv[nt] = v2_; nt++; } while (0)
-    for (int r = 0; r <= m; r++) {
-        if (r < m && newof[r] < 0) continue;
-        const int con = r < m ? newof[r] : -1;
-        for (int q = 0; q < R[r].n; q++) {
-            const uint64_t key = R[r].e[q].k;
-            const int g = freeof(key);
-            if (g >= 0 && elim[g]) continue;            /* cannot happen: eliminated columns are gone */
-            tput(con, key, R[r].e[q].v, 0);
-            if (g >= 0) tput(con, key, R[r].e[q].v, 1);   /* the skipped pair's '-' slot */
-        }
+    {
+        int *cur = fx(sizeof(int) * (m + 1));
+        for (int k = 0; k < nb; k++)
+            for (int rr = -1; rr < m; rr++) {
+                const int r = rr < 0 ? m : rr;               /* the objective's row first */
+                if (r < m && newof[r] < 0) continue;
+                const int con = r < m ? newof[r] : -1;
+                const size_t seg0 = nt; int extra = 0;
+                while (cur[r] < R[r].n && KB(R[r].e[cur[r]].k) == k) {
+                    const uint64_t key = R[r].e[cur[r]].k; const double v = R[r].e[cur[r]].v;
+                    cur[r]++;
+                    const int g = freeof(key);
+                    if (g >= 0 && elim[g]) continue;            /* cannot happen: eliminated columns are gone */
+                    tput(con, key, v, 0);
+                    if (g >= 0) { tput(con, key, v, 1); extra = 1; }   /* the skipped pair's '-' slot */
+                }
+                if (extra && nt - seg0 > 1) {               /* the segment by (i, j): insertion, the segments are rows of one block */
+                    for (size_t a = seg0 + 1; a < nt; a++) {
+                        const int xc = tc[a], xb = tb[a], xi = ti[a], xj = tj[a]; const double xv = tv[a];
+                        size_t b = a;
+                        while (b > seg0 && (ti[b - 1] > xi || (ti[b - 1] == xi && tj[b - 1] > xj))) {
+                            tc[b] = tc[b - 1]; tb[b] = tb[b - 1]; ti[b] = ti[b - 1]; tj[b] = tj[b - 1]; tv[b] = tv[b - 1]; b--;
+                        }
+                        tc[b] = xc; tb[b] = xb; ti[b] = xi; tj[b] = xj; tv[b] = xv;
+                    }
+                }
+            }
+        free(cur);
     }
+    if (fedbg) printf("   [free-elim: %zu triplets written %.2fs]\n", nt, wtime() - tfe0);
     int *bsz = fx(sizeof(int) * (nb + 1));
     for (int k = 0; k < nb; k++) bsz[k] = P->blk[k].type == BLK_LP ? -P->blk[k].n : P->blk[k].n;
+    /* 24 October 2026: the old blocks and the rows are not read from here on: freed before the new problem is built, so
+     * that its blocks reuse their memory instead of pages never touched before (dopt_n56_p24000, SDP with SOCP, 38
+     * million entries: the new LP block took 7.2 s to build, the same block 1.1 s when the file is read) */
+    for (int k = 0; k < nb; k++) block_free_contents(&P->blk[k]);
+    for (int r = 0; r <= m; r++) { free(R[r].e); R[r].e = NULL; }
     double *bn = fx(sizeof(double) * (mn + 1));
     for (int r = 0; r < m; r++) if (newof[r] >= 0) bn[newof[r]] = b[r];
     /* 4.30: rows left numerically dependent by the elimination (roa_acrobot_d6_K: 3 of 3112,
@@ -574,8 +663,9 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         } else { free(F->lpmap); F->lpmap = NULL; }
         free(used);
     }
+    if (fedbg) printf("   [free-elim: LP slots compacted %.2fs]\n", wtime() - tfe0);
     problem_from_trips(&Q, mn, nb, bsz, bn, nt, tc, tb, ti, tj, tv);
-    for (int k = 0; k < nb; k++) block_free_contents(&P->blk[k]);
+    if (fedbg) printf("   [free-elim: problem built from the triplets %.2fs]\n", wtime() - tfe0);
     free(P->blk); free(P->b); free(P->b0); free(P->orig);
     P->blk = Q.blk; P->b = Q.b; P->b0 = Q.b0; P->m = mn;
     P->orig = fx(sizeof(int) * (mn + 1));

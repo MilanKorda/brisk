@@ -606,8 +606,10 @@ static void prec_apply(MF *S, const double *r, double *z) {
 /* PCG on M x = h; stop on the P^-1-norm residual relative to that of h */
 /* rabs > 0: the residual-controlled rule (5.5): stop when the true residual |h - M x|_2 <= rabs
  * and the P^-1-norm residual is below tol (tol is then the loose 1e-2: a direction, not a guess);
- * rabs = 0: stop on the P^-1-norm residual alone. *r2_out: the final |h - M x|_2. */
-static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double tmax, double *res_out, int warm, double rabs, double *r2_out) {
+ * rabs = 0: stop on the P^-1-norm residual alone. *r2_out: the final |h - M x|_2. tend: the clock time (wtime) at which
+ * the solve stops (HUGE_VAL: none; 24 October 2026, ISSUES 274: a clock time instead of a duration computed once for both
+ * solves of an iteration); it also stops on the user's interrupt. */
+static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double tend, double *res_out, int warm, double rabs, double *r2_out) {
     const int m = S->m;
     double *r = mx(sizeof(double) * m), *z = mx(sizeof(double) * m), *p = mx(sizeof(double) * m), *q = mx(sizeof(double) * m);
     memcpy(r, h, sizeof(double) * m);
@@ -625,7 +627,6 @@ static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double 
         else if (res < tol && (rabs <= 0 || sqrt(dotn(m, r, r)) <= rabs)) { S->ncg += 0; if (r2_out) *r2_out = sqrt(dotn(m, r, r)); free(r); free(z); free(p); free(q); *res_out = res; return 0; }
     } else memset(x, 0, sizeof(double) * m);
     memcpy(p, z, sizeof(double) * m);
-    const double t0 = wtime();
     for (k = 1; k <= maxit; k++) {
         matvec(S, p, q);
         const double pq = dotn(m, p, q);
@@ -636,7 +637,7 @@ static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double 
         const double rz2 = dotn(m, r, z);
         res = sqrt(fabs(rz2)) / nb;
         if (res < tol && (rabs <= 0 || sqrt(dotn(m, r, r)) <= rabs)) break;
-        if (tmax > 0 && wtime() - t0 > tmax) break;
+        if (brisk_stop_flag || wtime() > tend) break;
         const double be = rz2 / rz; rz = rz2;
         for (int i = 0; i < m; i++) p[i] = z[i] + be * p[i];
     }
@@ -724,6 +725,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
     for (int k = 0; k < nb; k++) best_X[k] = mx(sizeof(double) * blen(&S.b[k]));
     int nstall = 0, cg_capped = 0, best_it = 0, last_cg[2] = { 0, 0 };
     int trial_stop = 0;
+    double t_setup_last = 0;              /* the last iteration's scaling and preconditioner, seconds (ISSUES 289) */
     const int sdir = !proj && getenv("BRISK_MFNOSDIR") == NULL;
     for (it = 0; it < par->maxit; it++) {
         /* residuals */
@@ -764,6 +766,9 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 break;
             }
             if (brisk_time_up(par)) { status = ST_TIME; break; }
+            /* 25 October 2026 (ISSUES 289): the scaling and the preconditioner below are not interrupted; they are not
+             * started when their last measured duration does not fit in the time left */
+            if (par->timelimit > 0 && t_setup_last > 0 && wtime() + t_setup_last > par->t_start + par->timelimit) { status = ST_TIME; break; }
             if (nstall >= par->mf_stall) {
                 if (verbose > 0) printf("matrix-free IPM: no progress in %d iterations with the CG budget exhausted (best %.1e at iteration %d): stopping\n", nstall, best_merit, best_it);
                 status = ST_MAXIT; break;
@@ -771,21 +776,51 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
         }
         /* NT scaling, W Rd W, preconditioner */
         double tn = wtime();
+        /* 25 October 2026 (ISSUES 289): with a time limit, a semidefinite block's scaling is not begun when its duration,
+         * predicted from the seconds per n^3 of the blocks scaled before it in this iteration, does not fit in the time
+         * left; nor is the preconditioner, whose eigendecompositions are of the same blocks, when this iteration's
+         * scaling time does not fit. Neither can be interrupted, and at the first iteration no earlier duration is
+         * known (pglib_opf_case4661_sdet, SDP: the scaling of its block of order 9,322 takes 276 s and the
+         * preconditioner 213 s, both begun 2 s into a 300 s limit) */
+        const double tdead = par->timelimit > 0 ? par->t_start + par->timelimit : HUGE_VAL;
+        double nt_n3 = 0, nt_sec = 0;
         for (int k = 0; k < nb; k++) {
             MB *b = &S.b[k];
+            const double nk = b->n;
+            if (tdead < HUGE_VAL && b->type == BLK_SDP && nt_n3 > 0 && wtime() + nt_sec / nt_n3 * nk * nk * nk > tdead) {
+                if (verbose > 0) printf("matrix-free IPM: the scaling of block %d (order %d) would take about %.0f s, more than the %.0f s left: stopped by the time limit\n",
+                                        k + 1, b->n, nt_sec / nt_n3 * nk * nk * nk, fmax(0.0, tdead - wtime()));
+                status = ST_TIME; goto done;
+            }
+            const double tb = wtime();
             const int e = nt_block(b);
             if (e) { if (verbose >= 0) printf("matrix-free IPM: block %d: %s not positive definite\n", k + 1, e == 1 ? "X" : e == 2 ? "Z" : "L'ZL"); status = ST_NUMERIC; goto done; }
             wvw(b, b->Rd, b->E0, b->T2);
+            if (b->type == BLK_SDP) { nt_n3 += nk * nk * nk; nt_sec += wtime() - tb; }
         }
         S.t_nt += wtime() - tn;
+        if (tdead < HUGE_VAL && wtime() + (wtime() - tn) > tdead) {
+            if (verbose > 0) printf("matrix-free IPM: the preconditioner would take about %.0f s (as the scaling did), more than the %.0f s left: stopped by the time limit\n",
+                                    wtime() - tn, fmax(0.0, tdead - wtime()));
+            status = ST_TIME; goto done;
+        }
         double kk = 0; prec_setup(&S, par, &kk);
+        t_setup_last = wtime() - tn;
         double kbulk = 0; for (int k = 0; k < nb; k++) if (S.b[k].type == BLK_SDP) kbulk = fmax(kbulk, S.b[k].kbulk);
         const double cgtol = fmin(par->mf_cgtol_max, fmax(par->mf_cgtol_min, 1e-2 * mu / mu0));
-        double tleft = par->timelimit > 0 ? par->timelimit - (wtime() - par->t_start) : 0;
-        if (par->mf_cgtime > 0 && (tleft <= 0 || par->mf_cgtime < tleft)) tleft = par->mf_cgtime;   /* 4.35: a solve may not take longer than this */
         int cgk[2] = { 0, 0 }; double cgres[2] = { 0, 0 };
         double ap = 0, ad = 0, sigma = 0;
+        int time_out = 0;
         for (int stage = 0; stage < 2; stage++) {
+            /* 24 October 2026 (ISSUES 274): the deadline of this stage's solve, taken when it starts: the run's time
+             * limit, or the cap of one solve (-mfcgtime, 4.35) when that comes first. The time left was computed once
+             * for both solves, so that the corrector's could take as long again as the predictor's, and a time already
+             * spent (by the preconditioner) gave the solve no limit at all: pglib_opf_case4661_sdet (SDP) ran 1,290 s
+             * of its 900 s before its first iteration ended. A solve that would start after the limit is not started,
+             * and the iteration ends with the time limit as at its start. */
+            if (brisk_time_up(par)) { time_out = 1; break; }
+            double tend = par->timelimit > 0 ? par->t_start + par->timelimit : HUGE_VAL;
+            if (par->mf_cgtime > 0) tend = fmin(tend, wtime() + par->mf_cgtime);
             /* Rc: predictor -X; corrector from Mehrotra's NT-scaled formula */
             for (int k = 0; k < nb; k++) {
                 MB *b = &S.b[k]; const int n = b->n; const size_t len = blen(b);
@@ -830,12 +865,17 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             /* 5.7: inside the first attempt of the automatic choice (main.c) a solve gets mf_trial CG
              * steps while the iterate is far from optimal, and the attempt ends when it needs more */
             const int trial_far = par->mf_trial && fmax(gap, fmax(pinf, dinf)) > 1e-6;
-            cgk[stage] = pcg(&S, h, dyv, proj ? cgtol : 1e-2, trial_far && par->mf_cgmax > par->mf_trial ? par->mf_trial : par->mf_cgmax, tleft > 0 ? tleft : 0, &cgres[stage], stage == 1 && par->mf_warm, rabs, &r2);
+            cgk[stage] = pcg(&S, h, dyv, proj ? cgtol : 1e-2, trial_far && par->mf_cgmax > par->mf_trial ? par->mf_trial : par->mf_cgmax, tend, &cgres[stage], stage == 1 && par->mf_warm, rabs, &r2);
             if (proj ? cgres[stage] > cgtol : r2 > rabs) cg_capped = 1;
             if (trial_far && cgk[stage] >= par->mf_trial && (proj ? cgres[stage] > cgtol : r2 > rabs)) trial_stop = 1;
             tot_cg += cgk[stage];
             if (par->mf_trial && par->mf_trial_total > 0 && S.nmv > par->mf_trial_total) trial_stop = 2;
             if (trial_stop) break;
+            /* 25 October 2026 (ISSUES 289): a solve that the time limit stopped ends the iteration here, as a limit reached
+             * at its start does (the best iterate is returned): the direction's assembly and the step lengths after it are
+             * dense work on every block, minutes on a block of order 9,321 (pglib_opf_case4661_sdet, SDP: 1,182 s of a
+             * 900 s run, zero iterations ended) */
+            if (brisk_time_up(par)) { time_out = 1; break; }
             /* dZ = Rd - A*(dy); dX = Rc - W dZ W; exact projection */
             for (int k = 0; k < nb; k++) {
                 MB *b = &S.b[k]; const size_t len = blen(b);
@@ -896,6 +936,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                 if (fmin(a1, a2) < 0.3) sigma = fmax(sigma, fmin(a1, a2) < 0.1 ? 0.5 : 0.2);     /* short affine step: recentre */
             }
         }
+        if (time_out) { status = ST_TIME; break; }
         if (trial_stop) {
             if (verbose > 0) { if (trial_stop == 1) printf("matrix-free IPM: a solve needs more than %d CG steps at iteration %d: the interior-point method with the factored Schur complement is cheaper\n", par->mf_trial, it);
                                else printf("matrix-free IPM: %ld products at iteration %d, a quarter of the solve with the factored Schur complement: stopping\n", S.nmv, it); }

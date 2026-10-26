@@ -29,6 +29,10 @@ typedef struct {
     int *rsgn;                      /* its sign there: y_orig = rsgn * y_std */
 } LpMap;
 int  lp_read_mps(const char *fname, LpProb *L, char *msg, size_t nmsg);
+/* the mixed-integer program of an MPS file: lp_read_mps, and *isint (n, allocated; 1 for an integer column) read in the
+ * same pass; an integer column of a marker section (INTORG / INTEND) with no bound in BOUNDS is binary, [0, 1], as
+ * MIPLIB 2017's solution checker and Gurobi read it (lp_read_mps leaves it [0, +inf)). Returns as lp_read_mps. */
+int  lp_read_mps_mip(const char *fname, LpProb *L, signed char **isint, char *msg, size_t nmsg);
 void lp_free(LpProb *L);
 /* presolve (level 0: none) and standard form; S and M are allocated */
 int  lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M);
@@ -45,4 +49,5 @@ int  lp_is_mps(const char *fname);
  * the objective of the file is +-(c'x) + c0 (maxim: the file maximizes, c is negated) */
 int  cbf_is_file(const char *fname);
 int  cbf_read(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, char *msg, size_t nmsg);
+int  cbf_read_ex(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, int **intcol, signed char **intsgn, char *msg, size_t nmsg);
 #endif

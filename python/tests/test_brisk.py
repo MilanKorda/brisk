@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.5.5"
+    assert brisk.version() == "1.6"
     assert os.path.exists(brisk.library_path())
 
 
@@ -242,6 +242,29 @@ def test_ctrl_c():
 cp = pytest.importorskip("cvxpy")
 from brisk.cvxpy_solver import cone_program_to_sdpa  # noqa: E402
 
+
+
+def test_ctrl_c_before_the_library_starts():
+    """(24 October 2026, ISSUES 272) a Ctrl-C after the solve was handed to the worker thread and before the library
+    starts it: the worker held back 0.3 s, the signal at 0.1 s; the solve must stop at once (the library cleared such
+    an interrupt when it started, and the solve ran to its end)."""
+    code = textwrap.dedent(f"""
+        import os, signal, threading, sys, time
+        sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
+        import brisk, test_brisk as T
+        from brisk import _core
+        class SlowStart(_core._Worker):
+            def _loop(self):
+                while True:
+                    job = self.jobs.get(); time.sleep(0.3); job()
+        _core._worker = SlowStart()
+        d = T.maxcut_sdpa(150)
+        threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+        r = brisk.solve_sdpa(**d, options=T.LONG, verbose=False)
+        print("RESULT", r.status_str, r.interrupted, flush=True)
+    """)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert "RESULT INTERRUPTED True" in out.stdout, out.stdout + out.stderr
 
 def _rng(seed):
     return np.random.default_rng(seed)
@@ -934,3 +957,182 @@ def test_a_priori_bounds_without_a_margin(tmp_path):
     r = brisk.solve_file(str(g), {"acc": "high"}, verbose=False)
     cd = brisk.certify(str(g), "d", y=r.y + 1e-4)
     assert cd["certified"] and cd["bound"] <= r.pobj + 1e-7 * (1 + abs(r.pobj))
+
+
+# ---- convex QPs (brisk.solve_qp; 22 October 2026) ----------------------------------------------------------------------
+def _hs21():
+    # min 0.01 x1^2 + x2^2 - 100  s.t.  10 x1 - x2 >= 10,  2 <= x1 <= 50,  -50 <= x2 <= 50;  optimum -99.96 at (2, 0)
+    return dict(P=np.diag([0.02, 2.0]), q=[0.0, 0.0], A=[[10.0, -1.0]], l=[10.0], u=None, lb=[2.0, -50.0], ub=[50.0, 50.0], c0=-100.0)
+
+
+def test_qp_hs21():
+    r = brisk.solve_qp(**_hs21(), verbose=False)
+    assert r.status == 0 and r.status_str == "OPTIMAL"
+    assert abs(r.obj - (-99.96)) < 1e-7
+    assert np.allclose(r.x, [2.0, 0.0], atol=1e-6)
+    assert np.all(r.errors <= 1e-8)
+
+
+def test_qp_multipliers_stationarity():
+    rng = np.random.default_rng(3)
+    n, m = 30, 20
+    M = rng.standard_normal((n, n))
+    P = M @ M.T + 0.1 * np.eye(n)
+    q = rng.standard_normal(n)
+    A = rng.standard_normal((m, n))
+    l = -rng.random(m); u = rng.random(m)
+    r = brisk.solve_qp(P, q, A, l, u, lb=-np.ones(n), ub=np.ones(n), verbose=False)
+    assert r.status == 0
+    res = P @ r.x + q - A.T @ r.y - r.z
+    assert np.max(np.abs(res)) <= 1e-6 * (1 + np.max(np.abs(q)))
+    assert np.all(A @ r.x >= l - 1e-7) and np.all(A @ r.x <= u + 1e-7)
+
+
+def test_qp_triangle_and_lp():
+    import scipy.sparse as sp
+    d = _hs21()
+    full = brisk.solve_qp(**d, verbose=False)
+    d2 = dict(d); d2["P"] = sp.triu(sp.csc_matrix(d["P"]))          # one triangle is accepted
+    assert abs(brisk.solve_qp(**d2, verbose=False).obj - full.obj) < 1e-9
+    lp = brisk.solve_qp(None, [1.0, 1.0], [[1.0, 1.0]], [1.0], None, [0.0, 0.0], None, verbose=False)   # an LP
+    assert lp.status == 0 and abs(lp.obj - 1.0) < 1e-7
+
+
+def test_qp_infeasible():
+    r = brisk.solve_qp(np.eye(2), [0.0, 0.0], [[1.0, 1.0]], [3.0], None, [0.0, 0.0], [1.0, 1.0], verbose=False)
+    assert r.status == 1, r.status_str
+
+
+def test_qp_not_convex():
+    # (24 October 2026) min x1 x2 over a box: a product without square terms, refused before any method (status -1, not
+    # solved); until then the interior-point method reported OPTIMAL at 0 against the minimum -1
+    r = brisk.solve_qp([[0.0, 1.0], [1.0, 0.0]], [0.0, 0.0], [[1.0, 1.0]], None, [1.5], [-1.0, -1.0], [1.0, 1.0], verbose=False)
+    assert r.status == -1 and r.status_str == "NOT SOLVED", (r.status, r.status_str)
+
+
+def test_qp_active_set_and_file(tmp_path):
+    d = _hs21()
+    r = brisk.solve_qp(**d, options=["-qpas"], verbose=False)
+    assert r.status == 0 and abs(r.obj - (-99.96)) < 1e-7
+    f = tmp_path / "hs21.qps"
+    f.write_text(textwrap.dedent("""\
+        NAME          HS21
+        ROWS
+         N  obj
+         G  c1
+        COLUMNS
+            x1        c1          10.0
+            x2        c1          -1.0
+        RHS
+            rhs       obj         100.0
+            rhs       c1          10.0
+        BOUNDS
+         LO bnd       x1          2.0
+         UP bnd       x1          50.0
+         LO bnd       x2          -50.0
+         UP bnd       x2          50.0
+        QUADOBJ
+            x1        x1          0.02
+            x2        x2          2.0
+        ENDATA
+        """))
+    rf = brisk.solve_file(str(f), verbose=False)
+    assert isinstance(rf, brisk.QpResult) and rf.status == 0 and abs(rf.obj - (-99.96)) < 1e-7
+
+
+def test_cvxpy_qp_solver():
+    cp = pytest.importorskip("cvxpy")
+    rng = np.random.default_rng(1)
+    n, m = 30, 15
+    M = rng.standard_normal((40, n)); b0 = rng.standard_normal(40)
+    A = rng.standard_normal((m, n)); c = A @ (0.1 * rng.standard_normal(n)); F = rng.standard_normal((10, n))
+    x = cp.Variable(n, bounds=[-1, 1])
+    cons = [A @ x == c, F @ x <= 0.1, cp.sum(x) >= 0.5]
+    prob = cp.Problem(cp.Minimize(cp.sum_squares(M @ x - b0) + 0.3 * cp.sum(x) + 7), cons)
+    vals, duals = [], []
+    for kw in ({}, {"active_set": True}):
+        vals.append(prob.solve(solver=brisk.BRISK_QP(), **kw)); duals.append(np.concatenate([cons[1].dual_value, [cons[2].dual_value]]))
+        assert prob.status == "optimal"
+    ref = prob.solve(solver="CLARABEL")
+    rd = np.concatenate([cons[1].dual_value, [cons[2].dual_value]])
+    for v, d in zip(vals, duals):
+        assert abs(v - ref) <= 1e-6 * (1 + abs(ref)) and np.max(np.abs(d - rd)) <= 1e-4 * (1 + np.max(np.abs(rd)))
+
+
+def test_cvxpy_qp_infeasible_unbounded():
+    cp = pytest.importorskip("cvxpy")
+    y = cp.Variable(2)
+    p = cp.Problem(cp.Minimize(cp.sum_squares(y)), [y >= 1, cp.sum(y) <= 1]); p.solve(solver=brisk.BRISK_QP())
+    assert p.status == "infeasible"
+    z = cp.Variable(2)
+    p = cp.Problem(cp.Minimize(z[0] - z[1]), [z >= 0]); p.solve(solver=brisk.BRISK_QP())
+    assert p.status == "unbounded"
+
+
+def test_qp_model_warm_branch_and_bound():
+    rng = np.random.default_rng(2)
+    n = 10
+    M = rng.standard_normal((n, n)); P = M @ M.T + np.eye(n); q = rng.standard_normal(n) * 5
+    lb0, ub0 = np.zeros(n), np.full(n, 5.0)
+    keep = lb0.copy()
+    res = {}
+    for aset in (True, False):
+        mdl = brisk.QpModel(P, q, np.ones((1, n)), [10.0], [10.0], lb0, ub0, active_set=aset)
+        best = [np.inf]; its = [0]
+
+        def bb(lb, ub):
+            for j in range(n):
+                mdl.set_var_bounds(j, lb[j], ub[j])
+            r = mdl.solve(); its[0] += r.iterations
+            if r.status != 0 or r.obj >= best[0] - 1e-9:
+                return
+            f = np.abs(r.x - np.round(r.x)); j = int(np.argmax(f))
+            if f[j] < 1e-6:
+                best[0] = r.obj; return
+            u2 = ub.copy(); u2[j] = np.floor(r.x[j]); bb(lb, u2)
+            l2 = lb.copy(); l2[j] = np.ceil(r.x[j]); bb(l2, ub)
+        bb(lb0.copy(), ub0.copy())
+        res[aset] = (best[0], its[0]); mdl.close()
+    assert abs(res[True][0] - res[False][0]) <= 1e-6 * (1 + abs(res[False][0]))
+    assert np.array_equal(lb0, keep)                     # the caller's arrays untouched
+    m2 = brisk.QpModel(P, q, np.ones((1, n)), [10.0], [10.0], lb0, ub0)
+    r1 = m2.solve(); m2.set_cost(q + 1.0); r2 = m2.solve()
+    assert r1.status == 0 and r2.status == 0 and abs(r2.obj - brisk.solve_qp(P, q + 1.0, np.ones((1, n)), [10.0], [10.0], lb0, ub0, verbose=False).obj) <= 1e-7 * (1 + abs(r2.obj))
+
+
+def test_socp_model_warm_branch_and_bound():
+    # the nearest integer point to p in the plane, min t, (t, x - p) in a second-order cone, x integer: branch and bound
+    # on the SOCP model, each node warm from the last optimal point, against enumeration; then the cutoff
+    import scipy.sparse as sp
+    p = np.array([0.3, 0.6])
+    A = sp.csc_matrix(np.array([[-1.0, 0, 0, 1.0, 0], [0, -1.0, 0, 0, 1.0]]))
+    b = -p; c = np.array([0, 0, 1.0, 0, 0]); K = {"f": 2, "q": [3]}
+    mdl = brisk.SocpModel(A, b, c, K)
+    r0 = mdl.solve()
+    assert r0.status == 0 and abs(r0.pobj) <= 1e-6
+    best = [np.inf, None]; nodes = [0]
+
+    def bb(lo, hi):
+        for j in range(2):
+            mdl.set_var_bounds(j, lo[j], hi[j])
+        r = mdl.solve(); nodes[0] += 1
+        if r.status != 0 or r.pobj >= best[0] - 1e-9:
+            return
+        x = r.x[:2]; f = np.abs(x - np.round(x)); j = int(np.argmax(f))
+        if f[j] < 1e-6:
+            best[0], best[1] = r.pobj, np.round(x); return
+        pt = mdl.save_point()                  # each child from its parent's point
+        h2 = hi.copy(); h2[j] = np.floor(x[j]); bb(lo, h2)
+        mdl.restore_point(pt)
+        l2 = lo.copy(); l2[j] = np.ceil(x[j]); bb(l2, hi)
+    bb(np.full(2, -np.inf), np.full(2, np.inf))
+    assert abs(best[0] - 0.5) <= 1e-6 and np.array_equal(best[1], [0.0, 1.0]), (best, nodes)
+    # the cutoff: with x1 >= 1 the node's value 0.7 exceeds 0.5, the solve stops (status 9)
+    mdl.set_var_bounds(0, lo=1.0, hi=np.inf); mdl.set_var_bounds(1, lo=-np.inf, hi=np.inf); mdl.set_cutoff(0.5)
+    assert mdl.solve().status == 9
+    mdl.set_cutoff(np.inf)
+    r = mdl.solve()
+    assert r.status == 0 and abs(r.pobj - 0.7) <= 1e-6
+    with pytest.raises(ValueError):
+        brisk.SocpModel(A, b, c, {"f": 2, "l": 1, "q": [3]})
+    mdl.close()

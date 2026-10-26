@@ -39,8 +39,14 @@ o = p.Results;
 
 here = fileparts(mfilename('fullpath'));
 src = fullfile(here, '..');
-names = {'problem.c', 'presolve.c', 'postsolve.c', 'dictroute.c', 'chordal.c', 'freeelim.c', ...
-         'dualize.c', 'momaff.c', 'blkscale.c', 'fom.c', 'mfipm.c', 'lralm.c', 'bm.c', 'bmip.c', 'symred.c', 'symalg.c', 'sparsechol.c', 'dualscale.c', 'ddend.c', 'crossover.c', 'solver.c', 'bound.c', 'boundcert.c', 'hpmp.c', 'hpsolve.c', 'socp.c', 'sedumi.c', 'lpio.c', 'lpsolve.c', 'nd.c', 'simplex.c', 'simplex_lu.c', 'simplex_pre.c', 'main.c'};
+% (25 October 2026) the solver's C files as the Makefile's SRC line lists them (the OpenMP runtime's sources, $(OMPSRC),
+% added below when needed): a second list kept here went stale when the QP and QCQP solvers were added, and the MEX file
+% then failed to load (an undefined symbol, qcqp_socp)
+mk = fileread(fullfile(src, 'Makefile'));
+tok = regexp(mk, '(?m)^SRC\s*=\s*([^\n]*)', 'tokens', 'once');
+if isempty(tok), error('brisk:build', 'no SRC line in %s', fullfile(src, 'Makefile')); end
+names = regexp(tok{1}, '\S+', 'match');
+names = names(cellfun(@(f) numel(f) > 2 && strcmp(f(end-1:end), '.c'), names));
 files = [cellfun(@(f) fullfile(src, f), names, 'UniformOutput', false), {fullfile(here, 'brisk_mex.c')}];
 for k = 1:numel(files)
     if ~exist(files{k}, 'file'), error('brisk:build', 'missing source file %s', files{k}); end

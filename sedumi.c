@@ -408,6 +408,7 @@ static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nm
         else if (!strcmp(a, "-acc") && i + 1 < argc) { const char *l = argv[++i]; o->tol = !strcmp(l, "low") ? 1e-6 : !strcmp(l, "high") ? 1e-10 : 1e-8; }
         else if (!strcmp(a, "-maxit") && i + 1 < argc) o->maxit = atoi(argv[++i]);
         else if (!strcmp(a, "-timelimit") && i + 1 < argc) o->timelimit = atof(argv[++i]);
+        else if (!strcmp(a, "-coneretry") && i + 1 < argc) o->noretry = atoi(argv[++i]) == 0;     /* (internal: the QCQP route's call, qcqp.c; the command line does not take it) */
         else if (!strcmp(a, "-threads") && i + 1 < argc) {
 #ifdef _OPENMP
             const int k = atoi(argv[i + 1]); if (k > 0) omp_set_num_threads(k);
@@ -559,7 +560,14 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
     BriskResult B; memset(&B, 0, sizeof B);
     char **av = (char **)malloc(sizeof(char *) * ((size_t)argc + 1)); int ac = 0;      /* the options without -conesolver */
     for (int i = 0; i < argc; i++) { if (argv[i] && !strcmp(argv[i], "-conesolver") && i + 1 < argc) { i++; continue; } av[ac++] = argv[i]; }
+    /* 23 October 2026: the cones' blocks come back as their cone vectors when the solve kept them so (main.c, g_xcone_res):
+     * no n x n completion of a cone of order 17,012 (the owner's dg3d_1000, SDP with SOCP) only to read its trace and
+     * first row here */
+    const int acc_prev = g_xcone_accept;
+    g_xcone_accept = 1; free(g_xcone_res); g_xcone_res = NULL;
     const int rc = run_sdp(&D, ac, av, &B);
+    g_xcone_accept = acc_prev;
+    int *xcr = g_xcone_res; g_xcone_res = NULL;
     free(av);
     R->exit_code = rc;
     if (B.status >= 0 && B.y) {
@@ -576,9 +584,17 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
             for (int j = 0; j < P->nl; j++, col++) (xo)[col] = xl[2 * P->nf + j]; \
             for (int k = 0; k < ncone; k++) { \
                 const int d = bs[blk_cone0 - 1 + k]; const double *X = (XB)[blk_cone0 - 1 + k]; \
-                double tr = 0; for (int i = 0; i < d; i++) tr += X[(size_t)i * d + i]; \
-                (xo)[col] = tr; \
-                for (int t = 1; t < d; t++) (xo)[col + t] = 2.0 * X[(size_t)t * d]; \
+                const int hv = xcv && d > 1 ? xcv[blk_cone0 - 1 + k] : -1; \
+                double *Xtmp = NULL; \
+                if (hv == 0) { for (int t = 0; t < d; t++) (xo)[col + t] = X[t]; }   /* the cone vector itself (hub 0, as written above) */ \
+                else { \
+                if (hv > 0) { Xtmp = (double *)malloc(sizeof(double) * ((size_t)d * d + 1)); if (Xtmp) xc_complete(d, hv, X, Xtmp); X = Xtmp; } \
+                double tr = 0, trc = 0; /* (compensated: the completion's diagonal holds x_0 / 2 at the hub and n - 1 small terms) */ \
+                if (X) for (int i = 0; i < d; i++) { const double v_ = X[(size_t)i * d + i], t_ = tr + v_; trc += fabs(tr) >= fabs(v_) ? (tr - t_) + v_ : (v_ - t_) + tr; tr = t_; } \
+                (xo)[col] = tr + trc; \
+                for (int t = 1; t < d; t++) (xo)[col + t] = X ? 2.0 * X[(size_t)t * d] : 0.0; \
+                free(Xtmp); \
+                } \
                 if (k >= P->nq) { const double a = (xo)[col], b2 = (xo)[col + 1]; (xo)[col] = rs * (a + b2); (xo)[col + 1] = rs * (a - b2); } \
                 col += d; \
             } \
@@ -586,17 +602,18 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
             for (int k = 0; k < P->ns; k++) { \
                 const int d = P->s[k]; \
                 if (d == 1) { (xo)[col++] = xl[slot++]; continue; } \
-                memcpy((xo) + col, (XB)[kb2], sizeof(double) * (size_t)d * d); \
+                if (xcv && xcv[kb2] >= 0) xc_complete(d, xcv[kb2], (XB)[kb2], (xo) + col);   /* (a K.s block with arrow data) */ \
+                else memcpy((xo) + col, (XB)[kb2], sizeof(double) * (size_t)d * d); \
                 col += d * d; kb2++; \
             } \
         } while (0)
-        if (B.have_x && B.X) SD_MAP_X(B.X, R->x);
+        { const int *xcv = xcr; if (B.have_x && B.X) SD_MAP_X(B.X, R->x); }
         for (int s = 0; s < 2; s++) {
             R->bnd[s].asked = B.bnd[s].asked; R->bnd[s].have = B.bnd[s].have; R->bnd[s].valid = B.bnd[s].valid; R->bnd[s].certified = B.bnd[s].certified;
             R->bnd[s].value = B.bnd[s].value; R->bnd[s].resid = B.bnd[s].resid; R->bnd[s].lammin = B.bnd[s].lammin; R->bnd[s].rigorous = B.bnd[s].rigorous;
             memcpy(R->bnd[s].src, B.bnd[s].src, sizeof(R->bnd[s].src));
         }
-        if (B.bnd[0].X) { R->bnd[0].x = (double *)calloc((size_t)n + 1, sizeof(double)); SD_MAP_X(B.bnd[0].X, R->bnd[0].x); }
+        if (B.bnd[0].X) { const int *xcv = NULL; R->bnd[0].x = (double *)calloc((size_t)n + 1, sizeof(double)); SD_MAP_X(B.bnd[0].X, R->bnd[0].x); }
         if (B.bnd[1].y) { R->bnd[1].y = (double *)malloc(sizeof(double) * ((size_t)m + 1)); memcpy(R->bnd[1].y, B.bnd[1].y, sizeof(double) * (size_t)m); }
 #undef SD_MAP_X
         /* z = c - A'y */
@@ -606,6 +623,7 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
         if (!B.have_x) R->pobj = B.pobj;
     }
     brisk_result_free(&B);
+    free(xcr);
     free(bs); free(tm); free(tb); free(ti); free(tj); free(tv);
     return rc;
 }

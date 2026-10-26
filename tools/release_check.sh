@@ -14,9 +14,11 @@ have() { command -v "$1" > /dev/null 2>&1; }
 JULIA=${JULIA:-$(command -v julia || ls "$HOME"/tools/julia-*/bin/julia 2>/dev/null | head -1)}
 echo "release_check: $(pwd), log in $LOG"
 run "build (solver, library)"                make -s brisk libbrisk
-run "examples (as the public CI)"             bash -c 'for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat; do [ "$f" = examples/pop_wood_20.dat-s ] && continue; ./brisk "$f" -q || { echo "$f failed"; exit 1; }; done'
-run "command-line suites (R1, R4)"           make hpredtest restoretest advicetest frtest bindtest
+run "examples (as the public CI)"             bash -c 'for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat examples/*.qps; do [ "$f" = examples/pop_wood_20.dat-s ] && continue; ./brisk "$f" -q || { echo "$f failed"; exit 1; }; done'
+run "command-line suites (R1, R4)"           make hpredtest restoretest advicetest frtest bindtest timetest
+run "-threads on every LP method (R11)"       bash -c 'for k in 2 3 4 5; do ./brisk examples/afiro.mps -lpmethod $k -threads 1 -v | grep -q "^Number of threads: 1" || { echo "-lpmethod $k ignores -threads"; exit 1; }; done'
 run "C API (R5)"                              make capitest
+run "QP solver and the readers"               make qptest readertest
 run "Python and CVXPY"                        make pytest
 run "MATLAB's ILP64 BLAS layer (R2, R3)"      make blas64test
 run "library under AddressSanitizer (R5)"     make asantest

@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.5.5"
+#define BRISK_VERSION "1.6"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -157,6 +157,13 @@ typedef struct Block {
     int allweyl;         /* 5.18 (ISSUES 96a): every constraint a symmetric Weyl operator of Z_2^p (n = 2^p), A[c ^ wx, c] =
                             wk (-1)^(wz . c): the pairs by Walsh-Hadamard transforms of the XOR diagonals of X A_a Zi */
     int *wx, *wz; double *wk;   /* per sparse constraint (slist order) */
+    int wpd;             /* 23 October 2026: the Weyl constraints are the real form of Pauli constraints on a Hermitian block: the
+                            route's products in complex arithmetic of order n/2 (weylpd.c, schur_weyl_pd) */
+    int wpd_k;           /* the index bit of the real form (real and imaginary parts) */
+    int *wpd_ap;         /* per sparse constraint its packed Pauli index ax (n/2) + az on the other bits */
+    unsigned char *wpd_t;              /* per sparse constraint: whether its factor carries i */
+    int *ltr_off, *ltr_t; double *ltr_v; /* 23 October 2026: a large LP block's entries by variable (rows of A'), in constraint
+                                            order, so that A'y runs on the threads with each sum in the serial order */
     int allmono;         /* 16 October 2026 (ISSUES 96a): every constraint of the block a monomial matrix (one entry per row and column): the products X A_a Zi batched into one BLAS-3 call per chunk, the pairs by gathers */
     double asm_cost;     /* estimated work of the block's Schur assembly by the chosen routes, in BLAS-3 flops (0 for the low-rank route) */
     int nd, ns;          /* number of dense / sparse constraints */
@@ -267,6 +274,7 @@ typedef struct {
     int hsd_sig;         /* sigma-search candidates (the corrector family is affine in sigma) */
     double hsd_pshrink;
     int hsd_refine, hsd_free, hsd_stall, hsd_reghint, hsd_qscale, hsd_batch;
+    double hsd_x0;           /* 23 October 2026: the embedding's primal start scaled by this factor (0: automatic; -hsdx0) */
     int hsd_corr, hsd_ctrace, hsd_ctarget;   /* embedding: correctors, trace-free shift, target (0 trial mean, 1 sigma mu) */
     double hsd_cbmin, hsd_cbmax, hsd_cacc, hsd_soltol, hsd_cfrac, hsd_fomega, hsd_pivtol, hsd_cucap, hsd_cgain;   /* corrector box and acceptance factor */
     int hsd_dir;          /* self-dual embedding: 0 HKM, 1 NT */
@@ -376,6 +384,9 @@ typedef struct {
     int symnodes;        /* 4.32: ... node cap (500) */
     const char *symfile; /* 4.32: -sym: "auto" (default, 4.33), NULL (none) or a file of generators (symred.c) */
     int symsign;         /* 4.33: sign symmetries first (1) */
+    int fom_bound; long fom_bound_maxit;   /* 25 October 2026: rows g X_ij + alpha s = b (s >= 0 in that row alone) taken as bounds on X's entries in the
+                                           first-order engine (fom.c); 1 (default) also the engine first when at least half the rows are such
+                                           bounds and m >= 2000 (main.c), 0 off; the iteration cap of that attempt (set by run_pipeline; -1 made) */
     double fom_race, fom_race_budget;   /* 4.42: the first-order engine first at tol >= 1e-6 on few large dense blocks: share of the expected IPM time (0 off, the default since 19 October 2026; 0.2 before); the budget in seconds (set by run_pipeline) */
     int returnx;         /* 4.42 (library): X of a chordal-decomposed block: -1 returned unless its dense form exceeds 30% of the memory, 0 never (measured on the cliques, fastest), 1 always */
     int symalg;          /* 4.41: *-algebra block diagonalisation (symalg.c): -1 auto (blocks up to symalgmax), 0 off, 1 every block */
@@ -429,6 +440,9 @@ typedef struct {
     int bound_prior;         /* -boundprior: when the margin check fails, a bound from a-priori bounds of the other side (1, default; 0 off) */
     int soc;                 /* 5.16: semidefinite blocks with arrow data as second-order cones in the embedding: 1 on (default), 0 off */
     int soc_minn;            /* ... blocks of at least this order (3) */
+    const int *xcone;        /* 23 October 2026, internal (main.c): per block of the problem solved, its hub when brisk_solve is to
+                              * return X of this block (arrow data) as its cone vector (x_0 = tr X, x_t = 2 X_{hub, t-th other index}),
+                              * not as the dense n x n completion; -1 otherwise; NULL: none */
     int deprows;             /* 20 October 2026: linearly dependent equality constraints removed in the presolve: 1 on (default), 0 off */
 } Params;
 
@@ -484,7 +498,8 @@ typedef struct {
     double err[7];       /* DIMACS errors 1..6 */
     double t_total, t_setup, t_schur, t_chol, t_dense, t_step;
     /* 4.37 reporting: the in-solver method retry (standard <-> embedding) */
-    int nretry, retry_kept, retry_hsd;   /* retries run (0/1), whether its result was kept, it was the embedding */
+    int nretry, retry_kept, retry_hsd;   /* retries run (0/1), whether its result was kept, it was the embedding (2: the embedding with its primal start at the scale the first one reached) */
+    double retry_x0;                     /* (retry_hsd 2) the factor of that start */
     double t_retry, acc_first;           /* its time; the first method's accuracy (internal) */
     int nreg, npcg;                      /* regularized Schur factorizations, PCG steps (last method) */
 } Result;
@@ -498,6 +513,7 @@ void lowrank_rng_reset(void);
 void symred_rng_reset(void);
 void problem_free(Problem *P);
 int  facial_reduction(Problem *P, int verbose);
+int  lifted_faces(Problem *P, int verbose);   /* 23 October 2026: faces of lifted relaxations from their linear constraints (presolve.c) */
 int  remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc);   /* 20 October 2026: linearly dependent equality constraints (presolve.c) */
 int  chordal_convert(Problem *P, const Params *par, int verbose);
 void problem_from_trips(Problem *P, int m, int nblk, const int *bsz, const double *b,
@@ -508,6 +524,7 @@ int  schur_dense_needed(const Problem *P, const Params *par);   /* 5.8: the stan
 int  dsdp_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
 int  dual_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
 int  fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);   /* 4.31 fom.c */
+int  fom_bound_rows(const Problem *P);   /* 25 October 2026: rows g X_ij + alpha s = b that are bounds on single entries of X (fom.c) */
 void brisk_log_threads(int verbose);   /* (solver.c) the log line "Number of threads: k", once per run */
 void brisk_log_threads_reset(void);
 void brisk_threads_adapt(int verbose);          /* 5.11 (solver.c): the thread count of the next iteration = the free cores */
@@ -569,6 +586,11 @@ void   schol_inverse(const SChol *S, double *Zi, int ldz);              /* 5.12:
 const int *schol_perm(const SChol *S);                 /* perm[new] = old */
 void   schol_lsolve(const SChol *S, double *x);        /* L x = b, permuted ordering */
 void   schol_ltsolve(const SChol *S, double *x);       /* L' x = b, permuted ordering */
+/* (22 October 2026) L w = P b for a sparse b, the supernodes reached only (lpsolve.c's dense columns); see sparsechol.c */
+int    schol_lsolve_sparse(const SChol *S, const int *bi, const double *bv, int nb, double *x, int *sn, char *mark);
+void   schol_sn_cols(const SChol *S, int k, int *j0, int *w);
+void   schol_perm_vec(const SChol *S, const double *b, double *x);
+void   schol_unperm_vec(const SChol *S, const double *x, double *b);
 double schol_cost(const SChol *S, double c_narrow, double c_wide);
 void   schol_set_flopcap(double cap);
 double schol_flops(const SChol *S);
@@ -582,20 +604,31 @@ SChol *chordal_take_estimate(int m, int *deg, int **nbr, size_t fillcap, double 
 void   spsym_finish(SpSym *S, int n, int is_lp);
 double analyze_sdp_block(Block *B, const Params *par);
 void   block_free_contents(Block *B);
+/* weylpd.c (23 October 2026): the Weyl route on Hermitian blocks in their real form, in complex arithmetic */
+int    weylpd_setup(Block *B);    /* 1 when taken (B->wpd); BRISK_WEYLPD=0: never */
+void   weylpd_free(Block *B);
+void   weylpd_split(const double *A, int n, int kbit, double *re, double *im);
 void   problem_clone(const Problem *P, Problem *Q);   /* 4.30: exact copy of an unprepared problem */
 double dict_build(Block *B, const Params *par);
 double class_build(Block *B, const Params *par);
 void   class_free(Block *B);
 /* 5.16: the solver's double-precision measure of a candidate (X, Z, y), for the endgame's choice of the
  * iterate it returns (ddend.c) */
-typedef double (*brisk_dd_measure)(void *ctx, double **X, double **Z, const double *y);
+/* (23 October 2026: *rest receives the same measure without the primal residual, the part the Euclidean polish removes;
+ * bar is the score the endgame's result must beat to be kept, the polished iterate's, 0 when none) */
+typedef double (*brisk_dd_measure)(void *ctx, double **X, double **Z, const double *y, double *rest);
 int  dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Params *par,
-                int maxit, double tol, int verbose, brisk_dd_measure meas, void *mctx);
+                int maxit, double tol, int verbose, brisk_dd_measure meas, void *mctx, double bar);
 void   dict_free(Block *B);
 void params_default(Params *par);
 void params_accuracy(Params *par, int level);
 void tracebound_add(Problem *P, double R);   /* 4.30: sum tr(X_k) + s = R as the last row / block */   /* -acc: 0 low, 1 default, 2 high */
 int  brisk_solve(Problem *P, const Params *par, Result *res, double *yout, double **Xout);
+/* 24 October 2026: the last brisk_solve's other point (the point before its end phase on the augmented Newton system
+ * replaced it, ...), in the layout of yout and Xout, with its Result and what it is. 1 and the arrays (the caller's:
+ * Xout's block count) when there is one */
+int  brisk_alt_take(Result *R, double **y, double ***X, const char **what);
+void brisk_alt_clear(void);
 double wtime(void);
 #include <signal.h>
 extern volatile sig_atomic_t brisk_stop_flag;   /* 4.37: set by brisk_interrupt (capi.c) */
@@ -697,6 +730,10 @@ typedef struct Postsolve {
     int nch;                /* chordal conversions, in the order they were made */
     PSMoment *mom;          /* moment-form conversion, or NULL */
     PSChordal *ch;
+    /* 23 October 2026: constraints added by the presolve as exact combinations of the file's (lifted_faces): a record
+     * with con = -2 - j removed combination j, sum_q comb_w[q] A_{comb_i[q]} for q in [comb_ptr[j], comb_ptr[j + 1]) */
+    int ncomb, *comb_ptr, *comb_i;
+    double *comb_w;
 } Postsolve;
 /* compact copy of the data as read, for measuring the returned solution */
 typedef struct {
@@ -730,7 +767,7 @@ typedef struct {
     int np; FreePair *pr;   /* pairs as read; pair p has row prow[p] */
     int *prow;
 } PSDual;
-PSDual *dualize_apply(Problem *P, int automatic, int verbose);   /* NULL: not applied */
+PSDual *dualize_apply(Problem *P, int automatic, int verbose, PSOrig **pOf);   /* NULL: not applied; *pOf: the problem before, when applied */
 int dualize_has_objective(const Problem *P);   /* b != 0: the automatic dual form needs an objective (19 October 2026) */
 void dualize_unmap(const PSDual *D, double **Xp, const double *yp, double ***Xo, double *yo);
 void dualize_free(PSDual *D);
@@ -771,6 +808,7 @@ double brisk_mem_scale(void);   /* max(1, memory / 8 GB): the factor of the caps
 void brisk_hp_clear(void);
 int brisk_hp_certify_given(const char *fname, const BriskData *data, BriskResult *res, const char *cx, const char *cy, int kind, int digits, int verbose);   /* 5.2 */
 int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, const BriskResult *warm, const Params *par, int kind, int digits, double tol, const char *yfile, const char *xfile, const char *zfile);
+int brisk_double_solve_data(const BriskData *d, BriskResult *res);   /* 23 October 2026: a silent double solve of a problem in memory (main.c; the ray check of hpsolve.c) */
 int bound_certify(const PSOrig *O, int side, double **X, const double *y, int na, double ***Xa, double **ya,
                   double margin, double tol, const char *src, int verbose, BoundCert *out);
 int bound_better(const BoundCert *a, const BoundCert *b);
@@ -825,7 +863,7 @@ void sign_free(PSSign *S);
  * multiplicity cm[g], basis cQ[g] (n x cd cm), reduced block crb[g] (-1 dropped; lpblk: an LP
  * variable at cpos[g]); bmap[k]: reduced block of a block kept as it is (-1: decomposed) */
 typedef struct { int m, nblk, nbr, ncomp, lpblk; int *bs, *bmap, *ck, *cd, *cm, *crb, *cpos; double **cQ; } PSAlg;
-PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose);
+PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose, int soc_minn);   /* soc_minn: blocks with arrow data of at least this order are cones, skipped (0: none) */
 void alg_unmap(const PSAlg *S, double **Xred, const double *yred, double **Xo, double *yo);
 void alg_free(PSAlg *S);
 void sym_unmap(const PSSym *S, double **Xred, const double *yred, double **Xo, double *yo, const int *bs);
@@ -851,15 +889,32 @@ typedef struct {
     int recovered;          /* removed constraints whose y was recovered */
     int unrecovered;        /* ... and those where recovery was not possible */
     int fr_corrected;       /* the lift of the reduced dual was corrected through complementarity with the primal (ISSUES 93) */
+    int late;               /* the time limit was reached: the dual recovery, or its later passes, and the projection skipped (ISSUES 284) */
     double t;               /* seconds */
 } PSResult;
+void    postsolve_set_time_left(double left);   /* the seconds the run has left (INFINITY: no limit); main.c, before postsolve */
 int  ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res);   /* 4.30: errors of (Xo, yo) on O */
-int  ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol);   /* 5.8: is the point a certificate of the infeasibility verdict (1), not (0), none (-1) */
+int  ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol, const int *xc);   /* 5.8: is the point a certificate of the infeasibility verdict (1), not (0), none (-1); xc: the cone-vector blocks of Xo (NULL: none) */
 /* Map (X_red, y_red) back, recover y of removed constraints, measure everything on O.
  * Xo[k]: n_k x n_k (SDP) or n_k (LP) arrays for the original blocks, allocated here
  * (NULL if unavailable); yo: length O->m.                                          */
 int     postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yred,
-                  double ***Xo_out, double *yo, PSResult *res, int verbose);
+                  double ***Xo_out, double *yo, PSResult *res, int verbose, const int *xc_red, int *xc_o);
+/* 23 October 2026: X of a block with arrow data held as its cone vector (a second-order cone written as a semidefinite
+ * block, solved as a cone): x_0 = tr X, x_t = 2 X_{h, i_t} with i_1 < i_2 < ... the indices other than the hub h; Z as
+ * z_0 = its diagonal, z_t = Z_{h, i_t}. xc[k] is the hub of such a block, -1 for a block held densely; xc NULL: none.
+ * The dense form is the rank-two completion 1/2 [[x_0, xb'], [xb, x_0 u u']], u = xb / |xb| (PSD iff x is in the cone). */
+static inline int xc_index(int h, int t) { return t == 0 ? h : (t - 1 < h ? t - 1 : t); }
+void    xc_complete(int n, int h, const double *x, double *X);              /* the dense completion (n x n, column major) */
+void    xc_of_dense(int n, int h, const double *X, double *x);              /* the cone vector of a dense X (tr X, 2 X_{h, i_t}) */
+double  xc_lammin_x(int n, const double *x);                                 /* lambda_min of the completion, at most 0 */
+int     xc_expand(const PSOrig *O, double **Xo, int *xc);                    /* every cone-vector block of Xo to its dense completion (xc
+                                                                              * reset to -1); 0, or 1 when memory failed */
+int     ps_arrow_hub(const PSOrig *O, int o, const int *kept);               /* the hub of O's block o when its data (C and the rows
+                                                                              * with kept[i], all when kept is NULL) are arrow matrices, or -1 */
+int     brisk_arrow_hub(const Block *B);                                     /* solver.c: the hub of a block with arrow data, or -1 */
+extern int g_xcone_accept;    /* the caller maps cone-vector blocks itself (sedumi.c): the library result keeps them as vectors */
+extern int *g_xcone_res;      /* ... and then, per block of the result's X, the hub of a cone-vector block or -1 (NULL: none) */
 double  ps_lammin(int n, const double *M, double *work);
 double  ps_lammin_tol(int n, const double *M, double *work, double delta);
 

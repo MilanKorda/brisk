@@ -644,7 +644,7 @@ static void hp_measure(HPJob *J, uint64_t *const *X, const uint64_t *y, uint64_t
          * status with it; a user's SOS problem, ISSUES 89.) */
         #define HP_PD_AT(dd_) (memcpy(W, Z[k], sizeof(uint64_t) * (size_t)n * n * Wm), \
             ((dd_) > 0 ? (mpx_setd(u, (dd_) * (1 + ncn)), ({ for (int i = 0; i < n; i++) mpx_add(W + ((size_t)i * n + i) * Wm, W + ((size_t)i * n + i) * Wm, u); 0; })) : 0), \
-            cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL) == 0)
+            cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL, 0.0) == 0)
         double d = 0;
         if (!HP_PD_AT(0.0)) {
             double lo = 0, hi = -1;

@@ -39,7 +39,7 @@ static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(
 static void *xcalloc(size_t n, size_t s) { void *p = calloc(n ? n : 1, s ? s : 1); if (!p) { fprintf(stderr, "brisk: out of memory (presolve)\n"); exit(1); } return p; }
 static void *xrealloc(void *q, size_t n) { void *p = realloc(q, n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (presolve)\n"); exit(1); } return p; }
 
-enum { R_EMPTYROW = 1, R_REDROW, R_SINGROW, R_FIXCOL, R_FREESING, R_FORCING, R_DOUBLETON, R_AGG, R_SLACK, R_PARROW, R_PARCOL, R_COSTSING };
+enum { R_EMPTYROW = 1, R_REDROW, R_SINGROW, R_FIXCOL, R_FREESING, R_FORCING, R_DOUBLETON, R_AGG, R_SLACK, R_PARROW, R_PARCOL, R_COSTSING, R_AGGB, R_SLACK2, R_SLACKREST };
 
 struct SxPre {
     int m, n;                       /* the problem as read */
@@ -51,9 +51,14 @@ struct SxPre {
     int nrec, caprec;
     int *rtype; long *ristart, *rdstart;
     int *ibuf; double *dbuf; long ni, nd, capi, capd;
+    /* (24 October 2026) the open run of slack columns of one row (slack_singleton): run_i the row (-1: none), its other
+     * active columns and entries (run_col, run_val, run_n; run_pos: a column's place in them, -1 when not there) */
+    int run_i, run_n, run_cap, *run_col, *run_pos; double *run_val;
 };
+static void run_close(SxPre *P);
 
 static void rec_begin(SxPre *P, int type) {
+    if (P->run_i >= 0 && type != R_SLACK2 && type != R_SLACKREST) run_close(P);    /* (any other record ends the run) */
     if (P->nrec == P->caprec) {
         P->caprec = 2 * P->caprec + 64;
         P->rtype = xrealloc(P->rtype, sizeof(int) * P->caprec); P->ristart = xrealloc(P->ristart, sizeof(long) * (P->caprec + 1));
@@ -63,12 +68,22 @@ static void rec_begin(SxPre *P, int type) {
 }
 static void rec_i(SxPre *P, int v) { if (P->ni == P->capi) { P->capi = 2 * P->capi + 1024; P->ibuf = xrealloc(P->ibuf, sizeof(int) * P->capi); } P->ibuf[P->ni++] = v; }
 static void rec_d(SxPre *P, double v) { if (P->nd == P->capd) { P->capd = 2 * P->capd + 1024; P->dbuf = xrealloc(P->dbuf, sizeof(double) * P->capd); } P->dbuf[P->nd++] = v; }
+/* the end of a run of slack columns: the row's other active columns and entries as at the run's last slack (the
+ * postsolve, undoing the records in reverse, meets this record first and sums the row's rest once) */
+static void run_close(SxPre *P) {
+    const int i = P->run_i; if (i < 0) return;
+    P->run_i = -1;
+    rec_begin(P, R_SLACKREST); rec_i(P, i); rec_i(P, P->run_n);
+    for (int t = 0; t < P->run_n; t++) { rec_i(P, P->run_col[t]); rec_d(P, P->run_val[t]); P->run_pos[P->run_col[t]] = -1; }
+    P->run_n = 0;
+}
 
 void sxpre_free(SxPre *P) {
     if (!P) return;
     free(P->rmap); free(P->cmap); free(P->l); free(P->u); free(P->rl); free(P->ru);
     free(P->Ap); free(P->Ai); free(P->Ax); free(P->c);
     free(P->rtype); free(P->ristart); free(P->rdstart); free(P->ibuf); free(P->dbuf);
+    free(P->run_col); free(P->run_val); free(P->run_pos);
     free(P);
 }
 
@@ -222,6 +237,7 @@ static void add_entry(W *w, int r, int k, double d, double scale) {
     } else { w->rv[r][pr] = v; w->cv[k][pc] = v; }
 }
 /* the bounds of row i's activity without column skip: min and max, with the counts of infinite contributions */
+
 static void activity(const W *w, int i, int skip, double *lmin, double *lmax, int *nimin, int *nimax) {
     double a0 = 0, a1 = 0; int n0 = 0, n1 = 0;
     for (int p = 0; p < w->rlen[i]; p++) {
@@ -265,13 +281,84 @@ static void implied_col_bounds(const W *w, double *ilo, double *iup, int *sl, in
         }
     }
 }
+/* (24 October 2026) the implied bounds kept while the problem is as it was: four steps of a presolve pass compute them
+ * (the dominated columns, the rows the cost makes tight, the substitution, the rows the other rows make redundant), each a
+ * sweep of the whole matrix, and nch counts every change; on osa-30 and pds-20 (LPs) 16 and 36 sweeps, a tenth of their
+ * dual simplex method's time. The rows that give the bounds are kept with them. BRISK_SXPRE_NOIBCACHE=1: every time */
+typedef struct { long nch; double *ilo, *iup; int *sl, *su; } IbCache;
+static void implied_col_bounds_c(const W *w, IbCache *C, long nch, double *ilo, double *iup, int *sl, int *su) {
+    static int off = -1; if (off < 0) off = getenv("BRISK_SXPRE_NOIBCACHE") != NULL;
+    const size_t n = (size_t)w->n;
+    if (off) { implied_col_bounds(w, ilo, iup, sl, su); return; }
+    if (C->nch != nch) {
+        implied_col_bounds(w, C->ilo, C->iup, C->sl, C->su);
+        C->nch = nch;
+    }
+    memcpy(ilo, C->ilo, sizeof(double) * n); memcpy(iup, C->iup, sizeof(double) * n);
+    if (sl) { memcpy(sl, C->sl, sizeof(int) * n); memcpy(su, C->su, sizeof(int) * n); }
+}
 
 /* implied bounds on the row duals of an optimal solution (minimization): y_i >= 0 for a row with only a lower bound,
  * <= 0 for one with only an upper bound (the original bounds); then each column's optimality condition, z_j = c_j - a_j'y
  * >= 0 if x_j has no upper bound and <= 0 if it has no lower bound (a bound the rows imply strictly counts as absent),
  * gives a bound on each y_i from the original bounds of the others (as HiGHS does: no chaining of derived bounds, which
  * could be circular) */
-static void dual_bounds(const W *w, double *ylo, double *yup, const double *ilo, const double *iup, double *y0l, double *y0u, int *slo, int *sup) {
+/* (24 October 2026, the night) an inert bound: x_j's upper bound when c_j > 0 and, at that bound, x_j alone keeps every
+ * row of its column within the bound that a decrease of x_j moves towards (whatever the other columns do within their
+ * bounds); its lower bound likewise when c_j < 0. Dropping all such bounds at once keeps the optimal value and every
+ * optimum: projecting a solution of the relaxed problem onto them (x_j -> min(x_j, u_j), max(x_j, l_j)) keeps every row
+ * feasible (a row whose activity a projection lowered is above its lower bound by that column's condition, all columns
+ * then being within their bounds) and lowers the cost. So for the dual reasoning below the bound counts as absent. On a
+ * set covering (x in [0, 1], A x >= 1, c > 0) every upper bound is inert: lp_setcover_8k (LP) 60,001 -> 12,313 columns,
+ * the interior-point method's presolve and Gurobi's alike. BRISK_SXINERT=0: off */
+static int inert_on(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXINERT"); c = !(e && atoi(e) == 0); } return c; }
+static void inert_bounds(const W *w, char *inu, char *inl) {
+    const int m = w->m, n = w->n;
+    memset(inu, 0, n); memset(inl, 0, n);
+    if (!inert_on()) return;
+    double *amin = xmalloc(sizeof(double) * (m + 1)), *amax = xmalloc(sizeof(double) * (m + 1));
+    int *nmin = xmalloc(sizeof(int) * (m + 1)), *nmax = xmalloc(sizeof(int) * (m + 1));
+    for (int i = 0; i < m; i++) {
+        amin[i] = amax[i] = 0; nmin[i] = nmax[i] = 0;
+        if (!w->rowon[i]) continue;
+        for (int p = 0; p < w->rlen[i]; p++) {
+            const int j = w->ri[i][p];
+            if (!w->colon[j]) continue;
+            const double a = w->rv[i][p], lo = a > 0 ? w->l[j] : w->u[j], hi = a > 0 ? w->u[j] : w->l[j];
+            if (fabs(lo) >= PHUGE) nmin[i]++; else amin[i] += a * lo;
+            if (fabs(hi) >= PHUGE) nmax[i]++; else amax[i] += a * hi;
+        }
+    }
+    for (int j = 0; j < n; j++) {
+        if (!w->colon[j] || w->c[j] == 0) continue;
+        const int up = w->c[j] > 0;                 /* the bound the cost pushes x_j to leave from above (up) or below */
+        const double b = up ? w->u[j] : w->l[j];
+        if (fabs(b) >= PHUGE) continue;
+        int ok = 1;
+        for (int p = 0; p < w->clen[j] && ok; p++) {
+            const int i = w->ci[j][p];
+            if (!w->rowon[i]) continue;
+            const double a = w->cv[j][p];
+            /* moving x_j towards its other side lowers the row's activity when a > 0 and up (or a < 0 and down): then the
+             * row's lower bound must hold with x_j at b and the others at their least; otherwise its upper bound with the
+             * others at their most */
+            if ((a > 0) == up) {
+                if (w->rl[i] <= -PHUGE) continue;
+                const double lo = a > 0 ? w->l[j] : w->u[j];
+                const int own = fabs(lo) >= PHUGE;
+                if (nmin[i] - own > 0 || a * b + (amin[i] - (own ? 0 : a * lo)) < w->rl[i]) ok = 0;
+            } else {
+                if (w->ru[i] >= PHUGE) continue;
+                const double hi = a > 0 ? w->u[j] : w->l[j];
+                const int own = fabs(hi) >= PHUGE;
+                if (nmax[i] - own > 0 || a * b + (amax[i] - (own ? 0 : a * hi)) > w->ru[i]) ok = 0;
+            }
+        }
+        if (ok) { if (up) inu[j] = 1; else inl[j] = 1; }
+    }
+    free(amin); free(amax); free(nmin); free(nmax);
+}
+static void dual_bounds(const W *w, double *ylo, double *yup, const double *ilo, const double *iup, double *y0l, double *y0u, int *slo, int *sup, const char *inu, const char *inl) {
     for (int i = 0; i < w->m; i++) {
         if (!w->rowon[i]) { y0l[i] = y0u[i] = 0; continue; }
         const int linf = w->rl[i] <= -PHUGE, uinf = w->ru[i] >= PHUGE;
@@ -281,7 +368,7 @@ static void dual_bounds(const W *w, double *ylo, double *yup, const double *ilo,
     for (int j = 0; j < w->n; j++) {
         if (!w->colon[j]) continue;
         const double mu = (w->ccnt[j] != 1 ? 1 : -1) * FTOL * (1 + fabs(w->u[j])), ml = (w->ccnt[j] != 1 ? 1 : -1) * FTOL * (1 + fabs(w->l[j]));
-        const int noup = w->u[j] >= PHUGE || iup[j] < w->u[j] - mu, nolo = w->l[j] <= -PHUGE || ilo[j] > w->l[j] + ml;
+        const int noup = w->u[j] >= PHUGE || iup[j] < w->u[j] - mu || inu[j], nolo = w->l[j] <= -PHUGE || ilo[j] > w->l[j] + ml || inl[j];
         if (!noup && !nolo) continue;
         double smin = 0, smax = 0; int nmin = 0, nmax = 0;     /* a_j'y over the original box */
         for (int p = 0; p < w->clen[j]; p++) {
@@ -425,12 +512,36 @@ static int parallel_cols(W *w, SxPre *P) {
  * (rl - max a s <= rest <= ru - min a s over l <= s <= u). Record: i, j, the other active columns of the row (count,
  * columns, entries); a, l, u and the row's bounds before. */
 static void slack_singleton(W *w, SxPre *P, int i, int j, double a) {
-    rec_begin(P, R_SLACK); rec_i(P, i); rec_i(P, j);
-    int cnt = 0;
-    for (int p = 0; p < w->rlen[i]; p++) if (w->ri[i][p] != j && w->colon[w->ri[i][p]]) cnt++;
-    rec_i(P, cnt);
-    rec_d(P, a); rec_d(P, w->l[j]); rec_d(P, w->u[j]); rec_d(P, w->rl[i]); rec_d(P, w->ru[i]);
-    for (int p = 0; p < w->rlen[i]; p++) { const int k = w->ri[i][p]; if (k != j && w->colon[k]) { rec_i(P, k); rec_d(P, w->rv[i][p]); } }
+    /* (24 October 2026) slack columns of one row removed one after another form a run: each record holds the column's own
+     * data, the row's other columns are recorded once when the run ends (R_SLACKREST), and the postsolve adds each restored
+     * slack's activity to the row's rest. Before, each record listed the whole row: a row with k slack columns cost k times
+     * its length (neos-787933, LP: 172,668 slack columns in 1,897 rows, 31 million values). BRISK_SXPRE_SLACKRUN=0: the
+     * whole row in every record */
+    static int srun = -1; if (srun < 0) { const char *e = getenv("BRISK_SXPRE_SLACKRUN"); srun = !(e && atoi(e) == 0); }
+    if (!srun) {
+        rec_begin(P, R_SLACK); rec_i(P, i); rec_i(P, j);
+        int cnt = 0;
+        for (int p = 0; p < w->rlen[i]; p++) if (w->ri[i][p] != j && w->colon[w->ri[i][p]]) cnt++;
+        rec_i(P, cnt);
+        rec_d(P, a); rec_d(P, w->l[j]); rec_d(P, w->u[j]); rec_d(P, w->rl[i]); rec_d(P, w->ru[i]);
+        for (int p = 0; p < w->rlen[i]; p++) { const int k = w->ri[i][p]; if (k != j && w->colon[k]) { rec_i(P, k); rec_d(P, w->rv[i][p]); } }
+    } else {
+        if (P->run_i != i) {
+            run_close(P);
+            if (!P->run_pos) { P->run_pos = xmalloc(sizeof(int) * (P->n + 1)); for (int k = 0; k < P->n; k++) P->run_pos[k] = -1; }
+            if (w->rlen[i] > P->run_cap) { P->run_cap = w->rlen[i] + 64; P->run_col = xrealloc(P->run_col, sizeof(int) * P->run_cap); P->run_val = xrealloc(P->run_val, sizeof(double) * P->run_cap); }
+            P->run_n = 0;
+            for (int p = 0; p < w->rlen[i]; p++) { const int k = w->ri[i][p]; if (w->colon[k]) { P->run_pos[k] = P->run_n; P->run_col[P->run_n] = k; P->run_val[P->run_n++] = w->rv[i][p]; } }
+            P->run_i = i;
+        }
+        const int t = P->run_pos[j];
+        if (t >= 0) {       /* (j leaves the row's rest: the last entry takes its place) */
+            const int last = --P->run_n;
+            P->run_col[t] = P->run_col[last]; P->run_val[t] = P->run_val[last]; P->run_pos[P->run_col[t]] = t; P->run_pos[j] = -1;
+        }
+        rec_begin(P, R_SLACK2); rec_i(P, i); rec_i(P, j);
+        rec_d(P, a); rec_d(P, w->l[j]); rec_d(P, w->u[j]); rec_d(P, w->rl[i]); rec_d(P, w->ru[i]);
+    }
     const double l = w->l[j], u = w->u[j];
     const double smax = a > 0 ? (u >= PHUGE ? PINF : a * u) : (l <= -PHUGE ? PINF : a * l);     /* max a s */
     const double smin = a > 0 ? (l <= -PHUGE ? -PINF : a * l) : (u >= PHUGE ? -PINF : a * u);   /* min a s */
@@ -450,10 +561,62 @@ static void cost_singleton(W *w, SxPre *P, int i, int j, double a, double rhs) {
     w->c[j] = 0;
     w->rl[i] = w->ru[i] = rhs;
 }
+static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose, int aggbmode, char *why, size_t nwhy);
+/* (24 October 2026, a diagnostic: BRISK_SXPRE_STATS=1) the structure of the presolved problem, to compare with another
+ * solver's: rows by kind and length, columns by bounds and length, column singletons by the kind of their row */
+static void presolved_stats(const LpProb *R) {
+    const int m = R->m, n = R->n;
+    int *rlen = calloc(m + 1, sizeof(int)); long rk[4] = {0}, rh[6] = {0}, ch[6] = {0}, cb[5] = {0}, c0 = 0, cs[4] = {0};
+    for (int p = 0; p < R->Ap[n]; p++) rlen[R->Ai[p]]++;
+    #define KIND(i) (R->rl[i] == R->ru[i] ? 0 : (R->rl[i] <= -1e30 || R->ru[i] >= 1e30) ? ((R->rl[i] <= -1e30 && R->ru[i] >= 1e30) ? 3 : 1) : 2)
+    #define BIN(k) ((k) <= 1 ? (k) : (k) == 2 ? 2 : (k) == 3 ? 3 : (k) <= 10 ? 4 : 5)
+    for (int i = 0; i < m; i++) { rk[KIND(i)]++; rh[BIN(rlen[i])]++; }
+    for (int j = 0; j < n; j++) {
+        const int len = R->Ap[j + 1] - R->Ap[j]; ch[BIN(len)]++;
+        const int hl = R->l[j] > -1e30, hu = R->u[j] < 1e30;
+        cb[R->l[j] == R->u[j] ? 4 : hl && hu ? 3 : hl ? 1 : hu ? 2 : 0]++;
+        if (R->c[j] == 0) c0++;
+        if (len == 1) cs[KIND(R->Ai[R->Ap[j]])]++;
+    }
+    printf("presolved: %d rows (%ld equations, %ld one-sided, %ld ranged, %ld free); row lengths 0:%ld 1:%ld 2:%ld 3:%ld 4-10:%ld >10:%ld\n", m, rk[0], rk[1], rk[2], rk[3], rh[0], rh[1], rh[2], rh[3], rh[4], rh[5]);
+    printf("presolved: %d columns (%ld free, %ld lower only, %ld upper only, %ld boxed, %ld fixed; %ld of cost zero); lengths 0:%ld 1:%ld 2:%ld 3:%ld 4-10:%ld >10:%ld; singletons in equations %ld, one-sided rows %ld, ranged %ld\n",
+           n, cb[0], cb[1], cb[2], cb[3], cb[4], c0, ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], cs[0], cs[1], cs[2]);
+    /* three ranged rows, each column with its bounds, cost, length and the other rows it meets */
+    int shown = 0;
+    int *rp = calloc(m + 2, sizeof(int)), *rc = malloc(sizeof(int) * (R->Ap[n] + 1)), *fill = calloc(m + 1, sizeof(int));
+    for (int i = 0; i < m; i++) rp[i + 1] = rp[i] + rlen[i];
+    for (int j = 0; j < n; j++) for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int i = R->Ai[p]; rc[rp[i] + fill[i]++] = j; }
+    for (int i = 0; i < m && shown < 3; i++) {
+        static int want = -1; if (want < 0) { const char *e = getenv("BRISK_SXPRE_STATS"); want = e ? atoi(e) : 1; }
+        static int wrow = -2; if (wrow == -2) { const char *e = getenv("BRISK_SXPRE_ROW"); wrow = e ? atoi(e) : -1; }
+        if (wrow >= 0 ? i != wrow : want == 1 ? (KIND(i) != 2 || rlen[i] > 8) : rlen[i] != want) continue;
+        shown++; printf("presolved: row %d, %d entries, [%g, %g]:\n", i, rlen[i], R->rl[i], R->ru[i]);
+        for (int q = rp[i]; q < rp[i + 1]; q++) {
+            const int j = rc[q]; double a = 0;
+            for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) if (R->Ai[p] == i) a = R->Ax[p];
+            printf("   column %d: a %g, [%g, %g], cost %g, %d entries;", j, a, R->l[j], R->u[j], R->c[j], R->Ap[j + 1] - R->Ap[j]);
+            for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) if (R->Ai[p] != i) { const int k = R->Ai[p]; printf(" row %d (%s, %d entries, [%g, %g], a %g)", k, KIND(k) == 0 ? "equation" : KIND(k) == 1 ? "one-sided" : "ranged", rlen[k], R->rl[k], R->ru[k], R->Ax[p]); }
+            printf("\n");
+        }
+    }
+    free(rp); free(rc); free(fill);
+    fflush(stdout);
+    #undef KIND
+    #undef BIN
+    free(rlen);
+}
 int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *why, size_t nwhy) {
+    return sxpre_presolve_m(L, R, out, verbose, -1, why, nwhy);
+}
+/* (23 October 2026) aggbmode 1: the bounded substitution of columns without cost, at most 4 new entries (the simplex
+ * method's own presolve of the race, simplex.c aggb_route); 0: none; -1: as the environment says (experiments) */
+int sxpre_presolve_ex(const LpProb *L, LpProb *R, SxPre **out, int verbose, int aggbmode, char *why, size_t nwhy) {
+    return sxpre_presolve_m(L, R, out, verbose, aggbmode, why, nwhy);
+}
+static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose, int aggbmode, char *why, size_t nwhy) {
     const int m = L->m, n = L->n;
     SxPre *P = xcalloc(1, sizeof(SxPre));
-    P->m = m; P->n = n;
+    P->m = m; P->n = n; P->run_i = -1;
     const double sg = L->maxim ? -1.0 : 1.0;
     W w; memset(&w, 0, sizeof w);
     w.m = m; w.n = n;
@@ -486,14 +649,25 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
     const int nodbl = getenv("BRISK_SXPRE_NODBL") != NULL, noimpl = getenv("BRISK_SXPRE_NOIMPLFREE") != NULL, nodom = getenv("BRISK_SXPRE_NODOM") != NULL;
     double *ylo = xmalloc(sizeof(double) * (m + 1)), *yup = xmalloc(sizeof(double) * (m + 1));
     double *ilo = xmalloc(sizeof(double) * (n + 1)), *iup = xmalloc(sizeof(double) * (n + 1));
+    IbCache ibc = { -1, xmalloc(sizeof(double) * (n + 1)), xmalloc(sizeof(double) * (n + 1)), xmalloc(sizeof(int) * (n + 1)), xmalloc(sizeof(int) * (n + 1)) };
     double *y0l = xmalloc(sizeof(double) * (m + 1)), *y0u = xmalloc(sizeof(double) * (m + 1));
     int *ysl = xmalloc(sizeof(int) * (m + 1)), *ysu = xmalloc(sizeof(int) * (m + 1));
+    char *inu = xmalloc(n + 1), *inl = xmalloc(n + 1);
     const int noweak = getenv("BRISK_SXPRE_NOWEAKDOM") != NULL, noagg = getenv("BRISK_SXPRE_NOAGG") != NULL;
     const int noslack = getenv("BRISK_SXPRE_NOSLACK") != NULL, notight = getenv("BRISK_SXPRE_NOTIGHT") != NULL;
+    const int noside = getenv("BRISK_SXPRE_NOSIDE") != NULL; int nside = 0;
+    const int notightrow = getenv("BRISK_SXPRE_NOTIGHTROW") != NULL; int ntightrow = 0;
+    const int noimplred = getenv("BRISK_SXPRE_NOIMPLRED") != NULL; int nimplred = 0;
+    int *dropsrc = xmalloc(sizeof(int) * (n + 1)); for (int j = 0; j < n; j++) dropsrc[j] = -1;
+    char *trole = xcalloc(m + 1, 1);    /* the rows the cost made tight (2) and the rows such an argument rested on (1) */
+    char *rowdropsrc = xcalloc(m + 1, 1), *rowanydrop = xcalloc(m + 1, 1);   /* (the guard of the dropped bounds) */   /* the row whose implication dropped x_j's bound */
     const int nocostsing = getenv("BRISK_SXPRE_NOCOSTSING") != NULL;
     const int noparallel = getenv("BRISK_SXPRE_NOPARALLEL") != NULL, nocascade = getenv("BRISK_SXPRE_NOCASCADE") != NULL;
     int nslack = 0, ntight = 0, npar = 0, nparc = 0, ncostsing = 0;
-    int nagg = 0;
+    int nagg = 0, naggb = 0;
+    const int aggb = aggbmode >= 0 ? aggbmode == 1 : getenv("BRISK_SXAGGB") && atoi(getenv("BRISK_SXAGGB")) == 1;   /* (experiment) */
+    const long aggbfill = aggbmode >= 0 ? 4 : getenv("BRISK_SXAGGBFILL") ? atol(getenv("BRISK_SXAGGBFILL")) : 16;   /* (experiment: the fill allowed a bounded substitution) */
+    const int aggbzc = aggbmode >= 0 ? 1 : getenv("BRISK_SXAGGBZC") && atoi(getenv("BRISK_SXAGGBZC")) == 1;   /* (experiment: only columns without cost) */
     int ndom = 0;
     int parstall = 0;
     /* (22 October 2026) a step that ran on the problem as it is now and found nothing finds nothing again: nch counts
@@ -501,8 +675,17 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
      * while nch is the count at which they last found nothing. A pass after a few reductions elsewhere repeated them in
      * full: lp_cheb_10000x300 (6.04 million nonzeros), one fixed column removed, a second pass of whole-matrix sweeps */
     long nch = 0, col_clean = -1, dom_clean = -1, agg_clean = -1, act_clean = -1;
+    /* (25 October 2026) three costly steps that found nothing in their last run wait while the other steps still change
+     * the problem (the previous pass changed it), and run again in a pass of every step before the presolve ends: the rows
+     * the cost makes tight, the aggregator and the rows redundant by implied bounds sweep every row with the implied
+     * bounds. A chain of
+     * dominated columns and redundant rows took 14 passes on neos-3402294-bobin (LP: 591,076 rows, 586,984 -> 32,932 over
+     * the passes), each sweeping all rows with both steps that found nothing. BRISK_SXPRE_NODEFER=1: every step each pass */
+    static int nodefer = -1; if (nodefer < 0) nodefer = getenv("BRISK_SXPRE_NODEFER") != NULL;
+    int tr_idle = 0, ir_idle = 0, ag_idle = 0, prev_changed = 0;
     for (int pass = 0; pass < 100 && status == 0; pass++) {
-        int changed = 0;
+        int changed = 0, deferred = 0;
+        const int defer = !nodefer && prev_changed;
         int act0 = 0; for (int i = 0; i < m; i++) act0 += w.rowon[i]; for (int j = 0; j < n; j++) act0 += w.colon[j];
         /* rows: empty, singleton */
         for (int i = 0; i < m && status == 0; i++) {
@@ -627,8 +810,9 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
          * the bound it prefers (Andersen and Andersen 1995) */
         const long nch_d = nch; const int dom_run = !nodom && nch != dom_clean;
         if (dom_run) {
-            implied_col_bounds(&w, ilo, iup, NULL, NULL);
-            dual_bounds(&w, ylo, yup, ilo, iup, y0l, y0u, ysl, ysu);
+            implied_col_bounds_c(&w, &ibc, nch, ilo, iup, NULL, NULL);
+            inert_bounds(&w, inu, inl);
+            dual_bounds(&w, ylo, yup, ilo, iup, y0l, y0u, ysl, ysu, inu, inl);
             for (int j = 0; j < n && status == 0; j++) {
                 if (!w.colon[j] || w.ccnt[j] == 0) continue;
                 double smin = 0, smax = 0; int nmin = 0, nmax = 0;
@@ -666,6 +850,79 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
             }
         }
         if (dom_run && nch == nch_d) dom_clean = nch;
+        /* (24 October 2026, the night) a row the cost makes tight: a column j with c_j > 0 whose decrease no other row of
+         * it can stop (a <= row with a > 0 or a >= row with a < 0, without the other side), and whose lower bound the row r
+         * implies (decreasing x_j until r is tight keeps x_j within its bounds): some optimum has r tight, and r becomes an
+         * equation at that side (c_j < 0 likewise). A two-entry row then goes as a doubleton equation (neos-4387871-tavua,
+         * LP: 2,000 rows y >= x / 13 with y of cost 1, Gurobi's presolved size). No record: a dual of r of the wrong sign for
+         * the row as it was is the final check's (the problem as read from the postsolved basis). BRISK_SXPRE_NOTIGHTROW=1: off */
+        const long nch_t = nch;
+        const int tr_run = !notightrow && !(defer && tr_idle);
+        if (!notightrow && !tr_run) deferred = 1;
+        if (tr_run && status == 0) {
+            int *sl = xmalloc(sizeof(int) * (n + 1)), *su = xmalloc(sizeof(int) * (n + 1));
+            char *rchg = xcalloc(m + 1, 1);
+            implied_col_bounds_c(&w, &ibc, nch, ilo, iup, sl, su);
+            /* (and a column of cost zero, in either direction: moving it costs nothing; neos-1171448, LP: x0 <= 8 y with y of
+             * cost zero, its other rows relaxed as it falls) */
+            for (int jj = 0; jj < 2 * n; jj++) {
+                const int j = jj % n;
+                if (!w.colon[j] || (jj >= n && w.c[j] != 0)) continue;
+                const int up = jj < n ? w.c[j] < 0 : 1;    /* the cost pushes x_j up (else down); cost zero: down, then up */
+                const int r = up ? su[j] : sl[j];
+                if (r < 0 || !w.rowon[r] || rchg[r] || w.rl[r] == w.ru[r]) continue;
+                const double b = up ? w.u[j] : w.l[j], ib = up ? iup[j] : ilo[j];
+                if (fabs(b) < PHUGE && (up ? ib > b + FTOL * (1 + fabs(b)) : ib < b - FTOL * (1 + fabs(b)))) continue;
+                /* where r implies x_j's bound only as tight as it is (not strictly tighter), the bound is dropped, r keeping it:
+                 * otherwise x_j could rest at it with r tight and r's dual of the wrong sign for the row as read (tavua: 1,104
+                 * iterations of the final check); with no bound to rest at, x_j is basic or at its other bound, and r's dual
+                 * has the sign of the row. Not when a column of r, or of another row of x_j, had a bound dropped from that row
+                 * (the implied bounds would rest on each other) */
+                const int eqb = fabs(b) < PHUGE && !(up ? ib < b - FTOL * (1 + fabs(b)) : ib > b + FTOL * (1 + fabs(b)));
+                /* (BRISK_SXPRE_TIGHTEQ: 0 such a row is not made an equation, 1 it is and the bound kept, 2 the default, the
+                 * bound dropped as above. 238 LPs (Netlib, Kennington, 124 MIPLIB relaxations, dual simplex method at one
+                 * thread): the final check's iterations 1,099 with 1 (neos-873061, LP: 352 reduced costs of the wrong sign,
+                 * 967 iterations), 34 with 2; the times the same, every objective the same) */
+                static int teq = -1; if (teq < 0) { const char *e = getenv("BRISK_SXPRE_TIGHTEQ"); teq = e ? atoi(e) : 2; }
+                if (eqb && teq == 0) continue;
+                int ok = 1; double ar = 0;
+                for (int p = 0; p < w.clen[j] && ok; p++) {
+                    const int i = w.ci[j][p];
+                    if (!w.rowon[i]) continue;
+                    const double a = w.cv[j][p];
+                    if (i == r) { ar = a; continue; }
+                    /* the move of x_j lowers row i's activity when (a > 0) != up: then no lower side, else no upper side */
+                    if ((a > 0) != up) { if (w.rl[i] > -PHUGE) ok = 0; } else { if (w.ru[i] < PHUGE) ok = 0; }
+                }
+                if (!ok || ar == 0) continue;
+                /* the duals' signs: the argument needs x_j's other rows one-sided at the solution, so a row made an equation
+                 * here never serves as another column's other row, and one that served is never made an equation (else the
+                 * final check repairs the signs: physiciansched6-2, LP, 2,648 iterations) */
+                if (trole[r] == 1) continue;
+                for (int p = 0; p < w.clen[j] && ok; p++) { const int i = w.ci[j][p]; if (w.rowon[i] && i != r && trole[i] == 2) ok = 0; }
+                if (!ok) continue;
+                /* (the guard of the dropped bounds, by flags per row: a row that was the source of a dropped bound, a row with
+                 * a column whose bound was dropped; tested only now, a scan of the rows for every column took 40 s on
+                 * s250r10, LP, 269,588 columns) */
+                if (eqb && teq == 2) {
+                    if (dropsrc[j] >= 0 || rowanydrop[r]) continue;
+                    for (int p = 0; p < w.clen[j] && ok; p++) { const int i = w.ci[j][p]; if (w.rowon[i] && rowdropsrc[i]) ok = 0; }
+                    if (!ok) continue;
+                }
+                /* the side of r that bounds the move: the move lowers r's activity when (ar > 0) != up, so its lower side */
+                if ((ar > 0) != up) { if (w.rl[r] <= -PHUGE) continue; w.ru[r] = w.rl[r]; }
+                else { if (w.ru[r] >= PHUGE) continue; w.rl[r] = w.ru[r]; }
+                if (eqb && teq == 2) {
+                    if (up) w.u[j] = PINF; else w.l[j] = -PINF;
+                    dropsrc[j] = r; rowdropsrc[r] = 1;
+                    for (int p = 0; p < w.clen[j]; p++) rowanydrop[w.ci[j][p]] = 1;
+                }
+                rchg[r] = 1; trole[r] = 2; ntightrow++; changed = 1, nch++;
+                for (int p = 0; p < w.clen[j]; p++) { const int i = w.ci[j][p]; if (w.rowon[i] && i != r) trole[i] = 1; }
+            }
+            free(sl); free(su); free(rchg);
+        }
+        if (tr_run) tr_idle = nch == nch_t;
         /* doubleton equations: a x_j + b x_k = rhs, x_j substituted (the column with fewer entries, if its coefficient
          * is not small against the other's) */
         if (!nodbl) for (int i = 0; i < m && status == 0; i++) {
@@ -721,22 +978,26 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
          * bounds as implied, and an implied bound that came from a row with that column may have rested on them
          * (x + y = 1, 0 <= x, y <= 1: each is implied free by the other's bounds, not both): the columns whose needed
          * bound came from such a row wait for the next pass, whose implied bounds are computed again */
-        const long nch_a = nch; const int agg_run = !noagg && nch != agg_clean;
+        const long nch_a = nch; const int agg_want = !noagg && nch != agg_clean, agg_run = agg_want && !(defer && ag_idle);
+        if (agg_want && !agg_run) deferred = 1;
         if (agg_run) {
             int *srl = xmalloc(sizeof(int) * (n + 1)), *sru = xmalloc(sizeof(int) * (n + 1));
-            implied_col_bounds(&w, ilo, iup, srl, sru);
+            implied_col_bounds_c(&w, &ibc, nch, ilo, iup, srl, sru);
             char *stale = xcalloc(n + 1, 1);
             for (int j = 0; j < n && status == 0; j++) {
                 if (!w.colon[j] || w.ccnt[j] < 2 || stale[j]) continue;
                 const int lok = w.l[j] <= -PHUGE || ilo[j] >= w.l[j] - FTOL * (1 + fabs(w.l[j]));
                 const int uok = w.u[j] >= PHUGE || iup[j] <= w.u[j] + FTOL * (1 + fabs(w.u[j]));
-                if (!lok || !uok) continue;
+                /* (an experiment, BRISK_SXAGGB=1, 23 October 2026) a column with bounds the rows do not imply is
+                 * substituted too, its bounds kept by the row, which stays as a range (R_AGGB) */
+                const int bnd = !(lok && uok);
+                if (bnd && (!aggb || (aggbzc && w.c[j] != 0.0))) continue;
                 int ib = -1; double ab = 0; long fb = 0;
                 for (int p = 0; p < w.clen[j]; p++) {
                     const int i = w.ci[j][p];
                     if (!w.rowon[i] || w.rl[i] != w.ru[i] || w.rl[i] <= -PHUGE || w.rcnt[i] > 24) continue;
                     const long fill = (long)(w.ccnt[j] - 1) * (w.rcnt[i] - 2);
-                    if (fill > 16 || (ib >= 0 && fill >= fb)) continue;
+                    if (fill > (bnd ? aggbfill : 16) || (ib >= 0 && fill >= fb)) continue;
                     double amax = 0;
                     for (int q = 0; q < w.rlen[i]; q++) if (w.colon[w.ri[i][q]] && fabs(w.rv[i][q]) > amax) amax = fabs(w.rv[i][q]);
                     if (fabs(w.cv[j][p]) < 0.01 * amax) continue;
@@ -744,7 +1005,9 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
                 }
                 if (ib < 0) continue;
                 const int i = ib; const double a = ab, cj = w.c[j], rhs = w.rl[i];
-                rec_begin(P, R_AGG); rec_i(P, i); rec_i(P, j); rec_d(P, a); rec_d(P, rhs);
+                if (bnd) w.cmod[j] = 1;      /* (the record lists the column without row i, which stays) */
+                if (bnd && getenv("SXDBG") && naggb < 40) printf("    bounded substitution: column %d (bounds %g, %g) by row %d (a %g, rhs %g, %d entries)\n", j, w.l[j], w.u[j], i, ab, w.rl[i], w.rcnt[i]);
+                rec_begin(P, bnd ? R_AGGB : R_AGG); rec_i(P, i); rec_i(P, j); rec_d(P, a); rec_d(P, rhs);
                 int cnt = 0;
                 for (int q = 0; q < w.rlen[i]; q++) if (w.ri[i][q] != j && w.colon[w.ri[i][q]]) cnt++;
                 rec_i(P, cnt);
@@ -764,10 +1027,20 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
                 }
                 w.off += cj * rhs / a;
                 w.colon[j] = 0;
-                drop_row(&w, i);
+                if (!bnd) drop_row(&w, i);
+                else {
+                    /* row i without x_j: x_j = (rhs - s) / a in [l_j, u_j] is s in [rhs - a u_j, rhs - a l_j] (a > 0) */
+                    const double lj = w.l[j], uj = w.u[j];
+                    const double s1 = uj >= PHUGE ? (a > 0 ? -PINF : PINF) : rhs - a * uj, s2 = lj <= -PHUGE ? (a > 0 ? PINF : -PINF) : rhs - a * lj;
+                    w.rl[i] = fmin(s1, s2); w.ru[i] = fmax(s1, s2);
+                    if (w.rl[i] <= -PHUGE) w.rl[i] = -PINF;
+                    if (w.ru[i] >= PHUGE) w.ru[i] = PINF;
+                    w.rcnt[i]--;
+                    naggb++;
+                }
                 for (int p = 0; p < w.clen[j]; p++) {
                     const int r = w.ci[j][p];
-                    if (!w.rowon[r]) continue;
+                    if (!w.rowon[r] || r == i) continue;
                     const double f = w.cv[j][p] / a;
                     w.rcnt[r]--;
                     if (w.rl[r] > -PHUGE) w.rl[r] -= f * rhs;
@@ -781,6 +1054,7 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
         }
         if (status) break;
         if (agg_run && nch == nch_a) agg_clean = nch;
+        if (agg_run) ag_idle = nch == nch_a;
         /* rows: activity bounds */
         const long nch_r = nch; const int act_run = nch != act_clean;
         for (int i = 0; i < m && status == 0 && act_run; i++) {
@@ -798,6 +1072,15 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
                 rec_begin(P, R_REDROW); rec_i(P, i);
                 drop_row(&w, i); nred++; changed = 1, nch++;
                 continue;
+            }
+            /* (24 October 2026, the night) one side of a ranged row that the columns' bounds cannot reach is dropped: the
+             * feasible set is the same, and the row becomes one-sided, so that dual fixing and the dual bounds can use its
+             * sign (supportcase12, LP: 15,271 ranged rows x - y1 - y2 - y3 in [0, 7.2] with x <= 1.33, the y of cost zero;
+             * Gurobi's presolved problem has none). No record: a solution, its duals and its statuses are the same for both
+             * rows (the dropped side is never active). BRISK_SXPRE_NOSIDE=1: kept */
+            if (!noside && rl > -PHUGE && ru < PHUGE && (lowok || upok)) {
+                if (lowok) w.rl[i] = -PINF; else w.ru[i] = PINF;
+                nside++; changed = 1, nch++;
             }
             int side = 0;    /* +1: forced at rl (the columns at the bounds of the largest activity), -1: at ru */
             if (ninfmax == 0 && rl > -PHUGE && lmax <= rl + tl) side = 1;
@@ -826,6 +1109,50 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
             nforce++; changed = 1, nch++;
         }
         if (status) break;
+        /* (24 October 2026, the night) rows redundant by the bounds the other rows imply (not only the columns' own): a row
+         * whose activity, with each column's bounds tightened by the rows that imply tighter ones, stays within its sides is
+         * dropped; the bounds themselves are not changed. In one pass a row that gave such a bound is not dropped, and a
+         * dropped row gives none, so no two rows justify each other's removal (neos-1171448, LP: x0 + x567 <= 8 with
+         * x0 <= 3 and x567 <= 3 from rows of 22 entries; Gurobi drops them). BRISK_SXPRE_NOIMPLRED=1: off */
+        const long nch_i = nch;
+        const int ir_run = act_run && !noimplred && !(defer && ir_idle);
+        if (act_run && !noimplred && !ir_run) deferred = 1;
+        if (ir_run && status == 0) {
+            int *sl = xmalloc(sizeof(int) * (n + 1)), *su = xmalloc(sizeof(int) * (n + 1));
+            char *src = xcalloc(m + 1, 1), *gone = xcalloc(m + 1, 1);
+            implied_col_bounds_c(&w, &ibc, nch, ilo, iup, sl, su);
+            for (int i = 0; i < m && status == 0; i++) {
+                if (!w.rowon[i] || w.rcnt[i] < 2 || src[i]) continue;
+                double a0 = 0, a1 = 0; int n0 = 0, n1 = 0, used = 0, ok = 1;
+                for (int p = 0; p < w.rlen[i] && ok; p++) {
+                    const int j = w.ri[i][p];
+                    if (!w.colon[j]) continue;
+                    const double a = w.rv[i][p];
+                    double lj = w.l[j], uj = w.u[j];
+                    if (sl[j] >= 0 && sl[j] != i && !gone[sl[j]] && ilo[j] > lj) { lj = ilo[j]; used = 1; }
+                    if (su[j] >= 0 && su[j] != i && !gone[su[j]] && iup[j] < uj) { uj = iup[j]; used = 1; }
+                    const double bl = a > 0 ? lj : uj, bu = a > 0 ? uj : lj;
+                    if (fabs(bl) >= PHUGE) n0++; else a0 += a * bl;
+                    if (fabs(bu) >= PHUGE) n1++; else a1 += a * bu;
+                }
+                if (!used) continue;          /* (the plain test above has judged it) */
+                const double rl = w.rl[i], ru = w.ru[i];
+                /* (a margin: an implied bound is a sum of rounded terms) */
+                const double tl = 1e-9 * (1 + fabs(rl)), tu = 1e-9 * (1 + fabs(ru));
+                const int lowok = rl <= -PHUGE || (n0 == 0 && a0 >= rl + tl), upok = ru >= PHUGE || (n1 == 0 && a1 <= ru - tu);
+                if (!(lowok && upok)) continue;
+                for (int p = 0; p < w.rlen[i]; p++) {
+                    const int j = w.ri[i][p];
+                    if (!w.colon[j]) continue;
+                    if (sl[j] >= 0 && sl[j] != i && !gone[sl[j]] && ilo[j] > w.l[j]) src[sl[j]] = 1;
+                    if (su[j] >= 0 && su[j] != i && !gone[su[j]] && iup[j] < w.u[j]) src[su[j]] = 1;
+                }
+                rec_begin(P, R_REDROW); rec_i(P, i);
+                drop_row(&w, i); gone[i] = 1; nred++; nimplred++; changed = 1, nch++;
+            }
+            free(sl); free(su); free(src); free(gone);
+        }
+        if (ir_run) ir_idle = nch == nch_i;
         if (act_run && nch == nch_r) act_clean = nch;
         if (!nocascade && cascade(&w, P, &nsing, &nfix, &nempty, &status, why, nwhy)) changed = 1, nch++;
         if (status) break;
@@ -844,8 +1171,11 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
             const int dc = parallel_cols(&w, P);
             if (dc) { nparc += dc; changed = 1, nch++; }
         }
-        if (!changed) break;
+        /* (a pass without a change that deferred a step: one more pass with every step) */
+        if (!changed && !deferred) break;
+        prev_changed = changed;
     }
+    run_close(P);
     /* the reduced problem */
     memset(R, 0, sizeof *R);
     if (status == 0) {
@@ -878,14 +1208,15 @@ int sxpre_presolve(const LpProb *L, LpProb *R, SxPre **out, int verbose, char *w
         R->c0 = w.off; R->maxim = 0;
         snprintf(R->name, sizeof R->name, "%.48s (presolved)", L->name);
         free(rnew); free(cnew);
-        if (verbose) printf("presolve: %d of %d rows and %d of %d columns left (%d singleton rows, %d fixed columns, %d by dual fixing, %d column singletons in equations, %d in inequalities their cost makes tight, %d slack columns, %d column singletons whose cost moved to their row and bounds to its range, %d doubleton equations, %d substituted columns, %d dominated columns, %d parallel rows, %d parallel columns, %d forcing and %d redundant rows, %d empty)\n",
-                            mr, m, nr, n, nsing, nfix, ndual, nfree, ntight, nslack, ncostsing, ndbl, nagg, ndom, npar, nparc, nforce, nred, nempty);
+        if (verbose) printf("presolve: %d of %d rows and %d of %d columns left (%d singleton rows, %d fixed columns, %d by dual fixing, %d column singletons in equations, %d in inequalities their cost makes tight, %d slack columns, %d column singletons whose cost moved to their row and bounds to its range, %d doubleton equations, %d substituted columns (%d with their bounds kept by their row), %d dominated columns, %d parallel rows, %d parallel columns, %d forcing and %d redundant rows, %d empty, %d sides of ranged rows dropped, %d rows made equations by a cost, %d rows redundant by implied bounds)\n",
+                            mr, m, nr, n, nsing, nfix, ndual, nfree, ntight, nslack, ncostsing, ndbl, nagg, naggb, ndom, npar, nparc, nforce, nred, nempty, nside, ntightrow, nimplred);
+        if (getenv("BRISK_SXPRE_STATS")) presolved_stats(R);
     }
     for (int j = 0; j < n; j++) { free(w.ci[j]); free(w.cv[j]); }
     for (int i = 0; i < m; i++) { free(w.ri[i]); free(w.rv[i]); }
     free(w.ci); free(w.cv); free(w.clen); free(w.ccap); free(w.ri); free(w.rv); free(w.rlen); free(w.rcap);
     free(w.c); free(w.l); free(w.u); free(w.rl); free(w.ru); free(w.rowon); free(w.colon); free(w.cmod); free(w.rcnt); free(w.ccnt);
-    free(ylo); free(yup); free(ilo); free(iup); free(y0l); free(y0u); free(ysl); free(ysu);
+    free(ylo); free(yup); free(ilo); free(iup); free(ibc.ilo); free(ibc.iup); free(ibc.sl); free(ibc.su); free(y0l); free(y0u); free(ysl); free(ysu); free(inu); free(inl); free(dropsrc); free(trole); free(rowdropsrc); free(rowanydrop);
     *out = P;
     return status;
 }
@@ -905,11 +1236,43 @@ static double zt_rec(const SxPre *P, int j, const int **I, const double **D, con
     return z;
 }
 
+void sxpre_restrict(const SxPre *P, const double *x, const double *y, double *xr, double *yr) {
+    /* the records replayed in the presolve's order on a copy (23 October 2026): a merged pair of parallel columns is
+     * x_j + lambda x_k in the reduced problem, a merged pair of parallel rows has the dual y_i + lambda y_k, a cost moved
+     * to its row shifts the row's dual by -c_j / a (the inverses of the postsolve's steps); the other reductions leave the
+     * kept values as they are. Not exact in general (tools/sxpre_restrict_check.c: the reductions by the costs choose one
+     * optimal point among several; on 13 Netlib LPs an optimal basic point restricted so violates the reduced problem's
+     * dual conditions): the crossover route no longer uses it (struct SxOrig in simplex.c); kept for that check */
+    double *xo = xmalloc(sizeof(double) * (P->n + 1)), *yo = xcalloc(P->m + 1, sizeof(double));
+    memcpy(xo, x, sizeof(double) * P->n); if (y) memcpy(yo, y, sizeof(double) * P->m);
+    char *allrows = NULL;
+    for (int r = 0; r < P->nrec; r++) {
+        const int *I = P->ibuf + P->ristart[r]; const double *D = P->dbuf + P->rdstart[r];
+        switch (P->rtype[r]) {
+        case R_PARCOL: xo[I[0]] += D[0] * xo[I[1]]; break;
+        case R_PARROW: yo[I[0]] += D[0] * yo[I[1]]; break;
+        case R_COSTSING: yo[I[0]] -= D[1] / D[0]; break;
+        case R_AGGB: {
+            const int i = I[0], j = I[1], cnt = I[2];
+            if (!allrows) { allrows = xmalloc(P->m + 1); memset(allrows, 1, P->m); }
+            const int *Ic = I + 3 + cnt; const double *Dc = D + 2 + cnt;
+            const double zt = zt_rec(P, j, &Ic, &Dc, yo, allrows);
+            yo[i] -= zt / D[0];
+            break; }
+        default: break;
+        }
+    }
+    for (int k = 0; k < P->nr; k++) xr[k] = xo[P->cmap[k]];
+    for (int k = 0; k < P->mr; k++) yr[k] = y ? yo[P->rmap[k]] : 0;
+    free(xo); free(yo); free(allrows);
+}
+
 /* the postsolve: x, the row duals y (as minimization) and the statuses of the problem as read from those of the reduced
  * problem (xr, yr, cstr, rstr; yr as minimization). */
 void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const int *cstr, const int *rstr, double *x, double *y, int *cst, int *rst) {
     const int m = P->m, n = P->n;
     char *rowpres = xcalloc(m + 1, 1);
+    double *rrun = xcalloc(m + 1, sizeof(double));     /* (a run's row rest: R_SLACKREST, R_SLACK2) */
     for (int i = 0; i < m; i++) { y[i] = 0; rst[i] = SX_BASIC; }
     for (int j = 0; j < n; j++) { x[j] = 0; cst[j] = SX_LOWER; }
     for (int k = 0; k < P->mr; k++) { const int i = P->rmap[k]; y[i] = yr ? yr[k] : 0; rst[i] = rstr[k]; rowpres[i] = 1; }
@@ -1022,13 +1385,29 @@ void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const i
             y[k] = y[i] / lam; y[i] = 0; rst[i] = SX_BASIC;
             rst[k] = st == -2 ? SX_FIXED : ((st == SX_LOWER) == (lam > 0)) ? SX_LOWER : SX_UPPER;
             break; }
-        case R_SLACK: {
-            const int i = I[0], j = I[1], cnt = I[2];
+        case R_SLACKREST: {      /* (the rest of a run's row, summed once; the run's slacks add theirs below) */
+            const int i = I[0], cnt = I[1];
+            double r = 0; for (int t = 0; t < cnt; t++) r += D[t] * x[I[2 + t]];
+            rrun[i] = r;
+            break; }
+        case R_SLACK: case R_SLACK2: {
+            const int sl2 = P->rtype[r] == R_SLACK2;
+            const int i = I[0], j = I[1], cnt = sl2 ? 0 : I[2];
             const double a = D[0], l = D[1], u = D[2], rl = D[3], ru = D[4];
             double r = 0;
-            for (int t = 0; t < cnt; t++) r += D[5 + t] * x[I[3 + t]];
+            if (sl2) r = rrun[i]; else for (int t = 0; t < cnt; t++) r += D[5 + t] * x[I[3 + t]];
             const int eq = rl == ru;
             const double sup = a > 0 ? u : l, slo = a > 0 ? l : u;      /* the s giving max a s, min a s */
+            /* (24 October 2026, the night) "fixed" for a row that was not an equation here: made one later (a row the cost
+             * makes tight) at either side of its widened range; the side is the one its activity is at (physiciansched6-2,
+             * LP: s put at the wrong bound, 15 rows violated by up to 960, 1,532 iterations of the final check) */
+            /* (and for a row that was an equation: widened by a slack with one infinite bound, it is one-sided, and made an
+             * equation later at its finite side; dfl001, LP, s in [0, inf) put at +inf. Before the rule only a fixed slack
+             * gave a "fixed" widened row, whose two sides are one) */
+            if (rst[i] == SX_FIXED) {
+                const double lw = rl > -PHUGE && fabs(sup) < PHUGE ? rl - a * sup : -PINF, uw = ru < PHUGE && fabs(slo) < PHUGE ? ru - a * slo : PINF;
+                rst[i] = fabs(r - lw) <= fabs(r - uw) ? SX_LOWER : SX_UPPER;
+            }
             if (rst[i] == SX_LOWER || rst[i] == SX_FIXED) {
                 x[j] = sup; cst[j] = sup == u ? SX_UPPER : SX_LOWER; rst[i] = eq ? SX_FIXED : SX_LOWER;
             } else if (rst[i] == SX_UPPER) {
@@ -1053,6 +1432,7 @@ void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const i
                     x[j] = v; cst[j] = SX_BASIC; rst[i] = t == rl ? SX_LOWER : SX_UPPER;
                 }
             }
+            if (sl2) rrun[i] += a * x[j];
             break; }
         case R_AGG: {
             const int i = I[0], j = I[1], cnt = I[2];
@@ -1063,6 +1443,34 @@ void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const i
             const double zt = zt_rec(P, j, &Ic, &Dc, y, rowpres);
             x[j] = sx / a; cst[j] = SX_BASIC;
             y[i] = zt / a; rst[i] = SX_FIXED; rowpres[i] = 1;
+            break; }
+        case R_AGGB: {
+            /* x_j = (rhs - s) / a, s the row's other terms; row i (present: a range in the reduced problem) is the
+             * equality again. Its reduced status gives x_j's: the range basic, x_j basic; at the lower end of s (rhs -
+             * a u_j when a > 0) x_j at its upper bound, at the upper end at its lower one. The equality's dual: the
+             * column's reduced cost without row i, over a, plus the range's dual (x_j's reduced cost is then -a y_r) */
+            const int i = I[0], j = I[1], cnt = I[2];
+            const double a = D[0], rhs = D[1];
+            double sx = rhs;
+            for (int t = 0; t < cnt; t++) sx -= D[2 + t] * x[I[3 + t]];
+            const int *Ic = I + 3 + cnt; const double *Dc = D + 2 + cnt;
+            const double zt = zt_rec(P, j, &Ic, &Dc, y, rowpres);
+            x[j] = sx / a;
+            const int rs = rst[i];
+            if (rs == SX_LOWER) cst[j] = a > 0 ? SX_UPPER : SX_LOWER;
+            else if (rs == SX_UPPER) cst[j] = a > 0 ? SX_LOWER : SX_UPPER;
+            else if (rs == SX_FIXED) {
+                /* (23 October 2026) the row nonbasic, its side not named: a later record of the same row read the row's
+                 * bounds as read, where it is the equality (a forcing row: "fixed" with one of its columns made basic);
+                 * the column is at the bound nearer its value (basic as before, the basis had two columns for the row:
+                 * singular, 47 columns replaced on greenbea, LP) */
+                const double lj = P->l[j], uj = P->u[j];
+                const double dl = lj > -1e30 ? fabs(x[j] - lj) : 1e300, du = uj < 1e30 ? fabs(x[j] - uj) : 1e300;
+                cst[j] = dl >= 1e300 && du >= 1e300 ? SX_ZERO : dl <= du ? SX_LOWER : SX_UPPER;
+            }
+            else cst[j] = SX_BASIC;
+            if (cst[j] != SX_BASIC && P->l[j] == P->u[j]) cst[j] = SX_FIXED;
+            y[i] = zt / a + y[i]; rst[i] = SX_FIXED; rowpres[i] = 1;
             break; }
         case R_DOUBLETON: {
             const int i = I[0], j = I[1], k = I[2], from = I[3];
@@ -1117,7 +1525,17 @@ void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const i
             break; }
         }
     }
-    free(rowpres);
+    /* (24 October 2026, the night) a row whose status names a side it does not have in the problem as read: one made an
+     * equation by the presolve (a row the cost makes tight, 27.7), its records' status "fixed" or the side of the equation.
+     * It is at the side it has; a ranged row at the side its dual's sign says (physiciansched6-2, LP: 15 rows at the
+     * wrong side, the final check 1,532 iterations) */
+    for (int i = 0; i < m; i++) {
+        if (rst[i] == SX_BASIC || P->rl[i] == P->ru[i]) continue;
+        const int nolo = P->rl[i] <= -PHUGE, noup = P->ru[i] >= PHUGE;
+        if (rst[i] == SX_FIXED || (rst[i] == SX_LOWER && nolo) || (rst[i] == SX_UPPER && noup))
+            rst[i] = nolo ? SX_UPPER : noup ? SX_LOWER : y[i] >= 0 ? SX_LOWER : SX_UPPER;
+    }
+    free(rowpres); free(rrun);
 }
 
 /* ---------------------------------------------------------------- the dual problem (tall problems)
@@ -1302,6 +1720,18 @@ static void ref_split(Refine *R, int *cls, const unsigned long long *key, int *a
         const int c = cls[a[t]];
         int e = t; while (e < na && cls[a[e]] == c) e++;
         const int all = R->cnt[c] == R->size[c];
+        /* (23 October 2026) when every member is touched, the largest group keeps c (Hopcroft's rule: only the lines
+         * that move are propagated, the smaller parts); otherwise the members not touched keep it with its key */
+        static int large = -1; if (large < 0) large = !(getenv("BRISK_SXSYMLARGE") && atoi(getenv("BRISK_SXSYMLARGE")) == 0);
+        if (all && large) {
+            int best = -1; unsigned long long kb = 0;
+            for (int g = t; g < e; ) {
+                int h = g; while (h < e && key[a[h]] == key[a[g]]) h++;
+                if (h - g > best) { best = h - g; kb = key[a[g]]; }
+                g = h;
+            }
+            R->key[c] = kb;
+        }
         int keep = 0;   /* whether some group keeps c */
         for (int g = t; g < e; ) {
             int h = g; while (h < e && key[a[h]] == key[a[g]]) h++;
@@ -1323,18 +1753,11 @@ static void ref_split(Refine *R, int *cls, const unsigned long long *key, int *a
         t = e;
     }
 }
-int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose) {
+int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double budget) {
     const int m = A0->m, n = A0->n;
     *out = NULL;
     if (m == 0 || n == 0) return 0;
     const int nz = A0->Ap[n];
-    /* rows of A */
-    int *rp = xcalloc(m + 2, sizeof(int)), *ri = xmalloc(sizeof(int) * (nz + 1)); double *rv = xmalloc(sizeof(double) * (nz + 1));
-    for (int p = 0; p < nz; p++) rp[A0->Ai[p] + 1]++;
-    for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
-    { int *f = xmalloc(sizeof(int) * (m + 1)); memcpy(f, rp, sizeof(int) * m);
-      for (int j = 0; j < n; j++) for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) { const int q = f[A0->Ai[p]]++; ri[q] = j; rv[q] = A0->Ax[p]; }
-      free(f); }
     int *rc = xcalloc(m + 1, sizeof(int)), *cc = xcalloc(n + 1, sizeof(int));
     unsigned long long *rk = xmalloc(sizeof(unsigned long long) * (m + 1)), *ck = xmalloc(sizeof(unsigned long long) * (n + 1));
     for (int i = 0; i < m; i++) rk[i] = mix64(dbits(A0->rl[i]) ^ mix64(dbits(A0->ru[i])));
@@ -1352,28 +1775,44 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose) {
     ref_split(&Rr, rc, rk, alist, m);
     for (int j = 0; j < n; j++) alist[j] = j;
     ref_split(&Rc, cc, ck, alist, n);
-    int first = 1;
+    /* (23 October 2026) the refinement only splits classes: when the classes by the data alone are already too many,
+     * nothing of use can follow (lp_transport_1000, LP, 1,000,000 columns of distinct costs: 0.5 s for the rounds, twice
+     * since the problem as read is tried too, sym_first) */
+    if ((double)(Rr.ncls + Rc.ncls) > ratio * (m + n)) {
+        if (verbose) printf("symmetry: %d x %d in classes %d x %d by the data (not used)\n", m, n, Rr.ncls, Rc.ncls);
+        ref_free(&Rr); ref_free(&Rc); free(alist); free(amark); free(rc); free(cc); free(rk); free(ck);
+        return 0;
+    }
+    /* rows of A */
+    int *rp = xcalloc(m + 2, sizeof(int)), *ri = xmalloc(sizeof(int) * (nz + 1)); double *rv = xmalloc(sizeof(double) * (nz + 1));
+    for (int p = 0; p < nz; p++) rp[A0->Ai[p] + 1]++;
+    for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
+    { int *f = xmalloc(sizeof(int) * (m + 1)); memcpy(f, rp, sizeof(int) * m);
+      for (int j = 0; j < n; j++) for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) { const int q = f[A0->Ai[p]]++; ri[q] = j; rv[q] = A0->Ax[p]; }
+      free(f); }
+    int first = 1, overbudget = 0; double work = 0;
     for (;;) {
         rounds++;
         /* rows next to columns that changed class (all in the first round) */
         int na = 0;
         if (first) { for (int i = 0; i < m; i++) alist[na++] = i; }
         else for (int t = 0; t < Rc.nchg; t++) { const int j = Rc.chg[t]; for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) { const int i = A0->Ai[p]; if (!amark[i]) { amark[i] = 1; alist[na++] = i; } } }
-        for (int t = 0; t < na; t++) { const int i = alist[t]; amark[i] = 0; unsigned long long h = 0; for (int p = rp[i]; p < rp[i + 1]; p++) h += mix64(((unsigned long long)cc[ri[p]] << 32) ^ mix64(dbits(rv[p]))); rk[i] = h; }
+        for (int t = 0; t < na; t++) { const int i = alist[t]; amark[i] = 0; unsigned long long h = 0; for (int p = rp[i]; p < rp[i + 1]; p++) h += mix64(((unsigned long long)cc[ri[p]] << 32) ^ mix64(dbits(rv[p]))); rk[i] = h; work += rp[i + 1] - rp[i] + 1; }
         ref_split(&Rr, rc, rk, alist, na);
         /* columns next to rows that changed class */
         na = 0;
         if (first) { for (int j = 0; j < n; j++) alist[na++] = j; }
         else for (int t = 0; t < Rr.nchg; t++) { const int i = Rr.chg[t]; for (int p = rp[i]; p < rp[i + 1]; p++) { const int j = ri[p]; if (!amark[j]) { amark[j] = 1; alist[na++] = j; } } }
-        for (int t = 0; t < na; t++) { const int j = alist[t]; amark[j] = 0; unsigned long long h = 0; for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) h += mix64(((unsigned long long)rc[A0->Ai[p]] << 32) ^ mix64(dbits(A0->Ax[p]))); ck[j] = h; }
+        for (int t = 0; t < na; t++) { const int j = alist[t]; amark[j] = 0; unsigned long long h = 0; for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) h += mix64(((unsigned long long)rc[A0->Ai[p]] << 32) ^ mix64(dbits(A0->Ax[p]))); ck[j] = h; work += A0->Ap[j + 1] - A0->Ap[j] + 1; }
         ref_split(&Rc, cc, ck, alist, na);
         first = 0;
         if (Rc.nchg == 0) break;     /* (the rows were refined against these column classes: stable) */
         if ((double)(Rr.ncls + Rc.ncls) > ratio * (m + n)) break;   /* (too many classes to be of use: the check below fails) */
+        if (budget > 0 && work > budget) { overbudget = 1; break; }   /* (a caller's cap on the entries the rounds touch) */
     }
     int nr = Rr.ncls, nc = Rc.ncls;
     ref_free(&Rr); ref_free(&Rc); free(alist); free(amark);
-    int use = (double)(nr + nc) <= ratio * (m + n) && (nr < m || nc < n);
+    int use = !overbudget && (double)(nr + nc) <= ratio * (m + n) && (nr < m || nc < n);
     if (use) {
         const int e1 = lines_equitable(m, rp, ri, rv, rc, cc, nr), e2 = lines_equitable(n, A0->Ap, A0->Ai, A0->Ax, cc, rc, nc);
         if (getenv("SXDBG")) printf("symmetry check: rows %d columns %d\n", e1, e2);

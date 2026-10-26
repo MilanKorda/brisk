@@ -418,7 +418,8 @@ static int al_block(const Block *B, int kblk, int verbose, ACmp **out, int *nmul
     return ncomp;
 }
 
-PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose) {
+int brisk_arrow_hub(const Block *B);
+PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose, int soc_minn) {
     if (!mode) return NULL;
     const double t0 = wtime();
     const int nb = P->nblk, m = P->m;
@@ -429,6 +430,11 @@ PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose) {
         if (B->type != BLK_SDP || B->n < 2) continue;
         if (mode < 0 && B->n > maxn) continue;
         if (B->ncon == 0 && B->C.nnz == 0) continue;
+        /* 22 October 2026: a second-order cone read as a block with arrow data is solved as a cone (solver.c, -soc),
+         * in O(n) work an iteration; the test below costs about four n x n eigenvalue and product passes, and what it
+         * can find there (the cone's directions that no constraint touches) is worth nothing to the cone solve
+         * (rpcan_30, SDP with SOCP: 0.32 s of a 0.65 s run on a cone of dimension 901) */
+        if (soc_minn > 0 && B->n >= soc_minn && brisk_arrow_hub(B) >= 0) continue;
         if (brisk_stop_flag) break;        /* 4.42: Ctrl-C / brisk_interrupt(): the blocks not yet checked stay as they are */
         ntried++;
         int nmu = 0;
@@ -457,7 +463,7 @@ PSAlg *alg_reduce(Problem *P, int mode, int maxn, double symmin, int verbose) {
             c0 = F + w0; c1 = F + w1;
         }
         if (c0 / fmax(c1, 1.0) < (mode > 0 ? 1.0 + 1e-9 : symmin)) {
-            if (verbose > 0) printf("   algebra symmetry: block %d (n = %d): %d component(s), gain %.2f below %g: not applied\n", k + 1, B->n, nc, c0 / fmax(c1, 1.0), symmin);
+            if (verbose > 1)   /* (24 October 2026: per block with -vv; sep30000 printed 30,000 such lines) */ printf("   algebra symmetry: block %d (n = %d): %d component(s), gain %.2f below %g: not applied\n", k + 1, B->n, nc, c0 / fmax(c1, 1.0), symmin);
             for (int c = 0; c < nc; c++) free(cmp[k][c].Q);
             free(cmp[k]); cmp[k] = NULL; continue;
         }

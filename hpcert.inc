@@ -185,7 +185,7 @@ static int hpc_lammin_ge(const HPJob *J, int n, const uint64_t *M, double need, 
             if (i == j) mpx_sub(W + ((size_t)i * n + i) * Wm, M + ((size_t)i * n + i) * Wm, cm);
             else mpx_copy(W + ((size_t)i * n + j) * Wm, M + ((size_t)j * n + i) * Wm);
         }
-    return cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL) == 0;
+    return cholr_mp(n, W, 0.0, NULL, NULL, 0, NULL, NULL, 0.0) == 0;
 }
 
 typedef struct {

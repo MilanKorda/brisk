@@ -1,4 +1,4 @@
-# BRISK 1.5.5: the solver in detail
+# BRISK 1.6: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -29,16 +29,34 @@ are routed the same way.
 `./brisk problem.mps` reads a linear program in MPS format (free or fixed), presolves it and
 solves it by an interior-point method for linear programs (upper bounds kept as bounds, normal
 equations); infeasible and unbounded problems are handed to the SOCP solver, which returns the
-certificate. `-x file` writes x of the problem as read. The solution is an interior one (no
-crossover). `./brisk problem.cbf` (or `.cbf.gz`) reads the conic benchmark format of CBLIB for
+certificate. `-x file` writes x of the problem as read. The solution is an interior one;
+`-lpmethod 2` and `3` (the dual and the primal simplex method), `4` (the interior-point method
+followed by a crossover) and `5` (chosen automatically between 2 and 4) return an optimal basic
+solution. `./brisk problem.cbf` (or `.cbf.gz`) reads the conic benchmark format of CBLIB for
 linear and second-order cone problems; integer variables are relaxed.
+
+## Quadratic programs (QPS) and convex QCQPs
+
+`./brisk problem.qps` reads a convex quadratic program in the QPS format (an MPS file with a
+QUADOBJ, QMATRIX or QSECTION section): min ½ x'Hx + c'x subject to linear rows with ranges and
+bounds on x. It is solved by the dual active-set method of Goldfarb and Idnani when it is small
+and H is positive definite (as in model predictive control), and by an interior-point method for
+QPs otherwise (`-qpas` and `-qpipm` choose the method). Infeasible and unbounded QPs are reported
+with a certificate, and a QP that is not convex is refused. A QPS file with QCMATRIX sections
+(convex quadratic constraints) is solved by the SOCP solver, each quadratic constraint a
+second-order cone, and its point is polished to the QCQP's own optimality conditions. The same
+solvers are called by `brisk.solve_qp` and `brisk.solve_file` (Python), `brisk.BRISK_QP()`
+(CVXPY) and `brisk_solve_qp` (C). For branch and bound, `brisk.QpModel` and `brisk_qp_create` keep a
+QP and re-solve it after changes of its bounds and costs from the previous active set, and
+`brisk.SocpModel` and `brisk_socp_create` do the same for an SOCP, warm-started from the previous
+point. The QP and QCQP solvers are not yet available from Julia and MATLAB.
 
 ## Interfaces
 
-- **Command line:** `./brisk problem.dat-s [options]` (or `problem.mat`, SeDuMi format). `./brisk` alone lists every option.
+- **Command line:** `./brisk problem.dat-s [options]` (or `problem.mat`, SeDuMi format; `.mps`, `.cbf`, `.qps`). `./brisk` alone lists every option.
 - **Python / CVXPY** ([python/README.md](python/README.md)): `pip install "./python[cvxpy]"`.
-  Then `prob.solve(solver=brisk.BRISK())` in CVXPY, or `brisk.solve_file` / `brisk.solve_sdpa`
-  on SDPA data.
+  Then `prob.solve(solver=brisk.BRISK())` in CVXPY (`brisk.BRISK_QP()` for QPs), or
+  `brisk.solve_file` / `brisk.solve_sdpa` on SDPA data and `brisk.solve_qp` on a QP.
 - **Julia / JuMP** ([julia/Brisk/README.md](julia/Brisk/README.md)): `Model(Brisk.Optimizer)`,
   a MathOptInterface optimizer, plus direct calls on SDPA files or data.
 - **MATLAB / Octave** ([matlab/README.md](matlab/README.md)): a MEX interface taking SeDuMi
@@ -122,9 +140,10 @@ Every automatic choice below can be overridden from the command line.
     many split free pairs, or in the chordal moment form.
   - The infeasible start runs first only on large dense blocks with a cheap Schur complement
     (max-cut and graph-partitioning type problems).
-  - Each method is the other's fallback, and a first run that ends above 1e-7 (1e-6 for
+  - Each method is the other's fallback, and a first run that ends above 1e-7 (1e-5 for
     the embedding) is followed by the other one, and so is a result that misses 1e-6 on the
-    original data.
+    original data. After an embedding whose primal iterate ended at least 10 times its start's
+    size, the second run is the embedding again with its start at that size (`-hsdx0` sets it).
   - `-hsd` / `-nohsd` force one method.
   - The solve stops once the best iterate meets the tolerance, with a factor two to spare, in
     the DIMACS errors the status is set from, and an iteration does not improve on it.
@@ -234,8 +253,9 @@ Every automatic choice below can be overridden from the command line.
 - **`-lralm 1` (experimental):** a low-rank augmented Lagrangian method (X = R Rᵀ) for very large
   sparse SDPs such as AC-OPF relaxations beyond the interior-point method's reach. Its Newton
   steps use a sparse n × n preconditioner, so its memory stays O(nnz + n·rank). It reports
-  b'y as a lower bound when Z = C − A'y passes a sparse Cholesky test. It converges slowly on
-  mid-size problems; see `./brisk` for its options.
+  b'y as a lower bound when Z = C − A'y passes a sparse Cholesky test. It never forms X: the
+  interfaces return y, the objectives, the status and the errors, without X and Z. It converges
+  slowly on mid-size problems; see `./brisk` for its options.
 - **`-dual`:** a sparse dual-scaling method. It keeps Z sparse and never forms X, and is fast on
   sparse relaxations such as max-cut and box-QP.
 - **`-bound p|d|pd`:** returns *guaranteed* bounds on the optimal value beside the solution (the

@@ -64,7 +64,7 @@ SeDuMi). A problem without `K.s` is solved by BRISK's SOCP solver for linear and
 cone programs (`opts.conesolver = 0` forces the semidefinite solver, which takes the cones as
 arrow blocks). Complex data are not supported. `info` has SeDuMi's
 `pinf`, `dinf`, `numerr` (0 solved, 1 reduced accuracy, 2 failure), `iter`, `cpusec`, plus
-`pobj`, `dobj`, `dimacs` (the six DIMACS errors, measured on your data), `status`.
+`pobj`, `dobj`, `dimacs` (the six DIMACS errors, measured on your data; with `prec`, in the working precision), `status`.
 
 A problem exported by NCTSSOS/TSSOS/YALMIP in SeDuMi format can be passed as is (the free
 variables, e.g. the bound of a polynomial optimization problem, go in `K.f`).

@@ -8,12 +8,13 @@ BRISK is an interior-point solver for semidefinite programs (SDPs) with linear b
 (P)  min <C,X>  s.t. <A_i,X> = b_i,  X in K        (D)  max b'y  s.t.  sum y_i A_i + Z = C,  Z in K
 ```
 
-Since version 1.2 it also solves problems with second-order cones and free variables (a
-SOCP solver of its own when there is no semidefinite block) and linear programs from MPS
-files.
+It also solves problems with second-order cones and free variables (an SOCP solver of its
+own when there is no semidefinite block), linear programs (an interior-point method and the
+simplex method) and convex quadratic programs and QCQPs (an interior-point method and a dual
+active-set method for QPs).
 
-It is written in C on BLAS/LAPACK, reads SDPA sparse files (`.dat-s`), SeDuMi MAT-files, MPS
-and CBF files, and is called from the command line, Python (CVXPY), Julia (JuMP), MATLAB and
+It is written in C on BLAS/LAPACK, reads SDPA sparse files (`.dat-s`), SeDuMi MAT-files, MPS,
+QPS and CBF files, and is called from the command line, Python (CVXPY), Julia (JuMP), MATLAB and
 GNU Octave. All interfaces run the same code.
 
 **Website and documentation:** https://homepages.laas.fr/mkorda/brisk/
@@ -59,7 +60,7 @@ Details: [SOLVER.md](SOLVER.md) (methods, automatic choices, exit codes) and
 
 ## Status
 
-Version 1.5.5. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
+Version 1.6. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
 benchmark, AC optimal power flow and moment-SOS relaxations) and through the test suites of
 the three interfaces. The macOS build has not yet been validated on a Mac. Please report
 problems through the issue tracker, with the output of `./brisk problem.dat-s -v`.
@@ -68,6 +69,11 @@ problems through the issue tracker, with the output of `./brisk problem.dat-s -v
 
 Milan Korda, LAAS-CNRS, Toulouse. The AMD ordering in `amd/` is from SuiteSparse (BSD 3-clause,
 `amd/LICENSE_AMD.txt`).
+
+## Acknowledgements
+
+Thanks to Marek Tyburec and Michal Kočvara for test problems, bug reports, patches and suggestions
+that improved BRISK.
 
 ## License
 

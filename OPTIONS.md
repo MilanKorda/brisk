@@ -77,6 +77,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | option | meaning | default |
 |---|---|---|
 | `hsd` / `nohsd` | force / forbid the homogeneous self-dual embedding | automatic, each method the other's fallback |
+| `hsdx0` | the self-dual embedding's primal start scaled by this factor; when the embedding ends above 1e-5 with its primal iterate at least 10 times its start's size (Frobenius norm), the second solve is the embedding again with its start at that size (the advice names the factor) | as computed |
 | `hsdfirst` | automatic order: `1` the embedding first where it is cheap: its extra dense work 12·Σn³ is at most m³/3 (`hsdfirstc` 12), or at most half of m³/3 plus the estimated work of the Schur assembly (`hsdfirstasm` 0.5: problems whose iteration is mostly assembly), or the problem is tiny | 1 |
 | `dir` | search direction `auto`, `hkm`, `nt` | `auto` |
 | `hsddir` | direction inside the embedding: `0` HKM, `1` NT; automatic: NT on moment relaxations as given (the largest block a moment matrix, localizing blocks, no LP part, free variables or symmetry reduction; with the centred start `init 3`) and on the chordal moment form, HKM otherwise | automatic |
@@ -85,6 +86,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `cls` | entry-class route of the Schur assembly: a block whose entries fall into classes with the same coefficients in the same constraints (localizing matrices of moment relaxations) is assembled from the much smaller Schur complement of its classes: `-1` auto, `0` off, `1` force | `-1` |
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
+| `fombound` | constraints g X_ij + a s = b whose extra variable s ≥ 0 appears in no other constraint and has no cost are bounds on single entries of X (doubly nonnegative programs: k-means and theta-plus relaxations): the first-order engine solves the problem without them, with the bounds as a cone of their own on X; when at least half the constraints are such bounds and there are 4,000 or more, it runs *first* (not at `acc high`), within an iteration cap of about twice the interior-point method's estimated time, and the interior-point method follows if it misses the tolerance; `0` off | 1 |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off (the default since 19 October 2026: it lost wherever it ran on the sets) | 0 |
 | `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the interior-point method with the factored Schur complement from that iterate | 0 |
 | `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block and each LP variable is in one constraint at most); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the solve with the factored Schur complement in all), and the interior-point method with the factored Schur complement follows unless it ends OPTIMAL (from the attempt's iterate of merit 1e-3 if it got that far); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
@@ -106,6 +108,7 @@ leaves the flag out, so the step stays on).
 | `HSD: polish probe …`, `polishing: score … (the probe's candidate)` | during the iterations of the embedding: the primal residual of the iterate corrected in the metric of the last iteration with the Schur factor at hand (NT direction), else its Euclidean polish; the solve stops when the corrected point meets the tolerance | `nopolish` |
 | `restoring the primal feasibility …`, `square-root-metric polishing: …` | a point that missed the tolerance in its primal residual: X ← X^½ (I + W) X^½ with W chosen so that A(X) = b (X stays positive semidefinite, the complementarity stays), from the iterate with the smallest dual residual and complementarity, during the iterations and at the end | `nopolishr` (or `nopolish`) |
 | `dd k pinf …`, `high-precision endgame: …` | a small problem (m ≤ 1,200, the blocks within the memory) that ends short of the tolerance is continued in double-double arithmetic within a work budget | `nodd` |
+| `augmented-system end phase: polished … against …, kept` | where the double-double endgame is skipped (too many constraints, blocks too large for the memory, or fewer than three of its iterations within its budget): a few interior-point iterations whose Newton system is solved in its augmented form (MINRES with the factored Schur complement as the preconditioner), which keeps the primal equations that the Schur complement formed in double precision loses at a degenerate optimum; within the same budget (`ddfactor`), kept only if it ends better after the polish | `nodd` |
 | `X-metric polishing: …` | the returned point corrected in the metric of X (X stays positive definite); also tried as a probe during the iterations | `nopolishx` (or `nopolish`) |
 | `polishing: score … (Gram CG residual …)` | the Euclidean projection onto A(X) = b, when the steps above leave the point above the tolerance | `nopolish` |
 
@@ -161,8 +164,8 @@ digits (the usual result holds it rounded to doubles).
 | option | meaning | default |
 |---|---|---|
 | `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows); `3` with `lpmethod` 1, first parallel rows and columns, doubleton equations and slack columns, then as `2` | 3 |
-| `lpmethod` | `1` the LP interior-point method (bounds as bounds, normal equations; the SOCP solver takes over when it gives up), `0` the SOCP solver directly | 1 |
-| `lpcorr` | centrality correctors per iteration | 0–3 from the cost of a factorization against a solve (flop ratio above 10, 30, 50) |
+| `lpmethod` | `1` the LP interior-point method (bounds as bounds, normal equations; the SOCP solver takes over when it gives up far from the optimum, a stop within 100 times the tolerance returns its point at reduced accuracy), `0` the SOCP solver directly | 1 |
+| `lpcorr` | the interior-point method's centrality correctors per iteration (`lpmethod` 1, 4 and 5) | 0–3 from the cost of a factorization against a solve (flop ratio above 10, 30, 50) |
 
 Also `tol` (1e-8), `maxit` (200), `timelimit`, `q`, `v`, and `-x file` (x of the problem as read).
 The mfipm options `mfproj` (0: no projection of the primal direction; 1: the earlier scheme)
@@ -181,8 +184,17 @@ usage: brisk problem.dat-s [options]      (an SDPA sparse file)
        brisk problem.mps [options]        (a linear program: MPS, free or fixed format)
        brisk problem.cbf[.gz] [options]   (CBF, the format of CBLIB: linear and second-order cones;
                                            integer variables are relaxed)
+       brisk problem.qps [options]        (a convex quadratic program: an MPS file with a QUADOBJ,
+                                           QMATRIX or QSECTION section; QCMATRIX: quadratic constraints)
+A convex QP read from a QPS file is solved by the QP solver: by the dual active-set method of Goldfarb
+and Idnani when it is small and its quadratic term positive definite, by the QP interior-point method
+otherwise (-qpas, -qpipm: that method). A convex QCQP is solved by the SOCP solver, each quadratic
+constraint a second-order cone, and its point polished to the QCQP's own optimality conditions. A QP
+that is not convex is refused. Their options: -qpas, -qpipm, -tol, -maxit, -timelimit, -threads,
+-x <file> (x, one value per line), -q, -v.
 A linear program read from an MPS file is presolved and solved by the LP interior-point method
 (bounds kept as bounds, normal equations); the SOCP solver takes over when that method gives up
+far from the optimum (within 100 times the tolerance its point is returned at reduced accuracy)
 (infeasible or unbounded problems: it returns the certificates). Its options: -tol, -maxit,
 -timelimit, -q, -v, -x <file> (x of the problem as read, one value per line), and
   -lppresolve <k>  0 none, 1 rows and columns (fixed, singleton, redundant, forcing, dual fixing),
@@ -194,8 +206,8 @@ A linear program read from an MPS file is presolved and solved by the LP interio
                    followed by a crossover, 5 chosen automatically between 2 and 4 (2-5: an optimal basic solution;
                    with 5 and two threads or more, 2 and 4 run at the same time and the first to finish gives
                    the result, which can then differ from run to run; -threads 1 gives the same result every run)
-  -lpcorr <k>      centrality correctors per iteration (default: 0-3 from the cost of a
-                   factorization against a solve)
+  -lpcorr <k>      the interior-point method's centrality correctors per iteration (-lpmethod 1, 4
+                   and 5; default: 0-3 from the cost of a factorization against a solve)
 A problem in SeDuMi format without semidefinite blocks (a linear or second-order cone program)
 is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -timelimit, -q,
 -v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With
@@ -295,6 +307,9 @@ method
   -hsdfirstc <c>   ... i.e. when c * sum n^3 <= m^3/3 (12),
   -hsdfirstasm <f> ... or <= f * (m^3/3 + the estimated work of the Schur assembly) (0.5; 0: off)
   -stdslow <k>     infeasible-start method: stop for the retry when the best score has not halved in k iterations (10; 0 off)
+  -hsdx0 <f>       the self-dual embedding's primal start scaled by f (default: as computed). When the embedding
+                   ends above 1e-5 with its primal iterate at least 10 times its start's size (Frobenius norm), the
+                   second solve is the embedding again with its start at that size (the log names the factor)
   -retryacc <a>    retry with the embedding only if the first result is worse than a (1e-7)
   -warm <l>        re-solve from l x (first point) + (1 - l) x (standard start) (0 = off; measured slower)
   -dir auto|hkm|nt search direction of the interior-point method, with either start (auto;
@@ -304,8 +319,9 @@ method
                    Z^{-1}, its products and the dual step length; X stays dense (200; 0 off)
   -zsparsefill <f> ... when the factor has at most f n^2 nonzeros (0.1)
   -ntfast <k>      NT: form dX on the pattern of dZ (1) or by dense transforms (0, default)
-  -nodd            no double-double endgame
-  -ddfactor <f>    endgame work budget as a multiple of the solve's work (1.0)
+  -nodd            no double-double endgame (nor the end phase on the augmented Newton system)
+  -ddfactor <f>    endgame work budget as a multiple of the solve's work (1.0); also the time of the end
+                   phase on the augmented Newton system, where the double-double endgame is too large
   -ddminwork <w>   ... but at least this many flop-equivalents (1e11)
   -ddmaxm <k>      size limit for the endgame (1200)
   -ddmaxn2 <s>     ... and the largest sum of the squares of the block orders (0: from the memory limit)
@@ -401,6 +417,14 @@ presolve
                    first-order engine runs first for the fraction f of that time (default 0: off;
                    it lost wherever it ran on the sets, e.g. 0.2);
                    the interior-point method follows if it has not reached the tolerance
+  -fombound <0|1>  constraints g X_ij + a s = b whose extra variable s >= 0 appears in no
+                   other constraint are bounds on single entries of X (doubly nonnegative
+                   programs: k-means and theta-plus relaxations). With 1 (the default) the
+                   first-order engine solves the problem without them, with the bounds as a
+                   cone of their own on X; when at least half the constraints are such bounds
+                   and there are 4,000 or more, it runs first, within an iteration cap of about
+                   twice the interior-point method's estimated time, and the interior-point method
+                   follows if it has not reached the tolerance (not with -acc high). 0: off
   -fomstart-x <f>  start the first-order engine from the X in f (the -x format) ...
   -fomstart-y <f>  ... and the y in f (the -y format): continuing a long run (needs -nosym
                    when a symmetry was found, and a problem the presolve keeps as read)

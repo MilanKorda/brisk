@@ -547,6 +547,248 @@ int fr_has_candidate(const Problem *P) {
     return any;
 }
 
+/* 23 October 2026: faces of lifted relaxations exposed by their linear constraints. In a block Y = [g x'; x X] whose
+ * diagonal entry Y_hh = g > 0 is fixed by a constraint of its own, a constraint on row h alone reads a'x = beta (x the
+ * rest of row h, a_j = 2 A_hj, beta = b - A_hh g) and gives v = (-beta/g at h, a elsewhere) with v'Yv = a'Xa - beta^2/g,
+ * which is >= 0 for every Y >= 0 (X >= x x'/g). When v v' is a combination sum d_i A_i of the constraints with b'd = 0,
+ * every feasible Y has <v v', Y> = b'd = 0, hence Y v = 0: a face of the cone that only that combination exposes, so the
+ * single-constraint facial reduction below does not see it (the lifted QAP relaxation: its row and column sums with the
+ * diagonal and the products of two entries of one row or column, the face of Zhao, Karisch, Rendl and Wolkowicz, 1998).
+ * The test is exact linear algebra on the constraints of the block whose entries lie in supp(v) x supp(v): the normal
+ * equations of the least-squares fit, two refinement steps, the residual against |v|^2 and b'd against the sizes of its
+ * terms. Each exact v becomes a constraint <v v', Y> = 0 (b = 0, rank one) that the facial reduction then removes like
+ * any other (sparse: a unit vector plus one entry per index); its orig is -2 - j for combination j of the postsolve's
+ * table, through which the postsolve spreads its dual over the file's rows. Returns the number of constraints added.
+ * BRISK_LIFTFACE=0: off. */
+double g_lf_time = 0;     /* (the detection's time, for BRISK_LFSCAN) */
+int lifted_faces(Problem *P, int verbose) {
+    static int off = -1; if (off < 0) { const char *e = getenv("BRISK_LIFTFACE"); off = e && atoi(e) == 0; }
+    if (off || !P->ps || !P->orig || P->m < 3) return 0;
+    const double tlf0 = wtime();
+    const int m0 = P->m;
+    int *nb = calloc((size_t)m0 + 1, sizeof(int));          /* blocks in which a constraint has entries */
+    for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) if (P->blk[k].A[t].nnz) nb[P->blk[k].con[t]]++;
+    int nf = 0, fcap = 0, *fblk = NULL, *fns = NULL, **fsup = NULL, *fnr = NULL, **fri = NULL;
+    double **fval = NULL, **frw = NULL;
+    double work = 0;
+    for (int k = 0; k < P->nblk && work < 2e9; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_SDP || B->n < 3) continue;
+        const int n = B->n;
+        double *g = calloc((size_t)n, sizeof(double));      /* Y_hh = g[h] > 0 fixed by a constraint of its own */
+        int nfix = 0;
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *S = &B->A[t]; const int i = B->con[t];
+            if (nb[i] != 1 || S->nnz != 1 || S->row[0] != S->col[0] || P->b[i] == 0 || S->val[0] == 0) continue;
+            const double gh = P->b[i] / S->val[0];
+            if (gh > 0 && g[S->row[0]] == 0) { g[S->row[0]] = gh; nfix++; }
+        }
+        if (!nfix) { free(g); continue; }
+        int *pos = malloc(sizeof(int) * (size_t)n); for (int j = 0; j < n; j++) pos[j] = -1;
+        double *vd = calloc((size_t)n, sizeof(double));
+        int *sup = malloc(sizeof(int) * (size_t)n);
+        /* an orthonormal basis of the face vectors accepted in this block (dense, n <= 4000): a candidate in their span
+         * adds nothing (Y v = 0 follows from the others), so at most n - 1 faces a block reach the facial reduction (a
+         * Mittelmann problem with one block of order 569 has 9,900 candidates) */
+        double *Qb = n <= 4000 ? malloc(sizeof(double) * (size_t)n * 64) : NULL, *wq = Qb ? malloc(sizeof(double) * (size_t)n) : NULL;
+        int nq = 0, qcap = Qb ? 64 : 0;
+        /* the constraints of this block alone by index (each listed under the indices of its entries), so that a
+         * candidate visits only the constraints that meet its support (fap25: a scan of all 2,118 constraints for each
+         * of its candidates took 1.9 s) */
+        int *ip = calloc((size_t)n + 1, sizeof(int)), *il = NULL, *stamp = malloc(sizeof(int) * ((size_t)B->ncon + 1));
+        for (int t = 0; t < B->ncon; t++) {
+            stamp[t] = -1;
+            const SpSym *A = &B->A[t];
+            if (nb[B->con[t]] != 1) continue;
+            for (int e = 0; e < A->nnz; e++) { ip[A->row[e] + 1]++; if (A->col[e] != A->row[e]) ip[A->col[e] + 1]++; }
+        }
+        for (int j = 0; j < n; j++) ip[j + 1] += ip[j];
+        il = malloc(sizeof(int) * ((size_t)ip[n] + 1));
+        {
+            int *fp = malloc(sizeof(int) * ((size_t)n + 1)); memcpy(fp, ip, sizeof(int) * (size_t)n);
+            for (int t = 0; t < B->ncon; t++) {
+                const SpSym *A = &B->A[t];
+                if (nb[B->con[t]] != 1) continue;
+                for (int e = 0; e < A->nnz; e++) { il[fp[A->row[e]]++] = t; if (A->col[e] != A->row[e]) il[fp[A->col[e]]++] = t; }
+            }
+            free(fp);
+        }
+        work += (double)ip[n];
+        for (int t0 = 0; t0 < B->ncon && work < 2e9 && !(Qb && nq >= n - 1); t0++) {
+            const SpSym *S = &B->A[t0]; const int i0 = B->con[t0];
+            if (nb[i0] != 1 || S->nnz < 1) continue;
+            int h = -1;                                      /* every entry on row h of a fixed diagonal, one off it at least */
+            for (int side = 0; side < 2 && h < 0; side++) {
+                int hh = -1;
+                for (int e = 0; e < S->nnz; e++) if (S->row[e] != S->col[e]) { hh = side ? S->col[e] : S->row[e]; break; }
+                if (hh < 0 || g[hh] == 0) continue;
+                int ok = 1;
+                for (int e = 0; e < S->nnz && ok; e++) if (S->row[e] != hh && S->col[e] != hh) ok = 0;
+                if (ok) h = hh;
+            }
+            if (h < 0) continue;
+            double ahh = 0; int s = 0;
+            sup[s] = h; pos[h] = s++;
+            for (int e = 0; e < S->nnz; e++) {
+                if (S->row[e] == S->col[e]) { ahh += S->val[e]; continue; }
+                const int j = S->row[e] == h ? S->col[e] : S->row[e];
+                if (pos[j] < 0) { sup[s] = j; pos[j] = s++; }
+                vd[j] += 2.0 * S->val[e];
+            }
+            vd[h] = -(P->b[i0] - ahh * g[h]) / g[h];
+            if (Qb) {                                        /* the part of v outside the span of the accepted faces */
+                double vn = 0; for (int q = 0; q < s; q++) vn += vd[sup[q]] * vd[sup[q]];
+                /* first |w|^2 = |v|^2 - |Q'v|^2 from the support of v alone (most candidates lie in the span: nq s work
+                 * instead of 2 nq n); only a candidate that passes is projected densely */
+                double s2 = 0;
+                for (int c = 0; c < nq; c++) { const double *qc = Qb + (size_t)c * n; double dt = 0; for (int q = 0; q < s; q++) dt += qc[sup[q]] * vd[sup[q]]; s2 += dt * dt; }
+                work += (double)nq * s;
+                if (!(vn - s2 > 1e-12 * vn)) { for (int q = 0; q < s; q++) { vd[sup[q]] = 0; pos[sup[q]] = -1; } continue; }
+                memset(wq, 0, sizeof(double) * (size_t)n);
+                for (int q = 0; q < s; q++) wq[sup[q]] = vd[sup[q]];
+                for (int pass = 0; pass < 2; pass++)
+                    for (int c = 0; c < nq; c++) {
+                        const double *qc = Qb + (size_t)c * n; double dt = 0;
+                        for (int j = 0; j < n; j++) dt += qc[j] * wq[j];
+                        for (int j = 0; j < n; j++) wq[j] -= dt * qc[j];
+                    }
+                double wn = 0; for (int j = 0; j < n; j++) wn += wq[j] * wq[j];
+                work += 2.0 * nq * n;
+                if (!(wn > 1e-18 * vn)) { for (int q = 0; q < s; q++) { vd[sup[q]] = 0; pos[sup[q]] = -1; } continue; }
+            }
+            const long npos = (long)s * (s + 1) / 2;
+            /* the constraints of the block with every entry in supp(v) x supp(v) (and no entries in other blocks), from
+             * the index; and whether they cover every nonzero of v v' (if one is left out, no combination exists) */
+            int nr = 0, *rt = malloc(sizeof(int) * ((size_t)B->ncon + 1));
+            double visits = 0;
+            for (int q = 0; q < s; q++) {
+                const int j = sup[q];
+                visits += ip[j + 1] - ip[j];
+                for (int u = ip[j]; u < ip[j + 1]; u++) {
+                    const int t = il[u];
+                    if (stamp[t] == t0) continue;
+                    stamp[t] = t0;
+                    const SpSym *A = &B->A[t];
+                    int in = A->nnz > 0;
+                    for (int e = 0; e < A->nnz && in; e++) if (pos[A->row[e]] < 0 || pos[A->col[e]] < 0) in = 0;
+                    visits += A->nnz;
+                    if (in) rt[nr++] = t;
+                }
+            }
+            int covered = nr > 0;
+            if (covered) {
+                char *cov = calloc((size_t)npos, 1);
+                for (int a = 0; a < nr; a++) { const SpSym *A = &B->A[rt[a]]; for (int e = 0; e < A->nnz; e++) { const int r = pos[A->row[e]], c = pos[A->col[e]]; cov[r <= c ? (long)c * (c + 1) / 2 + r : (long)r * (r + 1) / 2 + c] = 1; } }
+                for (int c = 0; c < s && covered; c++) for (int r = 0; r <= c && covered; r++)
+                    if (vd[sup[r]] * vd[sup[c]] != 0 && !cov[(long)c * (c + 1) / 2 + r]) covered = 0;
+                free(cov);
+            }
+            work += visits + (covered ? (double)nr * npos : (double)npos);
+            int exact = 0;
+            double *Ah = NULL, *G = NULL, *d = NULL, *rhs = NULL, *res = NULL, *tv = NULL;
+            if (covered && nr <= 4000 && (double)nr * npos <= 2e7) {
+                /* A^ (nr x npos): <A_a, M> = A^_a . vec(M) with vec(M)_p = M_rc (r == c), sqrt2 M_rc (r < c), p over the
+                 * pairs of supp(v) in the order of their positions */
+                Ah = calloc((size_t)nr * npos, sizeof(double));
+                #define LF_P(a, b) ((a) <= (b) ? (long)(b) * ((b) + 1) / 2 + (a) : (long)(a) * ((a) + 1) / 2 + (b))
+                for (int a = 0; a < nr; a++) {
+                    const SpSym *A = &B->A[rt[a]];
+                    for (int e = 0; e < A->nnz; e++) {
+                        const int r = pos[A->row[e]], c = pos[A->col[e]];
+                        Ah[a + (size_t)nr * LF_P(r, c)] += r == c ? A->val[e] : M_SQRT2 * A->val[e];
+                    }
+                }
+                tv = malloc(sizeof(double) * (size_t)npos);
+                for (int c = 0; c < s; c++) for (int r = 0; r <= c; r++)
+                    tv[LF_P(r, c)] = r == c ? vd[sup[r]] * vd[sup[c]] : M_SQRT2 * vd[sup[r]] * vd[sup[c]];
+                G = malloc(sizeof(double) * (size_t)nr * nr);
+                const double one = 1.0, zero = 0.0, mone = -1.0; const int inc = 1, np_ = (int)npos;
+                BL(dsyrk_)("L", "N", &nr, &np_, &one, Ah, &nr, &zero, G, &nr);
+                int info = 0;
+                BL(dpotrf_)("L", &nr, G, &nr, &info);
+                if (info == 0) {
+                    d = calloc((size_t)nr, sizeof(double)); rhs = malloc(sizeof(double) * (size_t)nr); res = malloc(sizeof(double) * (size_t)npos);
+                    double vv = 0; for (int q = 0; q < s; q++) vv += vd[sup[q]] * vd[sup[q]];
+                    double rn = 0;
+                    for (int it = 0; it < 3; it++) {
+                        memcpy(res, tv, sizeof(double) * (size_t)npos);            /* res = vec(v v') - A^' d */
+                        BL(dgemv_)("T", &nr, &np_, &mone, Ah, &nr, d, &inc, &one, res, &inc);
+                        rn = 0; for (long p = 0; p < npos; p++) rn += res[p] * res[p];
+                        rn = sqrt(rn);
+                        if (it == 2) break;
+                        BL(dgemv_)("N", &nr, &np_, &one, Ah, &nr, res, &inc, &zero, rhs, &inc);
+                        BL(dpotrs_)("L", &nr, &inc, G, &nr, rhs, &nr, &info);
+                        for (int a = 0; a < nr; a++) d[a] += rhs[a];
+                    }
+                    double bd = 0, bs = 0;
+                    for (int a = 0; a < nr; a++) { const double x = P->b[B->con[rt[a]]] * d[a]; bd += x; bs += fabs(x); }
+                    int origok = 1;
+                    for (int a = 0; a < nr; a++) if (P->orig[B->con[rt[a]]] < 0) origok = 0;
+                    exact = origok && vv > 0 && rn <= 1e-11 * vv && fabs(bd) <= 1e-11 * fmax(bs, vv);
+                    if (verbose >= 2) printf("   lifted face candidate: block %d, row %d, |supp| %d, %d constraints inside: residual %.1e of |v|^2, b'd %.1e of %.1e%s\n",
+                                             k, h, s, nr, rn / vv, fabs(bd), fmax(bs, vv), exact ? " (exact)" : "");
+                }
+            }
+            if (exact) {
+                if (nf == fcap) {
+                    fcap = fcap ? 2 * fcap : 16;
+                    fblk = realloc(fblk, sizeof(int) * fcap); fns = realloc(fns, sizeof(int) * fcap); fnr = realloc(fnr, sizeof(int) * fcap);
+                    fsup = realloc(fsup, sizeof(int *) * fcap); fval = realloc(fval, sizeof(double *) * fcap);
+                    fri = realloc(fri, sizeof(int *) * fcap); frw = realloc(frw, sizeof(double *) * fcap);
+                }
+                fblk[nf] = k; fns[nf] = s; fnr[nf] = nr;
+                fsup[nf] = malloc(sizeof(int) * s); fval[nf] = malloc(sizeof(double) * s);
+                for (int q = 0; q < s; q++) { fsup[nf][q] = sup[q]; fval[nf][q] = vd[sup[q]]; }
+                fri[nf] = malloc(sizeof(int) * nr); frw[nf] = malloc(sizeof(double) * nr);
+                for (int a = 0; a < nr; a++) { fri[nf][a] = B->con[rt[a]]; frw[nf][a] = d[a]; }
+                nf++;
+                if (Qb) {                                    /* (wq: v without its part in the span, from the test above) */
+                    if (nq == qcap) { qcap *= 2; Qb = realloc(Qb, sizeof(double) * (size_t)n * qcap); }
+                    double wn = 0; for (int j = 0; j < n; j++) wn += wq[j] * wq[j];
+                    wn = sqrt(wn);
+                    for (int j = 0; j < n; j++) Qb[(size_t)nq * n + j] = wq[j] / wn;
+                    nq++;
+                }
+            }
+            free(Ah); free(G); free(d); free(rhs); free(res); free(tv); free(rt);
+            for (int q = 0; q < s; q++) { vd[sup[q]] = 0; pos[sup[q]] = -1; }
+        }
+        free(g); free(pos); free(vd); free(sup); free(Qb); free(wq); free(ip); free(il); free(stamp);
+    }
+    free(nb);
+    g_lf_time = wtime() - tlf0;
+    if (nf == 0) return 0;
+    /* the constraints <v v', Y> = 0, appended; their combinations in the postsolve's table (the file's rows) */
+    Postsolve *ps = P->ps;
+    const int m1 = m0 + nf, c0 = ps->ncomb;
+    P->b = realloc(P->b, sizeof(double) * m1); P->b0 = realloc(P->b0, sizeof(double) * m1); P->orig = realloc(P->orig, sizeof(int) * m1);
+    int tot = ps->ncomb ? ps->comb_ptr[ps->ncomb] : 0;
+    for (int f = 0; f < nf; f++) tot += fnr[f];
+    ps->comb_ptr = realloc(ps->comb_ptr, sizeof(int) * (c0 + nf + 1)); if (c0 == 0) ps->comb_ptr[0] = 0;
+    ps->comb_i = realloc(ps->comb_i, sizeof(int) * (tot + 1)); ps->comb_w = realloc(ps->comb_w, sizeof(double) * (tot + 1));
+    for (int f = 0; f < nf; f++) {
+        const int i = m0 + f, j = c0 + f, s = fns[f];
+        P->b[i] = 0; P->b0[i] = 0; P->orig[i] = -2 - j;
+        int w = ps->comb_ptr[j];
+        for (int a = 0; a < fnr[f]; a++) { ps->comb_i[w] = P->orig[fri[f][a]]; ps->comb_w[w] = frw[f][a]; w++; }
+        ps->comb_ptr[j + 1] = w;
+        Block *B = &P->blk[fblk[f]];
+        B->con = realloc(B->con, sizeof(int) * (B->ncon + 1)); B->A = realloc(B->A, sizeof(SpSym) * (B->ncon + 1));
+        memset(&B->A[B->ncon], 0, sizeof(SpSym));
+        Ent *E = malloc(sizeof(Ent) * ((size_t)s * (s + 1) / 2 + 1)); size_t ne = 0;
+        for (int a = 0; a < s; a++) for (int b2 = a; b2 < s; b2++) { E[ne].r = fsup[f][a]; E[ne].c = fsup[f][b2]; E[ne].v = fval[f][a] * fval[f][b2]; ne++; }
+        sp_from_entries(&B->A[B->ncon], E, ne, B->n, 0);
+        free(E);
+        B->con[B->ncon++] = i;
+        free(fsup[f]); free(fval[f]); free(fri[f]); free(frw[f]);
+    }
+    ps->ncomb = c0 + nf;
+    P->m = m1;
+    free(fblk); free(fns); free(fnr); free(fsup); free(fval); free(fri); free(frw);
+    if (verbose >= 0) printf("presolve: %d face%s of a lifted relaxation found from its linear constraints: <v v', X> = 0 added as exact combinations of the constraints, for the facial reduction\n", nf, nf > 1 ? "s" : "");
+    return nf;
+}
+
 int facial_reduction(Problem *P, int verbose) {
     int removed = 0, reduced_dims = 0;
     if (!P->orig) {                        /* read_sdpa normally sets the identity map */
@@ -567,6 +809,10 @@ int facial_reduction(Problem *P, int verbose) {
      * constraint after every reduction, as before, costs (reductions x m) tests.     */
     int progress = 1, maxlev = 0, ncoupled = 0;
     int *clev = calloc(P->m + 1, sizeof(int));
+    /* 23 October 2026: the constraints lifted_faces added are each an exact certificate on the data as read (a
+     * combination of its constraints): their level stays 0 until their own reduction, however the others change
+     * their coordinates (the 2n - 1 faces of a QAP relaxation share the corner index) */
+    const int has_comb = P->ps && P->ps->ncomb > 0;
     unsigned char *mask = calloc(maxn + 1, 1);
     prune_empty_parts(P);
     while (progress) {
@@ -676,6 +922,7 @@ int facial_reduction(Problem *P, int verbose) {
                 }
             }
             if (rec) rec->coupled = coupled;
+            if (has_comb) for (int r = 0; r < P->m; r++) if (P->orig[r] <= -2) clev[r] = 0;
             ncoupled += coupled;
             remove_parts_of(P, i, parts, np);
             dead[i] = 1; ndead++;
@@ -918,7 +1165,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     const double budget = getenv("BRISK_DEPWORK") ? atof(getenv("BRISK_DEPWORK")) : 2e9;
     int removed = 0;
     int *rp = NULL, *ri = NULL, *deg = NULL, **nbr = NULL, *pool = NULL, *mark = NULL;
-    double *acc = NULL, *d0 = NULL, *piv = NULL, *x = NULL, *u = NULL, *wk = NULL;
+    double *acc = NULL, *d0 = NULL, *piv = NULL, *x = NULL, *u = NULL, *wk = NULL, *Gacc = NULL;
     char *dead = NULL;
     SChol *S = NULL;
     /* dense data (every constraint at most positions): G = A A' by one BLAS-3 product of the dense m x positions matrix,
@@ -936,7 +1183,43 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     mark = malloc(sizeof(int) * ((size_t)m + 1)); for (int i = 0; i < m; i++) mark[i] = -1;
     deg = calloc((size_t)m + 1, sizeof(int));
     size_t tot = 0;
-    if (dense) { for (int i = 0; i < m; i++) deg[i] = m - 1; tot = (size_t)m * (size_t)(m - 1); }
+    /* G accumulated as a dense array in one pass when it fits and its pattern can be dense (the work of forming it at
+     * least a quarter of its entries); the pattern is then read from the values instead of two more passes over the
+     * pairs of entries (a random SDP with 1,500 constraints in three blocks of order 150, forming work 2.9e8: the pattern
+     * 0.91 s and the values 0.46 s, on one thread, for a pattern 99 % full). The columns on the threads, each written by
+     * one thread and summed in the same order as before (the same values at any thread count). */
+    if (!dense && (double)work >= 0.25 * mm * (mm - 1.0) && 8.0 * mm * mm <= 0.1 * brisk_mem_limit() && !getenv("BRISK_DEPNOACC")) {
+        /* (zeroed on one thread before the parallel loop: the threads' first touches of a fresh array fault its pages
+         * at the same time, and with little work a column that cost 15 ns a product, against 1 ns; poly_slack_n32,
+         * a control LMI with 2,016 core constraints) */
+        Gacc = malloc(sizeof(double) * (size_t)m * m);
+        if (!Gacc) goto out;
+        memset(Gacc, 0, sizeof(double) * (size_t)m * m);
+        const double ta0 = wtime();
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int i = 0; i < m; i++) {
+            double *col = Gacc + (size_t)i * m;
+            for (int p = rp[i]; p < rp[i + 1]; p++) { const DepEnt *ei = &E[ri[p]]; const int g = colof[ri[p]];
+                for (size_t q = gs[g]; q < gs[g + 1]; q++) if (E[q].con >= i) col[E[q].con] += ei->v * E[q].v; }
+        }
+        const double ta1 = wtime();
+        /* the upper triangle from the lower by tiles (each column then holds the whole row: the lists below are read
+         * from one column each, contiguously; a list filled from both triangles costs a cache miss an entry, 0.1 s for
+         * a full pattern of a million entries) */
+        { const int TB = 64;
+          #pragma omp parallel for schedule(dynamic, 1)
+          for (int jb = 0; jb < m; jb += TB)
+              for (int ib = jb; ib < m; ib += TB)
+                  for (int j = jb; j < jb + TB && j < m; j++)
+                      for (int i = ib > j + 1 ? ib : j + 1; i < ib + TB && i < m; i++) Gacc[(size_t)i * m + j] = Gacc[(size_t)j * m + i]; }
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < m; i++) { const double *col = Gacc + (size_t)i * m; int c = 0;
+            for (int j = 0; j < m; j++) if (j != i && col[j] != 0) c++;
+            deg[i] = c; }
+        for (int i = 0; i < m; i++) tot += (size_t)deg[i];
+        if (getenv("BRISK_DEPDBG")) printf("   [... dense accumulation %.3fs, transpose and pattern %.3fs]\n", ta1 - ta0, wtime() - ta1);
+    }
+    else if (dense) { for (int i = 0; i < m; i++) deg[i] = m - 1; tot = (size_t)m * (size_t)(m - 1); }
     else for (int i = 0; i < m; i++) {
         mark[i] = i;
         for (int p = rp[i]; p < rp[i + 1]; p++) { const int g = colof[ri[p]];
@@ -945,9 +1228,23 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     }
     const size_t fillcap = (size_t)(0.1 * brisk_mem_limit() / 8.0);
     if (tot > fillcap) goto out;
+    const double fcap = getenv("BRISK_DEPFLOPS") ? atof(getenv("BRISK_DEPFLOPS")) : 2e10;
+    {   /* 24 October 2026: the factor holds at least the pattern, nnz(L) >= tot/2 + m in any order, and its flops (the sum
+         * of the squared column counts) are at least nnz(L)^2 / m (Cauchy-Schwarz): over the flop budget the ordering is
+         * not computed (pglib_opf_case13659_pegase, SDP: a core of 17,467 constraints, the bound 1.5e11; the analysis took
+         * 10.5 s to find 3.5e11 and the check was then not made) */
+        const double nl = 0.5 * (double)tot + mm, lbf = nl * nl / mm;
+        if (lbf > fcap) { if (verbose >= 2) printf("presolve: dependent constraints not checked (factoring the Gram matrix: at least %.2g flops > %.2g)\n", lbf, fcap); goto out; }
+    }
     pool = malloc(sizeof(int) * (tot + 1)); nbr = malloc(sizeof(int *) * (m + 1));
     for (int i = 0; i < m; i++) mark[i] = -1;
-    { size_t o = 0;
+    if (Gacc) {   /* (each list from its own column, in increasing order) */
+        size_t o = 0; for (int i = 0; i < m; i++) { nbr[i] = pool + o; o += (size_t)deg[i]; }
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < m; i++) { const double *col = Gacc + (size_t)i * m; int c = 0;
+            for (int j = 0; j < m; j++) if (j != i && col[j] != 0) nbr[i][c++] = j; }
+    }
+    else { size_t o = 0;
       for (int i = 0; i < m; i++) {
           nbr[i] = pool + o; int c = 0; mark[i] = i;
           if (dense) { for (int j = 0; j < m; j++) if (j != i) nbr[i][c++] = j; o += (size_t)c; continue; }
@@ -956,7 +1253,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
           o += (size_t)c;
       } }
     const int dbg = getenv("BRISK_DEPDBG") != NULL;
-    if (dbg) printf("   [dependent constraints: %zu entries, %zu positions, forming work %.3g, pattern %zu; %.2fs]\n", ne, ng, work, tot, wtime() - t0);
+    if (dbg) printf("   [dependent constraints: %zu entries, %zu positions, forming work %.3g, pattern %zu%s; %.2fs]\n", ne, ng, work, tot, Gacc ? " (from the values accumulated as dense)" : "", wtime() - t0);
     /* (AMD alone, as for the LP's normal equations: one factorization does not repay the search for a better ordering;
      * a pattern of AC-OPF's moment relaxation, 4,517 constraints and 40 % dense: 0.63 -> 0.2 s) */
     /* (a pattern at least a quarter full is factored as dense: the identity order, the values gathered from a dense
@@ -971,8 +1268,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     if (dpat) { schol_set_perm(NULL); free(idp); }
     if (dbg && S) printf("   [... analysis: factor %zu entries, %.3g flops; %.2fs]\n", schol_nnz(S), schol_flops(S), wtime() - t0);
     if (!S) { if (verbose >= 2) printf("presolve: dependent constraints not checked (the factor of the Gram matrix exceeds its memory budget)\n"); goto out; }
-    { const double fcap = getenv("BRISK_DEPFLOPS") ? atof(getenv("BRISK_DEPFLOPS")) : 2e10;
-      if (schol_flops(S) > fcap) { if (verbose >= 2) printf("presolve: dependent constraints not checked (factoring the Gram matrix: %.2g flops > %.2g)\n", schol_flops(S), fcap); goto out; } }
+    if (schol_flops(S) > fcap) { if (verbose >= 2) printf("presolve: dependent constraints not checked (factoring the Gram matrix: %.2g flops > %.2g)\n", schol_flops(S), fcap); goto out; }
     /* the values */
     schol_zero(S);
     acc = calloc((size_t)m, sizeof(double)); d0 = malloc(sizeof(double) * m);
@@ -985,6 +1281,15 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
         for (int i = 0; i < m; i++) d0[i] = Gd[(size_t)i * m + i];
         schol_gather_dense(S, Gd);
         free(Gd);
+    }
+    else if (Gacc) {
+        for (int i = 0; i < m; i++) d0[i] = Gacc[(size_t)i * m + i];
+        if (dpat) schol_gather_dense(S, Gacc);
+        else for (int i = 0; i < m; i++) {
+            schol_add(S, (size_t)i, (size_t)i, d0[i]);
+            for (int c = 0; c < deg[i]; c++) { const int j = nbr[i][c]; if (j > i) schol_add(S, (size_t)j, (size_t)i, Gacc[(size_t)i * m + j]); }
+        }
+        free(Gacc); Gacc = NULL;
     }
     else if (dpat) {
         double *Gd = calloc((size_t)m * m, sizeof(double));
@@ -1146,7 +1451,7 @@ out:
     }
     free(pdead);
     if (S) schol_free(S);
-    free(E); free(colof); free(gs); free(rp); free(ri); free(deg); free(nbr); free(pool); free(mark);
+    free(E); free(colof); free(gs); free(rp); free(ri); free(deg); free(nbr); free(pool); free(mark); free(Gacc);
     free(acc); free(d0); free(piv); free(x); free(u); free(wk); free(dead); free(cmap); free(bb);
     return removed;
 }

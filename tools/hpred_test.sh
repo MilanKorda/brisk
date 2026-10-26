@@ -6,6 +6,9 @@
 #   3. a symmetry that holds only for the data rounded to doubles (one entry of C is
 #      1.000000000000000001) is detected and not used, and the value is that of the solve
 #      without reductions.
+#   4. (23 October 2026, ISSUES 258) an infeasibility verdict is reported on the right side, also when the solve
+#      takes the dual form (the default on these two problems: 8 constraints on a 4 x 4 block): <E11, X> = -1 is
+#      primal infeasible (exit code 11), a problem unbounded along E44 dual infeasible (12).
 # usage: tools/hpred_test.sh [brisk]
 B=${1:-./brisk}; T=$(mktemp -d); fail=0
 python3 - "$T" <<'PY'
@@ -53,5 +56,13 @@ chk "value without them: 20 digits ($v2)" 'close "$v2" "$ex" 1e-20'
 chk "a symmetry of the rounded data only is not used" 'echo "$o3" | grep -q "does not hold in the working precision" && ! echo "$o3" | grep -q "^presolve: block structure"'
 chk "its value is that of the solve without reductions ($v3)" 'close "$v3" "$v4" 1e-22'
 chk "and differs from the symmetric problem's" '! close "$v3" "$ex" 1e-22'
+printf '"<E11,X> = -1: primal infeasible\n8\n1\n4\n-1 1 1 1 0.2 0.1 0.3 0.4\n0 1 1 1 1\n0 1 2 2 1\n0 1 3 3 1\n0 1 4 4 1\n1 1 1 1 1\n2 1 2 2 1\n3 1 3 3 1\n4 1 4 4 1\n5 1 1 2 0.5\n6 1 1 3 0.5\n7 1 2 3 0.5\n8 1 3 4 0.5\n' > $T/pinf4.dat-s
+printf '"unbounded along E44: dual infeasible\n8\n1\n4\n1 1 1 0 0 0 0.1 0.1\n0 1 1 1 -1\n0 1 4 4 1\n1 1 1 1 1\n2 1 2 2 1\n3 1 3 3 1\n4 1 1 2 0.5\n5 1 1 3 0.5\n6 1 2 3 0.5\n7 1 1 4 0.5\n8 1 3 4 0.5\n' > $T/dinf4.dat-s
+for f in pinf4 dinf4; do for d in "" 0; do
+  o=$(env ${d:+BRISK_HPDUAL=$d} "$B" $T/$f.dat-s -prec dd -threads 1 2>&1); rc=$?
+  want=11; st="PRIMAL INFEASIBLE"; [ $f = dinf4 ] && { want=12; st="DUAL INFEASIBLE"; }
+  form="the dual form"; [ -n "$d" ] && form="the problem as read"
+  chk "$f: $st with $form (exit code $rc)" '[ $rc = $want ] && echo "$o" | grep -q "^status: $st" && { [ -n "$d" ] || echo "$o" | grep -q "the dual form"; }'
+done; done
 rm -rf "$T"
 exit $fail

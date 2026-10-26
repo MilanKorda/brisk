@@ -7,7 +7,11 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 tar -C "$SRC" --exclude=./benchmarks --exclude=./bench --exclude=./.git -cf - . | tar -C "$D" -xf -
 cd "$D"; make -s clean > /dev/null 2>&1 || true
-make -s -j${JOBS:-4} libbrisk CC="gcc -fsanitize=address -fno-omit-frame-pointer -g" > build.log 2>&1 || { tail -20 build.log; exit 1; }
+# (26 October 2026) without -march=native: on an AVX-512 host GCC 13 copies large local structs with 64-byte aligned
+# moves (vmovdqa64), and AddressSanitizer's frames for its use-after-return check are only 32-byte aligned, so the copy
+# itself faulted (the QP solver object's copy of its problem, qpas.c, in the C API test) where no memory error exists;
+# the generic x86-64 code keeps that check
+make -s -j${JOBS:-4} libbrisk ARCHFLAG= CC="gcc -fsanitize=address -fno-omit-frame-pointer -g" > build.log 2>&1 || { tail -20 build.log; exit 1; }
 export ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:exitcode=99
 gcc -fsanitize=address -g -std=gnu11 -I. -o capi_test tools/capi_test.c -L. -lbrisk -Wl,-rpath,"$D" -lm
 gcc -fsanitize=address -g -std=gnu11 -o capi_bound_test tools/capi_bound_test.c -L. -lbrisk -Wl,-rpath,"$D" -lm

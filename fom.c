@@ -264,8 +264,8 @@ static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int v
      * all of it sorting them). Then the pairs are summed in a dense m x m array instead. The
      * count is that of the loop below. */
     double *acc = NULL;
+    double tot = 0;    /* (the pairs with multiplicity: at least the number of distinct pairs, used below) */
     {
-        double tot = 0;
         for (int k = 0; k < P->nblk; k++) {
             const Block *B = &P->blk[k];
             const size_t npos = B->type == BLK_LP ? (size_t)B->n : (size_t)B->n * B->n;
@@ -282,6 +282,57 @@ static Gram *gram_build(const Problem *P, double *const *Dw, double shift, int v
         }
         if (tot > 1e6 && 16.0 * tot > 8.0 * (double)m * m && 8.0 * (double)m * m <= 0.25 * brisk_mem_limit())
             acc = calloc((size_t)m * m, sizeof(double));
+    }
+    /* 25 October 2026 (ISSUES 290): when the dense matrix cannot be held, the number of distinct entries, which decides
+     * between the dense and the sparse matrix below, is counted before the list of pairs is formed: a marker per
+     * constraint, as in the symbolic phase of a sparse product, without the list's memory and sort. Past the density at
+     * which the dense matrix is chosen the build ends here, as it would after the list (pglib_opf_case4661_sdet: 65 s of
+     * list and sort to learn that); below it, nothing changes. The count is at most the list's, so it never ends a build
+     * that the list would have kept; and it runs only when the pairs with multiplicity, counted above, could pass that
+     * density at all (the distinct pairs are at most as many), so elsewhere nothing is done. */
+    if (!Dw && !acc && m > 2500 && !getenv("BRISK_FOMDENSE") && 8.0 * (double)m * m > 0.6 * brisk_mem_limit()
+        && tot > 0.5 * (0.25 * (double)m * m - m)) {
+        size_t ne = 0;
+        for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) ne += P->blk[k].A[t].nnz;
+        Ent *E = fo_malloc(sizeof(Ent) * (ne ? ne : 1));
+        size_t q0 = 0; int64_t off = 0;
+        for (int k = 0; k < P->nblk; k++) {
+            const Block *B = &P->blk[k];
+            const int lp = B->type == BLK_LP;
+            for (int t = 0; t < B->ncon; t++) {
+                const SpSym *S = &B->A[t];
+                for (int q = 0; q < S->nnz; q++) {
+                    const int r = S->row[q], c = lp ? r : S->col[q];
+                    E[q0].key = off + (int64_t)r * B->n + c; E[q0].con = B->con[t]; E[q0].val = 0; q0++;
+                }
+            }
+            off += lp ? (int64_t)B->n : (int64_t)B->n * B->n;
+        }
+        qsort(E, ne, sizeof(Ent), cmp_ent);
+        /* each constraint's positions, as the index of their first entry in E (a position's constraints are E[a..b)) */
+        size_t *rp = calloc((size_t)m + 1, sizeof(size_t)), *gs = fo_malloc(sizeof(size_t) * (ne ? ne : 1)), *gend = fo_malloc(sizeof(size_t) * (ne ? ne : 1));
+        for (size_t p = 0; p < ne; p++) rp[E[p].con + 1]++;
+        for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
+        size_t *fill = malloc(sizeof(size_t) * ((size_t)m + 1)); memcpy(fill, rp, sizeof(size_t) * ((size_t)m + 1));
+        for (size_t a = 0; a < ne;) {
+            size_t b = a; while (b < ne && E[b].key == E[a].key) b++;
+            for (size_t p = a; p < b; p++) { const size_t s = fill[E[p].con]++; gs[s] = a; gend[s] = b; }
+            a = b;
+        }
+        free(fill);
+        int *mark = malloc(sizeof(int) * (size_t)m); for (int i = 0; i < m; i++) mark[i] = -1;
+        const double lim = 0.5 * (0.25 * (double)m * m - m);   /* (2 cnt + m) / m^2 > 0.25 */
+        double cnt = 0; int over = 0;
+        for (int i = 0; i < m && !over; i++) {
+            for (size_t s = rp[i]; s < rp[i + 1]; s++)
+                for (size_t p = gs[s]; p < gend[s]; p++) { const int j = E[p].con; if (j > i && mark[j] != i) { mark[j] = i; cnt += 1; } }
+            over = cnt > lim;
+        }
+        free(mark); free(rp); free(gs); free(gend); free(E);
+        if (over) {
+            if (verbose) printf("first-order: the Gram matrix A A' has more than a quarter of its entries nonzero; the dense matrix (%.1f GB) does not fit in memory\n", 8.0 * (double)m * m / 1e9);
+            g_fom_gram_nofit = 1; free(pr); free(diag); free(G); if (t_gram) *t_gram = wtime() - t0; return NULL;
+        }
     }
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
@@ -1705,21 +1756,9 @@ static double fom_point_res(Problem *P, double **Xb, double **Zb, const double *
     return fmax(fmax(*pinf_o, *dinf_o), *gap_o);
 }
 
-int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout) {
-    const double t0 = wtime();
-    memset(R, 0, sizeof(*R));
-    const int m = P->m, nb = P->nblk, verbose = par->verbose;
-    /* the Gram matrix first: when its factor does not fit, nothing else is set up (5.7) */
-    double t_gram = 0;
-    g_fom_gram_nofit = 0;
-    Gram *G = fom_gram_build(P, verbose, &t_gram);
-    if (!G && g_fom_gram_nofit) return -7;
-    const double sc = P->bs * P->cs;
-    const int halpern = par->fom_halpern;
-    { const char *e = getenv("BRISK_FOMPARTIAL"); if (e) g_fom_partial = atoi(e); }
-    { const char *e = getenv("BRISK_FOMDCPART"); if (e) g_fom_dcpart = atoi(e); }
-    { const char *e = getenv("BRISK_FOMRR"); if (e) g_fom_rr = atoi(e); e = getenv("BRISK_RRREFRESH"); if (e) g_rr_refresh = atoi(e); e = getenv("BRISK_FOMSRANGE"); if (e) g_fom_srange = atoi(e); }
-    const double rr_c = getenv("BRISK_RRTOL") ? atof(getenv("BRISK_RRTOL")) : 1e-2;
+/* The engine's per-block state and the workspaces of its projections (fb_project). */
+static FB *fb_alloc_all(const Problem *P, const Params *par, int halpern, double *sumn2_o, int *maxn_o) {
+    const int nb = P->nblk;
     FB *F = calloc(nb, sizeof(FB));
     double sumn2 = 0; int maxn = 0;
     for (int k = 0; k < nb; k++) {
@@ -1773,6 +1812,28 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
             sumn2 += (double)n * n; if (n > maxn) maxn = n;
         }
     }
+    *sumn2_o = sumn2; *maxn_o = maxn;
+    return F;
+}
+static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
+int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout) {
+    { const int st = fom_bound_solve(P, par, R, yout, Xout); if (st != 1) return st; }
+    const double t0 = wtime();
+    memset(R, 0, sizeof(*R));
+    const int m = P->m, nb = P->nblk, verbose = par->verbose;
+    /* the Gram matrix first: when its factor does not fit, nothing else is set up (5.7) */
+    double t_gram = 0;
+    g_fom_gram_nofit = 0;
+    Gram *G = fom_gram_build(P, verbose, &t_gram);
+    if (!G && g_fom_gram_nofit) return -7;
+    const double sc = P->bs * P->cs;
+    const int halpern = par->fom_halpern;
+    { const char *e = getenv("BRISK_FOMPARTIAL"); if (e) g_fom_partial = atoi(e); }
+    { const char *e = getenv("BRISK_FOMDCPART"); if (e) g_fom_dcpart = atoi(e); }
+    { const char *e = getenv("BRISK_FOMRR"); if (e) g_fom_rr = atoi(e); e = getenv("BRISK_RRREFRESH"); if (e) g_rr_refresh = atoi(e); e = getenv("BRISK_FOMSRANGE"); if (e) g_fom_srange = atoi(e); }
+    const double rr_c = getenv("BRISK_RRTOL") ? atof(getenv("BRISK_RRTOL")) : 1e-2;
+    double sumn2 = 0; int maxn = 0;
+    FB *F = fb_alloc_all(P, par, halpern, &sumn2, &maxn);
     /* split free pairs: identity projection on both members */
     {
         FreePair *fp = NULL; const int nf = getenv("BRISK_FOMNOFREE") ? 0 : free_pairs_detect(P, &fp);
@@ -2399,5 +2460,309 @@ resume_splitting:
     for (int k = 0; k < nb; k++) { FB *f = &F[k]; free(f->Vf); free(f->evf); free(f->workf); free(f->iworkf); free(f->X); free(f->Z); if (!Wall) free(f->W); free(f->V); free(f->ev); free(f->work); free(f->iwork); free(f->Xa); free(f->Za); free(f->T); free(f->P); free(f->freev); free(f->Vp); free(f->rrQ); free(f->rrT); free(f->rrH); free(f->rrE); free(f->srZ); free(f->dcd); free(f->dce); free(f->dctau); free(f->dcw); free(f->dciw); free(f->dcdd); free(f->dcde); free(f->dcdtau); free(f->dcdw); free(f->dcdiw); free(f->srsup); free(f->srwork); free(f->sriwork); free(f->isup); if (f->lz) { lz_free(f->lz); free(f->lz); } }
     free(F); free(y); free(ya); free(rhs); free(rp); fom_gram_free(G);
     free(Xa); free(Wa); free(Ta); free(Wall); free(Wp); free(pko); free(AZ); free(AC); free(Za); free(AvX); free(AvZ); free(Avy); free(Avr); free(AvXa); free(AvZa); fop_free(g_fop); g_fop = NULL;
+    return 0;
+}
+
+/* ---- 25 October 2026: entrywise bounds on a semidefinite block as a cone of their own -------------
+ * Doubly nonnegative programs (the k-means relaxation of Peng and Wei, the theta-plus number, the
+ * nonnegative relaxations of quadratic assignment) come in a file as one equality row per bound,
+ *     g X_ij + alpha s = b_r,   s >= 0 an LP variable of this row alone, with cost 0,
+ * so m grows as n^2/2: the interior-point method factors a dense Schur complement of that order every
+ * iteration (kmeans_n200_k10: m = 20,101, 583 s; MOSEK 388 s), and this engine in that form solves
+ * with a Gram matrix of that order and converges slowly (kmeans_n300_k15: 855 iterations, 2.3e-6,
+ * 217 s of its 383 s in the Gram solves). Such a row is a bound on X_ij: X_ij >= b_r/g when g and alpha
+ * have opposite signs, X_ij <= b_r/g otherwise. Here the problem is solved without these rows, with the
+ * bounds L <= X <= U as a cone of their own on the block's entries (SDPNAL+'s form):
+ *     max b'y - h(Z_B)  s.t.  A*y + S + Z_B = C,  S in K,     h(Z) = sup_{L <= X <= U} <-Z, X>,
+ * by the symmetric Gauss-Seidel ADMM of SDPNAL+'s first phase (Sun, Toh and Yang 2015): Z_B, y, S, y,
+ * then X += tau sigma (A*y + S + Z_B - C), tau = 1.618. The linear system is that of the remaining rows
+ * alone (n + 1 for k-means), factored once; an iteration costs one eigenvalue decomposition per block.
+ * The bound's step is the proximal map of h, Z_B = V + Pi_[L,U](-sigma V) / sigma with
+ * V = C - A*y - S - X/sigma (zero where an entry has no bound). The result goes back to the problem
+ * with the rows: X as solved, s from its row, the row's multiplier y_r = (Z_B)_ij / a (a the row's
+ * stored value at (i, j)) and the dual slack of s, -alpha y_r, nonnegative by the sign of Z_B. A numpy
+ * prototype reached 1e-6 on kmeans_n140_k8 in 2.2 s against the interior-point method's 57 s.
+ * -fombound 0 turns it off; returns 1 when it does not apply (fom_solve then runs as before). */
+typedef struct { int row, blk, i, j, lpb, lpv; double a, g, alpha; } BPair;
+static int bpairs_detect(const Problem *P, BPair **out) {
+    const int m = P->m, nb = P->nblk;
+    const size_t m1 = (size_t)m + 1;
+    int *nsd = calloc(m1, sizeof(int)), *nlp = calloc(m1, sizeof(int)), *noth = calloc(m1, sizeof(int));
+    int *sdk = calloc(m1, sizeof(int)), *sdt = calloc(m1, sizeof(int)), *lpk = calloc(m1, sizeof(int)), *lpt = calloc(m1, sizeof(int));
+    int **occ = calloc((size_t)nb + 1, sizeof(int *)); double **cst = calloc((size_t)nb + 1, sizeof(double *)); unsigned char **tk = calloc((size_t)nb + 1, sizeof(unsigned char *));
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type == BLK_LP) {
+            occ[k] = calloc((size_t)B->n + 1, sizeof(int)); cst[k] = calloc((size_t)B->n + 1, sizeof(double));
+            for (int q = 0; q < B->C.nnz; q++) cst[k][B->C.row[q]] = B->C.val[q];
+        }
+        for (int t = 0; t < B->ncon; t++) {
+            const int r = B->con[t]; const SpSym *S = &B->A[t];
+            if (B->type == BLK_SDP) { nsd[r] += S->nnz; sdk[r] = k; sdt[r] = t; }
+            else if (B->type == BLK_LP) { nlp[r] += S->nnz; lpk[r] = k; lpt[r] = t; for (int q = 0; q < S->nnz; q++) occ[k][S->row[q]]++; }
+            else noth[r] += S->nnz;
+        }
+    }
+    BPair *pr = malloc(sizeof(BPair) * m1); int np = 0;
+    for (int r = 0; r < m; r++) {
+        if (nsd[r] != 1 || nlp[r] != 1 || noth[r]) continue;
+        const Block *Bs = &P->blk[sdk[r]], *Bl = &P->blk[lpk[r]];
+        const SpSym *As = &Bs->A[sdt[r]], *Al = &Bl->A[lpt[r]];
+        const int v = Al->row[0];
+        if (occ[lpk[r]][v] != 1 || cst[lpk[r]][v] != 0) continue;
+        const double a = As->val[0], alpha = Al->val[0];
+        if (a == 0 || alpha == 0) continue;
+        const int i = As->row[0] < As->col[0] ? As->row[0] : As->col[0], j = As->row[0] < As->col[0] ? As->col[0] : As->row[0];
+        if (!tk[sdk[r]]) tk[sdk[r]] = calloc((size_t)Bs->n * Bs->n, 1);
+        unsigned char *mk = tk[sdk[r]] + i + (size_t)j * Bs->n;
+        if (*mk) continue;                    /* one bound row per entry */
+        *mk = 1;
+        BPair *p = &pr[np++];
+        p->row = r; p->blk = sdk[r]; p->i = i; p->j = j; p->lpb = lpk[r]; p->lpv = v; p->a = a; p->g = i == j ? a : 2.0 * a; p->alpha = alpha;
+    }
+    for (int k = 0; k < nb; k++) { free(occ[k]); free(cst[k]); free(tk[k]); }
+    free(occ); free(cst); free(tk); free(nsd); free(nlp); free(noth); free(sdk); free(sdt); free(lpk); free(lpt);
+    *out = pr;
+    return np;
+}
+int fom_bound_rows(const Problem *P) {
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SOC) return 0;
+    BPair *pr = NULL; const int np = bpairs_detect(P, &pr); free(pr);
+    return np;
+}
+static void fb_free_all(FB *F, int nb) {
+    for (int k = 0; k < nb; k++) { FB *f = &F[k]; free(f->Vf); free(f->evf); free(f->workf); free(f->iworkf); free(f->X); free(f->Z); free(f->W); free(f->V); free(f->ev); free(f->work); free(f->iwork); free(f->Xa); free(f->Za); free(f->T); free(f->P); free(f->freev); free(f->Vp); free(f->rrQ); free(f->rrT); free(f->rrH); free(f->rrE); free(f->srZ); free(f->dcd); free(f->dce); free(f->dctau); free(f->dcw); free(f->dciw); free(f->dcdd); free(f->dcde); free(f->dcdtau); free(f->dcdw); free(f->dcdiw); free(f->srsup); free(f->srwork); free(f->sriwork); free(f->isup); if (f->lz) { lz_free(f->lz); free(f->lz); } }
+    free(F);
+}
+/* the smallest eigenvalue of a symmetric matrix (A is overwritten) */
+static double bnd_lmin(int n, double *A) {
+    int mf = 0, il = 1, iu = 1, info = 0, lw = -1, liw = -1, iq; double wq, z[1]; const double at = 0;
+    double *w = malloc(sizeof(double) * ((size_t)n + 1));   /* dsyevr uses all n entries of W */
+    int *sup = malloc(sizeof(int) * 2 * ((size_t)n + 1));
+    BL(dsyevr_)("N", "I", "L", &n, A, &n, &DZERO, &DZERO, &il, &iu, &at, &mf, w, z, &IONE, sup, &wq, &lw, &iq, &liw, &info);
+    lw = (int)wq + 1; liw = iq; double *wk = malloc(sizeof(double) * lw); int *iw = malloc(sizeof(int) * liw);
+    BL(dsyevr_)("N", "I", "L", &n, A, &n, &DZERO, &DZERO, &il, &iu, &at, &mf, w, z, &IONE, sup, wk, &lw, iw, &liw, &info);
+    const double l0 = info == 0 && mf == 1 ? w[0] : 0.0;
+    free(wk); free(iw); free(sup); free(w);
+    return l0;
+}
+int g_fom_bound_used = 0;   /* the bound rows the last solve of the engine took as bounds (0: none; the Summary's method line) */
+static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout) {
+    g_fom_bound_used = 0;
+    if (par->fom_bound <= 0 || P->m < 2 || par->fom_X0 || par->fom_y0) return 1;
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SOC) return 1;
+    BPair *pr = NULL; const int np = bpairs_detect(P, &pr);
+    if (np < 1 || (double)np < 0.25 * P->m || np >= P->m) { free(pr); return 1; }
+    const double t0 = wtime();
+    const int m = P->m, nb = P->nblk, verbose = par->verbose;
+    /* the problem without the bound rows and their LP variables */
+    int *rmap = malloc(sizeof(int) * m); for (int r = 0; r < m; r++) rmap[r] = 0;
+    for (int q = 0; q < np; q++) rmap[pr[q].row] = -1;
+    int m2 = 0; for (int r = 0; r < m; r++) if (rmap[r] >= 0) rmap[r] = m2++;
+    int **vmap = calloc(nb, sizeof(int *)), *bmap = malloc(sizeof(int) * nb), *bsz2 = malloc(sizeof(int) * nb), nb2 = 0;
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k]; int keep = B->n;
+        if (B->type == BLK_LP) {
+            vmap[k] = calloc(B->n, sizeof(int));
+            for (int q = 0; q < np; q++) if (pr[q].lpb == k) vmap[k][pr[q].lpv] = -1;
+            keep = 0; for (int v = 0; v < B->n; v++) if (vmap[k][v] >= 0) vmap[k][v] = keep++;
+        }
+        bmap[k] = keep > 0 ? nb2 : -1;
+        if (keep > 0) bsz2[nb2++] = B->type == BLK_LP ? -keep : keep;
+    }
+    size_t nt = 0;
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k]; if (bmap[k] < 0) continue;
+        nt += B->C.nnz;
+        for (int t = 0; t < B->ncon; t++) if (rmap[B->con[t]] >= 0) nt += B->A[t].nnz;
+    }
+    int *tc = malloc(sizeof(int) * (nt + 1)), *tb = malloc(sizeof(int) * (nt + 1)), *ti = malloc(sizeof(int) * (nt + 1)), *tj = malloc(sizeof(int) * (nt + 1));
+    double *tv = malloc(sizeof(double) * (nt + 1)), *b2 = malloc(sizeof(double) * (m2 + 1));
+    for (int r = 0; r < m; r++) if (rmap[r] >= 0) b2[rmap[r]] = P->b[r];
+    size_t w = 0;
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k]; const int k2 = bmap[k]; if (k2 < 0) continue;
+        for (int t = -1; t < B->ncon; t++) {
+            const SpSym *S = t < 0 ? &B->C : &B->A[t];
+            const int r2 = t < 0 ? -1 : rmap[B->con[t]];
+            if (t >= 0 && r2 < 0) continue;
+            for (int q = 0; q < S->nnz; q++) {
+                int i = S->row[q], j = B->type == BLK_LP ? S->row[q] : S->col[q];
+                if (B->type == BLK_LP) { i = j = vmap[k][i]; if (i < 0) continue; }
+                tc[w] = r2; tb[w] = k2; ti[w] = i; tj[w] = j; tv[w] = S->val[q]; w++;
+            }
+        }
+    }
+    Problem Q; problem_from_trips(&Q, m2, nb2, bsz2, b2, w, tc, tb, ti, tj, tv);
+    free(tc); free(tb); free(ti); free(tj); free(tv); free(b2); free(bsz2);
+    problem_prepare(&Q, par);
+    /* the bounds in Q's scaling (X~ = X / Q.bs), per SDP block of Q, both triangles */
+    double **lo = calloc(nb2, sizeof(double *)), **hi = calloc(nb2, sizeof(double *)); unsigned char **hb = calloc(nb2, sizeof(unsigned char *));
+    for (int q = 0; q < np; q++) {
+        const int k2 = bmap[pr[q].blk], n = Q.blk[k2].n;
+        if (!lo[k2]) {
+            const size_t len = (size_t)n * n;
+            lo[k2] = malloc(sizeof(double) * len); hi[k2] = malloc(sizeof(double) * len); hb[k2] = calloc(len, 1);
+            for (size_t e = 0; e < len; e++) { lo[k2][e] = -HUGE_VAL; hi[k2][e] = HUGE_VAL; }
+        }
+        const double val = P->b[pr[q].row] / pr[q].g / Q.bs;
+        const int lower = (pr[q].g > 0) != (pr[q].alpha > 0);
+        const size_t e1 = pr[q].i + (size_t)pr[q].j * n, e2 = pr[q].j + (size_t)pr[q].i * n;
+        if (lower) { lo[k2][e1] = lo[k2][e2] = val; } else { hi[k2][e1] = hi[k2][e2] = val; }
+        hb[k2][e1] = hb[k2][e2] = 1;
+    }
+    if (verbose >= 0) printf("first-order engine: %d of the %d constraints are bounds on single entries of X (g X_ij + alpha s = b, s >= 0 in this constraint alone): solved as entrywise bounds, %d constraints left\n", np, m, m2);
+    double t_gram = 0; g_fom_gram_nofit = 0;
+    Gram *G = fom_gram_build(&Q, verbose, &t_gram);
+    if (!G) {
+        for (int k = 0; k < nb2; k++) { free(lo[k]); free(hi[k]); free(hb[k]); }
+        free(lo); free(hi); free(hb); problem_free(&Q);
+        for (int k = 0; k < nb; k++) free(vmap[k]);
+        free(vmap); free(bmap); free(rmap); free(pr);
+        return 1;
+    }
+    double sumn2 = 0; int maxn = 0;
+    FB *F = fb_alloc_all(&Q, par, 0, &sumn2, &maxn);
+    double **ZB = calloc(nb2, sizeof(double *));
+    for (int k = 0; k < nb2; k++) if (lo[k]) ZB[k] = calloc((size_t)Q.blk[k].n * Q.blk[k].n, sizeof(double));
+    double *y = calloc(m2 + 1, sizeof(double)), *rhs = malloc(sizeof(double) * (m2 + 1)), *rp = malloc(sizeof(double) * (m2 + 1));
+    /* the measures of the problem with the rows, in the file's units (fom_point_res's): P's scaling
+     * times Q's (X_P = Q.bs X~, y_P = Q.cs Q.d y~, S_P = Q.cs S~) */
+    const double sxp = P->bs * Q.bs, sdp = P->cs * Q.cs, sobj = P->bs * P->cs * Q.bs * Q.cs;
+    double *pdu = malloc(sizeof(double) * (m2 + 1));
+    for (int r = 0; r < m; r++) if (rmap[r] >= 0) pdu[rmap[r]] = P->du[r] * Q.du[rmap[r]];
+    double sigma = par->fom_sigma > 0 ? par->fom_sigma : (par->fom_sigma0 > 0 ? par->fom_sigma0 : 1.0);
+    const double tau = 1.618;
+    const int maxit = par->fom_maxit > 0 ? par->fom_maxit : 100000;
+    const double tol = par->fom_tol > 0 ? par->fom_tol : par->tol;
+    int it, status = ST_MAXIT;
+    double pinf = 1, dinf = 1, gap = 1, pcone = 0, po = 0, dob = 0, err = 1, acc_p = 0, acc_d = 0;
+    int nsig = 0;
+    double t_eig = 0, t_solve = 0;
+    if (verbose) printf("first-order: entrywise bounds, symmetric Gauss-Seidel ADMM (step %.3f), sigma %.3g, tol %.1e, %d blocks (max n %d), m = %d\n", tau, sigma, tol, nb2, maxn, m2);
+    if (verbose > 1) printf("   it        pobj          dobj        pinf     pcone    dinf     gap      sigma   time\n");
+    /* T = A*y - C (y = 0 at the start) */
+    for (int k = 0; k < nb2; k++) { const Block *B = &Q.blk[k]; FB *f = &F[k]; fb_ATy(B, y, f->T); fb_addC(B, -1.0, f->T); }
+    for (it = 1; it <= maxit; it++) {
+        /* Z_B = V + Pi_[L,U](-sigma V) / sigma, V = C - A*y - S - X/sigma = -(T + S + X/sigma) */
+        for (int k = 0; k < nb2; k++) {
+            if (!ZB[k]) continue;
+            FB *f = &F[k]; const size_t len = (size_t)f->n * f->n; double *Zk = ZB[k];
+            for (size_t e = 0; e < len; e++) {
+                if (!hb[k][e]) { Zk[e] = 0; continue; }
+                /* exactly zero inside the bounds (V + u / sigma would leave rounding of either sign) */
+                const double V = -(f->T[e] + f->Z[e] + f->X[e] / sigma), u = -sigma * V;
+                Zk[e] = u < lo[k][e] ? V + lo[k][e] / sigma : u > hi[k][e] ? V + hi[k][e] / sigma : 0.0;
+            }
+        }
+        /* the two y steps around the S step: y = (A A*)^-1 [ b/sigma - A(X/sigma + S + Z_B - C) ] */
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < m2; i++) rhs[i] = Q.b[i] / sigma;
+            for (int k = 0; k < nb2; k++) {
+                const Block *B = &Q.blk[k]; FB *f = &F[k]; const size_t len = fbsz(B);
+                for (size_t e = 0; e < len; e++) f->W[e] = f->X[e] / sigma + f->Z[e] + (ZB[k] ? ZB[k][e] : 0.0);
+                fb_addC(B, -1.0, f->W);
+                fb_Aop(B, f->W, rhs, -1.0);
+            }
+            const double ts = wtime(); fom_gram_solve(G, rhs); t_solve += wtime() - ts;
+            memcpy(y, rhs, sizeof(double) * m2);
+            for (int k = 0; k < nb2; k++) { const Block *B = &Q.blk[k]; FB *f = &F[k]; fb_ATy(B, y, f->T); fb_addC(B, -1.0, f->T); }
+            if (pass == 1) break;
+            /* S = Pi_K(-W), W = X/sigma + A*y - C + Z_B */
+            for (int k = 0; k < nb2; k++) {
+                const Block *B = &Q.blk[k]; FB *f = &F[k]; const size_t len = fbsz(B);
+                for (size_t e = 0; e < len; e++) f->W[e] = f->X[e] / sigma + f->T[e] + (ZB[k] ? ZB[k][e] : 0.0);
+                const double te = wtime(); fb_project(f, B, f->W, f->P, f->Z); t_eig += wtime() - te;
+            }
+        }
+        /* X += tau sigma (A*y + S + Z_B - C) */
+        double rd2 = 0;
+        for (int k = 0; k < nb2; k++) {
+            const Block *B = &Q.blk[k]; FB *f = &F[k]; const size_t len = fbsz(B);
+            for (size_t e = 0; e < len; e++) {
+                const double rd = f->T[e] + f->Z[e] + (ZB[k] ? ZB[k][e] : 0.0);
+                rd2 += rd * rd; f->X[e] += tau * sigma * rd;
+            }
+        }
+        const int last = it == maxit || brisk_time_up(par);
+        if (it % 10 == 0 || last) {
+            memcpy(rp, Q.b, sizeof(double) * m2);
+            double pobj = 0, dobj = 0, xneg = 0;
+            for (int k = 0; k < nb2; k++) {
+                const Block *B = &Q.blk[k]; FB *f = &F[k];
+                fb_Aop(B, f->X, rp, -1.0);
+                pobj += fb_Cdot(B, f->X);
+                if (B->type == BLK_LP) { for (int v = 0; v < B->n; v++) if (-f->X[v] > xneg) xneg = -f->X[v]; }
+                else {
+                    const size_t len = (size_t)B->n * B->n;
+                    memcpy(f->P, f->X, sizeof(double) * len);
+                    const double lm = bnd_lmin(B->n, f->P); if (-lm > xneg) xneg = -lm;
+                    if (ZB[k]) for (size_t e = 0; e < len; e++) {
+                        if (!hb[k][e]) continue;
+                        const double x = f->X[e], zb = ZB[k][e];
+                        if (x < lo[k][e] && lo[k][e] - x > xneg) xneg = lo[k][e] - x;
+                        if (x > hi[k][e] && x - hi[k][e] > xneg) xneg = x - hi[k][e];
+                        if (zb > 0 && lo[k][e] > -HUGE_VAL) dobj += zb * lo[k][e]; else if (zb < 0 && hi[k][e] < HUGE_VAL) dobj += zb * hi[k][e];
+                    }
+                }
+            }
+            double r2 = 0; for (int i = 0; i < m2; i++) { const double v = rp[i] * pdu[i]; r2 += v * v; dobj += Q.b[i] * y[i]; }
+            pinf = sqrt(r2) / (1 + P->normb2);
+            pcone = sxp * xneg / (1 + P->normb2);
+            dinf = sdp * sqrt(rd2) / (1 + P->normC2);
+            po = sobj * pobj; dob = sobj * dobj;
+            gap = fabs(po - dob) / (1 + fabs(po + P->obj_off) + fabs(dob + P->obj_off));
+            err = fmax(fmax(pinf, pcone), fmax(dinf, gap));
+            if (!(pinf == pinf && pcone == pcone && dinf == dinf && gap == gap)) err = HUGE_VAL;   /* (fmax ignores a NaN) */
+            if (verbose > 1 && (it % 200 == 0 || err <= tol || last)) printf("%6d %+.8e %+.8e %.2e %.2e %.2e %.2e %.2e %7.1f\n", it, po, dob, pinf, pcone, dinf, gap, sigma, wtime() - t0);
+            if (err <= tol) { status = ST_OPTIMAL; break; }
+            if (last) { status = it == maxit ? ST_MAXIT : ST_TIME; break; }
+            acc_p += fmax(pinf, pcone); acc_d += dinf;
+            if (it % 50 == 0) {   /* residual balancing: a smaller sigma lowers pinf and raises dinf */
+                if (acc_p > 3 * acc_d) { sigma /= 1.6; nsig++; }
+                else if (acc_d > 3 * acc_p) { sigma *= 1.6; nsig++; }
+                acc_p = acc_d = 0;
+            }
+        }
+    }
+    if (it > maxit) it = maxit;
+    /* back to the problem with the bound rows (P's scaling): X_P = Q.bs X~; s from its row; y_r = (Z_B)_ij / a */
+    double *yP = calloc(m + 1, sizeof(double));
+    for (int r = 0; r < m; r++) if (rmap[r] >= 0) yP[r] = Q.cs * Q.d[rmap[r]] * y[rmap[r]];
+    for (int q = 0; q < np; q++) {
+        const int k2 = bmap[pr[q].blk], n = Q.blk[k2].n;
+        yP[pr[q].row] = Q.cs * ZB[k2][pr[q].i + (size_t)pr[q].j * n] / pr[q].a;
+    }
+    if (yout) for (int r = 0; r < m; r++) yout[r] = P->cs * P->d[r] * yP[r];
+    if (Xout) {
+        for (int k = 0; k < nb; k++) {
+            const Block *B = &P->blk[k]; const int k2 = bmap[k];
+            if (B->type == BLK_LP) {
+                for (int v = 0; v < B->n; v++) Xout[k][v] = 0;
+                if (k2 >= 0) for (int v = 0; v < B->n; v++) if (vmap[k][v] >= 0) Xout[k][v] = P->bs * Q.bs * F[k2].X[vmap[k][v]];
+            } else {
+                const size_t len = (size_t)B->n * B->n;
+                for (size_t e = 0; e < len; e++) Xout[k][e] = P->bs * Q.bs * F[k2].X[e];
+            }
+        }
+        for (int q = 0; q < np; q++) {
+            const int k2 = bmap[pr[q].blk], n = Q.blk[k2].n;
+            const double xij = Q.bs * F[k2].X[pr[q].i + (size_t)pr[q].j * n];
+            Xout[pr[q].lpb][pr[q].lpv] = P->bs * (P->b[pr[q].row] - pr[q].g * xij) / pr[q].alpha;
+        }
+    }
+    memset(R, 0, sizeof(*R));
+    R->status = status; R->iters = it;
+    R->pobj = po; R->dobj = dob; R->pinf = fmax(pinf, pcone); R->dinf = dinf; R->relgap = gap; R->relcomp = gap;
+    R->methods = 4;
+    R->t_total = wtime() - t0; R->t_chol = t_solve; R->t_dense = t_eig; R->t_setup = t_gram;
+    if (verbose) printf("first-order: entrywise bounds: %d iterations, %d sigma changes, errors %.1e %.1e %.1e %.1e (primal, primal cone and bounds, dual, gap); eig %.1fs, Gram solves %.1fs, total %.1fs\n", it, nsig, pinf, pcone, dinf, gap, t_eig, t_solve, R->t_total);
+    free(yP); free(pdu); free(y); free(rhs); free(rp);
+    for (int k = 0; k < nb2; k++) { free(lo[k]); free(hi[k]); free(hb[k]); free(ZB[k]); }
+    free(lo); free(hi); free(hb); free(ZB);
+    fb_free_all(F, nb2); fom_gram_free(G); problem_free(&Q);
+    for (int k = 0; k < nb; k++) free(vmap[k]);
+    free(vmap); free(bmap); free(rmap); free(pr);
+    g_fom_bound_used = np;
     return 0;
 }

@@ -610,7 +610,7 @@ static int hpred_alg(HPStage *S, const HPJob *J, HPJob *Jn, const Params *par) {
     char *want = (char *)calloc((size_t)nb + 1, 1); int any = 0;
     {
         Problem P; hpred_shadow(J, &P);
-        PSAlg *A = alg_reduce(&P, par->symalg, par->symalgmax, par->symmin, -1);
+        PSAlg *A = alg_reduce(&P, par->symalg, par->symalgmax, par->symmin, -1, 0);   /* (the high-precision reductions: every block as before) */
         if (A) {
             /* Is the basis worth its cost in this precision? In multiply-adds of the target
              * arithmetic: an iteration costs about 5 n^3 of block algebra and, per constraint

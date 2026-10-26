@@ -137,9 +137,81 @@ void spsym_finish(SpSym *S, int n, int is_lp) {
 }
 
 /* blocks from (sorted or not) triplets; duplicates summed, zeros dropped */
+/* 23 October 2026: the triplets in the order (blk, con, i, j) of cmp_trip by a stable LSD radix sort, 11 bits a pass,
+ * the passes no value needs skipped; nothing when they are in order already. glibc's qsort is a merge sort (stable) at
+ * these sizes, so the order, ties included (duplicates are summed in it), is the same. A D-optimal design with 9.9
+ * million entries, rebuilt after the free elimination: 3.8 s in qsort's comparisons, 23 a triplet. BRISK_TRIPQSORT=1:
+ * qsort. */
+/* the order of a problem written row by row: (constraint, block, i, j), the objective's row (constraint -1) first or,
+ * with last = 1, after the constraints */
+static int cmp_rows(const Trip *x, const Trip *y, int last) {
+    if (x->con != y->con) {
+        if (last && (x->con < 0 || y->con < 0)) return x->con < 0 ? 1 : -1;
+        return x->con < y->con ? -1 : 1;
+    }
+    if (x->blk != y->blk) return x->blk < y->blk ? -1 : 1;
+    if (x->i != y->i) return x->i < y->i ? -1 : 1;
+    return (x->j > y->j) - (x->j < y->j);
+}
+static void sort_trips(Trip *T, size_t nt) {
+    if (nt < 2) return;
+    size_t q = 1;
+    while (q < nt && cmp_trip(&T[q - 1], &T[q]) <= 0) q++;
+    if (q == nt) return;
+    Trip *U = (nt >= 4096 && !getenv("BRISK_TRIPQSORT")) ? malloc(sizeof(Trip) * nt) : NULL;
+    if (!U) { qsort(T, nt, sizeof(Trip), cmp_trip); return; }
+    /* 23 October 2026: a problem written row by row (the free elimination's rebuild: the rows' entries in order, the
+     * objective last): one stable counting pass by (block, objective or constraint) gives the order (block, constraint,
+     * i, j), ties in their order; the radix sort's seven passes over 9.9 million triplets took 2 s on a D-optimal design */
+    for (int last = 0; last <= 1; last++) {
+        size_t r = 1;
+        while (r < nt && cmp_rows(&T[r - 1], &T[r], last) <= 0) r++;
+        if (r < nt) continue;
+        int nbk = 0; for (size_t e = 0; e < nt; e++) if (T[e].blk + 1 > nbk) nbk = T[e].blk + 1;
+        size_t *c2 = calloc(2 * (size_t)nbk + 1, sizeof(size_t));
+        if (!c2) break;
+        for (size_t e = 0; e < nt; e++) c2[2 * (size_t)T[e].blk + (T[e].con >= 0)]++;
+        size_t o = 0; for (size_t d = 0; d < 2 * (size_t)nbk; d++) { const size_t c = c2[d]; c2[d] = o; o += c; }
+        for (size_t e = 0; e < nt; e++) U[c2[2 * (size_t)T[e].blk + (T[e].con >= 0)]++] = T[e];
+        memcpy(T, U, sizeof(Trip) * nt);
+        free(c2); free(U);
+        return;
+    }
+    unsigned mx[4] = { 0, 0, 0, 0 };          /* the fields from the least significant: j, i, con + 1, blk */
+    for (size_t r = 0; r < nt; r++) {
+        if ((unsigned)T[r].j > mx[0]) mx[0] = (unsigned)T[r].j;
+        if ((unsigned)T[r].i > mx[1]) mx[1] = (unsigned)T[r].i;
+        if ((unsigned)(T[r].con + 1) > mx[2]) mx[2] = (unsigned)(T[r].con + 1);
+        if ((unsigned)T[r].blk > mx[3]) mx[3] = (unsigned)T[r].blk;
+    }
+    enum { RB = 11, RN = 1 << RB };
+    size_t *cnt = malloc(sizeof(size_t) * RN);
+    if (!cnt) { free(U); qsort(T, nt, sizeof(Trip), cmp_trip); return; }
+    Trip *src = T, *dst = U;
+    for (int f = 0; f < 4; f++)
+        for (int sh = 0; sh < 32 && (mx[f] >> sh) != 0; sh += RB) {
+            memset(cnt, 0, sizeof(size_t) * RN);
+            for (size_t r = 0; r < nt; r++) {
+                const unsigned v = f == 0 ? (unsigned)src[r].j : f == 1 ? (unsigned)src[r].i : f == 2 ? (unsigned)(src[r].con + 1) : (unsigned)src[r].blk;
+                cnt[(v >> sh) & (RN - 1)]++;
+            }
+            size_t o = 0; for (int d = 0; d < RN; d++) { const size_t c = cnt[d]; cnt[d] = o; o += c; }
+            for (size_t r = 0; r < nt; r++) {
+                const unsigned v = f == 0 ? (unsigned)src[r].j : f == 1 ? (unsigned)src[r].i : f == 2 ? (unsigned)(src[r].con + 1) : (unsigned)src[r].blk;
+                dst[cnt[(v >> sh) & (RN - 1)]++] = src[r];
+            }
+            Trip *t = src; src = dst; dst = t;
+        }
+    if (src != T) memcpy(T, src, sizeof(Trip) * nt);
+    free(cnt); free(U);
+}
+
 static void build_blocks(Problem *P, Trip *T, size_t nt, long lower_entries) {
     const int nblk = P->nblk;
-    qsort(T, nt, sizeof(Trip), cmp_trip);
+    static int bbdbg = -1; if (bbdbg < 0) bbdbg = getenv("BRISK_FEDBG") != NULL;
+    const double tbb0 = bbdbg ? wtime() : 0;
+    sort_trips(T, nt);
+    if (bbdbg && nt > 1000000) printf("   [build_blocks: %zu triplets sorted %.2fs]\n", nt, wtime() - tbb0);
     /* merge duplicates (summed, as SDPA does), then drop entries that cancelled */
     size_t w = 0, ndup = 0;
     for (size_t r = 0; r < nt; r++) {
@@ -155,10 +227,13 @@ static void build_blocks(Problem *P, Trip *T, size_t nt, long lower_entries) {
         fprintf(stderr, "brisk: warning: %zu duplicate entr%s summed%s\n", ndup, ndup == 1 ? "y" : "ies",
                 lower_entries ? " (the file also has lower-triangle entries: if it lists both triangles, "
                                 "off-diagonals are counted twice)" : "");
+    if (bbdbg && nt > 1000000) printf("   [build_blocks: duplicates merged %.2fs]\n", wtime() - tbb0);
     size_t r = 0;
+    double tfin = 0;
     for (int k = 0; k < nblk; k++) {
         Block *B = &P->blk[k];
         size_t s = r;
+        const double tk0 = bbdbg ? wtime() : 0;
         while (r < nt && T[r].blk == k) r++;
         /* count constraints in [s,r) (con = -1 is C) */
         int ncon = 0;
@@ -193,9 +268,12 @@ static void build_blocks(Problem *P, Trip *T, size_t nt, long lower_entries) {
             B->C.row = xmalloc(sizeof(int)); B->C.col = xmalloc(sizeof(int));
             B->C.val = xmalloc(sizeof(double));
         }
+        const double tf0 = bbdbg ? wtime() : 0;
         spsym_finish(&B->C, B->n, B->type == BLK_LP);
         for (int q = 0; q < ncon; q++) spsym_finish(&B->A[q], B->n, B->type == BLK_LP);
+        if (bbdbg) { tfin += wtime() - tf0; if (r - s > 1000000) printf("   [build_blocks: block %d (%s %d, %d constraints, %zu entries) %.2fs, of which spsym_finish %.2fs]\n", k + 1, B->type == BLK_LP ? "LP" : "SDP", B->n, ncon, r - s, wtime() - tk0, wtime() - tf0); }
     }
+    if (bbdbg && nt > 1000000) printf("   [build_blocks: blocks built %.2fs (spsym_finish %.2fs)]\n", wtime() - tbb0, tfin);
 }
 
 /* A problem built in memory (used by the moment form of the chordal conversion). T is
@@ -477,12 +555,13 @@ static void sp_mulvec(const SpSym *S, const double *x, double *y, int n) {   /* 
     for (int q = 0; q < S->ef; q++) y[S->fr[q]] += S->fv[q] * x[S->fc[q]];
 }
 
+/* (22 October 2026: Wout NULL asks for the rank alone, from the eigenvalues without vectors and with no verification) */
 static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double **sigout) {
-    const int one = 1;
+    const int one = 1, want = Wout != NULL;
     double anrm = 0;
     for (int q = 0; q < S->ef; q++) anrm += S->fv[q] * S->fv[q];
     anrm = sqrt(anrm);
-    if (anrm == 0) { *Wout = NULL; *sigout = NULL; return 0; }
+    if (anrm == 0) { if (want) { *Wout = NULL; *sigout = NULL; } return 0; }
     int r = S->nr;
     double *T = NULL, *ev = NULL, *Q = NULL, *W = NULL, *sig = NULL;
     int k = 0, rank = -1;
@@ -551,16 +630,20 @@ static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double
     ev = xmalloc(sizeof(double) * k);
     int lwork = -1, info;
     double wq;
-    BL(dsyev_)("V", "U", &k, T, &k, ev, &wq, &lwork, &info);
+    BL(dsyev_)(want ? "V" : "N", "U", &k, T, &k, ev, &wq, &lwork, &info);
     lwork = (int)wq + 1;
     double *work = xmalloc(sizeof(double) * lwork);
-    BL(dsyev_)("V", "U", &k, T, &k, ev, work, &lwork, &info);
+    BL(dsyev_)(want ? "V" : "N", "U", &k, T, &k, ev, work, &lwork, &info);
     free(work);
     if (info != 0) goto fail;
     double emax = 0;
     for (int j = 0; j < k; j++) emax = fmax(emax, fabs(ev[j]));
     rank = 0;
     for (int j = 0; j < k; j++) if (fabs(ev[j]) > 1e-14 * emax) rank++;
+    if (!want) {    /* (the verification's 2 n random draws taken all the same: the random stream, hence every later factor, as before) */
+        for (int i = 0; i < 2 * n; i++) (void)lr_rand();
+        free(T); free(ev); free(Q); return rank;
+    }
     W = xmalloc(sizeof(double) * (size_t)n * (rank ? rank : 1));
     sig = xmalloc(sizeof(double) * (rank ? rank : 1));
     {
@@ -611,8 +694,13 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
     long R = 0;
     int ok = 1;
     int small = n < 64 ? n : 64;
+    /* 22 October 2026: the decision from the ranks alone (eigenvalues without vectors, several times cheaper), the
+     * factors with their vectors and the verification only when the route is taken, the random numbers put back
+     * between the two passes so that a taken route gets the same factors as before (delay_indep_n32, a control LMI:
+     * 1,056 eigendecompositions with vectors, 0.56 s, for a route that is not taken) */
+    const unsigned long rng0 = lr_rng;
     for (int t = 0; t < nc && ok; t++) {
-        rk[t] = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, &Ws[t], &Ss[t]);
+        rk[t] = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, NULL, NULL);
         if (rk[t] < 0) ok = 0; else R += rk[t];
         if (ok && par->lowrank < 0) {
             double lbt = cb * (nd * nd * (R + (nc - t - 1)) + nd * (double)(R + nc - t - 1) * (R + nc - t - 1));
@@ -622,6 +710,18 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
     double cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R;
     double mem = 8.0 * (double)R * R;         /* single-buffer mode */
     if (getenv("BRISK_LRDBG")) printf("   [low-rank block: n %d, %d constraints, rank %ld (ok %d): cost %.3g against the routes' %.3g, memory %.3g of %.3g]\n", n, nc, R, ok, cost_lr, cost_now, mem, par->dense_mem);
+    if (ok && (par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) {
+        lr_rng = rng0;
+        long R2 = 0;
+        for (int t = 0; t < nc && ok; t++) {
+            const int r2 = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, &Ws[t], &Ss[t]);
+            if (r2 < 0) ok = 0; else { rk[t] = r2; R2 += r2; }
+        }
+        if (ok && R2 != R) {     /* (the vectors' pass found another rank somewhere: decide again on it) */
+            R = R2; cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R; mem = 8.0 * (double)R * R;
+            if (!(par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) ok = 0;
+        }
+    }
     if (ok && (par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) {
         B->lowrank = 1;
         B->lrR = (int)R;
@@ -850,7 +950,11 @@ double analyze_sdp_block(Block *B, const Params *par) {
     }
     /* dictionary route first (linear-time detection with gates), then low-rank;
      * the cheapest of {current routes, dictionary, low-rank} wins */
+    /* 22 October 2026: the analysis's parts timed with BRISK_SETUPT (delay_indep_n32, a control LMI: 0.57 s of 0.86 s here) */
+    static int setupt = -1; if (setupt < 0) setupt = getenv("BRISK_SETUPT") != NULL;
+    double ts0 = setupt ? wtime() : 0, ts_dict = 0, ts_lrd = 0, ts_lr = 0, ts_cls = 0;
     double cost_dict = (par->dict != 0) ? dict_build(B, par) : 1e300;
+    if (setupt) { ts_dict = wtime() - ts0; ts0 = wtime(); }
     if (!B->vb) {
         /* 5.18: the factors of low-rank constraints as the shared columns, with the gate of the entry-class route
          * below: cheaper by a fifth by the model, on a block whose assembly matters, and a saving of at least 4 % of a
@@ -862,7 +966,9 @@ double analyze_sdp_block(Block *B, const Params *par) {
             dict_free(B); B->dlr = 0; cost_dict = 1e300;
         } else cost_dict = c_lrd;
     }
+    if (setupt) { ts_lrd = wtime() - ts0; ts0 = wtime(); }
     if (!(B->vb && par->dict > 0)) lowrank_block(B, par, fmin(cost_now, cost_dict));
+    if (setupt) { ts_lr = wtime() - ts0; ts0 = wtime(); }
     if (B->lowrank) dict_free(B);
     else if (B->vb && (par->dict > 0 || cost_dict < cost_now)) { B->dict = 1; cost_now = cost_dict; }
     else dict_free(B);
@@ -881,6 +987,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
         if (take) { B->cls = 1; cost_now = cost_cls; }
         else class_free(B);
     }
+    if (setupt) { ts_cls = wtime() - ts0; printf("   [setup: block n %d, %d constraints: dictionary %.3fs, low-rank dictionary %.3fs, low-rank %.3fs, entry classes %.3fs]\n", n, nc, ts_dict, ts_lrd, ts_lr, ts_cls); }
     if (B->lowrank || B->cls) {                /* all constraints treated as sparse */
         for (int t = 0; t < nc; t++) B->dpos[t] = -1;
         for (int a = 0; a < nd; a++) { free(drW[a]); free(drS[a]); }
@@ -1057,7 +1164,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
      * pair <A_b, X A_a Zi> = k_b sum_c (-1)^(z_b . c) G_a[c ^ x_b, c] is entry z_b of the Walsh-Hadamard transform of
      * the x_b-th XOR diagonal of G_a: n^2 log n an a for all b instead of a gather of n entries a pair (m^2 n / 2
      * random reads an assembly). BRISK_WEYL=0 off. */
-    free(B->wx); free(B->wz); free(B->wk); B->wx = B->wz = NULL; B->wk = NULL; B->allweyl = 0;
+    free(B->wx); free(B->wz); free(B->wk); B->wx = B->wz = NULL; B->wk = NULL; B->allweyl = 0; weylpd_free(B);
     if (getenv("BRISK_WEYLDBG")) printf("   [Weyl check: n %d ns %d nd %d lowrank %d dict %d cls %d]\n", n, B->ns, B->nd, B->lowrank, B->dict, B->cls);
     if (!B->lowrank && !B->dict && !B->cls && B->nd == 0 && B->ns >= 2 * n && n >= 32 && (n & (n - 1)) == 0
         && !(getenv("BRISK_WEYL") && atoi(getenv("BRISK_WEYL")) == 0)) {
@@ -1086,7 +1193,8 @@ double analyze_sdp_block(Block *B, const Params *par) {
         }
         free(vc); free(have);
         if (getenv("BRISK_WEYLDBG")) printf("   [Weyl operators: block n %d, %d constraints: %s]\n", n, B->ns, ok ? "all" : "not all");
-        if (ok) { B->allweyl = 1; B->wx = wx; B->wz = wz; B->wk = wk; B->allmono = 1; for (int a = 0; a < B->ns; a++) B->route[B->slist[a]] = 5; }
+        if (ok) { B->allweyl = 1; B->wx = wx; B->wz = wz; B->wk = wk; B->allmono = 1; for (int a = 0; a < B->ns; a++) B->route[B->slist[a]] = 5;
+                  weylpd_setup(B); }   /* (23 October 2026: the pairs in the Pauli basis when that is cheaper, weylpd.c) */
         else { free(wx); free(wz); free(wk); }
     }
 
@@ -1135,17 +1243,26 @@ double analyze_sdp_block(Block *B, const Params *par) {
             double full = 0, area = 0, gath = 0;
             {   double sf = 0;
                 for (int a = ns - 1; a >= 0; a--) { sf += B->A[B->slist[a]].ef; if (B->route[B->slist[a]] == 1) gath += sf; } }
-            for (int a = 0; a < ns; a++) {
-                if (B->route[B->slist[a]] != 1) continue;
-                const SpSym *S = &B->A[B->slist[a]];
-                double ar = 0;
-                for (int q = 0; q < B->lv_u[a]; q++) {
-                    int lo = B->lv_cp[q], hi = B->lv_cp[q + 1];
-                    while (lo < hi) { const int mid = (lo + hi) >> 1; if (B->lv_ca[mid] < a) lo = mid + 1; else hi = mid; }
-                    if (lo < B->lv_cp[q + 1]) ar += B->lv_ch[lo];
+            /* (22 October 2026: the staircase of constraint a over the live prefix, sum over q < lv_u[a] of the
+             * height of column q's entries of the constraints >= a, by one sweep from the last constraint that keeps
+             * each column's height and the prefix's sum: linear in the entries, the same integers. A binary search per
+             * constraint and column cost ns n log: fap25, DIMACS, an SDP with 2.2 million constraints on a block of
+             * order 2,118, spent minutes here under a time limit of 900 s) */
+            {   int *H = xcalloc(n, sizeof(int)); double *ar = xmalloc(sizeof(double) * (ns ? ns : 1)); double S = 0; int P = 0;
+                for (int a = ns - 1; a >= 0; a--) {
+                    for (int k = B->foff[a]; k < B->foff[a + 1]; k++) {
+                        const int q = B->lv_rank[B->ffc[k]], h = B->lv_rank[B->ffr[k]] + 1;
+                        if (h > H[q]) { if (q < P) S += h - H[q]; H[q] = h; }
+                    }
+                    while (P < B->lv_u[a]) S += H[P++];
+                    ar[a] = S;
                 }
-                full += (double)S->nr * n2; area += (double)S->nr * ar;
-            }
+                for (int a = 0; a < ns; a++) {
+                    if (B->route[B->slist[a]] != 1) continue;
+                    const SpSym *Sa = &B->A[B->slist[a]];
+                    full += (double)Sa->nr * n2; area += (double)Sa->nr * ar[a];
+                }
+                free(H); free(ar); }
             /* 5.9 (a user's suggestion, refitted on his 24 relaxations with the flat gather of
              * 5.7): the ratio at which the live region stops paying grows with the block
              * order (measured, not derived). 0.67 up to n = 420 as before, then
@@ -1338,7 +1455,8 @@ void block_free_contents(Block *B) {
     free(B->route); free(B->urows); free(B->ufr); free(B->ufc);
     free(B->dpos); free(B->dlist); free(B->slist); free(B->Ad); free(B->Adl);
     free(B->dfoff); free(B->dfW); free(B->dfS); B->dfoff = NULL; B->dfW = NULL; B->dfS = NULL; B->dfac = 0;
-    free(B->wx); free(B->wz); free(B->wk); B->wx = B->wz = NULL; B->wk = NULL; B->allweyl = 0;
+    free(B->wx); free(B->wz); free(B->wk); B->wx = B->wz = NULL; B->wk = NULL; B->allweyl = 0; weylpd_free(B);
+    free(B->ltr_off); free(B->ltr_t); free(B->ltr_v); B->ltr_off = B->ltr_t = NULL; B->ltr_v = NULL;
     if (B->drk) { for (int a = 0; a < B->nd; a++) { free(B->drW[a]); free(B->drS[a]); } }
     free(B->drk); free(B->drW); free(B->drS);
     free(B->foff); free(B->ffr); free(B->ffc); free(B->ffv); free(B->ffp);
@@ -1361,9 +1479,60 @@ void problem_free(Problem *P) {
 /* 4.30: an exact copy of an unprepared problem (data as triplets, rebuilt), for undoing a
  * presolve step that is not kept (facial reduction rejected by the depth rule: the
  * pipeline used to start over from the file, repeating the free elimination) */
+/* 23 October 2026: the copy by arrays, when the blocks are in the form the rebuild from triplets gives (each matrix's
+ * entries strictly increasing in (row, col), none zero, row <= col, an LP's col equal to its row, every constraint of a
+ * block with an entry, the constraints ascending): the same problem without the sort and the rebuild (2.4 s for the
+ * 18.8 million entries of a D-optimal design, copied before the facial reduction, which then removed nothing) */
+static int spsym_canonical(const SpSym *S, int lp) {
+    for (int q = 0; q < S->nnz; q++) {
+        if (S->val[q] == 0.0 || S->row[q] > S->col[q] || (lp && S->col[q] != S->row[q])) return 0;
+        if (q > 0 && (S->row[q - 1] > S->row[q] || (S->row[q - 1] == S->row[q] && S->col[q - 1] >= S->col[q]))) return 0;
+    }
+    return 1;
+}
+/* (the derived arrays recomputed as the rebuild does, from the entries: never a stale copy) */
+static void spsym_copy(SpSym *D, const SpSym *S, int n, int lp) {
+    const size_t z = S->nnz;
+    D->nnz = S->nnz;
+    D->row = xmalloc(sizeof(int) * (z ? z : 1)); D->col = xmalloc(sizeof(int) * (z ? z : 1)); D->val = xmalloc(sizeof(double) * (z ? z : 1));
+    if (z) { memcpy(D->row, S->row, sizeof(int) * z); memcpy(D->col, S->col, sizeof(int) * z); memcpy(D->val, S->val, sizeof(double) * z); }
+    spsym_finish(D, n, lp);
+}
+static int problem_clone_arrays(const Problem *P, Problem *Q) {
+    const int m = P->m, nb = P->nblk;
+    if (getenv("BRISK_CLONETRIP")) return 0;
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP;
+        if (!B->C.row || !spsym_canonical(&B->C, lp)) return 0;
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *S = &B->A[t];
+            if (S->nnz == 0 || (t > 0 && B->con[t - 1] >= B->con[t]) || !spsym_canonical(S, lp)) return 0;
+        }
+    }
+    memset(Q, 0, sizeof(*Q));
+    Q->m = m; Q->nblk = nb;
+    Q->blk = xcalloc(nb, sizeof(Block));
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k]; Block *C = &Q->blk[k];
+        C->type = B->type; C->n = B->n; C->ncon = B->ncon;
+        C->con = xmalloc(sizeof(int) * (B->ncon ? B->ncon : 1));
+        if (B->ncon) memcpy(C->con, B->con, sizeof(int) * B->ncon);
+        C->A = xcalloc(B->ncon ? B->ncon : 1, sizeof(SpSym));
+        for (int t = 0; t < B->ncon; t++) spsym_copy(&C->A[t], &B->A[t], B->n, B->type == BLK_LP);
+        spsym_copy(&C->C, &B->C, B->n, B->type == BLK_LP);
+    }
+    Q->b = xmalloc(sizeof(double) * (m + 1)); Q->b0 = xmalloc(sizeof(double) * (m + 1)); Q->orig = xmalloc(sizeof(int) * (m + 1));
+    memcpy(Q->b, P->b, sizeof(double) * m); memcpy(Q->b0, P->b0, sizeof(double) * m); memcpy(Q->orig, P->orig, sizeof(int) * m);
+    Q->morig = P->morig; Q->tbR = P->tbR; Q->obj_off = P->obj_off;
+    return 1;
+}
 void problem_clone(const Problem *P, Problem *Q) {
+    if (problem_clone_arrays(P, Q)) return;
     const int m = P->m, nb = P->nblk;
     size_t nt = 0, ct = 1024;
+    /* (23 October 2026: sized by a count first; the doubling copied the five arrays of 9.9 million entries of a D-optimal
+     * design about twice over) */
+    for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; ct += B->C.nnz; for (int t = 0; t < B->ncon; t++) ct += B->A[t].nnz; }
     int *tc = xmalloc(sizeof(int) * ct), *tb = xmalloc(sizeof(int) * ct), *ti = xmalloc(sizeof(int) * ct), *tj = xmalloc(sizeof(int) * ct);
     double *tv = xmalloc(sizeof(double) * ct);
     for (int k = 0; k < nb; k++) {

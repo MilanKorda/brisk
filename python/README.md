@@ -19,10 +19,11 @@ and puts it inside the package; no Python extension module is compiled.
 2. [Installation on macOS](#installation-on-macos)
 3. [A first example](#a-first-example)
 4. [CVXPY](#cvxpy)
-5. [Low level: SDPA data](#low-level-sdpa-data)
-6. [Interrupting a solve](#interrupting-a-solve)
-7. [Reference](#reference)
-8. [Troubleshooting](#troubleshooting)
+5. [Convex quadratic programs](#convex-quadratic-programs)
+6. [Low level: SDPA data](#low-level-sdpa-data)
+7. [Interrupting a solve](#interrupting-a-solve)
+8. [Reference](#reference)
+9. [Troubleshooting](#troubleshooting)
 
 ## Installation on Linux
 
@@ -213,6 +214,71 @@ as the Julia package and BRISK's own dual form. The form used is reported in
 BRISK's statuses refer to its own (P) and (D). The interface translates them, since in the image
 form BRISK's (P) is CVXPY's dual problem.
 
+## Convex quadratic programs
+
+```python
+import numpy as np, brisk
+# min 1/2 x'Px + q'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub
+r = brisk.solve_qp(P=np.diag([0.02, 2.0]), q=[0, 0], A=[[10.0, -1.0]], l=[10.0], u=None,
+                   lb=[2.0, -50.0], ub=[50.0, 50.0], c0=-100.0, verbose=False)
+print(r.status_str, r.obj, r.x)      # OPTIMAL -99.96 [2. 0.]
+```
+
+`P` is symmetric (both triangles) or one triangle of it (upper or lower), dense or scipy sparse, or `None` for an LP;
+`A` is dense or scipy sparse; an absent bound is `None` or ±inf, and an equality row has `l = u`. The result
+(`brisk.QpResult`): `status` (0 optimal, 1 primal infeasible, 2 dual infeasible, 3 the iteration limit, 4 numerical
+difficulties, 5 reduced accuracy, 6 the time limit), `status_str`, `obj`, `x`, `y` (the rows' multipliers), `z` (the
+bounds' multipliers), with `P x + q - A'y - z = 0`, `errors` (primal, dual and gap errors on the problem as given),
+`iterations`. By default the solver chooses its method: the dual active-set method of Goldfarb and Idnani for a small
+QP with `P` positive definite (its dense work, about 2n³ + 2n(nnz(A) + n + m) flops, at most 4·10⁶: QPs of up to about
+a hundred variables, such as those of model predictive control), the interior-point method otherwise;
+`options=["-qpas"]` asks for the active-set method, `options=["-qpipm"]` for the interior-point method. `brisk.solve_file("problem.qps")` reads a QPS file (also with quadratic
+constraints, QCMATRIX: a convex QCQP) and returns a `QpResult`.
+
+From CVXPY, a problem with a quadratic objective and linear constraints goes to the QP method with
+
+```python
+prob.solve(solver=brisk.BRISK_QP())                    # the solver's choice of method
+prob.solve(solver=brisk.BRISK_QP(), active_set=True)   # the dual active-set method
+prob.solve(solver=brisk.BRISK_QP(), active_set=False)  # the interior-point method
+```
+
+(other options as keywords: `tol`, `maxit`, `timelimit`, `threads`; the duals in CVXPY's convention).
+
+For branch and bound on a mixed-integer QP, `brisk.QpModel` keeps the problem and re-solves it after changes of
+bounds, row bounds or the cost, each solve from the previous active set (the dual active-set method; `active_set=False`:
+the interior-point method, every solve cold):
+
+```python
+mdl = brisk.QpModel(P, q, A, l, u, lb, ub)
+r = mdl.solve()                         # cold
+mdl.set_var_bounds(j, lo=2.0)           # a branch: x_j >= 2
+r = mdl.solve()                         # from the parent's active set
+mdl.set_var_bounds(j, lo=lb[j])         # back
+mdl.set_row_bounds(i, lo, hi); mdl.set_cost(q2); mdl.close()
+```
+
+A depth-first branch and bound on a 12-variable integer QP (117 nodes): 282 iterations warm against 723 interior-point
+iterations cold. `brisk.BRISK()`
+solves the same problem through its conic form, CVXPY having turned the objective into a second-order cone.
+
+For branch and bound on a mixed-integer SOCP, `brisk.SocpModel` keeps an SOCP in SeDuMi format (min c'x, A x = b,
+x in K; K as `solve_sedumi`'s, without semidefinite blocks) and re-solves it after bound changes on any column, each solve
+after an optimal one warm-started from it; a cutoff stops a node that cannot beat the incumbent (status 9):
+
+```python
+mdl = brisk.SocpModel(A, b, c, {"f": 2, "q": [3]})
+r = mdl.solve()                         # cold
+mdl.set_var_bounds(j, lo=1.0)           # a branch: x_j >= 1 (a row of its own with a slack)
+mdl.set_cutoff(incumbent)               # stop once the node's lower bound exceeds the incumbent
+r = mdl.solve()                         # warm, from the last optimal point
+mdl.set_var_bounds(j, lo=-np.inf)       # back
+```
+
+`pt = mdl.save_point()` at a node and `mdl.restore_point(pt)` before each child start the children from their parent's
+point rather than from the last solve's. A depth-first branch and bound on CBLIB's 123 mixed-integer SOCPs (300 nodes
+each): the warm node solves take 0.666 of the cold iterations, with the same values.
+
 ## Low level: SDPA data
 
 ```python
@@ -240,7 +306,7 @@ The problem is the numbers of an SDPA sparse file:
 | `x`, `y` | the SDPA variable x, and BRISK's y = −x |
 | `X`, `Z` | lists of numpy arrays per block (n×n, or a vector for an LP block): X is the SDPA dual matrix, Z = F(x) |
 | `pobj`, `dobj` | BRISK's ⟨C, X⟩ and b'y (the SDPA value c'x is −dobj) |
-| `dimacs` | the six DIMACS errors on the data as given |
+| `dimacs` | the six DIMACS errors on the data as given (with `prec`: in the working precision) |
 | `iterations`, `time`, `exit_code`, `blocksizes`, `interrupted` | |
 | `bound` | with the option `bound` (`-bound p\|d\|pd`): the first side asked for: `side`, `kind` (upper/lower bound on BRISK's (P) value), `value`, `resid`, `lammin`, `valid` (2 with the margin, 1 PSD, 0 not), `certified`, `rigorous` |
 | `bounds` | each side asked for (`"p"`, `"d"`): `kind`, `have`, `value`, `resid`, `lammin`, `valid`, `certified`, `rigorous` (a bound only when certified), `src`, and the certificate: `X` (blocks; `x` for a problem in SeDuMi form) for p, `y` for d |
@@ -266,6 +332,9 @@ in SeDuMi format), beside the solution, which stays the solve's own point. Under
 memory: above 30% of the memory, `r.X` and `r.Z` are `None`, the point is verified on the
 cliques, and the status and `r.dimacs` are as usual. `options={"returnx": 0}` never forms the
 dense X (fastest), `"returnx": 1` always does. `r.y` is always returned.
+
+**The low-rank augmented Lagrangian** (`options={"lralm": 1}`, experimental) works with factors R of X = R Rᵀ and
+never forms X: `r.X` and `r.Z` are `None`; `r.y`, the objectives, the status and `r.dimacs` are returned.
 
 ## SeDuMi format, linear and second-order cone programs
 
@@ -304,6 +373,9 @@ a worker thread, and the main thread waits for it:
   while.
 - `brisk.set_interruptible(False)` runs solves in the calling thread instead; Ctrl-C then waits
   until the solve ends. Solves started from other threads always run in their own thread.
+- A small QP (`solve_qp`, `QpModel`: fewer than 20,000 entries, rows and variables together) is
+  solved in the calling thread: it finishes within milliseconds, and handing it to the worker
+  thread would cost about as much as the solve.
 
 The library is not reentrant, so solves are serialized by a lock. Solves started from several
 threads run one after the other.
@@ -313,7 +385,11 @@ threads run one after the other.
 | function | |
 |---|---|
 | `brisk.BRISK()` | the CVXPY solver |
-| `brisk.solve_file(path, options=None, verbose=True)` | solve an SDPA file |
+| `brisk.BRISK_QP()` | the CVXPY solver for QPs (a quadratic objective, linear constraints) |
+| `brisk.QpModel(P, q, A, l, u, lb, ub, active_set=True)` | a QP re-solved warm after `set_var_bounds`, `set_row_bounds`, `set_cost` (`solve()`, `close()`) |
+| `brisk.SocpModel(A, b, c, K)` | an SOCP re-solved warm after `set_var_bounds`, `set_cost`, `set_cutoff` (`solve()`, `save_point()`, `restore_point(p)`, `close()`) |
+| `brisk.solve_file(path, options=None, verbose=True)` | solve an SDPA file, a SeDuMi MAT-file (`ConeResult`) or a QPS file (`QpResult`) |
+| `brisk.solve_qp(P, q, A, l, u, lb, ub, c0=0.0, options=None, verbose=True)` | solve a convex QP (above) |
 | `brisk.solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True)` | solve SDPA data |
 | `brisk.write_sdpa(path, blocksizes, c, mat, blk, i, j, v)` | write an SDPA file |
 | `brisk.hp_solution(convert=None)` | all the digits of the last high-precision solve (see below) |
