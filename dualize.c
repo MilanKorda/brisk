@@ -55,6 +55,12 @@ PSDual *dualize_apply(Problem *P, int automatic, int verbose, PSOrig **pOf) {
      * (pOf) only once the form is taken (a D-optimal design with 64 blocks and 9.9 million entries: 1.0 s of pair
      * detection and copy for a form the block count excludes) */
     if (automatic && (nsdp > 32 || !dualize_has_objective(P))) return NULL;
+    /* (27 October 2026) the rows of the dual form are 32-bit; and a block above the readers' cap of 46,340 is a long
+     * second-order cone kept as a cone vector (problem.c, big_blocks_ok), whose n(n+1)/2 entries as rows the dual form
+     * cannot hold (-dualize 1 ran out of memory on a cone of order 60,001), forced or not */
+    extern int g_read_maxn;
+    if (N + nlp >= 2147483647L) return NULL;
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP && P->blk[k].n > g_read_maxn) return NULL;
     FreePair *pr = NULL;
     const int np = free_pairs_detect(P, &pr);
     const long mK = m - np, mD = N + (nlp - 2L * np) + np - m;

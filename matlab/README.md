@@ -83,6 +83,30 @@ Y psd`. `F` is the SDPA-M cell array `F{k, i+1}` (block `k` of `F_i`; LP blocks 
 `T` an `nnz x 5` array `[i k r s value]` (the body of a `.dat-s` file). Outputs follow SDPA-M:
 `objVal = [c'x, F_0.Y]`, `X`, `Y` cell arrays (LP blocks as column vectors).
 
+### Quadratic programs
+
+```matlab
+% min 1/2 x'Hx + f'x  s.t.  l <= A x <= u,  lb <= x <= ub
+[x, info] = brisk_qp(H, f, A, l, u, lb, ub)
+[x, info] = brisk_qp(H, f, A, l, u, lb, ub, opts)
+[x, info] = brisk_qp('problem.qps', opts)          % a QPS file (a convex QP or QCQP), as ./brisk problem.qps
+
+mdl = BriskQpModel(H, f, A, l, u, lb, ub, opts);   % kept for re-solves
+[x, info] = mdl.solve();
+mdl.set_var_bounds(j, lo, hi);                     % or set_row_bounds(i, lo, hi), set_cost(f)
+[x, info] = mdl.solve();                           % from the previous active set
+delete(mdl)
+```
+
+`H` symmetric, or one of its triangles; `H`, `A` full or sparse; an absent bound is `-Inf` or `Inf`, `[]` means none
+of that kind; an equality row has `l(i) = u(i)`. `info`: `status`, `statuscode` (0 optimal, 1 primal infeasible, 2
+dual infeasible, 3 iteration limit, 4 numerical difficulties, 5 reduced accuracy, 6 time limit), `obj`, `y` (the
+rows' multipliers), `z` (the bounds' multipliers; `H x + f - A'y - z = 0`), `iter`, `time`, `errors`. By default a
+small QP with `H` positive definite is solved by the dual active-set method, any other by the interior-point method
+for QPs; `opts.qpas = true` or `opts.qpipm = true` chooses. A QP that is not convex is refused with an error. A
+`BriskQpModel` uses the active-set method (with `opts.qpipm = true`: the interior-point method, each solve from the
+start).
+
 ### Options
 
 ```matlab

@@ -995,7 +995,7 @@ static int prior_propagate(const PSOrig *O, int exact, int verbose, double *yl, 
 
 /* side p with given a-priori bounds: the bound for X~, or +inf with the reason */
 static double prior_eval_p(const PSOrig *O, double **X, int exact, const double *yl, const double *yu, double **zd,
-                           int verbose, char *reason, size_t rlen) {
+                           int verbose, char *reason, size_t rlen, double *lbk) {
     const int m = O->m;
     double **Xs = bound_alloc_blocks(O);
     for (int k = 0; k < O->nblk; k++) {
@@ -1038,6 +1038,7 @@ static double prior_eval_p(const PSOrig *O, double **X, int exact, const double 
     for (int k = 0; k < O->nblk && ok; k++) {
         const int n = abs(O->bs[k]);
         if (O->bs[k] < 0) {
+            if (lbk) { lbk[k] = INFINITY; for (int i = 0; i < n; i++) lbk[k] = fmin(lbk[k], Xs[k][i]); }
             for (int i = 0; i < n && ok; i++) {
                 if (Xs[k][i] >= 0) continue;
                 if (!(zd[k][i] < INFINITY)) { ok = 0; if (reason) snprintf(reason, rlen, "no a-priori bound of entry %d of linear block %d", i + 1, k + 1); break; }
@@ -1057,6 +1058,7 @@ static double prior_eval_p(const PSOrig *O, double **X, int exact, const double 
         const double lb0 = lammin_lower(n, W), est = g_lam_est;
         const double lb = lammin_lower_hi(n, W, lb0, est, "a-priori bound (P)");
         free(W);
+        if (lbk) lbk[k] = lb;
         lmin_worst = fmin(lmin_worst, lb);
         if (lb >= 0) { free(e); continue; }
         fesetround(FE_UPWARD);
@@ -1130,6 +1132,41 @@ static double prior_eval_d(const PSOrig *O, const double *y, int exact, double *
     if (verbose > 1 && ok) printf("     a-priori bound (D): %.17g\n", Lb);
     return ok ? Lb : -INFINITY;
 }
+/* 27 October 2026: X~ moved into the cone on one block: with S = diag(2^-e_j) as prior_eval_p takes it from the
+ * diagonal, the eigenvalues of W = S X~ S below tau = max(-lb, 64 n eps max W_jj) are raised to tau,
+ * X' = X~ + sum (tau - lambda_i) (S^-1 v_i)(S^-1 v_i)'. Only those directions move, so <C,X> and A(X) change by
+ * terms of the size of lambda_i in them, not in all n (a shift of the whole diagonal raised the residual term as
+ * much as it removed of the eigenvalue term). Xp: n x n, both triangles; 0 on a failure of the eigensolver. */
+static int prior_repair_block(int n, const double *X, double lb, double *Xp) {
+    int *e = malloc(sizeof(int) * (n + 1));
+    double *W = malloc(sizeof(double) * (size_t)n * n), *ev = malloc(sizeof(double) * (n + 1));
+    if (!e || !W || !ev) { free(e); free(W); free(ev); return 0; }
+    double wmax = 0;
+    for (int j = 0; j < n; j++) { const double d = X[j + (size_t)j * n]; e[j] = d > 0 && isfinite(d) ? (int)lround(0.5 * log2(d)) : 0; }
+    for (int j = 0; j < n; j++) for (int i = 0; i <= j; i++) {
+        const double w = ldexp(X[i + (size_t)j * n], -e[i] - e[j]);       /* (the upper triangle, as prior_eval_p reads it) */
+        W[i + (size_t)j * n] = W[j + (size_t)i * n] = w;
+        if (i == j) wmax = fmax(wmax, fabs(w));
+    }
+    int lwork = -1, liwork = -1, info = 0, iwq = 0; double wq = 0;
+    BL(dsyevd_)("V", "U", &n, W, &n, ev, &wq, &lwork, &iwq, &liwork, &info);
+    lwork = (int)wq + 1; liwork = iwq + 1;
+    double *work = malloc(sizeof(double) * lwork); int *iwork = malloc(sizeof(int) * liwork);
+    if (work && iwork) BL(dsyevd_)("V", "U", &n, W, &n, ev, work, &lwork, iwork, &liwork, &info); else info = -1;
+    free(work); free(iwork);
+    if (info != 0) { free(e); free(W); free(ev); return 0; }
+    const double tau = fmax(-lb, 64.0 * n * DBL_EPSILON * wmax);
+    for (int j = 0; j < n; j++) for (int i = 0; i <= j; i++) Xp[i + (size_t)j * n] = Xp[j + (size_t)i * n] = X[i + (size_t)j * n];
+    for (int q = 0; q < n && ev[q] < tau; q++) {
+        const double a = tau - ev[q], *v = W + (size_t)q * n;
+        for (int j = 0; j < n; j++) {
+            const double vj = ldexp(v[j], e[j]) * a;
+            for (int i = 0; i <= j; i++) { const double t = Xp[i + (size_t)j * n] + ldexp(v[i], e[i]) * vj; Xp[i + (size_t)j * n] = Xp[j + (size_t)i * n] = t; }
+        }
+    }
+    free(e); free(W); free(ev);
+    return 1;
+}
 /* The a-priori bound of side p (candidates X1, X2) or d (y1, y2); NULL candidates are skipped.
  * Returns 1 with the better finite bound in *bound and the candidate it came from in *which
  * (1 or 2), 0 with the reason otherwise. */
@@ -1153,12 +1190,41 @@ int brisk_prior_bound(const PSOrig *O, int side, double **X1, double **X2, const
             return 0;
         }
         prior_propagate(O, exact, verbose, yl, yu, zd);
+        double *lbk = malloc(sizeof(double) * (O->nblk + 1));
         for (int c = 0; c < 2; c++) {
             double **X = c == 0 ? X1 : X2;
             if (!X) continue;
-            const double B = prior_eval_p(O, X, exact, yl, yu, zd, verbose, c == 0 || !(*bound < INFINITY) ? reason : NULL, rlen);
+            for (int k = 0; lbk && k < O->nblk; k++) lbk[k] = INFINITY;
+            const double B = prior_eval_p(O, X, exact, yl, yu, zd, verbose, c == 0 || !(*bound < INFINITY) ? reason : NULL, rlen, lbk);
             if (B < *bound) { *bound = B; if (which) *which = c + 1; }
+            /* 27 October 2026: the candidate moved into the cone. A point with lambda_min(S X~ S) slightly below 0 pays
+             * |lambda_min| times the a-priori bound of tr(S^-1 Z S^-1) (eigenvalue term), which on blocks with large
+             * bounds of Z dwarfs the residual term: BRISK 1.6's primal restoration returns A(X) = b to 1e-12 with
+             * lambda_min(X) -5e-9 relative, and a PolyOpt cut SDP got 0.99040 (eigenvalue term 1.5e-3) where the
+             * same point's <C,X> is 0.98893 and 1.5.5's PSD point gave 0.98893415. X' (prior_repair_block on each block
+             * with lambda_min(S X~ S) >= lb_k < 0, the negative entries of linear blocks set to 0) trades that term for
+             * small changes of <C,X> and of the residual. X' is evaluated as any candidate (outward rounding, its own
+             * rigorous lambda_min), so the smaller of the two bounds is as rigorous as either. BRISK_PRIORSHIFT=0: off */
+            static int shift_on = -1;
+            if (shift_on < 0) { const char *e = getenv("BRISK_PRIORSHIFT"); shift_on = !(e && atoi(e) == 0); }
+            int need = 0;
+            for (int k = 0; lbk && k < O->nblk; k++) need |= lbk[k] < 0;
+            if (!shift_on || !need) continue;
+            double **Xp = bound_alloc_blocks(O);
+            if (!Xp) continue;
+            for (int k = 0; k < O->nblk; k++) {
+                const int n = abs(O->bs[k]);
+                memcpy(Xp[k], X[k], sizeof(double) * bsz_c(O->bs[k]));
+                if (!(lbk[k] < 0)) continue;
+                if (O->bs[k] < 0) { for (int i = 0; i < n; i++) if (Xp[k][i] < 0) Xp[k][i] = 0; continue; }
+                if (!prior_repair_block(n, X[k], lbk[k], Xp[k])) memcpy(Xp[k], X[k], sizeof(double) * bsz_c(O->bs[k]));
+            }
+            const double Bp = prior_eval_p(O, Xp, exact, yl, yu, zd, verbose, NULL, 0, NULL);
+            if (verbose > 1) printf("     a-priori bound (P), candidate %d moved into the cone: %.17g against %.17g%s\n", c + 1, Bp, B, Bp < B ? " (kept)" : "");
+            if (Bp < *bound) { *bound = Bp; if (which) *which = c + 1; }
+            bound_free_blocks(Xp, O->nblk);
         }
+        free(lbk);
         free(yl); free(yu);
         for (int k = 0; k < O->nblk; k++) free(zd[k]);
         free(zd);

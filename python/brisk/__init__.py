@@ -12,7 +12,7 @@
 from ._core import (STATUS, ConeResult, QpModel, QpResult, Result, SocpModel, certify, hp_solution, interrupt, library_path, load_library, options_to_argv,
                     set_interruptible, solve_file, solve_qp, solve_sdpa, solve_sedumi, version, write_sdpa)
 
-__version__ = "1.6"
+__version__ = "1.6.1"
 __all__ = ["STATUS", "ConeResult", "QpModel", "QpResult", "Result", "SocpModel", "certify", "hp_solution", "interrupt", "set_interruptible", "library_path", "load_library", "options_to_argv", "solve_file",
            "solve_qp", "solve_sdpa", "solve_sedumi", "version", "write_sdpa", "BRISK", "BRISK_QP"]
 

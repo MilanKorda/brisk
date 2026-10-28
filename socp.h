@@ -43,5 +43,7 @@ void socp_result_free(SocpRes *R);
 const char *socp_status_str(int s);
 extern int (*socp_printf)(const char *fmt, ...);   /* where the solver prints (default: printf) */
 extern void (*socp_note)(const char *fmt, ...);    /* 5.8: lines for the caller's summary (NULL: none) */
+volatile int *socp_stop_never(void);                /* the default of socp_stop (never set) */
 extern volatile int *socp_stop;                    /* a flag that stops the solve when it becomes nonzero */
+extern _Thread_local volatile int *socp_stop_call; /* a second one, the calling thread's (NULL: none; the caller sets and restores it) */
 #endif

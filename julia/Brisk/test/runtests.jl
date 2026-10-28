@@ -271,7 +271,11 @@ end
     @test termination_status(model) == DUAL_INFEASIBLE
     @test primal_status(model) == INFEASIBILITY_CERTIFICATE
     d = value.(X)
-    @test d[1, 2] > 0.5 && eigmin(Symmetric(d)) > -1e-6 && abs(d[1, 1] - d[2, 2]) < 1e-6
+    # a certificate of unboundedness is any direction D in the cone with D11 = D22 and D12 > 0 (28 October 2026: the
+    # test asked D12 > 0.5 of a normalized ray, the direction the SDP solver happened to return; since the problems
+    # whose blocks have order 1 or 2 are solved by the SOCP solver, it returns another valid one, D12 = 0.48)
+    nd = norm(d)
+    @test nd > 0 && d[1, 2] > 1e-6 * nd && eigmin(Symmetric(d)) > -1e-6 * nd && abs(d[1, 1] - d[2, 2]) < 1e-6 * nd
 
     # an objective variable in no constraint: unbounded
     model = brisk_model(form)
@@ -405,6 +409,131 @@ end
     @test isapprox(r1.primal_objective, r0.primal_objective; rtol = 1e-7)
     set_attribute(model, "nosuchoption", 1)
     @test_throws Exception optimize!(model)
+end
+
+@testset "QP from JuMP" begin
+    # HS21: min 0.01 x1^2 + x2^2 - 100, 10 x1 - x2 >= 10, 2 <= x1 <= 50, -50 <= x2 <= 50; x = (2, 0), -99.96
+    hs21() = (m = Model(Brisk.Optimizer); set_silent(m);
+              @variable(m, 2 <= x1 <= 50); @variable(m, -50 <= x2 <= 50); @constraint(m, c1, 10x1 - x2 >= 10); (m, x1, x2, c1))
+    model, x1, x2, c1 = hs21()
+    @objective(model, Min, 0.01x1^2 + x2^2 - 100)
+    optimize!(model)
+    @test termination_status(model) == OPTIMAL && primal_status(model) == FEASIBLE_POINT
+    @test isapprox(objective_value(model), -99.96; atol = 1e-7)
+    @test isapprox(value(x1), 2; atol = 1e-7) && isapprox(value(x2), 0; atol = 1e-7)
+    @test isapprox(dual(LowerBoundRef(x1)), 0.04; atol = 1e-7) && isapprox(dual(c1), 0; atol = 1e-7)
+    @test isapprox(dual_objective_value(model), -99.96; atol = 1e-6)
+    @test isapprox(value(c1), 20; atol = 1e-7)
+    # a changed bound: the same H and A, re-solved from the previous active set
+    set_lower_bound(x1, 3)
+    optimize!(model)
+    @test termination_status(model) == OPTIMAL && isapprox(objective_value(model), -99.91; atol = 1e-7)
+    @test isapprox(value(x1), 3; atol = 1e-7) && barrier_iterations(model) <= 2
+    # the cost's linear part changed: as a cold solve of the same model
+    @objective(model, Min, 0.01x1^2 + x2^2 - x2 - 100)
+    optimize!(model)
+    cold, y1, y2, _ = hs21(); set_lower_bound(y1, 3)
+    @objective(cold, Min, 0.01y1^2 + y2^2 - y2 - 100)
+    optimize!(cold)
+    @test termination_status(model) == OPTIMAL && isapprox(objective_value(model), objective_value(cold); atol = 1e-7)
+    @test isapprox(value(x2), 0.5; atol = 1e-7) && isapprox(value(y2), 0.5; atol = 1e-7)
+    # maximization: the duals and the dual objective in MOI's convention
+    model, x1, x2, c1 = hs21()
+    @objective(model, Max, 100 - 0.01x1^2 - x2^2)
+    optimize!(model)
+    @test termination_status(model) == OPTIMAL && isapprox(objective_value(model), 99.96; atol = 1e-7)
+    @test isapprox(dual(LowerBoundRef(x1)), 0.04; atol = 1e-7)
+    @test isapprox(dual_objective_value(model), 99.96; atol = 1e-6)
+    # an equality: min x1^2 + x2^2, x1 + x2 = 1; x = (1/2, 1/2), the multiplier 1; each method by its option
+    for meth in ("auto", "qpas", "qpipm")
+        model = Model(Brisk.Optimizer); set_silent(model)
+        meth == "auto" || set_attribute(model, meth, 1)
+        @variable(model, x[1:2])
+        @constraint(model, e, sum(x) == 1)
+        @objective(model, Min, x[1]^2 + x[2]^2)
+        optimize!(model)
+        @test termination_status(model) == OPTIMAL && isapprox(objective_value(model), 0.5; atol = 1e-7)
+        @test isapprox(value.(x), [0.5, 0.5]; atol = 1e-7) && isapprox(dual(e), 1; atol = 1e-6)
+    end
+    # an infeasible QP
+    model = Model(Brisk.Optimizer); set_silent(model)
+    @variable(model, x)
+    @constraint(model, x >= 2); @constraint(model, x <= 1)
+    @objective(model, Min, x^2)
+    optimize!(model)
+    @test termination_status(model) == INFEASIBLE
+    # a quadratic objective beside a second-order cone: (1, 2) projected onto the unit disc, 6 - 2 sqrt(5)
+    model = Model(Brisk.Optimizer); set_silent(model)
+    @variable(model, x[1:2])
+    @constraint(model, [1; x] in SecondOrderCone())
+    @objective(model, Min, (x[1] - 1)^2 + (x[2] - 2)^2)
+    optimize!(model)
+    @test termination_status(model) == OPTIMAL && isapprox(objective_value(model), 6 - 2sqrt(5); atol = 1e-6)
+    @test isapprox(value.(x), [1, 2] ./ sqrt(5); atol = 1e-5)
+    # and maximizing a concave one beside a semidefinite block
+    model = Model(Brisk.Optimizer); set_silent(model)
+    @variable(model, X[1:2, 1:2], PSD)
+    @constraint(model, tr(X) == 1)
+    @objective(model, Max, 2X[1, 2] - X[1, 1]^2 - X[2, 2]^2)
+    optimize!(model)
+    @test termination_status(model) == OPTIMAL
+    @test isapprox(objective_value(model), 0.5; atol = 1e-6)      # X = [1/2 1/2; 1/2 1/2]
+    @test isapprox(value.(X), fill(0.5, 2, 2); atol = 1e-5)
+    # a quadratic objective that is not convex is refused
+    model = Model(Brisk.Optimizer); set_silent(model)
+    @variable(model, 0 <= x <= 1)
+    @objective(model, Min, -x^2)
+    @test_throws Exception optimize!(model)
+    model = Model(Brisk.Optimizer); set_silent(model)
+    @variable(model, x[1:2]); @constraint(model, [1; x] in SecondOrderCone())
+    @objective(model, Min, x[1]^2 - x[2]^2)
+    @test_throws Exception optimize!(model)
+    # an option the QP solver does not take is an error
+    model, x1, x2, c1 = hs21()
+    @objective(model, Min, 0.01x1^2 + x2^2 - 100)
+    set_attribute(model, "fom", 1)
+    @test_throws Exception optimize!(model)
+end
+
+@testset "QP without JuMP" begin
+    # HS21 as arrays: min 1/2 x'Hx + c'x - 100, 10 x1 - x2 >= 10, 2 <= x1 <= 50, -50 <= x2 <= 50
+    H, c, A = [0.02 0; 0 2.0], [0.0, 0.0], [10.0 -1.0]
+    lb, ub = [2.0, -50.0], [50.0, 50.0]
+    r = Brisk.solve_qp(H, c, A, [10.0], nothing, lb, ub; c0 = -100, output = :silent)
+    @test r.status == 0 && isapprox(r.objective, -99.96; atol = 1e-7) && isapprox(r.x, [2, 0]; atol = 1e-7)
+    @test isapprox(H * r.x + c - A' * r.y - r.z, zeros(2); atol = 1e-8)
+    @test isapprox(r.z[1], 0.04; atol = 1e-7) && maximum(abs, r.dimacs) < 1e-8
+    # one triangle of H, sparse data, the interior-point method
+    ri = Brisk.solve_qp(Brisk.SparseArrays.sparse([0.02 0; 0 2.0]), c, Brisk.SparseArrays.sparse(A), [10.0], [Inf], lb, ub;
+                        c0 = -100, output = :silent, qpipm = true)
+    @test ri.status == 0 && isapprox(ri.objective, -99.96; atol = 1e-6)
+    @test_throws ArgumentError Brisk.solve_qp([1.0 2; 3 1], c, A, [10.0], nothing, lb, ub; output = :silent)
+    @test_throws DimensionMismatch Brisk.solve_qp(H, c, A, [10.0], nothing, [2.0], ub; output = :silent)
+    @test Brisk.solve_qp(H, c, [1.0 0; 1.0 0], [2.0, -Inf], [Inf, 1.0]; output = :silent).status == 1      # infeasible
+    @test_throws Brisk.BriskError Brisk.solve_qp([-1.0 0; 0 1], c, nothing, nothing, nothing, [0.0, 0], [1.0, 1]; output = :silent)
+    # the model: a bound changed, re-solved from the previous active set; then the cost and a row, against cold solves
+    mdl = Brisk.QpModel(H, c, A, [10.0], nothing, lb, ub; c0 = -100)
+    @test isapprox(Brisk.solve!(mdl).objective, -99.96; atol = 1e-7)
+    Brisk.set_var_bounds!(mdl, 1, 3.0, 50.0)
+    r2 = Brisk.solve!(mdl)
+    @test isapprox(r2.objective, -99.91; atol = 1e-7) && isapprox(r2.x, [3, 0]; atol = 1e-7) && r2.iterations <= 2
+    Brisk.set_cost!(mdl, [0.0, -1.0]); Brisk.set_row_bounds!(mdl, 1, 40.0, Inf)
+    r3 = Brisk.solve!(mdl)
+    rc = Brisk.solve_qp(H, [0.0, -1.0], A, [40.0], nothing, [3.0, -50], ub; c0 = -100, output = :silent)
+    @test r3.status == 0 && isapprox(r3.objective, rc.objective; atol = 1e-7) && isapprox(r3.x, rc.x; atol = 1e-6)
+    @test_throws BoundsError Brisk.set_var_bounds!(mdl, 3, 0.0, 1.0)
+    @test_throws DimensionMismatch Brisk.set_cost!(mdl, [1.0])
+    Brisk.free!(mdl)
+    @test_throws ArgumentError Brisk.solve!(mdl)
+    mdl = Brisk.QpModel(H, c, A, [10.0], nothing, lb, ub; c0 = -100, qpipm = true)
+    @test isapprox(Brisk.solve!(mdl).objective, -99.96; atol = 1e-6)
+    @test_throws ArgumentError Brisk.QpModel(H, c, A, [10.0], nothing, lb, ub; nosuchoption = 1, output = :silent)
+    # a file of each kind by its own reader
+    ex = joinpath(@__DIR__, "..", "..", "..", "examples")
+    rf = Brisk.solve_file(joinpath(ex, "hs21.qps"); output = :silent)
+    @test rf isa Brisk.QpResult && rf.status == 0 && isapprox(rf.objective, -99.96; atol = 1e-7) && isapprox(rf.x, [2, 0]; atol = 1e-7)
+    rs = Brisk.solve_file(joinpath(ex, "theta1.dat-s"); output = :silent)
+    @test rs isa Brisk.Result && rs.status == 0
 end
 
 if get(ENV, "BRISK_TEST_MOI", "1") != "0"

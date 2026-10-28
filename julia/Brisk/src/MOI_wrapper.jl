@@ -139,6 +139,36 @@ struct ConeData
     roww::Vector{Float64}
 end
 
+# (26 October 2026) a convex QP, min 1/2 x'Hx + c'x s.t. rl <= A x <= ru: a model with a quadratic objective and linear
+# constraints only (the cache's rows: Zeros, then Nonnegatives, A x + b in the set). H's lower triangle and A by columns,
+# 0-based, as brisk_qp_create takes them, with the sense applied (a maximization is solved as min -f); Q, a and c0 are the
+# objective as written (f = 1/2 x'Qx + a'x + c0)
+struct _QpData
+    n::Int
+    m::Int
+    Hp::Vector{Cint}
+    Hi::Vector{Cint}
+    Hx::Vector{Cdouble}
+    c::Vector{Cdouble}
+    Ap::Vector{Cint}
+    Ai::Vector{Cint}
+    Ax::Vector{Cdouble}
+    rl::Vector{Cdouble}
+    ru::Vector{Cdouble}
+    Q::SparseArrays.SparseMatrixCSC{Float64,Int}
+    a::Vector{Float64}
+    c0::Float64
+end
+
+# BRISK's QP model (brisk_qp_create, the method chosen as by brisk_solve_qp: -qpauto), kept across MOI.empty!: a JuMP
+# model re-solved after a change of bounds, constraint constants or the objective's linear part is copied again with the
+# same H and A, and the model is then re-solved from the previous active set after its row bounds and cost are updated
+mutable struct _QpHandle
+    model::QpModel          # (freed with it: QpModel's finalizer)
+    data::_QpData
+    opts::Vector{String}
+end
+
 mutable struct _Solution
     termination::MOI.TerminationStatusCode
     primal_status::MOI.ResultStatusCode
@@ -191,9 +221,11 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     a0::Vector{Float64}
     c0::Float64
     solution::Union{Nothing,_Solution}
+    qp::Union{Nothing,_QpData}
+    qpm::Union{Nothing,_QpHandle}
     function Optimizer()
         return new(Dict{String,Any}(), false, nothing, nothing, nothing, nothing, nothing,
-                   MOI.FEASIBILITY_SENSE, Float64[], 0.0, nothing)
+                   MOI.FEASIBILITY_SENSE, Float64[], 0.0, nothing, nothing, nothing)
     end
 end
 
@@ -212,6 +244,7 @@ function MOI.empty!(o::Optimizer)
     o.sense = MOI.FEASIBILITY_SENSE
     o.a0 = Float64[]
     o.c0 = 0.0
+    o.qp = nothing          # (the QP model o.qpm is kept: the next solve of the same QP is warm-started)
     return
 end
 
@@ -280,6 +313,9 @@ sdpa_data(o::Optimizer) = o.data
 
 MOI.supports(::Optimizer, ::MOI.ObjectiveSense) = true
 MOI.supports(::Optimizer, ::MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}) = true
+# a convex quadratic objective: with linear constraints only the QP solver, beside other cones its epigraph as a rotated
+# second-order cone (_quadratic_by_cone)
+MOI.supports(::Optimizer, ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}) = true
 MOI.supports_constraint(::Optimizer, ::Type{MOI.VectorAffineFunction{Float64}}, ::Type{<:_SUPPORTED_SETS}) = true
 
 # ---- the structure shared by both forms -----------------------------------------------------
@@ -644,6 +680,16 @@ function MOI.copy_to(dest::Optimizer, src::MOI.ModelLike)
     MOI.empty!(dest)
     cache = OptimizerCache()
     index_map = MOI.copy_to(cache, src)
+    if MOI.get(cache, MOI.ObjectiveSense()) != MOI.FEASIBILITY_SENSE &&
+       MOI.get(cache, MOI.ObjectiveFunctionType()) <: MOI.ScalarQuadraticFunction
+        if _only_linear(cache)
+            dest.cache = cache
+            dest.sense = MOI.get(cache, MOI.ObjectiveSense())
+            dest.qp = _build_qp(cache, dest.sense)
+            return index_map
+        end
+        cache, index_map = _quadratic_by_cone(src)
+    end
     n = MOI.get(cache, MOI.NumberOfVariables())
     sense = MOI.get(cache, MOI.ObjectiveSense())
     a0 = zeros(n)
@@ -671,6 +717,177 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     index_map = MOI.copy_to(dest, src)
     MOI.optimize!(dest)
     return index_map, false
+end
+
+# ---- quadratic objectives ------------------------------------------------------------------------
+
+function _only_linear(cache::OptimizerCache)
+    F = MOI.VectorAffineFunction{Float64}
+    return all(S -> MOI.get(cache, MOI.NumberOfConstraints{F,S}()) == 0,
+               (MOI.SecondOrderCone, MOI.RotatedSecondOrderCone, MOI.PositiveSemidefiniteConeTriangle))
+end
+
+# the objective's quadratic part as a symmetric matrix Q (f = 1/2 x'Qx + a'x + c0: MOI lists an off-diagonal term once,
+# with the coefficient Q_ij, and a diagonal term with Q_ii)
+function _quadratic_parts(f::MOI.ScalarQuadraticFunction{Float64}, n::Int)
+    I = Int[]; J = Int[]; V = Float64[]
+    for t in f.quadratic_terms
+        i, j = t.variable_1.value, t.variable_2.value
+        push!(I, i); push!(J, j); push!(V, t.coefficient)
+        i != j && (push!(I, j); push!(J, i); push!(V, t.coefficient))
+    end
+    a = zeros(n)
+    for t in f.affine_terms
+        a[t.variable.value] += t.coefficient
+    end
+    return SparseArrays.sparse(I, J, V, n, n), a
+end
+
+function _build_qp(cache::OptimizerCache, sense::MOI.OptimizationSense)
+    Ab = cache.constraints
+    A = Ab.coefficients
+    b = Ab.constants
+    n, m = A.n, A.m
+    nz = MOI.Utilities.num_rows(Ab.sets, MOI.Zeros)
+    f = MOI.get(cache, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
+    Q, a = _quadratic_parts(f, n)
+    σ = sense == MOI.MAX_SENSE ? -1.0 : 1.0
+    H = SparseArrays.tril(σ .* Q)
+    rows = Int[]; cols = Int[]; vals = Float64[]
+    for j in 1:n, p in A.colptr[j]:A.colptr[j+1]-1
+        push!(rows, A.rowval[p]); push!(cols, j); push!(vals, A.nzval[p])
+    end
+    As = SparseArrays.sparse(rows, cols, vals, m, n)        # (sorted rows, duplicates summed)
+    rl = Cdouble.(-b)
+    ru = [r <= nz ? -b[r] : Inf for r in 1:m]
+    return _QpData(n, m, Cint.(H.colptr .- 1), Cint.(H.rowval .- 1), Cdouble.(H.nzval), Cdouble.(σ .* a),
+                   Cint.(As.colptr .- 1), Cint.(As.rowval .- 1), Cdouble.(As.nzval), rl, Cdouble.(ru), Q, a, f.constant)
+end
+
+# a quadratic objective beside second-order or semidefinite cones: 1/2 x'Qx (minimizing; -1/2 x'Qx maximizing) replaced
+# by a new variable t with (t, 1, L x) in the rotated cone, 2 t >= |L x|^2, where L'L = Q (resp. -Q) from a pivoted
+# Cholesky factor of Q on the variables it involves; a Q that is not positive semidefinite (resp. negative) is refused
+function _quadratic_by_cone(src::MOI.ModelLike)
+    tmp = MOI.Utilities.Model{Float64}()
+    map1 = MOI.copy_to(tmp, src)
+    sense = MOI.get(tmp, MOI.ObjectiveSense())
+    f = MOI.get(tmp, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
+    vars = unique(vcat([t.variable_1 for t in f.quadratic_terms], [t.variable_2 for t in f.quadratic_terms]))
+    pos = Dict(v => k for (k, v) in enumerate(vars))
+    k = length(vars)
+    M = zeros(k, k)
+    for t in f.quadratic_terms
+        i, j = pos[t.variable_1], pos[t.variable_2]
+        M[i, j] += t.coefficient
+        i != j && (M[j, i] += t.coefficient)
+    end
+    σ = sense == MOI.MAX_SENSE ? -1.0 : 1.0
+    M .*= σ
+    F = LinearAlgebra.cholesky(LinearAlgebra.Symmetric(M), LinearAlgebra.RowMaximum(); check = false)
+    r = F.rank
+    L = zeros(r, k)
+    L[:, F.p] = F.U[1:r, :]
+    LinearAlgebra.norm(L' * L - M) <= 1e-9 * max(1.0, LinearAlgebra.norm(M)) ||
+        throw(ArgumentError("Brisk: the quadratic objective is not convex"))
+    t = MOI.add_variable(tmp)
+    terms = [MOI.VectorAffineTerm(1, MOI.ScalarAffineTerm(1.0, t))]
+    for i in 1:r, j in 1:k
+        L[i, j] != 0 && push!(terms, MOI.VectorAffineTerm(2 + i, MOI.ScalarAffineTerm(L[i, j], vars[j])))
+    end
+    MOI.add_constraint(tmp, MOI.VectorAffineFunction(terms, vcat([0.0, 1.0], zeros(r))), MOI.RotatedSecondOrderCone(r + 2))
+    obj = MOI.ScalarAffineFunction(vcat(f.affine_terms, [MOI.ScalarAffineTerm(σ, t)]), f.constant)
+    MOI.set(tmp, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(), obj)
+    cache = OptimizerCache()
+    map2 = MOI.copy_to(cache, tmp)
+    index_map = MOI.Utilities.IndexMap()
+    for (s, v) in map1.var_map
+        index_map[s] = map2[v]
+    end
+    for (s, c) in map1.con_map
+        index_map[s] = map2[c]
+    end
+    return cache, index_map
+end
+
+# the QP solver's options from the optimizer's attributes: tol, acc (its tolerance), maxit, the time limit, qpas or qpipm
+# (that method; by default the choice of brisk_solve_qp, -qpauto)
+function _qp_args(o::Optimizer)
+    args = String[]
+    method = "-qpauto"
+    for (k, v) in o.options
+        k in ("output", "write_sdpa", "form", "conesolver") && continue
+        if k in ("qpas", "qpipm")
+            (v === true || string(v) in ("1", "true")) && (method = "-" * k)
+        elseif k in ("tol", "maxit")
+            push!(args, "-" * k, string(v))
+        elseif k == "acc"
+            tol = get(Dict("low" => "1e-6", "default" => "1e-8", "high" => "1e-10"), String(v), nothing)
+            tol === nothing && throw(ArgumentError("Brisk: acc must be \"low\", \"default\" or \"high\""))
+            push!(args, "-tol", tol)
+        else
+            throw(ArgumentError("Brisk: the option \"$k\" does not apply to a QP (the QP solver takes qpas, qpipm, tol, acc and maxit)"))
+        end
+    end
+    o.time_limit !== nothing && push!(args, "-timelimit", string(o.time_limit))
+    push!(args, method)
+    _output(o) == :silent && push!(args, "-q")
+    return _tagged(args, "jump")
+end
+
+function _qp_statuses(st::Int)
+    st == 0 && return MOI.OPTIMAL, MOI.FEASIBLE_POINT, MOI.FEASIBLE_POINT
+    st == 1 && return MOI.INFEASIBLE, MOI.NO_SOLUTION, MOI.INFEASIBILITY_CERTIFICATE
+    st == 2 && return MOI.DUAL_INFEASIBLE, MOI.INFEASIBILITY_CERTIFICATE, MOI.NO_SOLUTION
+    st == 3 && return MOI.ITERATION_LIMIT, MOI.UNKNOWN_RESULT_STATUS, MOI.UNKNOWN_RESULT_STATUS
+    st == 5 && return MOI.ALMOST_OPTIMAL, MOI.NEARLY_FEASIBLE_POINT, MOI.NEARLY_FEASIBLE_POINT
+    st == 6 && return MOI.TIME_LIMIT, MOI.UNKNOWN_RESULT_STATUS, MOI.UNKNOWN_RESULT_STATUS
+    return MOI.NUMERICAL_ERROR, MOI.UNKNOWN_RESULT_STATUS, MOI.UNKNOWN_RESULT_STATUS
+end
+
+function _optimize_qp(o::Optimizer)
+    D = o.qp
+    t0 = time()
+    args = _qp_args(o)
+    h = o.qpm
+    same = h !== nothing && h.model.ptr != C_NULL && h.opts == args && h.data.n == D.n && h.data.m == D.m &&
+           h.data.Hp == D.Hp && h.data.Hi == D.Hi && h.data.Hx == D.Hx &&
+           h.data.Ap == D.Ap && h.data.Ai == D.Ai && h.data.Ax == D.Ax
+    if same
+        for i in 1:D.m          # the rows whose bounds changed, then the cost: the active set is kept
+            (D.rl[i] != h.data.rl[i] || D.ru[i] != h.data.ru[i]) && set_row_bounds!(h.model, i, D.rl[i], D.ru[i])
+        end
+        D.c != h.data.c && set_cost!(h.model, D.c)
+        h.data = D
+    else
+        h === nothing || free!(h.model)
+        o.qpm = nothing
+        C = (n = D.n, m = D.m, Hp = D.Hp, Hi = D.Hi, Hx = D.Hx, c = D.c, Ap = D.Ap, Ai = D.Ai, Ax = D.Ax, rl = D.rl, ru = D.ru,
+             xl = fill(-Inf, D.n), xu = fill(Inf, D.n))
+        h = _QpHandle(_qp_model(C, 0.0, args, _output(o)), D, args)
+        o.qpm = h
+    end
+    # (a QP refused by the solver, as a quadratic objective beside cones is: a Q that is not positive semidefinite)
+    h.model.output = _output(o)
+    res = solve!(h.model)
+    term, pst, dst = _qp_statuses(res.status)
+    b = o.cache.constraints.constants
+    x, dual = res.x, res.y
+    s = _Ax(o.cache.constraints.coefficients, x)
+    pst == MOI.INFEASIBILITY_CERTIFICATE || (s .+= b)
+    if pst == MOI.INFEASIBILITY_CERTIFICATE && (sx = maximum(abs, x; init = 0.0)) > 0
+        x = x ./ sx; s ./= sx
+    end
+    if dst == MOI.INFEASIBILITY_CERTIFICATE && (sd = maximum(abs, dual; init = 0.0)) > 0
+        dual = dual ./ sd
+    end
+    # the objectives from the returned point: f = 1/2 x'Qx + a'x + c0; the dual objective -1/2 x'Qx -+ b'y + c0
+    xQx = LinearAlgebra.dot(x, D.Q * x)
+    wbd = LinearAlgebra.dot(b, dual)
+    obj = 0.5 * xQx + LinearAlgebra.dot(D.a, x) + D.c0
+    dobj = -0.5 * xQx + (o.sense == MOI.MAX_SENSE ? wbd : -wbd) + D.c0
+    o.solution = _Solution(term, pst, dst, res.status_string, x, s, dual, obj, dobj, time() - t0, res.iterations,
+                           res.dimacs, nothing)
+    return
 end
 
 # ---- solving ----------------------------------------------------------------------------------
@@ -822,6 +1039,7 @@ end
 
 function MOI.optimize!(o::Optimizer)
     o.cache === nothing && error("Brisk.Optimizer: no model (copy_to first)")
+    o.qp === nothing || return _optimize_qp(o)
     D = o.data
     A = o.cache.constraints.coefficients
     b = o.cache.constraints.constants

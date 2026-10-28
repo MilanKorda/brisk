@@ -46,6 +46,23 @@ static Int clear_flag (Int wflg, Int wbig, Int W [ ], Int n)
  * an estimate stops once another one has shown that it cannot be chosen). */
 __thread const volatile double *brisk_amd_cap = NULL;
 __thread int brisk_amd_capped = 0;
+/* (BRISK, 26 October 2026) and a deadline (CLOCK_MONOTONIC seconds, 0: none) and a stop flag (may be NULL), looked at every
+ * 256 eliminations (the flag after every one since 28 October): the estimate of a form of a large LP's normal equations took 23 s past a time limit of 10 s
+ * (opm2-z12-s8, the mixed-integer developer's first LP); it then returns as capped */
+__thread double brisk_amd_deadline = 0;
+static __thread unsigned brisk_amd_tick = 0;
+__thread const volatile int *brisk_amd_stop = NULL;
+#include <time.h>
+static double amd_now (void) { struct timespec t ; clock_gettime (CLOCK_MONOTONIC, &t) ; return t.tv_sec + 1e-9 * t.tv_nsec ; }
+/* (BRISK, 28 October 2026, the night) the same test before each of AMD_order's passes over the matrix (the check of the input,
+ * its sort, the pattern of A + A'), which come before the first elimination: the estimate of the dual form of
+ * neos-5106984-jizera (LP), 62 million entries, spent 4.5 s in them (1.9 s in the sort) after the dual simplex method beside
+ * it had its result and set the flag; the stop flag is now also looked at after every elimination (a load), the clock
+ * every 256 */
+int brisk_amd_stopped (void)
+{
+    return (brisk_amd_stop && *brisk_amd_stop) || (brisk_amd_deadline > 0 && amd_now () > brisk_amd_deadline) ;
+}
 
 GLOBAL void AMD_2
 (
@@ -1548,9 +1565,12 @@ GLOBAL void AMD_2
 	    /* number of multiply-subtract pairs for LDL' */
 	    nms_ldl += (s + lnzme)/2 ;
 	}
-	if (Info != (double *) NULL && brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lu + 2.0 * lnz > *brisk_amd_cap)
+	if (Info != (double *) NULL && ((brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lu + 2.0 * lnz > *brisk_amd_cap)
+	    || (brisk_amd_stop && *brisk_amd_stop)
+	    || (brisk_amd_deadline > 0 && (++brisk_amd_tick & 255) == 0 && amd_now () > brisk_amd_deadline)))
 	{
-	    brisk_amd_capped = 1 ;
+	    /* (2: stopped by the deadline or the flag, the counts then no bound worth using; 1: by the cap) */
+	    brisk_amd_capped = (brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lu + 2.0 * lnz > *brisk_amd_cap) ? 1 : 2 ;
 	    Info [AMD_LNZ] = lnz ;
 	    Info [AMD_NMULTSUBS_LU] = nms_lu ;
 	    return ;

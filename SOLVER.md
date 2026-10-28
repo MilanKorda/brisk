@@ -1,4 +1,4 @@
-# BRISK 1.6: the solver in detail
+# BRISK 1.6.1: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -28,8 +28,11 @@ are routed the same way.
 
 `./brisk problem.mps` reads a linear program in MPS format (free or fixed), presolves it and
 solves it by an interior-point method for linear programs (upper bounds kept as bounds, normal
-equations); infeasible and unbounded problems are handed to the SOCP solver, which returns the
-certificate. `-x file` writes x of the problem as read. The solution is an interior one;
+equations); with two threads or more, the dual simplex method runs beside it on one thread and the
+first of the two to finish gives the result (`-lpmethod 1`: the interior-point method alone);
+infeasible and unbounded problems are handed to the SOCP solver, which returns the
+certificate. `-x file` writes x of the problem as read. The solution is an interior one (a basic one when the
+simplex method finished first);
 `-lpmethod 2` and `3` (the dual and the primal simplex method), `4` (the interior-point method
 followed by a crossover) and `5` (chosen automatically between 2 and 4) return an optimal basic
 solution. `./brisk problem.cbf` (or `.cbf.gz`) reads the conic benchmark format of CBLIB for
@@ -184,7 +187,7 @@ Every automatic choice below can be overridden from the command line.
   Douglas–Rachford splitting with Anderson acceleration, then an augmented Lagrangian with
   semismooth Newton-CG) is chosen automatically when the *dense* Schur complement would not
   fit in memory (8 m² bytes > half the memory), with at most 64 SDP blocks and one of them at
-  least 200 × 200. A large block with a very sparse pattern (≤ 1% dense, e.g. AC-OPF relaxations)
+  least 200 × 200 (blocks with arrow data, solved as second-order cones, not counted). A large block with a very sparse pattern (≤ 1% dense, e.g. AC-OPF relaxations)
   first gets the chordal conversion, and the first-order engine runs only if nothing converts.
   `-fom 1` forces it. The envelope and sparse Schur paths have no such limit.
   At a tolerance of 1e-6 or looser (`-acc low`) the engine also runs *first* on such

@@ -122,7 +122,7 @@ the end are those of the problem as read.
 
 | option | meaning | default |
 |---|---|---|
-| `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the SOCP solver; `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
+| `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the SOCP solver, and so is a problem whose semidefinite blocks are all of order 1 or 2 or have arrow data (a block of order 2 as a second-order cone of dimension 3); `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
 | `soc` | `1`: semidefinite blocks whose data are arrow matrices (the second-order cones of a problem with semidefinite blocks, and norm constraints written as matrix inequalities) are solved as second-order cones in the self-dual embedding, O(q) work per cone of dimension q instead of O(q³); `0`: as semidefinite blocks. A solve with cones that ends worse than reduced accuracy is repeated with them as semidefinite blocks. | 1 |
 | `socmin` | the smallest order of an arrow block that `soc` solves as a cone | 3 |
 
@@ -153,7 +153,7 @@ digits (the usual result holds it rounded to doubles).
 | `bound` | guaranteed bounds on the optimal value, beside the solution: `p` from a feasible X (an upper bound <C,X>), `d` from a feasible y (a lower bound b'y), `pd` both in one solve. The returned point, its status and `-x` / `-y` stay the solve's own; each certificate is checked rigorously on the problem as read and only a certified one is a bound. Python and Julia: `Result.bounds` (per side, with the certificate); MATLAB: `info.bounds.p`, `info.bounds.d`; CVXPY and JuMP: `bound = "primal"`, `"dual"`, `"sos"` or `"both"` | off |
 | `certify` | the rigorous check of a certificate (interval arithmetic, directed rounding, a verified λmin); implied by `bound`, accepted for compatibility | implied |
 | `boundx`, `boundy` | command line: write the certificate X of side p, the y of side d (the `-x` / `-y` formats) | – |
-| `boundprior` | when a certificate has no eigenvalue margin (the other side has no interior): a rigorous bound from a-priori bounds of the other side found from the problem (y bounded through Z(y) ⪰ 0, including pairs y_a ± y_b written by the symmetry reduction; the diagonal of X through equations with positive diagonal entries); `0` off | 1 |
+| `boundprior` | when a certificate has no eigenvalue margin (the other side has no interior): a rigorous bound from a-priori bounds of the other side found from the problem (y bounded through Z(y) ⪰ 0, including pairs y_a ± y_b written by the symmetry reduction; the diagonal of X through equations with positive diagonal entries); `0` off; `2` that bound first, on the returned point, and a certificate only when it fails (cheaper where the a-priori bounds exist, the bound weaker by about |λmin| times the a-priori bound; the certificate returned is the returned point) | 1 |
 | `boundprec` | the λmin checks of the bound mode beyond double when only their rounding allowance fails them: `-1` automatic (192 bits, then 384), `0` double only, a number ≥ 128 that many bits | -1 |
 | `bound` with `prec` | the certificate is built and checked in high precision on the problem as read; the rigorous bound has all the digits of `prec`, and the certificate is returned (and written by `-boundx` / `-boundy`) with all the digits of its check; `-x` / `-y` write the solution with the digits of `prec`. `-certify-x` / `-certify-y` with `prec` check a given certificate | – |
 | `boundtol`, `boundmargin` | residual and eigenvalue margin required of a certificate | 1e-10, 1e-13 |
@@ -163,8 +163,8 @@ digits (the usual result holds it rounded to doubles).
 
 | option | meaning | default |
 |---|---|---|
-| `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows); `3` with `lpmethod` 1, first parallel rows and columns, doubleton equations and slack columns, then as `2` | 3 |
-| `lpmethod` | `1` the LP interior-point method (bounds as bounds, normal equations; the SOCP solver takes over when it gives up far from the optimum, a stop within 100 times the tolerance returns its point at reduced accuracy), `0` the SOCP solver directly | 1 |
+| `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing; linearly dependent equality rows); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows); `3` with `lpmethod` 1, first parallel rows and columns, doubleton equations and slack columns, then as `2` | 3 |
+| `lpmethod` | not given: the LP interior-point method and, with two threads or more, the dual simplex method beside it on one thread (the first to end with a result gives it; it can then differ from run to run; `-threads 1` gives the same result every run); `1` the LP interior-point method alone (bounds as bounds, normal equations; the SOCP solver takes over when it gives up far from the optimum, a stop within 100 times the tolerance returns its point at reduced accuracy), `0` the SOCP solver directly, `2`-`5` the simplex method (see the full list) | not given |
 | `lpcorr` | the interior-point method's centrality correctors per iteration (`lpmethod` 1, 4 and 5) | 0–3 from the cost of a factorization against a solve (flop ratio above 10, 30, 50) |
 
 Also `tol` (1e-8), `maxit` (200), `timelimit`, `q`, `v`, and `-x file` (x of the problem as read).
@@ -181,9 +181,10 @@ Generated by `tools/gen_options_md.sh` from `./brisk` (do not edit by hand).
 usage: brisk problem.dat-s [options]      (an SDPA sparse file)
        brisk problem.mat [options]        (SeDuMi format: a MAT-file with A (or At), b, c, K;
                                            K.f, K.l, K.q, K.r, K.s; MAT versions 5 to 7)
-       brisk problem.mps [options]        (a linear program: MPS, free or fixed format)
+       brisk problem.mps [options]        (a linear program: MPS, free or fixed format; problem.mps.gz is read through gzip)
        brisk problem.cbf[.gz] [options]   (CBF, the format of CBLIB: linear and second-order cones;
-                                           integer variables are relaxed)
+                                           integer variables are relaxed; -x <file> writes x in the
+                                           file's own variables, one value per line)
        brisk problem.qps [options]        (a convex quadratic program: an MPS file with a QUADOBJ,
                                            QMATRIX or QSECTION section; QCMATRIX: quadratic constraints)
 A convex QP read from a QPS file is solved by the QP solver: by the dual active-set method of Goldfarb
@@ -197,11 +198,15 @@ A linear program read from an MPS file is presolved and solved by the LP interio
 far from the optimum (within 100 times the tolerance its point is returned at reduced accuracy)
 (infeasible or unbounded problems: it returns the certificates). Its options: -tol, -maxit,
 -timelimit, -q, -v, -x <file> (x of the problem as read, one value per line), and
-  -lppresolve <k>  0 none, 1 rows and columns (fixed, singleton, redundant, forcing, dual fixing),
+  -lppresolve <k>  0 none, 1 rows and columns (fixed, singleton, redundant, forcing, dual fixing;
+                   linearly dependent equality rows),
                    2 also substitutions: free column singletons, opposite column pairs, implied free
                    columns by their equality rows; 3 (default) with -lpmethod 1, first parallel rows
                    and columns, doubleton equations and slack columns, then as 2
-  -lpmethod <k>    1 (default) the LP interior-point method, 0 the SOCP solver directly,
+  -lpmethod <k>    not given (default): the LP interior-point method and, with two threads or more, the
+                   dual simplex method beside it on one thread; the first to end with a result gives it, which
+                   can then differ from run to run (-threads 1: the interior-point method alone, the same result
+                   every run); 1 the LP interior-point method alone, 0 the SOCP solver directly,
                    2 the dual simplex method, 3 the primal simplex method, 4 the interior-point method
                    followed by a crossover, 5 chosen automatically between 2 and 4 (2-5: an optimal basic solution;
                    with 5 and two threads or more, 2 and 4 run at the same time and the first to finish gives
@@ -213,7 +218,9 @@ is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -
 -v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With
 semidefinite blocks, or with -conesolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem
 goes to the semidefinite solver (second-order cones as arrow blocks, which its self-dual embedding
-solves as second-order cones again: -soc) with all the options below.
+solves as second-order cones again: -soc) with all the options below. A problem whose semidefinite
+blocks are all of order 1 or 2 or have arrow data (an SOCP written in semidefinite form) is again
+solved by the SOCP solver, a block of order 2 as a second-order cone of dimension 3 (-conesolver 0: not).
 output
   -q | -v          quiet | verbose   (Ctrl-C: stop and return the current point; twice: abort)
   -y <file>        write y (SDPA primal x = -y), one value per line, original numbering
@@ -224,7 +231,7 @@ termination
                    re-solve thresholds (10 tol, 100 tol after the embedding) and the reduced-
                    accuracy class (100 tol); high keeps the default ones. -tol/-retryacc override it
   -tol <t>         relative gap / infeasibility tolerance (1e-8)
-  -maxit <k>       iteration limit (100)
+  -maxit <k>       iteration limit (100); below 100 it is the run's budget: no re-solve after it
   -timelimit <s>   wall-clock limit in seconds (0 = none)
   -bound p|d|pd    also return GUARANTEED bounds on the optimal value, on the sides asked for:
                    p: a feasible X of (P) (A(X) = b to -boundtol, X > 0 with a margin), <C,X> an
@@ -251,7 +258,10 @@ termination
   -boundprior <k>  when a certificate has no margin (the other side without an interior): a rigorous
                    bound from a-priori bounds of the other side found from the problem (1, the
                    default; 0 off): y bounded through Z(y) >= 0 (moment relaxations with a ball or
-                   box constraint), the diagonal of X through equations of positive diagonal entries
+                   box constraint), the diagonal of X through equations of positive diagonal entries;
+                   2: that bound first, on the returned point, and a certificate only when there is
+                   none (cheaper where the a-priori bounds exist; the bound is weaker by about
+                   |lambda_min| times the a-priori bound, the certificate is the returned point)
   -certify         (implied by -bound) the rigorous check of a certificate on the problem as
                    read: the file's decimals enclosed in intervals, directed rounding, a
                    verified lambda_min; the rigorous bound is printed
@@ -294,7 +304,8 @@ high precision
                    (1e-24 for dd, 1e-48 for qd, 1e-77 for 100 digits) and a result within
                    2^(-0.6 bits) (1e-19, 1e-38, 1e-62) counts as OPTIMAL; -fom / -lralm aim at the latter
 method
-  -conesolver 0    a problem in SeDuMi format without semidefinite blocks: by the semidefinite solver
+  -conesolver 0    a problem in SeDuMi format without semidefinite blocks, or one whose semidefinite
+                   blocks are all of order 1 or 2 or have arrow data: by the semidefinite solver
                    (second-order cones as arrow blocks) instead of the SOCP solver (default 1)
   -dual            dual-scaling method (DSDP-style: potential reduction, correctors, verified
                    certificates); falls back to the primal-dual method unless certified
@@ -493,7 +504,7 @@ Schur complement and linear algebra
                    runs on one thread
   -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on
   -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)
-  -densemem <MB>   memory for dense constraint copies (768)
+  -densemem <MB>   memory for dense constraint copies and the low-rank routes' products (768)
   -pivtol <p>      squared-pivot threshold of the Schur factor (1e-14)
   -regill <r>      regularization used when it is violated (1e-10)
 iteration details

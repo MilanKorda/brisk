@@ -24,6 +24,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+#if defined(__AVX512F__) && defined(__AVX512VL__)
+#include <immintrin.h>
+#endif
+
+/* (27 October 2026) the simplex family's settings (environment variables BRISK_... and SX...) looked up in a table of
+ * those entries alone, one per thread, built again when a new solve has started (simplex_solve calls sx_env_refresh):
+ * getenv scans the whole environment, 166 entries in the benchmark's container, and the simplex method reads its
+ * settings on every solve and every factorization; on sc205 (LP) its getenv calls were 8.6 % of the solve's
+ * instructions. Changes of the environment between solves are seen (the Python tests set variables in the process);
+ * other names go to getenv. */
+extern char **environ;
+static atomic_long g_sx_env_gen = 1;
+void sx_env_refresh(void) { atomic_fetch_add_explicit(&g_sx_env_gen, 1, memory_order_relaxed); }
+static int sx_env_ours(const char *s) { return (s[0] == 'B' && !strncmp(s, "BRISK_", 6)) || (s[0] == 'S' && s[1] == 'X'); }
+#define SX_ENV_MAX 64
+static _Thread_local struct { long gen; int n, over; const char *ent[SX_ENV_MAX]; } g_sx_env;
+const char *sx_getenv(const char *name) {
+    if (!sx_env_ours(name)) return getenv(name);
+    const long gen = atomic_load_explicit(&g_sx_env_gen, memory_order_relaxed);
+    if (g_sx_env.gen != gen) {
+        g_sx_env.gen = gen; g_sx_env.n = 0; g_sx_env.over = 0;
+        for (char **e = environ; e && *e; e++) if (sx_env_ours(*e)) { if (g_sx_env.n < SX_ENV_MAX) g_sx_env.ent[g_sx_env.n++] = *e; else g_sx_env.over = 1; }
+    }
+    if (g_sx_env.over) return getenv(name);
+    const size_t l = strlen(name);
+    for (int k = 0; k < g_sx_env.n; k++) if (!strncmp(g_sx_env.ent[k], name, l) && g_sx_env.ent[k][l] == '=') return g_sx_env.ent[k] + l + 1;
+    return NULL;
+}
+#define getenv(n) sx_getenv(n)
 
 #define SX_TINY 1e-14          /* entries below this are dropped from solve results */
 #define SX_PIVTOL 1e-11        /* absolute pivot tolerance of the factorization */
@@ -38,25 +68,46 @@ static void *xrealloc(void *q, size_t n) { void *p = realloc(q, n ? n : 1); if (
 /* ---------------------------------------------------------------- vectors */
 void sxv_init(SxVec *v, int n) {
     v->n = n; v->cnt = 0;
-    v->idx = xmalloc(sizeof(int) * ((size_t)n + 1));
+    v->idx = xmalloc(sizeof(int) * ((size_t)n + 8));      /* (8: room for a whole vector block stored at the list's end) */
     v->val = xcalloc((size_t)n + 1, sizeof(double));
     v->mark = xcalloc((size_t)n + 1, 1);
 }
 static void sxv_prune(SxVec *v);
 void sxv_free(SxVec *v) { free(v->idx); free(v->val); free(v->mark); memset(v, 0, sizeof *v); }
+#ifndef SX_CLEAR_DIV
+#define SX_CLEAR_DIV 8      /* a vector listed with fewer entries than its length over this is cleared by its list */
+#endif
 void sxv_clear(SxVec *v) {
-    if (v->cnt >= 0 && v->cnt < v->n / 8) for (int k = 0; k < v->cnt; k++) v->val[v->idx[k]] = 0;
+    if (v->cnt >= 0 && v->cnt < v->n / SX_CLEAR_DIV) for (int k = 0; k < v->cnt; k++) v->val[v->idx[k]] = 0;
     else memset(v->val, 0, sizeof(double) * (size_t)v->n);
     v->cnt = 0;
 }
 void sxv_reindex(SxVec *v) {
     /* (24 October 2026, the night) without a branch per entry (each index written, the count advanced by whether its entry
-     * is nonzero), then the tiny entries dropped from the list: the same list (as the pricing's listing pass, simplex.c) */
-    int c = 0;
-    const int n = v->n; int *restrict ix = v->idx; const double *restrict val = v->val;
-    for (int i = 0; i < n; i++) { ix[c] = i; c += val[i] != 0; }
+     * is nonzero), then the tiny entries dropped from the list: the same list (as the pricing's listing pass, simplex.c).
+     * (27 October 2026) One pass that lists the entries not below SX_TINY and zeroes the others, eight at a time where the
+     * processor has AVX-512 (the kept positions compressed in a register and stored whole: the list has room for eight
+     * more); the same list and values as the two passes (a NaN is kept, as before). The listing loop was the costliest line
+     * of scfxm3's solve (LP, 8.7 % of its instructions, 2.5 calls an iteration), the dropping pass another 5 % */
+    const int n = v->n; int *restrict ix = v->idx; double *restrict val = v->val;
+    int c = 0, i = 0;
+#if defined(__AVX512F__) && defined(__AVX512VL__)
+    const __m512i absm = _mm512_set1_epi64(0x7fffffffffffffffLL);
+    const __m512d tiny = _mm512_set1_pd(SX_TINY), zero = _mm512_setzero_pd();
+    __m256i id = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7); const __m256i eight = _mm256_set1_epi32(8);
+    for (; i + 8 <= n; i += 8) {
+        const __m512d x = _mm512_loadu_pd(val + i);
+        const __m512d ax = _mm512_castsi512_pd(_mm512_and_epi64(_mm512_castpd_si512(x), absm));
+        const __mmask8 keep = _mm512_cmp_pd_mask(ax, tiny, _CMP_NLT_UQ);
+        const __mmask8 drop = _mm512_cmp_pd_mask(x, zero, _CMP_NEQ_UQ) & (__mmask8)~keep;
+        if (drop) _mm512_mask_storeu_pd(val + i, drop, zero);
+        _mm256_storeu_si256((__m256i *)(ix + c), _mm256_maskz_compress_epi32(keep, id));
+        c += __builtin_popcount((unsigned)keep);
+        id = _mm256_add_epi32(id, eight);
+    }
+#endif
+    for (; i < n; i++) { if (fabs(val[i]) < SX_TINY) { val[i] = 0; continue; } ix[c++] = i; }
     v->cnt = c;
-    sxv_prune(v);
 }
 void sxv_copy(SxVec *dst, const SxVec *src) {
     sxv_clear(dst);
@@ -509,8 +560,11 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
     int e = 0;
     for (int j = 0; j < m; j++) {
         A.cs[j] = e; A.cmax[j] = -1;
-        if (var[j] < n) for (int p = Ap[var[j]]; p < Ap[var[j] + 1]; p++) A.cmax0[j] = fmax(A.cmax0[j], fabs(Ax[p]));
         if (rowof[j] >= 0) continue;
+        /* (28 October 2026) the largest entries of the columns left to the elimination only (the searches read no other):
+         * the pass over every column of the basis was 3.5 % of the dual simplex method's time on the tester's largest
+         * coupled network (LP, 575,040 rows), whose columns are mostly pivoted in bulk above */
+        if (var[j] < n) for (int p = Ap[var[j]]; p < Ap[var[j] + 1]; p++) A.cmax0[j] = fmax(A.cmax0[j], fabs(Ax[p]));
         if (var[j] >= n) { /* a duplicate logical: an empty active column */ A.cact[j] = 1; A.cc[j] = 2; e += 2; continue; }
         A.cact[j] = 1;
         const int v = var[j];

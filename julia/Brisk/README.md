@@ -65,11 +65,31 @@ After the solve, `MOI.get(model, Brisk.DIMACSErrors())` returns BRISK's six DIMA
 errors, and `MOI.get(model, Brisk.RawResult())` returns the `Brisk.Result` in BRISK's
 convention.
 
-Supported: linear objectives, and affine functions in `Zeros`, `Nonnegatives` and
+Supported: linear and convex quadratic objectives, and affine functions in `Zeros`, `Nonnegatives` and
 `PositiveSemidefiniteConeTriangle`. Through MOI's bridges this covers equalities,
 inequalities, variable bounds, `PSDCone()` in both square and triangle forms,
 `SecondOrderCone`, `RotatedSecondOrderCone`, the nuclear and spectral norm cones, and the
 Hermitian PSD cone. There are no integer variables, and no exponential or power cones.
+
+**Quadratic programs.** A quadratic objective with linear constraints only is solved by BRISK's QP solver (the dual
+active-set method for a small QP with a positive definite objective, else the interior-point method for QPs;
+`set_attribute(model, "qpas", 1)` or `"qpipm"` chooses; the QP solver also takes `tol`, `acc`, `maxit` and the time
+limit, and refuses other options). After a change of variable bounds, right-hand sides or the objective's linear
+part, the next `optimize!` starts from the previous active set:
+
+```julia
+model = Model(Brisk.Optimizer)
+@variable(model, 2 <= x1 <= 50); @variable(model, -50 <= x2 <= 50)
+@constraint(model, 10x1 - x2 >= 10)
+@objective(model, Min, 0.01x1^2 + x2^2 - 100)
+optimize!(model)                  # x = (2, 0), -99.96
+set_lower_bound(x1, 3)
+optimize!(model)                  # one iteration: x = (3, 0), -99.91
+```
+
+Beside second-order cone or PSD constraints, the objective's quadratic part becomes a rotated second-order cone
+constraint (`2t >= |L x|^2` with `L'L = Q`) and the model goes to the cone solvers. An objective that is not convex
+(not concave when maximizing) is an error.
 
 SumOfSquares.jl works (`SOSModel(Brisk.Optimizer)`, see `examples/sos.jl`). Its Gram
 matrices reach BRISK as the X blocks of the kernel form.
@@ -119,6 +139,26 @@ Without semidefinite blocks the problem is solved by BRISK's SOCP solver; with t
 solver (second-order cones as arrow blocks). In JuMP, `SecondOrderCone` and
 `RotatedSecondOrderCone` constraints are supported; a model without PSD constraints goes to
 the SOCP solver (`set_attribute(model, "conesolver", 0)` forces the semidefinite solver).
+
+**Quadratic programs.**
+
+```julia
+# min 1/2 x'Hx + c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub   (nothing: no bounds of that kind)
+r = Brisk.solve_qp(H, c, A, l, u, lb, ub; c0 = -100)
+r.status, r.status_string, r.objective, r.x, r.y, r.z, r.dimacs      # H x + c - A'y - z = 0
+
+mdl = Brisk.QpModel(H, c, A, l, u, lb, ub)          # kept for re-solves (output = :silent by default)
+r = Brisk.solve!(mdl)
+Brisk.set_var_bounds!(mdl, 1, 3.0, 50.0)            # or set_row_bounds!(mdl, i, lo, hi), set_cost!(mdl, c)
+r = Brisk.solve!(mdl)                               # from the previous active set
+r = Brisk.solve_file("problem.qps")                 # a QPS file: a convex QP or QCQP (a Brisk.QpResult)
+```
+
+`H` symmetric, or one triangle of it, dense or sparse. By default a small QP with `H` positive definite is solved by
+the dual active-set method and any other by the interior-point method for QPs (`qpas = true`, `qpipm = true`: that
+method); a `Brisk.QpModel` uses the active-set method (`qpipm = true`: the interior-point method, each solve from the
+start). A QP that is not convex is refused (a `Brisk.BriskError`). `Brisk.solve_file` reads every format the command
+line reads and returns the result of its kind (`Brisk.Result`, `Brisk.ConeResult` for a MAT-file, `Brisk.QpResult`).
 
 **Very large chordal problems.** When BRISK decomposes a large sparse block into cliques
 (AC-OPF relaxations), the dense `X` and `Z` of that block are returned only if they fit in

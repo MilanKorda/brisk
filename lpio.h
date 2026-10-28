@@ -34,6 +34,12 @@ int  lp_read_mps(const char *fname, LpProb *L, char *msg, size_t nmsg);
  * MIPLIB 2017's solution checker and Gurobi read it (lp_read_mps leaves it [0, +inf)). Returns as lp_read_mps. */
 int  lp_read_mps_mip(const char *fname, LpProb *L, signed char **isint, char *msg, size_t nmsg);
 void lp_free(LpProb *L);
+/* a column whose cost improves without limit in a direction no row or bound stops (the problem as read is then infeasible or
+ * unbounded, exactly, by the signs of the data): its index, or -1 */
+int  lp_ray_column(const LpProb *L);
+/* the caller's stop flag for the standard presolve (per thread; NULL: none): its eliminator stops between substitutions */
+void lp_set_stop(const volatile int *f);
+const volatile int *lp_get_stop(void);
 /* presolve (level 0: none) and standard form; S and M are allocated */
 int  lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M);
 /* the same in the bounded form (ub != NULL): upper bounds returned in *ub (per column, LP_INF: none), no bound rows */
@@ -50,4 +56,11 @@ int  lp_is_mps(const char *fname);
 int  cbf_is_file(const char *fname);
 int  cbf_read(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, char *msg, size_t nmsg);
 int  cbf_read_ex(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, int **intcol, signed char **intsgn, char *msg, size_t nmsg);
+/* (28 October 2026) linearly dependent equality rows among the caller's (by rows: ep, ej, ev; sides eb; columns in [0, n)):
+ * dep[t] = 1 for a row that is a combination of rows that stay, with a consistent side; the number found (lpio.c) */
+int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double *ev, const double *eb, char *dep, const volatile int *stop);
+/* (28 October 2026) 1: lp_to_std of the calling thread skips its search for dependent rows (its input is the simplex method's
+ * presolved problem, which has had them removed); the caller sets it back to 0 */
+void lp_set_nodeprows(int v);
+int  cbf_read_vmap(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, int **vmap, signed char **vmsgn, int *nvar, char *msg, size_t nmsg);
 #endif

@@ -146,8 +146,12 @@ static int read_(const char *fname, QpProb *P, char *msg, size_t nmsg, int fixed
             }
             continue;
         }
-        const int nt = (fixed && (sec == S_ROWS || sec == S_COLS || sec == S_RHS || sec == S_RANGES || sec == S_BOUNDS || sec == S_QUAD))
-                       ? split_fixed(line, tok, 0) : split(line, tok, 7);
+        int nt = (fixed && (sec == S_ROWS || sec == S_COLS || sec == S_RHS || sec == S_RANGES || sec == S_BOUNDS || sec == S_QUAD))
+                 ? split_fixed(line, tok, 0) : split(line, tok, 7);
+        /* (28 October 2026) a name beginning with '$' after the line's first field begins a comment (the MPS convention; as
+         * the MPS reader, lpio.c: a MIPLIB 2017 file with "C0063540  LB_full  0  $ empty column" was refused) */
+        if (sec == S_COLS || sec == S_RHS || sec == S_RANGES || sec == S_BOUNDS || sec == S_QUAD)
+            for (int t = 1; t < nt; t++) if (tok[t][0] == '$') { nt = t; break; }
         if (nt == 0) continue;
         if (sec == S_OBJSENSE) { if ((tok[0][0] == 'M' || tok[0][0] == 'm') && (tok[0][1] == 'A' || tok[0][1] == 'a')) P->maxim = 1; continue; }
         if (sec == S_ROWS) {

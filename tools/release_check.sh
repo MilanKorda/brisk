@@ -18,6 +18,8 @@ run "examples (as the public CI)"             bash -c 'for f in examples/*.dat-s
 run "command-line suites (R1, R4)"           make hpredtest restoretest advicetest frtest bindtest timetest
 run "-threads on every LP method (R11)"       bash -c 'for k in 2 3 4 5; do ./brisk examples/afiro.mps -lpmethod $k -threads 1 -v | grep -q "^Number of threads: 1" || { echo "-lpmethod $k ignores -threads"; exit 1; }; done'
 run "C API (R5)"                              make capitest
+run "reproducible results (R16)"              make reprotest
+run "reproducible results under MKL (R16)"    make reprotest-mkl
 run "QP solver and the readers"               make qptest readertest
 run "Python and CVXPY"                        make pytest
 run "MATLAB's ILP64 BLAS layer (R2, R3)"      make blas64test

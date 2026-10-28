@@ -470,6 +470,15 @@ void xc_of_dense(int n, int h, const double *X, double *x) {
     x[0] = tr + trc;
     for (int t = 1; t < n; t++) x[t] = 2.0 * X[(size_t)xc_index(h, t) + (size_t)h * n];
 }
+/* 26 October 2026 (ISSUES 292): the entry (i, j) of the dense completion without forming it, with the same values
+ * xc_complete writes; f = xc_entry_f(n, x) once per block */
+double xc_entry_f(int n, const double *x) { const double nb = xc_nrm2c(n, x); return nb > 0 ? 0.5 * x[0] / (nb * nb) : NAN; }
+double xc_entry(int n, int h, const double *x, double f, int i, int j) {
+    if (i == h && j == h) return 0.5 * x[0];
+    if (i == h || j == h) { const int u = i == h ? j : i; return 0.5 * x[u < h ? u + 1 : u]; }
+    if (f != f) return i == j ? 0.5 * x[0] / (n - 1) : 0.0;
+    return f * x[i < h ? i + 1 : i] * x[j < h ? j + 1 : j];
+}
 /* the completion's eigenvalues are (x_0 +- |xb|) / 2 and 0 */
 double xc_lammin_x(int n, const double *x) { return fmin(0.0, 0.5 * (x[0] - xc_nrm2c(n, x))); }
 /* Z = Arw(z): eigenvalues z_0 +- |zb| and z_0 */
@@ -486,34 +495,49 @@ int xc_expand(const PSOrig *O, double **Xo, int *xc) {
     }
     return 0;
 }
-int ps_arrow_hub(const PSOrig *O, int o, const int *kept) {
-    const int n = O->bs[o];
-    if (n < 2) return -1;
-    /* per matrix (C and each row): its diagonal value and how many diagonal entries it has; the hub candidates are the
-     * indices in every off-diagonal entry (the test of solver.c's arrow_hub, on the triplets of the data as read) */
+/* 26 October 2026: every block's hub in one pass over the triplets, grouped by block first; the test per block as
+ * before. One block at a time over all the triplets cost (blocks) x (entries): 77 s on the report's tiny_soc_N50000
+ * (SDP with SOCP: 50,000 cones of order 3 to 10 and 650,000 entries), before the solve, outside its time */
+int ps_arrow_hubs(const PSOrig *O, const int *kept, int *hub) {
+    const int nb = O->nblk;
+    for (int o = 0; o < nb; o++) hub[o] = -1;
+    size_t *ptr = calloc((size_t)nb + 1, sizeof(size_t)), *qs = malloc(sizeof(size_t) * (O->nnz + 1));
     double *dv = malloc(sizeof(double) * ((size_t)O->m + 2)); int *nd = calloc((size_t)O->m + 2, sizeof(int));
-    int c1 = -1, c2 = -1, offd = 0, ok = dv && nd;
-    for (size_t q = 0; q < O->nnz && ok; q++) {
-        if (O->blk[q] != o) continue;
-        const int r = O->con[q] + 1, i = O->ii[q], j = O->jj[q];
-        if (r > 0 && kept && !kept[r - 1]) continue;
-        const double v = O->v[q];
-        if (i == j) {
-            if (nd[r] == 0) dv[r] = v;
-            else if (!(fabs(v - dv[r]) <= 1e-14 * fabs(dv[r]))) ok = 0;
-            nd[r]++;
-            continue;
+    int *touched = malloc(sizeof(int) * ((size_t)O->m + 2));
+    if (!ptr || !qs || !dv || !nd || !touched) { free(ptr); free(qs); free(dv); free(nd); free(touched); return 1; }
+    for (size_t q = 0; q < O->nnz; q++) ptr[O->blk[q]]++;          /* (blk[q] in [0, nblk): the triplets of the blocks) */
+    { size_t s = 0; for (int o = 0; o < nb; o++) { const size_t c = ptr[o]; ptr[o] = s; s += c; } ptr[nb] = s; }
+    for (size_t q = 0; q < O->nnz; q++) qs[ptr[O->blk[q]]++] = q;
+    for (int o = nb; o > 0; o--) ptr[o] = ptr[o - 1];
+    ptr[0] = 0;
+    for (int o = 0; o < nb; o++) {
+        const int n = O->bs[o];
+        if (n < 2) continue;
+        /* per matrix (C and each row): its diagonal value and how many diagonal entries it has; the hub candidates are
+         * the indices in every off-diagonal entry (the test of solver.c's arrow_hub, on the triplets of the data as read) */
+        int c1 = -1, c2 = -1, offd = 0, ok = 1, nt = 0;
+        for (size_t e = ptr[o]; e < ptr[o + 1] && ok; e++) {
+            const size_t q = qs[e];
+            const int r = O->con[q] + 1, i = O->ii[q], j = O->jj[q];
+            if (r > 0 && kept && !kept[r - 1]) continue;
+            const double v = O->v[q];
+            if (i == j) {
+                if (nd[r] == 0) { dv[r] = v; touched[nt++] = r; }
+                else if (!(fabs(v - dv[r]) <= 1e-14 * fabs(dv[r]))) ok = 0;
+                nd[r]++;
+                continue;
+            }
+            offd++;
+            if (c1 < 0 && c2 < 0) { c1 = i; c2 = j; continue; }
+            if (c1 >= 0 && c1 != i && c1 != j) c1 = -1;
+            if (c2 >= 0 && c2 != i && c2 != j) c2 = -1;
+            if (c1 < 0 && c2 < 0) ok = 0;
         }
-        offd++;
-        if (c1 < 0 && c2 < 0) { c1 = i; c2 = j; continue; }
-        if (c1 >= 0 && c1 != i && c1 != j) c1 = -1;
-        if (c2 >= 0 && c2 != i && c2 != j) c2 = -1;
-        if (c1 < 0 && c2 < 0) ok = 0;
+        for (int t = 0; t < nt; t++) { if (nd[touched[t]] != n) ok = 0; nd[touched[t]] = 0; }
+        if (ok && offd) hub[o] = c1 >= 0 ? c1 : c2;
     }
-    for (int r = 0; r <= O->m && ok; r++) if (nd[r] != 0 && nd[r] != n) ok = 0;
-    free(dv); free(nd);
-    if (!ok || !offd) return -1;
-    return c1 >= 0 ? c1 : c2;
+    free(ptr); free(qs); free(dv); free(nd); free(touched);
+    return 0;
 }
 
 static double g_lam_cap = INFINITY;   /* largest shift the ladder may report (absolute) */
@@ -2715,39 +2739,48 @@ int ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, 
     }
     return -1;
 }
-int ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res) {
+int ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res) { return ps_measure_xc(O, Xo, yo, res, NULL); }
+/* 26 October 2026 (ISSUES 292): xc, the cone-vector blocks of Xo (their data are arrow matrices): X and Z there as cone
+ * vectors, measured as postsolve() measures them, without the n^2 completion */
+int ps_measure_xc(const PSOrig *O, double **Xo, const double *yo, PSResult *res, const int *xc) {
     const double t0 = ps_now();
     const int nbo = O->nblk, mo = O->m;
     memset(res, 0, sizeof(*res));
     double **Zo = pmalloc(sizeof(double *) * (nbo + 1));
-    for (int o = 0; o < nbo; o++) Zo[o] = pcalloc(bsize(O->bs[o]) + 1, sizeof(double));
+    for (int o = 0; o < nbo; o++) Zo[o] = pcalloc(ps_zlen(O, xc, o) + 1, sizeof(double));
     for (size_t q = 0; q < O->nnz; q++) {
-        const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
         const double coef = O->con[q] < 0 ? O->v[q] : -yo[O->con[q]] * O->v[q];
         if (coef == 0) continue;
-        if (O->bs[o] < 0) Zo[o][i] += coef;
-        else { Zo[o][i + (size_t)j * no] += coef; if (i != j) Zo[o][j + (size_t)i * no] += coef; }
+        ps_zadd(O, xc, Zo, q, coef);
     }
     size_t maxn2 = 1;
-    for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
+    for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && !(xc && xc[o] >= 0) && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
     double *work = pmalloc(sizeof(double) * maxn2);
     double pobj = 0, dobj = 0, xz = 0, lamx = 0, lamz = 0;
     for (int i = 0; i < mo; i++) dobj += O->b[i] * yo[i];
-    for (int o = 0; o < nbo; o++) {
-        const int no = abs(O->bs[o]);
-        if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamz = fmin(lamz, Zo[o][i]); }
-        else lamz = fmin(lamz, ps_lammin_tol(no, Zo[o], work, 1e-12 * (1.0 + O->nC1)));
-    }
+    for (int o = 0; o < nbo; o++) lamz = fmin(lamz, ps_zlam(O, xc, Zo, o, work, 1e-12 * (1.0 + O->nC1)));
     if (Xo) {
         double *rp = pcalloc(mo + 1, sizeof(double));
         for (size_t q = 0; q < O->nnz; q++) {
             const int o = O->blk[q], i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
-            const double x = O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
-            const double c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
+            double c;
+            if (xc && xc[o] >= 0) {   /* <A, X> = a_0 x_0 + sum_t a_t x_t (as in postsolve) */
+                const int h = xc[o];
+                if (i == j) c = i == h ? O->v[q] * Xo[o][0] : 0.0;
+                else { const int u = i == h ? j : i; c = O->v[q] * Xo[o][u < h ? u + 1 : u]; }
+            } else {
+                const double x = O->bs[o] < 0 ? Xo[o][i] : Xo[o][i + (size_t)j * no];
+                c = (O->bs[o] > 0 && i != j) ? 2.0 * O->v[q] * x : O->v[q] * x;
+            }
             if (O->con[q] < 0) pobj += c; else rp[O->con[q]] += c;
         }
         for (int o = 0; o < nbo; o++) {
             const int no = abs(O->bs[o]);
+            if (xc && xc[o] >= 0) {
+                for (int t = 0; t < no; t++) xz += Xo[o][t] * Zo[o][t];
+                lamx = fmin(lamx, xc_lammin_x(no, Xo[o]));
+                continue;
+            }
             const size_t len = bsize(O->bs[o]);
             for (size_t q = 0; q < len; q++) xz += Xo[o][q] * Zo[o][q];
             if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamx = fmin(lamx, Xo[o][i]); }

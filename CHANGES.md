@@ -1,5 +1,64 @@
 # BRISK change log
 
+## Version 1.6.1 (October 2026)
+
+Quadratic programs from MATLAB and Julia:
+- **MATLAB and Octave:** `[x, info] = brisk_qp(H, f, A, l, u, lb, ub, opts)` solves a convex QP, and `brisk_qp('problem.qps')`
+  a QPS file; `BriskQpModel` keeps one for re-solves after changes of variable bounds, row bounds or the cost
+  (`set_var_bounds`, `set_row_bounds`, `set_cost`), each from the previous active set, as in model predictive control or
+  branch and bound.
+- **Julia and JuMP:** `Brisk.solve_qp`, `Brisk.QpModel` and `Brisk.solve_file` on a QPS file; a JuMP model with a quadratic
+  objective and linear constraints is solved by the QP solver, and after a change of variable bounds, right-hand sides or
+  the objective's linear part the next `optimize!` starts from the previous active set. Beside second-order cone or
+  semidefinite constraints, the objective's quadratic part is passed as a rotated second-order cone. An objective that is
+  not convex is an error.
+- BRISK is described as an interior-point solver for conic programs (the README and the citation).
+
+Semidefinite programs:
+- **The same results from solve to solve and at every thread count.** Repeated solves in one process (MATLAB, Python,
+  Julia, the C library) could give different results: a few sums depended on the thread schedule, state kept between
+  solves was keyed by an array's address, and MKL took BRISK's thread count. Every sum now has a fixed order, nothing
+  outlives a solve unless it belongs to it, and every BLAS library runs on one thread a call (MKL in its reproducible
+  mode). The release is tested for it at 1, 2 and all threads, with thread changes during a solve and alternating
+  problems in one process.
+- **Many small blocks and cones.** A semidefinite program whose blocks all have order 1 or 2, or are cones written as
+  arrow blocks, is solved by the SOCP solver. Problems with many small second-order cones next to semidefinite blocks
+  run about ten times faster, and the loops over many small blocks run on the threads without waiting at OpenBLAS's
+  lock (a problem with 50,000 blocks of order 2 to 5: about half the time).
+- **Long second-order cones next to semidefinite blocks** no longer make the Schur complement dense, and cones with more
+  than 46,340 coordinates, refused until now, are solved as cones (from the SeDuMi format: MATLAB, Python, CVXPY,
+  `.mat` files). A re-solve that would need such a cone as a dense matrix is not started when it cannot fit in memory.
+- **Faster on structured problems:** FIR filter designs about 1.7 times faster and more of them to full accuracy (the
+  free-variable elimination's cost estimate); blocks with many low-rank constraints (metric learning) without two dense
+  matrices of the order of the total rank; a regularized Schur factorization starts at the level that last worked.
+- **On Apple Silicon** the default thread count is the number of performance cores (8 threads on an M3 took 1.06 to 1.57
+  times as long as 4); `-threads` and `OMP_NUM_THREADS` still decide.
+- **Bounds:** `-boundprior 2` tries the a-priori bound first, and the rigorous bounds after the primal restoration are
+  tighter.
+- `-maxit k` below the default of 100 is the run's budget: a solve stopped by it is not retried by another method. The
+  reported total time is the wall time of the whole run. BRISK builds without OpenMP again (`make OMP=0`).
+
+Linear programs:
+- **The default LP route runs the dual simplex method beside the interior-point method** (two threads or more, no
+  `-lpmethod` given), and the first to end with a result gives it; when the interior-point method gives up, the dual
+  simplex method gets all the threads and the SOCP solver starts beside it. `-lpmethod 1` is the interior-point method
+  alone, and `-threads 1` runs one method at a time with the same result every run.
+- **Linearly dependent equality rows are removed** by the LP presolves; an infeasible or unbounded verdict on the
+  presolved problem is checked on the problem as read; an unbounded LP that one column proves is recognised at once.
+- `brisk problem.mps.gz` reads a compressed MPS file (as MIPLIB distributes them); names beginning with `$` after a line's
+  first field start a comment, as in other MPS readers.
+- Faster presolves and simplex factorizations, and the time limit kept by every phase of every route.
+
+Second-order cone programs:
+- **Through the library** (Python, CVXPY, JuMP, MATLAB, the C API) the SOCP solver no longer lets OpenBLAS start threads
+  inside its own parallel loops: an SOCP that took 7.0 s on four threads takes 1.2 s.
+- **Symmetry:** a problem whose rows and variables fall into classes of equal data is solved in the class averages
+  (data fitting with repeated observations: up to ten times faster).
+- **The same problem written differently costs about the same:** scaled rows and variables, repeated rows, rows that are
+  sums of others and permutations no longer change the solve's path.
+- The factorization's choice between the normal equations and the full system by their work; SOCP solves on several
+  threads at once in one process; `-x` on a CBF file writes x in the file's own variables.
+
 ## Version 1.6 (October 2026)
 
 New: quadratic programs

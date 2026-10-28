@@ -77,7 +77,7 @@ static void xo_Z(const XOData *D, const double *y, double **Z) {
 }
 
 /* DIMACS errors 1..6 on O (err[3] = 0: Z is C - A'y exactly) */
-static double g_xo_pd[2], g_xo_floor;
+static _Thread_local double g_xo_pd[2], g_xo_floor;   /* (per thread: the solvers may run on several threads at once, ISSUES 526) */
 static void xo_errors(const XOData *D, double **X, const double *y, double **Z, double *err) {
     const PSOrig *O = D->O;
     const int m = D->m;

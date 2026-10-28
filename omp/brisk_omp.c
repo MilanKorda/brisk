@@ -23,7 +23,8 @@
  * taskwait runs only children of the task it waits in (libgomp's rule, so
  * a suspended task's per-thread scratch data is never reused by an unrelated task). Worksharing
  * loops with dynamic schedules share a ring of dispatch buffers indexed by the per-thread loop
- * count. Environment: OMP_NUM_THREADS (default: all online processors), BRISK_OMP_SPIN_US
+ * count. Environment: OMP_NUM_THREADS (default: all online processors; on Apple Silicon the
+ * performance cores, see rt_init), BRISK_OMP_SPIN_US
  * (busy-wait time before sleeping, default 1000). */
 #include "omp.h"
 #include <pthread.h>
@@ -36,6 +37,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 /* every symbol of this file is internal to the binary or MEX file it is linked into: no
  * interposition with (or of) an OpenMP runtime the host process may have loaded */
@@ -190,6 +194,18 @@ static void rt_init(void) {
     long np = sysconf(_SC_NPROCESSORS_ONLN);
     g_nprocs = np > 0 ? (int)np : 1;
     int nt = g_nprocs;
+#ifdef __APPLE__
+    /* Apple Silicon: the default team is the performance cores. The barriers of a team wait for
+     * its slowest thread and an efficiency core is several times slower than a performance core,
+     * so with all cores (4 + 4 on an M1 or an M3) the solves took longer than on the four
+     * performance cores (M3, geometric mean of the time, 8 threads against 4: 1.55 on the 13 SDPs
+     * of 50 ms to 1 s and 1.57 on 5 high-precision SOS relaxations on battery; 1.14 and 1.06 on
+     * mains power; 1.6 as released against this build, each at its default, 0.75-0.89 on mains).
+     * OMP_NUM_THREADS and -threads still decide. Intel Macs have no perflevel0: all processors,
+     * as before. */
+    { int pc = 0; size_t sz = sizeof pc;
+      if (sysctlbyname("hw.perflevel0.logicalcpu", &pc, &sz, NULL, 0) == 0 && pc > 0 && pc < nt) nt = pc; }
+#endif
     const char *e = getenv("OMP_NUM_THREADS");
     if (e && atoi(e) > 0) nt = atoi(e);
     if (nt > MAXTHREADS) nt = MAXTHREADS;

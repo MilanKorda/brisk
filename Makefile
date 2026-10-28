@@ -41,7 +41,9 @@ else ifeq ($(OMP),bundled)
   OMPSRC  := omp/brisk_omp.c
   OMPLD   := -lpthread
 else
-  OMPFLAG := -Wno-unknown-pragmas
+  # without OpenMP (OMP=0; ISSUES 713): the runtime's queries declared for every file and defined for one thread
+  OMPFLAG := -Wno-unknown-pragmas -include omp/ompstub.h
+  OMPSRC  := omp/ompstub.c
 endif
 # -ffp-contract=off (5.18): each expression is rounded as written; with gcc's default (fast) the fusion of a*b + c into
 # an FMA follows the inlining, so an edit of one function moved the last bits of others (the ill-posed files of the
@@ -114,7 +116,7 @@ HDRS := $(wildcard *.h)
 boundcert.o libobj/boundcert.o: CFLAGS += -frounding-math -fno-fast-math
 hpsolve.o libobj/hpsolve.o: hp.h hpipm.inc hpfom.inc hplr.inc hppre.inc hpcert.inc hpred.inc
 hpmp.o libobj/hpmp.o: hp.h
-socp.o libobj/socp.o: socp.h
+socp.o libobj/socp.o: socp.h blas_one.h
 sedumi.o libobj/sedumi.o main.o libobj/main.o: socp.h sedumi.h
 # (22 October 2026) the LP method's options struct is shared by these: a field added to it in lpsolve.h left main.o with
 # the old layout (memset of the smaller struct, the new field from the stack)
@@ -165,6 +167,13 @@ capitest: $(LIBBRISK) tools/capi_test.c
 # the library under AddressSanitizer: the C API test and the bound-mode handle test (memory errors and leaks)
 asantest:
 	tools/asan_test.sh
+
+# reproducibility (CLAUDE.md, ISSUES 708): the same bits at 1, 2 and all threads, with thread changes, and from the C
+# library with problems of the same dimensions alternated; reprotest-mkl: the same under MKL (tools/setup_env.sh --mkl)
+reprotest: brisk $(LIBBRISK)
+	tools/repro_suite.sh
+reprotest-mkl: brisk $(LIBBRISK)
+	tools/repro_suite.sh --mkl
 
 # the MATLAB build's integer-widening BLAS layer (blas64.c) against an ILP64 OpenBLAS (libopenblas64-dev)
 blas64test: brisk
@@ -219,6 +228,8 @@ lpmodeltest: $(LIBOBJ) $(LIBAMDOBJ) lpmodel.c lpmodel.h sxmodel.h tools/lpmodel_
 	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_bb tools/lpmodel_bb.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
 	./tools/lpmodel_test $(LPMODEL_FILES)
 	./tools/lpmodel_bb $(addprefix benchmarks/mip_small/,flugpl.mps gr4x6.mps khb05250.mps)
+	./tools/lpmodel_bb -weights 1 $(addprefix benchmarks/mip_small/,gr4x6.mps khb05250.mps)
+	./tools/lpmodel_bb -weights 2 $(addprefix benchmarks/mip_small/,gr4x6.mps)
 
 # the same under AddressSanitizer (memory errors and leaks)
 lpmodelasan:

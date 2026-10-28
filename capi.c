@@ -264,7 +264,9 @@ BRISK_API long brisk_qp_lower(int n, const int *Hp, const int *Hi, const double 
 /* (22 October 2026) the QP solver object for warm starts (mixed-integer QPs by branch and bound): created on the data of
  * brisk_solve_qp, then bounds, row bounds and the cost changed and the problem re-solved from the previous active set.
  * Options: -qpas (the active-set method, the default here: it carries the active set from solve to solve), -qpipm (each
- * solve cold), -tol, -maxit, -timelimit, -q, -v, -vv. NULL on bad data or an unknown option. */
+ * solve cold), -qpauto (the choice of brisk_solve_qp: the active-set method, warm, for a small QP with H positive
+ * definite, else the interior-point method, cold; used by JuMP), -tol, -maxit, -timelimit, -q, -v, -vv. NULL on bad data
+ * or an unknown option. */
 void brisk_qp_fill_result(BriskResult *res, int n, int m, QpRes *R, double t);
 typedef struct { QpSolver *S; int n, m; } BriskQp;
 static double qp_bnd(const double v, const int lo) { return lo ? (v <= -QP_INF ? -QP_INF : v) : (v >= QP_INF ? QP_INF : v); }
@@ -277,6 +279,8 @@ BRISK_API void *brisk_qp_create(int n, int m, const int *Hp, const int *Hi, cons
         const char *a = opts[i];
         if (!strcmp(a, "-qpas")) o.method = QP_METHOD_ACTIVESET;
         else if (!strcmp(a, "-qpipm")) o.method = QP_METHOD_IPM;
+        else if (!strcmp(a, "-qpauto")) o.method = QP_METHOD_AUTO;
+        else if (!strcmp(a, "-caller") && i + 1 < nopt) i++;    /* (the interfaces' tag, as every entry point takes it; the model gives no advice) */
         else if (!strcmp(a, "-tol") && i + 1 < nopt) o.tol = atof(opts[++i]);
         else if (!strcmp(a, "-maxit") && i + 1 < nopt) o.maxit = atoi(opts[++i]);
         else if (!strcmp(a, "-timelimit") && i + 1 < nopt) o.timelimit = atof(opts[++i]);

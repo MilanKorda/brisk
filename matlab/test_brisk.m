@@ -184,6 +184,53 @@ catch
 end
 nfail = nfail + check('opts: output files are refused (the solution is returned)', thrown);
 
+% ---- QPs: brisk_qp and BriskQpModel (re-solves from the previous active set) ----------------
+% HS21: min 0.01 x1^2 + x2^2 s.t. 10 x1 - x2 >= 10, 2 <= x1 <= 50, -50 <= x2 <= 50 (the optimum x = (2, 0), 0.04)
+Hq = diag([0.02, 2]); fq = [0; 0]; Aq = [10 -1]; lbq = [2; -50]; ubq = [50; 50];
+[xq, iq] = brisk_qp(Hq, fq, Aq, 10, Inf, lbq, ubq);
+nfail = nfail + check('QP: HS21 optimal', strcmp(iq.status, 'OPTIMAL') && norm(xq - [2; 0]) < 1e-7 && abs(iq.obj - 0.04) < 1e-9);
+nfail = nfail + check('QP: the multipliers satisfy H x + f - A''y - z = 0', norm(Hq * xq + fq - Aq' * iq.y - iq.z) < 1e-8);
+[xu, iu] = brisk_qp(triu(Hq), fq, sparse(Aq), 10, [], lbq, ubq, struct('qpipm', true));
+nfail = nfail + check('QP: one triangle of H, the interior-point method', strcmp(iu.status, 'OPTIMAL') && norm(xu - xq) < 1e-6);
+mdl = BriskQpModel(Hq, fq, Aq, 10, Inf, lbq, ubq);
+[x1, i1] = mdl.solve();
+mdl.set_var_bounds(1, 3, 50);
+[x2, i2] = mdl.solve();
+[x2c, i2c] = brisk_qp(Hq, fq, Aq, 10, Inf, [3; -50], ubq);
+nfail = nfail + check('QP model: a bound changed, re-solved from the active set', norm(x1 - xq) < 1e-9 && norm(x2 - [3; 0]) < 1e-9 ...
+                       && abs(i2.obj - i2c.obj) < 1e-12 && i2.iter <= 2);
+mdl.set_cost([1; 0]);
+mdl.set_row_bounds(1, 40, Inf);
+[x3, i3] = mdl.solve();
+[x3c, i3c] = brisk_qp(Hq, [1; 0], Aq, 40, Inf, [3; -50], ubq);
+nfail = nfail + check('QP model: the cost and a row changed, as a cold solve', strcmp(i3.status, 'OPTIMAL') && norm(x3 - x3c) < 1e-8 ...
+                       && abs(i3.obj - i3c.obj) < 1e-10);
+h = mdl.handle; delete(mdl);
+thrown = false; try, brisk_mex('qp_solve', h); catch, thrown = true; end
+nfail = nfail + check('QP model: freed by delete', thrown);
+rng_seed(7);
+nq = 30; mq = 12; Mq = randn(nq); Hr = Mq' * Mq + eye(nq); fr = randn(nq, 1); Ar = sprandn(mq, nq, 0.3) + [speye(mq), sparse(mq, nq - mq)];
+lr = -ones(mq, 1); ur = ones(mq, 1); ur(1:3) = lr(1:3);
+[xa, ia] = brisk_qp(Hr, fr, Ar, lr, ur, -2 * ones(nq, 1), 2 * ones(nq, 1), struct('qpas', true));
+[xb, ib] = brisk_qp(Hr, fr, Ar, lr, ur, -2 * ones(nq, 1), 2 * ones(nq, 1), struct('qpipm', true));
+nfail = nfail + check('QP: a random QP, the two methods agree', strcmp(ia.status, 'OPTIMAL') && strcmp(ib.status, 'OPTIMAL') ...
+                       && abs(ia.obj - ib.obj) < 1e-6 * (1 + abs(ia.obj)) && norm(xa - xb) < 1e-4);
+[~, ii] = brisk_qp(Hq, fq, Aq, 10, Inf, [2; -50], [1; 50]);
+nfail = nfail + check('QP: an infeasible QP reported', ii.statuscode == 1);
+thrown = false; try, brisk_qp(-Hq, fq, Aq, 10, Inf, lbq, ubq); catch, thrown = true; end
+nfail = nfail + check('QP: a QP that is not convex is refused', thrown);
+thrown = false; try, brisk_qp([1 2; 3 1], fq, Aq, 10, Inf, lbq, ubq); catch, thrown = true; end
+nfail = nfail + check('QP: an H neither symmetric nor triangular is refused', thrown);
+thrown = false; try, brisk_qp(Hq, fq, Aq, [10; 1], Inf, lbq, ubq); catch, thrown = true; end
+nfail = nfail + check('QP: a bound vector of the wrong length is refused', thrown);
+thrown = false; try, brisk_mex('qp_example.dat-s', {'-q'}); catch err, thrown = isempty(strfind(err.message, 'QP model')); end %#ok<STREMP>
+nfail = nfail + check('QP: a file name beginning with qp is still a file name', thrown);
+hsq = fullfile(here, '..', 'examples', 'hs21.qps');
+[xq, iq] = brisk_qp(hsq);
+nfail = nfail + check('QP: a QPS file (HS21) solved', iq.statuscode == 0 && abs(iq.obj + 99.96) < 1e-6 && norm(xq - [2; 0]) < 1e-6);
+thrown = false; try, brisk_qp(ex1); catch err, thrown = ~isempty(strfind(err.message, 'QPS')); end %#ok<STREMP>
+nfail = nfail + check('QP: a file other than QPS is refused by brisk_qp', thrown);
+
 % ---- 6. against SeDuMi, when installed ---------------------------------------------------
 if exist('sedumi', 'file') == 2 || exist('sedumi', 'file') == 3
     pars.fid = 0;

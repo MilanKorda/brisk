@@ -988,6 +988,38 @@ static int cmp_depent(const void *a, const void *b) {
     if (x->key != y->key) return x->key < y->key ? -1 : 1;
     return x->con - y->con;
 }
+/* The entries in cmp_depent's order (by position, then constraint) by a least-significant-digit radix sort: stable
+ * passes of 17 bits over the constraint, then over the position, as many as their largest values need (the
+ * constraint's passes are skipped when con_sorted: the entries of one position then lie in one block, in the order of
+ * its constraints, which ascend). Where the
+ * positions are too many for a counting sort (a block of order 100,001 has 5e9 positions; r2_reglmi_N100k, SDP with
+ * SOCP: 10 million entries, 1.6 s in qsort) it takes a few passes over the entries. Falls back to qsort without memory. */
+static void dep_sort(DepEnt **pE, size_t ne, int con_sorted) {
+    DepEnt *a = *pE, *b = malloc(sizeof(DepEnt) * (ne + 1));
+    enum { DB = 17, DN = 1 << DB };
+    size_t *cnt = malloc(sizeof(size_t) * (DN + 1));
+    if (!b || !cnt) { free(b); free(cnt); qsort(a, ne, sizeof(DepEnt), cmp_depent); return; }
+    uint64_t kmax = 0; unsigned cmax = 0;
+    for (size_t q = 0; q < ne; q++) { if (a[q].key > kmax) kmax = a[q].key; if ((unsigned)a[q].con > cmax) cmax = (unsigned)a[q].con; }
+    for (int pass = con_sorted ? 1 : 0; pass < 2; pass++) {   /* the constraint first (the minor key), then the position */
+        const uint64_t top = pass == 0 ? cmax : kmax;
+        for (int sh = 0; sh < 64 && (top >> sh) != 0; sh += DB) {
+            memset(cnt, 0, sizeof(size_t) * (DN + 1));
+            for (size_t q = 0; q < ne; q++) {
+                const uint64_t v = pass == 0 ? (uint64_t)(unsigned)a[q].con : a[q].key;
+                cnt[((v >> sh) & (DN - 1)) + 1]++;
+            }
+            for (int d = 0; d < DN; d++) cnt[d + 1] += cnt[d];
+            for (size_t q = 0; q < ne; q++) {
+                const uint64_t v = pass == 0 ? (uint64_t)(unsigned)a[q].con : a[q].key;
+                b[cnt[(v >> sh) & (DN - 1)]++] = a[q];
+            }
+            DepEnt *t = a; a = b; b = t;
+        }
+    }
+    free(cnt); free(b);
+    *pE = a;
+}
 int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     const int mfull = P->m;
     int m = mfull;
@@ -1018,8 +1050,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     }
     ne = w;
     {   /* by position, then constraint: a counting sort over the positions when there are not many more of them than
-         * entries (stable, and the constraints come in ascending order within a block), else qsort (a random problem
-         * with 300 dense 80 x 80 constraints: 0.12 s in qsort) */
+         * entries (stable, and the constraints come in ascending order within a block), else a radix sort (dep_sort) */
         size_t R = 0;
         size_t *off = malloc(sizeof(size_t) * ((size_t)P->nblk + 1));
         for (int k = 0; k < P->nblk; k++) { off[k] = R; const size_t n = (size_t)P->blk[k].n; R += P->blk[k].type == BLK_SDP ? n * (n + 1) / 2 : n; }
@@ -1030,7 +1061,12 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
             DepEnt *E2 = malloc(sizeof(DepEnt) * (ne + 1));
             for (size_t q = 0; q < ne; q++) E2[cnt[E[q].key]++] = E[q];
             free(cnt); free(E); E = E2;
-        } else qsort(E, ne, sizeof(DepEnt), cmp_depent);
+        } else {   /* (the positions as one index, as above: 33 bits for a block of order 100,001) */
+            int con_sorted = 1;
+            for (int k = 0; k < P->nblk && con_sorted; k++) for (int t = 1; t < P->blk[k].ncon; t++) if (P->blk[k].con[t] <= P->blk[k].con[t - 1]) { con_sorted = 0; break; }
+            for (size_t q = 0; q < ne; q++) E[q].key = off[E[q].key >> 44] + (E[q].key & (((uint64_t)1 << 44) - 1));
+            dep_sort(&E, ne, con_sorted);
+        }
         free(off);
     }
     w = 0;                                     /* (one entry per constraint and position; no zeros: a zero is no entry) */

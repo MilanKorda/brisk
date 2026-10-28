@@ -104,7 +104,7 @@ int lm_set_opts(LpModel *M, const LmOpts *o) {
 static void ensure_state(LpModel *M) {
     if (!M->E || !M->rebuild) return;
     SxModel *E = sxm_new(&M->P, M->csc, M->rsc, M->msc, M->costsc);
-    sxm_set_basis(E, M->cst, M->rst);
+    sxm_set_basis_w(E, M->cst, M->rst, M->opt.basis_weights);
     sxm_free(M->E);
     M->E = E;
     M->rebuild = 0;
@@ -279,7 +279,7 @@ int lm_solve(LpModel *M, LmInfo *info) {
             pthread_mutex_unlock(&g_first_mu);
             it0 = si.iters; itd0 = si.iters_dual; itp0 = si.iters_primal; nf0 = si.nfactor; wk0 = si.work;
             M->E = sxm_new(&M->P, NULL, NULL, 0, 0);
-            if (st != 3 && st != 6) sxm_set_basis(M->E, cs, rs);
+            if (st != 3 && st != 6) sxm_set_basis_w(M->E, cs, rs, M->opt.basis_weights);
             free(cs); free(rs);
             if (st == 3 || st == 6) {
                 /* a limit: no basis to take; the state stays at the basis of the row activities */
@@ -348,7 +348,7 @@ int lm_set_basis(LpModel *M, const int *cstat, const int *rstat) {
     if (!M->E) M->E = sxm_new(&M->P, NULL, NULL, 0, 0);
     ensure_state(M);
     changed(M);
-    return sxm_set_basis(M->E, cstat, rstat);
+    return sxm_set_basis_w(M->E, cstat, rstat, M->opt.basis_weights);
 }
 
 /* ---- the tableau */

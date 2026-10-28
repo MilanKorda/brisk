@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/MilanKorda/brisk/actions/workflows/ci.yml/badge.svg)](https://github.com/MilanKorda/brisk/actions/workflows/ci.yml)
 
-BRISK is an interior-point solver for semidefinite programs (SDPs) with linear blocks:
+BRISK is an interior-point solver for conic programs:
 
 ```
 (P)  min <C,X>  s.t. <A_i,X> = b_i,  X in K        (D)  max b'y  s.t.  sum y_i A_i + Z = C,  Z in K
@@ -60,7 +60,7 @@ Details: [SOLVER.md](SOLVER.md) (methods, automatic choices, exit codes) and
 
 ## Status
 
-Version 1.6. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
+Version 1.6.1. Tested on Linux at every release on about 350 instances (SDPLIB, Mittelmann's
 benchmark, AC optimal power flow and moment-SOS relaxations) and through the test suites of
 the three interfaces. The macOS build has not yet been validated on a Mac. Please report
 problems through the issue tracker, with the output of `./brisk problem.dat-s -v`.

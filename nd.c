@@ -63,7 +63,13 @@ static _Thread_local double g_nd_qwork = 0, g_nd_wlim = 0;
 void nd_set_work_budget(double units) { g_nd_wlim = units > 0 ? units : 0; if (units > 0) g_nd_qwork = 0; g_nd_abort = 0; }   /* (the count kept after a 0, for the log) */
 double nd_work_done(void) { return g_nd_qwork; }
 int nd_aborted(void) { return g_nd_abort; }      /* (the last nd_order stopped at its budget) */
-static int nd_over(void) { return nd_past() || (g_nd_wlim > 0 && g_nd_qwork > g_nd_wlim); }
+/* (28 October 2026, the LP developer) a stop flag of the caller, read where the budget is: the LP interior-point method
+ * stopped while it orders (the simplex method beside it has won) gives up the dissection at once for AMD's order; only
+ * an analysis whose result is discarded is cut, so the orders that are used stay those of the budget alone */
+static _Thread_local const volatile int *g_nd_stopf;
+void nd_set_stop(const volatile int *f) { g_nd_stopf = f; }
+const volatile int *nd_get_stop(void) { return g_nd_stopf; }
+static int nd_over(void) { return nd_past() || (g_nd_wlim > 0 && g_nd_qwork > g_nd_wlim) || (g_nd_stopf && *g_nd_stopf); }
 #define ND_WORK(units) (g_nd_qwork += (double)(units))
 static _Thread_local unsigned int nd_seed;     /* (per thread: orderings run on several threads at once) */
 static unsigned int nd_rand(void) { nd_seed = nd_seed * 1664525u + 1013904223u; return nd_seed >> 8; }
@@ -220,11 +226,15 @@ static long refine(const Gr *g, char *part, long maxside, int npass) {
     for (int pass = 0; pass < npass; pass++) {
         memset(lock, 0, (size_t)n);
         pq_clear(&H[0]); pq_clear(&H[1]);
-        for (int v = 0; v < n; v++) if (ed[v] > 0 || g->xadj[v + 1] == g->xadj[v]) pq_push(&H[(int)part[v]], ed[v] - id[v], v);
+        int nbnd = 0;
+        for (int v = 0; v < n; v++) if (ed[v] > 0 || g->xadj[v + 1] == g->xadj[v]) { pq_push(&H[(int)part[v]], ed[v] - id[v], v); nbnd++; }
         const int ok0 = w[0] <= maxside && w[1] <= maxside;
         long best = ok0 ? cut : LONG_MAX, cur = cut, bestimb = labs(w[0] - w[1]);
         int nm = 0, bestk = 0, bad = 0;
-        const int limit = 100 + n / 50;
+        /* (27 October 2026, the SOCP developer, a test: BRISK_NDFMLIM=1) METIS's limit of moves without gain in a two-way pass,
+         * min(max(boundary / 100, 15), 100), against 100 + n / 50 (20,100 on a graph of a million vertices) */
+        static int fmlim = -1; if (fmlim < 0) { const char *e_ = getenv("BRISK_NDFMLIM"); fmlim = e_ ? atoi(e_) : 0; }
+        const int limit = fmlim == 1 ? (nbnd / 100 < 15 ? 15 : nbnd / 100 > 100 ? 100 : nbnd / 100) : 100 + n / 50;
         while (bad < limit) {
             /* the side to move from: the one over its limit, else the better gain */
             int side = -1;
@@ -391,7 +401,9 @@ static int bisect(const Gr *g0, char *part0, int mode) {
 }
 
 /* maximum matching in the bipartite graph of the cut edges (Kuhn's augmenting paths) */
+static _Thread_local const volatile int *g_nd_stopf;
 static int aug(int a, const Gr *g, const char *part, const int *bidx, int *mb, int *seen, int stamp, const int *alist) {
+    if (g_nd_stopf && *g_nd_stopf) return 0;     /* (28 October 2026: stopped by the caller; the loop below then gives up) */
     const int v = alist[a];
     /* (24 October 2026, the night: the edges each search goes over counted in the work: uncounted, the matching of a set
      * covering's dense cut, most of its dissection's time, ran past the budget: lp_setcover_8k, LP, 4.3e8 units counted in
@@ -406,6 +418,68 @@ static int aug(int a, const Gr *g, const char *part, const int *bidx, int *mb, i
         if (mb[b] < 0 || aug(mb[b], g, part, bidx, mb, seen, stamp, alist)) { mb[b] = a; return 1; }
     }
     return 0;
+}
+/* (28 October 2026, on trial: BRISK_NDHK=1) a maximum matching of the cut edges by Hopcroft and Karp (1973): in each phase
+ * a breadth-first layering from the unmatched A vertices, then depth-first searches along the layers for shortest
+ * augmenting paths, O(E sqrt(V)) in all, where the search of aug above, one per A vertex, is O(V E): it was most of
+ * satellites2-25's 10.8 s analysis (LP). Iterative (no recursion depth); the same counted work and stop. mb[b]: the A
+ * vertex matched to b, or -1. Returns 1 when stopped or past the budget */
+static int hk_match(const Gr *g, const char *part, const int *bidx, const int *alist, int na, int nb, int *mb) {
+    int *ma = malloc(sizeof(int) * (na + 1)), *dist = malloc(sizeof(int) * (na + 1)), *q = malloc(sizeof(int) * (na + 1));
+    int *it = malloc(sizeof(int) * (na + 1)), *stk = malloc(sizeof(int) * (na + 1)), *via = malloc(sizeof(int) * (na + 1));
+    for (int a = 0; a < na; a++) ma[a] = -1;
+    for (int b = 0; b < nb; b++) mb[b] = -1;
+    const int INF = 0x7fffffff;
+    int stopped = 0;
+    for (;;) {
+        if (nd_over()) { stopped = 1; break; }
+        int qh = 0, qt = 0, dfree = INF;
+        for (int a = 0; a < na; a++) { if (ma[a] < 0) { dist[a] = 0; q[qt++] = a; } else dist[a] = INF; }
+        while (qh < qt) {
+            const int a = q[qh++];
+            if (dist[a] >= dfree) continue;
+            const int v = alist[a];
+            for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) {
+                g_nd_work += 1.0;
+                const int u = g->adj[p];
+                if (part[u] == part[v]) continue;
+                const int a2 = mb[bidx[u]];
+                if (a2 < 0) { if (dfree == INF) dfree = dist[a] + 1; }
+                else if (dist[a2] == INF) { dist[a2] = dist[a] + 1; q[qt++] = a2; }
+            }
+        }
+        if (dfree == INF) break;
+        for (int a = 0; a < na; a++) it[a] = g->xadj[alist[a]];
+        for (int a0 = 0; a0 < na && !stopped; a0++) {
+            if (ma[a0] >= 0 || dist[a0] != 0) continue;
+            if (g_nd_stopf && *g_nd_stopf) { stopped = 1; break; }
+            int sp = 0, done = 0; stk[sp++] = a0;
+            while (sp > 0 && !done) {
+                const int a = stk[sp - 1], v = alist[a];
+                int pushed = 0;
+                while (it[a] < g->xadj[v + 1]) {
+                    const int p = it[a]++;
+                    g_nd_work += 1.0;
+                    const int u = g->adj[p];
+                    if (part[u] == part[v]) continue;
+                    const int b = bidx[u], a2 = mb[b];
+                    if (a2 < 0) {
+                        if (dist[a] + 1 != dfree) continue;
+                        /* the path a0 .. a and b: each A vertex on it takes the next B vertex, its old one goes to the
+                         * vertex before it */
+                        int bnew = b;
+                        for (int k = sp - 1; k >= 0; k--) { const int ak = stk[k], bold = k > 0 ? via[ak] : -1; mb[bnew] = ak; ma[ak] = bnew; bnew = bold; }
+                        done = 1; break;
+                    }
+                    if (dist[a2] == dist[a] + 1) { via[a2] = b; stk[sp++] = a2; pushed = 1; break; }
+                }
+                if (!done && !pushed) { dist[a] = INF; sp--; }
+            }
+        }
+        if (stopped) break;
+    }
+    free(ma); free(dist); free(q); free(it); free(stk); free(via);
+    return stopped;
 }
 /* the separator of the bisection: sep[v] = 1 for the vertices of a minimum vertex cover of the cut edges */
 static void vertex_cover(const Gr *g, const char *part, char *sep) {
@@ -422,19 +496,29 @@ static void vertex_cover(const Gr *g, const char *part, char *sep) {
     }
     int *mb = malloc(sizeof(int) * (nb + 1)), *seen = calloc((size_t)nb + 1, sizeof(int)), *ma = malloc(sizeof(int) * (na + 1));
     for (int b = 0; b < nb; b++) mb[b] = -1;
+    static int hk = -1; if (hk < 0) { const char *e = getenv("BRISK_NDHK"); hk = e && atoi(e) != 0; }
+    if (hk) {
+        if (hk_match(g, part, bidx, alist, na, nb, mb)) {      /* (past the budget, or stopped: the smaller side) */
+            g_nd_abort = 1;
+            if (na <= nb) for (int a2 = 0; a2 < na; a2++) sep[alist[a2]] = 1; else for (int b = 0; b < nb; b++) sep[blist[b]] = 1;
+            free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
+            return;
+        }
+    } else {
     if (na > 20000) {                               /* (deep recursion: the smaller side instead) */
         if (na <= nb) for (int a = 0; a < na; a++) sep[alist[a]] = 1; else for (int b = 0; b < nb; b++) sep[blist[b]] = 1;
         free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
         return;
     }
     for (int a = 0; a < na; a++) {
-        if ((a & 31) == 0 && nd_over()) {      /* (past the time budget: the smaller side) */
+        if (((a & 31) == 0 || (g_nd_stopf && *g_nd_stopf)) && nd_over()) {      /* (past the time budget, or stopped: the smaller side) */
             g_nd_abort = 1;
             if (na <= nb) for (int a2 = 0; a2 < na; a2++) sep[alist[a2]] = 1; else for (int b = 0; b < nb; b++) sep[blist[b]] = 1;
             free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
             return;
         }
         aug(a, g, part, bidx, mb, seen, a + 1, alist);
+    }
     }
     for (int a = 0; a < na; a++) ma[a] = -1;
     for (int b = 0; b < nb; b++) if (mb[b] >= 0) ma[mb[b]] = b;

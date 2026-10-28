@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.6"
+#define BRISK_VERSION "1.6.1"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -28,11 +28,28 @@
 #if defined(__APPLE__) && !defined(BRISK_PLAIN_MALLOC)
 #include <string.h>
 #include <malloc/malloc.h>
+#ifdef BRISK_MALLOC_ZONE
+/* An experiment to be measured on a Mac (ISSUES 712), off unless built with -DBRISK_MALLOC_ZONE: posix_memalign of a
+ * block of a few hundred bytes goes through the tiny zone's memalign, which allocates size plus alignment and frees the
+ * rest at once, and costs seconds where a solver allocates many small blocks (freectl_T200, SDP: 2.4 s against 0.57 s
+ * with plain malloc). Blocks of 1009 bytes or more come from the small zone, whose blocks are multiples of 512 bytes
+ * and aligned to 512, or from the large zone (whole pages): a request of at least 1024 bytes is served aligned without
+ * memalign. Every address is checked; one not aligned to 256 goes the old way. */
+static inline void *brisk_malloc(size_t n) {
+    if (n < 128) return (malloc)(n);
+    void *p = (malloc)(n < 1024 ? 1024 : n);
+    if (!p || (uintptr_t)p % 256 == 0) return p;
+    (free)(p);
+    p = NULL;
+    return (posix_memalign)(&p, 256, n) ? NULL : p;
+}
+#else
 static inline void *brisk_malloc(size_t n) {
     if (n < 128) return (malloc)(n);
     void *p = NULL;
     return (posix_memalign)(&p, 256, n) ? NULL : p;
 }
+#endif
 static inline void *brisk_calloc(size_t k, size_t n) {
     if (n && k > (size_t)-1 / n) return NULL;
     const size_t t = k * n;
@@ -162,7 +179,7 @@ typedef struct Block {
     int wpd_k;           /* the index bit of the real form (real and imaginary parts) */
     int *wpd_ap;         /* per sparse constraint its packed Pauli index ax (n/2) + az on the other bits */
     unsigned char *wpd_t;              /* per sparse constraint: whether its factor carries i */
-    int *ltr_off, *ltr_t; double *ltr_v; /* 23 October 2026: a large LP block's entries by variable (rows of A'), in constraint
+    int *ltr_off, *ltr_t; double *ltr_v; /* 23 October 2026: a large LP or (27 October) second-order cone block's entries by variable (rows of A'), in constraint
                                             order, so that A'y runs on the threads with each sum in the serial order */
     int allmono;         /* 16 October 2026 (ISSUES 96a): every constraint of the block a monomial matrix (one entry per row and column): the products X A_a Zi batched into one BLAS-3 call per chunk, the pairs by gathers */
     double asm_cost;     /* estimated work of the block's Schur assembly by the chosen routes, in BLAS-3 flops (0 for the low-rank route) */
@@ -222,6 +239,10 @@ typedef struct Block {
     /* LP: coefficient lists by variable (CSC) */
     int *lp_ptr, *lp_con;
     double *lp_val;
+    /* 26 October 2026 (ISSUES 292): a long second-order cone (BLK_SOC) whose rank-one and rank-two Schur terms are kept
+     * out of the factorization: its sparse part enters M as an LP block's, the rest through the Schur object's low-rank
+     * correction (solver.c, lr_*) */
+    int soc_lr;
 } Block;
 
 typedef struct {
@@ -437,9 +458,11 @@ typedef struct {
     struct BoundTrack *btrack, *btrack2;
     const char *bound_xfile, *bound_yfile;   /* -boundx / -boundy (the high-precision path writes them itself) */
     int bound_prec;          /* -boundprec: the precision of the lambda_min checks of the bound mode beyond double (-1 auto, 0 off, > 0 bits) */
-    int bound_prior;         /* -boundprior: when the margin check fails, a bound from a-priori bounds of the other side (1, default; 0 off) */
+    int bound_prior;         /* -boundprior: when the margin check fails, a bound from a-priori bounds of the other side (1, default; 0 off; 2 first, on the returned point, a certificate only when it fails) */
     int soc;                 /* 5.16: semidefinite blocks with arrow data as second-order cones in the embedding: 1 on (default), 0 off */
     int soc_minn;            /* ... blocks of at least this order (3) */
+    int conesolver;          /* 26 October 2026: 1 (default) a problem whose semidefinite blocks are all of order 1 or 2 or
+                              * have arrow data (a second-order cone program) is solved by the SOCP solver; 0 by this one */
     const int *xcone;        /* 23 October 2026, internal (main.c): per block of the problem solved, its hub when brisk_solve is to
                               * return X of this block (arrow data) as its cone vector (x_0 = tr X, x_t = 2 X_{hub, t-th other index}),
                               * not as the dense n x n completion; -1 otherwise; NULL: none */
@@ -477,6 +500,9 @@ typedef struct {
     /* the candidate before its margin was restored (NULL when nothing moved it), and its value:
      * the a-priori route can certify it when the restoration gave away part of the objective */
     double **X0; double *y0; double value0, resid0, lammin0;
+    /* -boundprior 2: certified by the a-priori route on the returned point before any
+     * certificate was built (no X, y here; main.c then certifies that point) */
+    int prior_first;
 } BoundCert;
 
 #define ST_OPTIMAL 0
@@ -548,6 +574,9 @@ static inline size_t clique_off(const CliqueTab *T, int a, int b) {
 }
 long schol_uid(const SChol *S);
 void schol_set_tinypiv(SChol *S, double t);
+void schol_set_tinyreg(double eps);      /* (test) a tiny pivot replaced by eps times its original diagonal, its column kept */
+void schol_set_tinyflags(SChol *S, int on);   /* the columns whose tiny pivots a factorization regularized: flagged (on) */
+int schol_tiny_rows(const SChol *S, int *rows, int kmax);   /* their original indices; returns their number */
 void schol_set_dynpiv(SChol *S, double p);       /* signed factorization: wrong-sign pivots replaced by sign * p */
 int schol_ndyn(const SChol *S);
 int schol_ntiny(const SChol *S);
@@ -621,6 +650,7 @@ int  dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const P
                 int maxit, double tol, int verbose, brisk_dd_measure meas, void *mctx, double bar);
 void   dict_free(Block *B);
 void params_default(Params *par);
+int  params_maxit_is_budget(const Params *p);   /* an iteration limit below the default: the user's budget, no re-solve after it */
 void params_accuracy(Params *par, int level);
 void tracebound_add(Problem *P, double R);   /* 4.30: sum tr(X_k) + s = R as the last row / block */   /* -acc: 0 low, 1 default, 2 high */
 int  brisk_solve(Problem *P, const Params *par, Result *res, double *yout, double **Xout);
@@ -628,6 +658,7 @@ int  brisk_solve(Problem *P, const Params *par, Result *res, double *yout, doubl
  * replaced it, ...), in the layout of yout and Xout, with its Result and what it is. 1 and the arrays (the caller's:
  * Xout's block count) when there is one */
 int  brisk_alt_take(Result *R, double **y, double ***X, const char **what);
+int  brisk_bpt_take(double **y, double ***X);   /* (27 October 2026) the method's iterate before the polishes, for the bound */
 void brisk_alt_clear(void);
 double wtime(void);
 #include <signal.h>
@@ -786,9 +817,9 @@ double blkscale_probe(const Problem *P);   /* the spread -blkscale -2 would appl
 extern int g_blkscale_off;
 extern double g_blkscale_min;
 extern double g_blkscale_cap;   /* -blkscale 2: each factor within [1/cap, cap] */
-void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose);   /* 4.30 */
+void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose, const int *xc);   /* 4.30; xc: Xo's cone-vector blocks (NULL: none) */
 void free_elim_free(PSFreeElim *F);
-void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile);
+void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile, const int *xc);
 PSOrig *ps_orig_build(const Problem *P);
 /* 4.32 symmetry reduction (symred.c): generators of the automorphism group -> constraint orbits aggregated */
 typedef struct { int k, t, d, n, lp, p, rblk; double *W; } SymBlk;   /* rblk: block of the reduced problem; lp: a 1 x 1 piece kept as LP variable p of block lpblk */   /* 4.33: reduced block of type t (-1: LP) of file block k: d copies (the dimension of the irreducible), size n; W: d matrices n_k x n */
@@ -894,6 +925,7 @@ typedef struct {
 } PSResult;
 void    postsolve_set_time_left(double left);   /* the seconds the run has left (INFINITY: no limit); main.c, before postsolve */
 int  ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res);   /* 4.30: errors of (Xo, yo) on O */
+int  ps_measure_xc(const PSOrig *O, double **Xo, const double *yo, PSResult *res, const int *xc);   /* ... with Xo's cone-vector blocks (xc, NULL: none) */
 int  ps_infeas_check(const PSOrig *O, double **Xo, const double *yo, int status, double *obj, double *viol, const int *xc);   /* 5.8: is the point a certificate of the infeasibility verdict (1), not (0), none (-1); xc: the cone-vector blocks of Xo (NULL: none) */
 /* Map (X_red, y_red) back, recover y of removed constraints, measure everything on O.
  * Xo[k]: n_k x n_k (SDP) or n_k (LP) arrays for the original blocks, allocated here
@@ -908,11 +940,17 @@ static inline int xc_index(int h, int t) { return t == 0 ? h : (t - 1 < h ? t - 
 void    xc_complete(int n, int h, const double *x, double *X);              /* the dense completion (n x n, column major) */
 void    xc_of_dense(int n, int h, const double *X, double *x);              /* the cone vector of a dense X (tr X, 2 X_{h, i_t}) */
 double  xc_lammin_x(int n, const double *x);                                 /* lambda_min of the completion, at most 0 */
+double  xc_entry_f(int n, const double *x);                                  /* the factor of xc_entry for the block's vector x */
+double  xc_entry(int n, int h, const double *x, double f, int i, int j);    /* the completion's entry (i, j), without forming it */
 int     xc_expand(const PSOrig *O, double **Xo, int *xc);                    /* every cone-vector block of Xo to its dense completion (xc
                                                                               * reset to -1); 0, or 1 when memory failed */
-int     ps_arrow_hub(const PSOrig *O, int o, const int *kept);               /* the hub of O's block o when its data (C and the rows
-                                                                              * with kept[i], all when kept is NULL) are arrow matrices, or -1 */
+int     ps_arrow_hubs(const PSOrig *O, const int *kept, int *hub);          /* hub[o]: the hub of O's block o when its data (C and the
+                                                                              * rows with kept[i], all when kept is NULL) are arrow matrices,
+                                                                              * or -1; one pass over the data. 0, or 1 when memory failed */
+int     brisk_problem_as_socp(const Params *par, const Problem *P);       /* solver.c: brisk_solve gives P to the SOCP solver (its
+                                                                              * semidefinite blocks all of order 1 or 2 or arrow blocks) */
 int     brisk_arrow_hub(const Block *B);                                     /* solver.c: the hub of a block with arrow data, or -1 */
+int     brisk_block_as_cone(const Params *par, const Block *B);              /* solver.c: brisk_solve takes this block as a second-order cone */
 extern int g_xcone_accept;    /* the caller maps cone-vector blocks itself (sedumi.c): the library result keeps them as vectors */
 extern int *g_xcone_res;      /* ... and then, per block of the result's X, the hub of a cone-vector block or -1 (NULL: none) */
 double  ps_lammin(int n, const double *M, double *work);
@@ -1030,6 +1068,7 @@ void brisk_spotrs1(int n, const float *L, int lda, float *x);
 void brisk_dpotrsk(int n, int k, const double *L, int lda, double *X, int ldx);   /* 5.12: k right-hand sides, L read once */
 void brisk_spotrsk(int n, int k, const float *L, int lda, float *X, int ldx);
 void brisk_threads_init(void);
+int brisk_blas_unreproducible(void);   /* 27 October 2026: MKL without its reproducible mode, which could not be set (ISSUES 708) */
 void brisk_threads_restore(void);
 #define XTRI_BASE 8
 /* B (m x nb, ld ldb) := L^{-1} B, L m x m */

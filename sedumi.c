@@ -441,7 +441,9 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
 #ifdef BRISK_LIBRARY
         socp_printf = brisk_printf;
 #endif
-        socp_stop = (volatile int *)&brisk_stop_flag;
+        /* (28 October 2026: only when no caller has set its own flag; the LP method's interior-point route sets one and could
+         * not stop this solve when its dual simplex had finished first) */
+        if (socp_stop == socp_stop_never()) socp_stop = (volatile int *)&brisk_stop_flag;
         /* (20 October 2026, LP/SOCP: a linear program in this form (no cones) folded by the coarsest equitable partition,
          * as the LP method's path (IMPLEMENTATION 26.8); the interfaces' linear programs and the LP method's fallback
          * come here. BRISK_LPNOFOLD=1 turns it off.) */
@@ -558,8 +560,10 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
     free(T);
     BriskData D = { m, nblk, bs, P->b, nt, tm, tb, ti, tj, tv };
     BriskResult B; memset(&B, 0, sizeof B);
-    char **av = (char **)malloc(sizeof(char *) * ((size_t)argc + 1)); int ac = 0;      /* the options without -conesolver */
-    for (int i = 0; i < argc; i++) { if (argv[i] && !strcmp(argv[i], "-conesolver") && i + 1 < argc) { i++; continue; } av[ac++] = argv[i]; }
+    /* (26 October 2026: -conesolver is passed on: the semidefinite solver gives a problem whose blocks are all cones in
+     * disguise to the SOCP solver unless -conesolver 0; until then the option was taken out here) */
+    char **av = (char **)malloc(sizeof(char *) * ((size_t)argc + 1)); int ac = 0;
+    for (int i = 0; i < argc; i++) av[ac++] = argv[i];
     /* 23 October 2026: the cones' blocks come back as their cone vectors when the solve kept them so (main.c, g_xcone_res):
      * no n x n completion of a cone of order 17,012 (the owner's dg3d_1000, SDP with SOCP) only to read its trace and
      * first row here */

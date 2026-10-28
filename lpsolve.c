@@ -56,6 +56,17 @@ double schol_set_amalg(double f);
 int schol_set_amalg_siblings(int on);
 
 static double lp_time(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+/* (26 October 2026) the solve's deadline (lp_time seconds, 0: none) and stop flag, for the analysis before the iterations:
+ * the estimates of the forms and of the dense columns' choices (AMD's counts) looked at neither, and the estimate of a
+ * large LP's primal form took 23 s past a time limit of 10 s (opm2-z12-s8, the mixed-integer developer's first LP).
+ * Set by lpipm_solve on its thread, taken over by the threads of the dense-column choice, handed to AMD (amd_2.c) */
+static __thread double ne_dl = 0;
+static __thread const volatile int *ne_stopf = NULL;
+#ifdef HAVE_AMD
+extern __thread double brisk_amd_deadline;
+extern __thread const volatile int *brisk_amd_stop;
+#endif
+static int ne_expired(void) { return (ne_stopf && *ne_stopf) || (ne_dl > 0 && lp_time() > ne_dl); }
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP solver)\n"); exit(1); } return p; }
 static void *xz(size_t n) { void *p = calloc(1, n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP solver)\n"); exit(1); } return p; }
 static double dot(int n, const double *a, const double *b) { double s = 0; for (int i = 0; i < n; i++) s += a[i] * b[i]; return s; }
@@ -131,7 +142,12 @@ static void At_mul(const LpS *S, const double *y, double *x) {          /* x = A
  * they too are the same at any thread count (and below LPV_MIN columns everything is as before). BRISK_LPVPAR=0: one
  * thread (the chunked sums kept). */
 #define LP_NDMAX 2048       /* the most columns kept apart from the factor when the cost model chooses them */
-#define LPV_MIN 100000
+/* (27 October 2026) from 20,000 columns, before 100,000: the interior-point method alone 4-10 % faster on LPs of 20,000 to
+ * 100,000 columns (pds-20, LP: 2.87 -> 2.57 s; pds-10, ken-18, cre-b, pilot87 alike), the race of the methods unchanged
+ * (Kennington 0.98 and 0.99 in two runs; 1.004 on the 237 MIPLIB relaxations, 0.999 on the 26 it touches).
+ * BRISK_LPVMIN=k: from k columns */
+static int lpv_min(void) { static int v = -1; if (v < 0) { const char *e = getenv("BRISK_LPVMIN"); v = e ? atoi(e) : 20000; } return v; }
+#define LPV_MIN lpv_min()
 #define LPV_CH 16384
 static int lpv_par(const LpS *S) {
     static int on = -1; if (on < 0) { const char *e = getenv("BRISK_LPVPAR"); on = e ? atoi(e) : 1; }
@@ -479,6 +495,7 @@ static double ne_dense_choice(int m, int n, const int *Ap, const int *Ai, const 
 static double ne_iter_cost_of(const LpS *S);   /* (an iteration's cost by ne_iter_cost on S's analysis) */
 static int ne_setup(LpS *S, int usedense) {
     const int m = S->m, n = S->n, nz = S->Ap[n];
+    if (ne_expired()) return 1;        /* (26 October 2026: past the time limit, or stopped: no analysis) */
     /* (25 October 2026) an estimate under a shared cap (the dense-column choice): its value now as the budget of the checks
      * on the pattern below (the bounds w^2 / m and the pattern's growth), which come before AMD's own stop at the cap:
      * savsched1's dual form (LP), the default rule's pattern alone took most of 46 s */
@@ -561,12 +578,18 @@ static int ne_setup(LpS *S, int usedense) {
             for (int p = S->Rq[q] + 1; p < S->Ap[j + 1]; p++) { const int k = S->Ai[p]; if (mark[k] != i) { mark[k] = i; Mi[w++] = k; } }
         }
         if ((double)w > wcap) { for (int r = i + 1; r <= m; r++) S->Mp[r] = (int)w; S->Mi = Mi; free(mark); S->est_lb = (double)w * (double)w / m; S->est_w = w; return 0; }
+        /* (28 October 2026, the night) an estimate stopped by the caller's flag or the deadline, here too (as AMD's count is,
+         * est_st 3 below): neos-5106984-jizera (LP), the dual form's pattern took seconds after the dual simplex method
+         * beside it had its result, and the run waited 5.8 s for it */
+        if (S->est && (i & 4095) == 4095 && ne_expired()) { for (int r = i + 1; r <= m; r++) S->Mp[r] = (int)w; S->Mi = Mi; free(mark); S->est_lb = 1e300; S->est_w = (long)1 << 62; return 0; }
     }
     S->Mp[m] = (int)w; S->Mi = Mi;
     free(mark);
     /* (a cost estimate against a budget: the factor has at least the w entries of the pattern, so by Cauchy-Schwarz
      * its factorization costs at least w^2 / m flops; above the budget the ordering is not made) */
     if (S->est && S->est_budget > 0 && (double)w * (double)w / m > S->est_budget) { S->est_lb = (double)w * (double)w / m; S->est_w = w; return 0; }
+    /* (28 October 2026, the night) stopped meanwhile: no adjacency, no ordering (neos-5106984-jizera, LP, above) */
+    if (S->est && ne_expired()) { S->est_lb = 1e300; S->est_w = (long)1 << 62; return 0; }
     int *deg = xz(sizeof(int) * (m + 1)), **nbr = xm(sizeof(int *) * (m + 1));
     for (int i = 0; i < m; i++) for (int e = S->Mp[i] + 1; e < S->Mp[i + 1]; e++) { deg[i]++; deg[Mi[e]]++; }
     int *pool = xm(sizeof(int) * (2 * (w - m) + 1));
@@ -584,9 +607,21 @@ static int ne_setup(LpS *S, int usedense) {
          * the count so far is then a lower bound, as the budget's other exits give one */
         volatile double capb = S->est_budget > 0 ? S->est_budget : 0;
         const volatile double *cap = S->est_cap ? S->est_cap : S->est_budget > 0 ? &capb : NULL;
-        if (S->est && estamd && schol_amd_estimate_cap(m, deg, nbr, cap, &efl, &enz) != 1) {
+#ifdef HAVE_AMD
+        brisk_amd_deadline = ne_dl; brisk_amd_stop = ne_stopf;
+#endif
+        const double tdbg0 = lp_time();
+        const int est_st = S->est && estamd ? schol_amd_estimate_cap(m, deg, nbr, cap, &efl, &enz) : 1;
+#ifdef HAVE_AMD
+        brisk_amd_deadline = 0; brisk_amd_stop = NULL;
+#endif
+        if (getenv("BRISK_LPDBG")) printf("     [ne_setup %d: the pattern %ld entries; AMD's count %.3fs, status %d]\n", m, w, lp_time() - tdbg0, est_st);
+        if (est_st != 1) {
             free(deg); free(nbr); free(pool);
-            S->est_lb = efl; S->est_w = (long)enz;
+            /* (26 October 2026) stopped by the clock or the stop flag (3): its count is no lower bound worth using (an
+             * estimate stopped early counts few flops and was chosen: opm2-z12-s8's primal form at 7.85e8 against the
+             * dual's 7.85e10, whose real analysis then took 147 s); the form or choice costs "too much" */
+            S->est_lb = est_st == 3 ? 1e300 : efl; S->est_w = est_st == 3 ? (long)1 << 62 : (long)enz;
             return 0;
         }
     }
@@ -615,7 +650,11 @@ static int ne_setup(LpS *S, int usedense) {
      * priced the factor with 271 columns of 50 to 2,700 entries in it, a sparse pattern whose factor is nearly full, to
      * find 2.65e12 flops against the other choice's 4.3e9: 13 s of its 14 s, the solve 0.03 s */
     if (S->est && S->est_budget > 0) schol_set_flopcap(S->est_budget);
+    /* (28 October 2026) the stop flag to the dissection (nd.c): stopped, it gives way to AMD's order at once (satellites2-25,
+     * LP: the dual simplex method beside it had won after 2.1 s, and this analysis ran on for 11 s) */
+    { extern void nd_set_stop(const volatile int *f); nd_set_stop(ne_stopf); }
     S->sc = schol_analyze_adj(m, deg, nbr, lp_fillcap());
+    { extern void nd_set_stop(const volatile int *f); nd_set_stop(NULL); }
     if (S->est && S->est_budget > 0) schol_set_flopcap(0);
     schol_set_amalg(oa); schol_set_amalg_siblings(osib);
     schol_set_nd(0);
@@ -829,6 +868,11 @@ static int lpipm_core(int m, int n, int nfree, const int *Ap0, const int *Ai0, c
     if (ne_setup(S, getenv("BRISK_LPNODENSE") ? 0 : 1)) { lps_free(S); info->status = 4; snprintf(info->why, sizeof info->why, "the factor of the normal equations does not fit"); return 4; }
     SChol *F = S->sc;
     info->lnz = (long)schol_nnz(F); info->ndense = S->nd;
+    /* (28 October 2026) stopped during the analysis (the simplex method beside it has won): no starting point */
+    if (ne_stopf && *ne_stopf) {
+        if (getenv("BRISK_LPDBG")) printf("   [LP: stopped after the analysis: copy %.3fs, scaling %.3fs, pattern and analysis %.3fs]\n", tph0 - t0, tph1 - tph0, lp_time() - tph1);
+        lps_free(S); info->status = 6; snprintf(info->why, sizeof info->why, "stopped"); return 6;
+    }
     if (opt->analyzed) {
         if (opt->analyzed(opt->analyzed_ctx, ne_iter_cost_of(S))) { lps_free(S); info->status = 6; snprintf(info->why, sizeof info->why, "declined"); return 6; }
     }
@@ -1452,12 +1496,16 @@ static void ne_cost(int m, int n, const int *Ap, const int *Ai, const double *Ax
      * (the same threshold and budget; a chosen candidate was below its budget, so its estimate is exact) was made
      * again here (irish-electricity, LP: 0.38 s of the default rule's analysis repeated). BRISK_LPNECHOICE=0: again */
     LpNeCost Ch; Ch.ok = -1;
+    const double tq0 = lp_time();
     const double thr = ne_dense_choice(m, n, Ap, Ai, Ax, 0, budget, &Ch);
+    if (getenv("BRISK_LPDBG")) printf("     [ne_cost %d x %d: the dense-column choice %.3fs (its estimate %s)]\n", m, n, lp_time() - tq0, Ch.ok >= 0 ? "taken" : "none");
     if (Ch.ok >= 0 && !(getenv("BRISK_LPNECHOICE") && atoi(getenv("BRISK_LPNECHOICE")) == 0)) { *C = Ch; C->dthr = thr; return; }
     LpS T; memset(&T, 0, sizeof T); T.m = m; T.n = n; T.est = 1; T.est_budget = budget; T.dthr = thr;
     C->dthr = T.dthr;
     T.Ap = (int *)Ap; T.Ai = (int *)Ai; T.Ax = (double *)Ax;
+    const double tq1 = lp_time();
     C->ok = ne_setup(&T, 1) == 0;
+    if (getenv("BRISK_LPDBG")) printf("     [ne_cost %d x %d: the analysis %.3fs (ok %d, a lower bound %.3g)]\n", m, n, lp_time() - tq1, C->ok, T.est_lb);
     C->dnz = ne_dense_nnz(&T);
     if (C->ok && T.est_lb > 0) { C->flops = T.est_lb; C->lnz = (double)T.est_w; C->nd = T.nd; T.Ap = NULL; T.Ai = NULL; T.Ax = NULL; lps_free(&T); return; }
     C->flops = C->ok ? schol_flops(T.sc) : 1e300; C->lnz = C->ok ? (double)schol_nnz(T.sc) : 1e300; C->nd = T.nd;
@@ -1472,6 +1520,10 @@ static void ne_cost(int m, int n, const int *Ap, const int *Ai, const double *Ax
  * form (53,824 rows, 232 columns of 231 entries apart) was priced at 2.4e10 flops an iteration against the primal's
  * 3.4e9, where Gurobi's barrier takes that dual form with a factor of 3e7 operations) */
 static double ne_iter_cost(const LpNeCost *C, int m, long nnz) {
+    /* (28 October 2026, the night) an estimate that did not complete costs "too much": its other fields may never have
+     * been set (the dense-column choice's estimates stopped by the deadline before they began), and they were read: a form
+     * priced at -8.55e20 flops, z26 (LP) with a time limit that expired in the analysis */
+    if (!C->ok) return 1e300;
     const double nd = C->nd;
     /* (each solve's correction: a pass over V or a second solve, whichever is cheaper, as ne_setup chooses) */
     const double corr = nd > 0 ? fmin(4.0 * nd * m, 4.0 * C->lnz + 2.0 * C->dnz) : 0.0;
@@ -1570,9 +1622,12 @@ static double ne_dense_choice(int m, int n, const int *Ap, const int *Ai, const 
      * estimate counted 4.8e14 flops in 48 s after the best candidate had shown 5.6e10. BRISK_LPDCCAP=0: no shared caps */
     static int dccap = -1; if (dccap < 0) { const char *e_ = getenv("BRISK_LPDCCAP"); dccap = !(e_ && atoi(e_) == 0); }
     volatile double cap0 = budget > 0 ? budget : 0, capc = bud;
+    const double dl0 = ne_dl; const volatile int *sf0 = ne_stopf;
     #pragma omp parallel for num_threads(npar) schedule(dynamic, 1) if (npar > 1)
     for (int k = 0; k < ntask; k++) {
         const int c = npar > 1 ? ntask - 1 - k : k;   /* (on the threads the default rule's first: it may take the longest) */
+        ne_dl = dl0; ne_stopf = sf0;
+        if (ne_expired()) { LpNeCost *E = c == nc ? &C0 : &Cc[c]; E->ok = 0; E->flops = E->lnz = 1e300; E->nd = 0; E->dnz = 0; E->dthr = 0; if (c != nc) cc[c] = 1e300; continue; }
         if (c == nc) {
             ne_cost_thr(m, n, Ap, Ai, Ax, &C0, budget, 0.0, dccap ? &cap0 : NULL);
             if (dccap && C0.ok) {
@@ -1700,24 +1755,51 @@ static int lp_dual_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
          * (a sparse quantile regression 30,000 x 501: the primal's analysis took 22-55 s for a solve of 0.27 s); and its
          * ordering is not made when its pattern alone shows that it costs more (ne_setup's budget) */
         LpNeCost P, D;
-        const double tds1 = lp_time();
-        ne_cost(m2, n2, Bp, Bi, Bx, &D, 0.0);
-        const double tds2 = lp_time();
-        cd = ne_iter_cost(&D, m2, nz2); dthr_d = D.dthr > 0 ? D.dthr : -1.0;
-        double lbp = 0;
+        /* the assembly of each form's normal equations, a lower bound on its iteration (its sparse columns' len (len + 1) / 2
+         * multiply-adds) and on its estimate's work (the pattern) */
+        double lbp = 0, lbd = 0;
         {   const double avg = (double)nnz / fmax(n, 1), thr = fmax(fmax(50.0, 10.0 * avg), 0.1 * m);
             int ndn = 0; for (int j = 0; j < n; j++) if (m >= 500 && Ap[j + 1] - Ap[j] > thr) ndn++;
             const int usedn = ndn > 0 && ndn <= 400 && ndn < n / 4;
             for (int j = 0; j < n; j++) { const double l = Ap[j + 1] - Ap[j]; if (!(usedn && l > thr)) lbp += 0.5 * l * (l + 1); } }
-        P.dthr = 0;
-        if (D.ok && lbp > 2.0 * cd) { P.ok = 0; cp = lbp; }
-        else {
-            int *Ai1 = xm(sizeof(int) * (nnz + 1)); double *Ax1 = xm(sizeof(double) * (nnz + 1));
+        {   const double avg = (double)nz2 / fmax(n2, 1), thr = fmax(fmax(50.0, 10.0 * avg), 0.1 * m2);
+            int ndn = 0; for (int j = 0; j < n2; j++) if (m2 >= 500 && Bp[j + 1] - Bp[j] > thr) ndn++;
+            const int usedn = ndn > 0 && ndn <= 400 && ndn < n2 / 4;
+            for (int j = 0; j < n2; j++) { const double l = Bp[j + 1] - Bp[j]; if (!(usedn && l > thr)) lbd += 0.5 * l * (l + 1); } }
+        /* (28 October 2026, the night; ISSUES 621) the form whose bound is smaller first, the other under the budget the rule
+         * below sets from it (the dual is chosen at most half the primal's cost: the primal under twice the dual's, the dual
+         * under half the primal's); the choice is the same in either order, only the work of the losing estimate differs.
+         * The dual's first, unbounded, took 5.4 s of neos-5106984-jizera (LP) and most of z26's 27.5 s, whose primal estimates
+         * were cheap. On the 17 LPs where the choice of form has mattered (formorder2, the interior-point method alone, no
+         * time limit): the same choice on every one, the estimates of savsched1 68.9 -> 7.6 s and of jizera 32.4 -> 27.2 s, the
+         * others within 0.6 s. BRISK_LPFORMORDER=0: the dual's first, as before */
+        static int ford = -1; if (ford < 0) { const char *e_ = getenv("BRISK_LPFORMORDER"); ford = !(e_ && atoi(e_) == 0); }
+        const int pfirst = ford && lbp < lbd;
+        int *Ai1 = NULL; double *Ax1 = NULL;
+        const double tds1 = lp_time();
+        P.dthr = 0; P.ok = 0; D.ok = 0; D.dthr = 0;
+        if (pfirst) {
+            Ai1 = xm(sizeof(int) * (nnz + 1)); Ax1 = xm(sizeof(double) * (nnz + 1));
             memcpy(Ai1, Ai, sizeof(int) * nnz); memcpy(Ax1, Ax, sizeof(double) * nnz); sort_cols(n, Ap, Ai1, Ax1);
-            ne_cost(m, n, Ap, Ai1, Ax1, &P, D.ok ? 2.0 * cd : 0.0); free(Ai1); free(Ax1);
+            ne_cost(m, n, Ap, Ai1, Ax1, &P, 0.0); free(Ai1); free(Ax1);
             cp = ne_iter_cost(&P, m, nnz);
+            if (P.ok && lbd > 0.5 * cp) { D.ok = 0; cd = lbd; }
+            else { ne_cost(m2, n2, Bp, Bi, Bx, &D, P.ok ? 0.5 * cp : 0.0); cd = ne_iter_cost(&D, m2, nz2); }
+            dthr_d = D.ok && D.dthr > 0 ? D.dthr : -1.0;
+        } else {
+            ne_cost(m2, n2, Bp, Bi, Bx, &D, 0.0);
+            cd = ne_iter_cost(&D, m2, nz2); dthr_d = D.dthr > 0 ? D.dthr : -1.0;
+            if (D.ok && lbp > 2.0 * cd) { P.ok = 0; cp = lbp; }
+            else {
+                Ai1 = xm(sizeof(int) * (nnz + 1)); Ax1 = xm(sizeof(double) * (nnz + 1));
+                memcpy(Ai1, Ai, sizeof(int) * nnz); memcpy(Ax1, Ax, sizeof(double) * nnz); sort_cols(n, Ap, Ai1, Ax1);
+                ne_cost(m, n, Ap, Ai1, Ax1, &P, D.ok ? 2.0 * cd : 0.0); free(Ai1); free(Ax1);
+                cp = ne_iter_cost(&P, m, nnz);
+            }
         }
-        if (getenv("BRISK_LPDBG")) printf("   [the forms' costs: the dual built %.3fs, its estimate %.3fs, the primal's %.3fs]\n", tds1 - tds0, tds2 - tds1, lp_time() - tds2);
+        const double tds2 = lp_time();
+        if (getenv("BRISK_LPDBG")) printf("   [the forms' costs: the dual built %.3fs, the estimates %.3fs (the %s first; bounds %.3g and %.3g); dual: ok %d flops %.3g lnz %.3g nd %d dnz %.3g; primal: ok %d flops %.3g lnz %.3g nd %d dnz %.3g]\n",
+                                          tds1 - tds0, tds2 - tds1, pfirst ? "primal's" : "dual's", lbp, lbd, D.ok, D.ok ? D.flops : cd, D.ok ? D.lnz : 0.0, D.ok ? D.nd : 0, D.ok ? D.dnz : 0.0, P.ok, P.ok ? P.flops : cp, P.ok ? P.lnz : 0.0, P.ok ? P.nd : 0, P.ok ? P.dnz : 0.0);
         /* the dual when it costs at most half: the primal is the form the method is tuned on, and its free
          * variables (the dual's free y) enter both as a proximal term */
         choose = D.ok && cd <= 0.5 * cp;
@@ -1783,7 +1865,7 @@ static int lp_dual_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
  * only a guide: the sums are verified before the fold is taken. BRISK_LPNOFOLD=1 turns it off. */
 static uint64_t fold_mix(uint64_t x) { x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull; return x ^ (x >> 31); }
 static uint64_t fold_dbl(double v) { uint64_t u; if (v == 0.0) v = 0.0; memcpy(&u, &v, 8); return fold_mix(u); }
-static const uint64_t *fold_keys_g;
+static _Thread_local const uint64_t *fold_keys_g;   /* (per thread: the comparator's keys, ISSUES 454) */
 static int fold_cmp(const void *a, const void *b) { const uint64_t ka = fold_keys_g[*(const int *)a], kb = fold_keys_g[*(const int *)b]; return ka < kb ? -1 : ka > kb ? 1 : (*(const int *)a < *(const int *)b ? -1 : 1); }
 /* classes 0..k-1 by increasing key; returns k */
 static int fold_relabel(int n, const uint64_t *keys, int *cls, int *idx) {
@@ -2075,7 +2157,7 @@ int lp_fold_quotient(int m, int n, int nfree, const int *Ap, const int *Ai, cons
  * columns of each row. Every restricted LP is made feasible by two elastic columns per row (+e_i and -e_i at the cost
  * M = 1e3 (1 + max |c|)); they are zero at the end unless the LP is infeasible or its duals exceed M, and then the
  * whole LP is solved. Returns -1 when not taken or given up (the caller solves the whole LP). */
-static const double *g_sift_rc;
+static _Thread_local const double *g_sift_rc;   /* (per thread, ISSUES 454) */
 static int sift_cmp(const void *a, const void *b) { const double x = g_sift_rc[*(const int *)a], y = g_sift_rc[*(const int *)b]; return x < y ? -1 : x > y ? 1 : (*(const int *)a < *(const int *)b ? -1 : 1); }
 static int lp_sift_solve(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
                          const LpIpmOpts *opt, double *xout, double *yout, double *zout, LpIpmInfo *info) {
@@ -2211,8 +2293,18 @@ static int lp_sift_solve(int m, int n, int nfree, const int *Ap, const int *Ai, 
     return st;
 }
 
+static int lpipm_solve_in(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
+                          const LpIpmOpts *opt, double *x, double *y, double *z, LpIpmInfo *info);
 int lpipm_solve(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
                 const LpIpmOpts *opt, double *x, double *y, double *z, LpIpmInfo *info) {
+    const double dl = ne_dl; const volatile int *sf = ne_stopf;
+    ne_dl = opt && opt->timelimit > 0 ? lp_time() + opt->timelimit : 0; ne_stopf = opt ? opt->stop : NULL;
+    const int st = lpipm_solve_in(m, n, nfree, Ap, Ai, Ax, b, c, u, opt, x, y, z, info);
+    ne_dl = dl; ne_stopf = sf;
+    return st;
+}
+static int lpipm_solve_in(int m, int n, int nfree, const int *Ap, const int *Ai, const double *Ax, const double *b, const double *c, const double *u,
+                          const LpIpmOpts *opt, double *x, double *y, double *z, LpIpmInfo *info) {
     /* (18 October 2026: the busy-machine rule of the other engines, solver.c: only the free cores; restored on return) */
 #ifdef _OPENMP
     const int ntb = omp_in_parallel() ? -1 : brisk_threads_busy(0);

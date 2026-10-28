@@ -304,6 +304,22 @@ void problem_from_trips(Problem *P, int m, int nblk, const int *bsz, const doubl
 /* 4.37: the problem from the numbers of an SDPA file held in memory (the library interface,
  * brisk_run_data). The same checks and the same result as read_sdpa on the file those
  * numbers would make: C = -F0, entries below the diagonal swapped, zeros skipped. */
+/* 26 October 2026 (ISSUES 292): a semidefinite block above g_read_maxn (46,340: an n x n index in a 32-bit integer) is
+ * accepted only when its data are arrow matrices, a second-order cone written as a block, and the caller takes such
+ * blocks back as cone vectors (g_xcone_accept: SeDuMi's K.q, sedumi.c): it is solved as a cone and kept as its cone
+ * vector to the output, never formed as an n x n matrix (a long cone of order 60,000-100,000 was rejected). Any other
+ * such block is refused as before. 0, or -1 with the message */
+int brisk_arrow_hub(const Block *B);
+static int big_blocks_ok(const Problem *P) {
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_SDP || B->n <= g_read_maxn) continue;
+        if (g_xcone_accept && brisk_arrow_hub(B) >= 0) continue;
+        fprintf(stderr, "brisk: SDP block %d of size %d exceeds the supported maximum (46340; larger only for a second-order cone given in the SeDuMi format and solved as a cone by the interior-point method in double precision; -lralm has no such limit)\n", k + 1, B->n);
+        return -1;
+    }
+    return 0;
+}
 int problem_from_sdpa_data(const BriskData *d, Problem *P) {
     memset(P, 0, sizeof(*P));
     const int m = d->m, nblk = d->nblk;
@@ -322,10 +338,7 @@ int problem_from_sdpa_data(const BriskData *d, Problem *P) {
         }
         P->blk[k].type = s < 0 ? BLK_LP : BLK_SDP;
         P->blk[k].n = abs(s);
-        if (P->blk[k].type == BLK_SDP && P->blk[k].n > g_read_maxn) {
-            fprintf(stderr, "brisk: SDP block %d of size %d exceeds the supported maximum (46340; -lralm has no such limit)\n", k + 1, P->blk[k].n);
-            goto bad;
-        }
+        /* (26 October 2026, ISSUES 292: a larger block is checked once its data are read, big_blocks_ok) */
     }
     P->b = xmalloc(sizeof(double) * (m ? m : 1));
     P->b0 = xmalloc(sizeof(double) * (m ? m : 1));
@@ -364,6 +377,7 @@ int problem_from_sdpa_data(const BriskData *d, Problem *P) {
     }
     build_blocks(P, T, nt, lower_entries);
     free(T);
+    if (big_blocks_ok(P)) { problem_free(P); memset(P, 0, sizeof(*P)); return -1; }
     return 0;
 bad:
     fprintf(stderr, "brisk: invalid problem data\n");
@@ -428,10 +442,7 @@ int read_sdpa(const char *fname, Problem *P) {
         int s = (int)v;
         P->blk[k].type = s < 0 ? BLK_LP : BLK_SDP;
         P->blk[k].n = abs(s);
-        if (P->blk[k].type == BLK_SDP && P->blk[k].n > g_read_maxn) {
-            fprintf(stderr, "brisk: SDP block %d of size %d exceeds the supported maximum (46340; -lralm has no such limit)\n", k + 1, P->blk[k].n);
-            goto bad;
-        }
+        /* (26 October 2026, ISSUES 292: a larger block is checked once its data are read, big_blocks_ok) */
     }
     P->b = xmalloc(sizeof(double) * m);
     P->b0 = xmalloc(sizeof(double) * m);
@@ -520,9 +531,13 @@ int read_sdpa(const char *fname, Problem *P) {
     free(buf);
     build_blocks(P, T, nt, lower_entries);
     free(T);
+    if (big_blocks_ok(P)) { problem_free(P); memset(P, 0, sizeof(*P)); return -1; }
     return 0;
 bad:
-    fprintf(stderr, "brisk: malformed SDPA file %s\n", fname);
+    /* (28 October 2026) the format is chosen by the name: a file of another kind under another name reached this reader
+     * (an LP named .mps.gz did, before that name was read as MPS) and was called a malformed SDPA file */
+    fprintf(stderr, "brisk: malformed SDPA file %s (the format is chosen by the file name: .mps, .mps.gz, .sif for an LP, .qps for a "
+                    "QP, .cbf, .cbf.gz for a conic program, .mat for SeDuMi data; any other name is read as SDPA, .dat-s)\n", fname);
     free(buf);
     return -1;
 }
@@ -555,8 +570,67 @@ static void sp_mulvec(const SpSym *S, const double *x, double *y, int n) {   /* 
     for (int q = 0; q < S->ef; q++) y[S->fr[q]] += S->fv[q] * x[S->fc[q]];
 }
 
-/* (22 October 2026: Wout NULL asks for the rank alone, from the eigenvalues without vectors and with no verification) */
-static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double **sigout) {
+/* 27 October 2026: the nonzero eigenpairs of a symmetric k x k matrix T (both triangles stored) of known rank r, from its
+ * range: Y = T Omega with p = r + 4 columns of a fixed pseudo-random matrix (the same at every call, so the result does
+ * not depend on the order of the calls), orthonormalized by Gram-Schmidt twice, and the eigendecomposition of U' T U, of
+ * order p. On success the first ne columns of T hold U times its eigenvectors and the ne eigenvalues are returned; NULL,
+ * with T unchanged, when U' T U does not show the rank r. */
+static long lr_range_used = 0;     /* (constraints factored by lowrank_range_eig, for BRISK_LRDBG) */
+static double *lowrank_range_eig(double *T, int k, int r, int *ne_out) {
+    const int one = 1, p = r + 4 < k ? r + 4 : k;
+    const double d1 = 1.0, d0 = 0.0;
+    double *Om = xmalloc(sizeof(double) * (size_t)k * p), *U = xmalloc(sizeof(double) * (size_t)k * p);
+    unsigned long g = 0x9E3779B97F4A7C15UL;
+    for (size_t i = 0; i < (size_t)k * p; i++) { g ^= g << 13; g ^= g >> 7; g ^= g << 17; Om[i] = (double)(g >> 11) / 9007199254740992.0 - 0.5; }
+    BL(dgemm_)("N", "N", &k, &p, &k, &d1, T, &k, Om, &k, &d0, U, &k);
+    int q = 0;
+    for (int j = 0; j < p; j++) {
+        double *uj = U + (size_t)j * k;
+        const double n0 = BL(dnrm2_)(&k, uj, &one);
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < q; i++) {
+                double c = -BL(ddot_)(&k, U + (size_t)i * k, &one, uj, &one);
+                BL(daxpy_)(&k, &c, U + (size_t)i * k, &one, uj, &one);
+            }
+        const double nj = BL(dnrm2_)(&k, uj, &one);
+        if (!(nj > 1e-10 * n0)) continue;
+        double *dst = U + (size_t)q * k;
+        for (int i = 0; i < k; i++) dst[i] = uj[i] / nj;
+        q++;
+    }
+    double *ev = NULL;
+    if (q >= r && q > 0) {
+        double *TU = Om, *Bm = xmalloc(sizeof(double) * (size_t)q * q);
+        BL(dgemm_)("N", "N", &k, &q, &k, &d1, T, &k, U, &k, &d0, TU, &k);
+        BL(dgemm_)("T", "N", &q, &q, &k, &d1, U, &k, TU, &k, &d0, Bm, &q);
+        for (int j = 0; j < q; j++)
+            for (int i = 0; i < j; i++) { const double v = 0.5 * (Bm[i + (size_t)j * q] + Bm[j + (size_t)i * q]); Bm[i + (size_t)j * q] = Bm[j + (size_t)i * q] = v; }
+        ev = xmalloc(sizeof(double) * q);
+        int lwork = -1, info;
+        double wq;
+        BL(dsyev_)("V", "U", &q, Bm, &q, ev, &wq, &lwork, &info);
+        lwork = (int)wq + 1;
+        double *work = xmalloc(sizeof(double) * lwork);
+        BL(dsyev_)("V", "U", &q, Bm, &q, ev, work, &lwork, &info);
+        free(work);
+        double emax = 0;
+        int rk = 0;
+        for (int j = 0; j < q; j++) emax = fmax(emax, fabs(ev[j]));
+        for (int j = 0; j < q; j++) if (fabs(ev[j]) > 1e-14 * emax) rk++;
+        if (info != 0 || rk != r) { free(ev); ev = NULL; }
+        else {
+            BL(dgemm_)("N", "N", &k, &q, &q, &d1, U, &k, Bm, &q, &d0, T, &k);
+            *ne_out = q;
+        }
+        free(Bm);
+    }
+    free(Om); free(U);
+    return ev;
+}
+
+/* (22 October 2026: Wout NULL asks for the rank alone, from the eigenvalues without vectors and with no verification;
+ * 27 October 2026: rhint >= 0 is that rank, known from such a call, -1 when unknown) */
+static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double **sigout, int rhint) {
     const int one = 1, want = Wout != NULL;
     double anrm = 0;
     for (int q = 0; q < S->ef; q++) anrm += S->fv[q] * S->fv[q];
@@ -626,9 +700,20 @@ static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double
             for (int i = 0; i < j; i++) { double v = 0.5 * (T[i + (size_t)j * k] + T[j + (size_t)i * k]); T[i + (size_t)j * k] = T[j + (size_t)i * k] = v; }
         free(AQ);
     }
-    /* eigendecomposition of the small matrix */
+    /* eigendecomposition of the small matrix; ne eigenpairs, the vectors in T's columns (leading dimension k) */
+    int ne = k, info = 0;
+    if (want && rhint >= 0 && k >= 2 * rhint + 8) {
+        /* 27 October 2026: the rank r is known, so only the r eigenpairs that make the factor are computed: the range of
+         * T from T Omega (r + 4 columns of a fixed pseudo-random matrix), orthonormalized, and the eigendecomposition of
+         * T projected onto it, of order r + 4: about 4 k^2 r operations instead of 9 k^3 (a control LMI, sat_roa_n64:
+         * 3,120 constraints of rank about 3 on supports of order up to 64, 1.7 s of setup with the full
+         * eigendecomposition). When the projection does not show the rank r (the range missed), the full one below. */
+        ev = lowrank_range_eig(T, k, rhint, &ne);
+        if (ev) { lr_range_used++; rank = 0; goto vectors; }
+        ne = k;
+    }
     ev = xmalloc(sizeof(double) * k);
-    int lwork = -1, info;
+    int lwork = -1;
     double wq;
     BL(dsyev_)(want ? "V" : "N", "U", &k, T, &k, ev, &wq, &lwork, &info);
     lwork = (int)wq + 1;
@@ -636,10 +721,11 @@ static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double
     BL(dsyev_)(want ? "V" : "N", "U", &k, T, &k, ev, work, &lwork, &info);
     free(work);
     if (info != 0) goto fail;
+vectors:;
     double emax = 0;
-    for (int j = 0; j < k; j++) emax = fmax(emax, fabs(ev[j]));
+    for (int j = 0; j < ne; j++) emax = fmax(emax, fabs(ev[j]));
     rank = 0;
-    for (int j = 0; j < k; j++) if (fabs(ev[j]) > 1e-14 * emax) rank++;
+    for (int j = 0; j < ne; j++) if (fabs(ev[j]) > 1e-14 * emax) rank++;
     if (!want) {    /* (the verification's 2 n random draws taken all the same: the random stream, hence every later factor, as before) */
         for (int i = 0; i < 2 * n; i++) (void)lr_rand();
         free(T); free(ev); free(Q); return rank;
@@ -649,7 +735,7 @@ static int lowrank_factor(const SpSym *S, int n, int kmax, double **Wout, double
     {
         int c = 0;
         const double d1 = 1.0, d0 = 0.0;
-        for (int j = 0; j < k; j++) {
+        for (int j = 0; j < ne; j++) {
             if (fabs(ev[j]) <= 1e-14 * emax) continue;
             BL(dgemv_)("N", &n, &k, &d1, Q, &n, T + (size_t)j * k, &one, &d0, W + (size_t)c * n, &one);
             sig[c++] = ev[j];
@@ -700,7 +786,7 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
      * 1,056 eigendecompositions with vectors, 0.56 s, for a route that is not taken) */
     const unsigned long rng0 = lr_rng;
     for (int t = 0; t < nc && ok; t++) {
-        rk[t] = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, NULL, NULL);
+        rk[t] = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, NULL, NULL, -1);
         if (rk[t] < 0) ok = 0; else R += rk[t];
         if (ok && par->lowrank < 0) {
             double lbt = cb * (nd * nd * (R + (nc - t - 1)) + nd * (double)(R + nc - t - 1) * (R + nc - t - 1));
@@ -708,17 +794,23 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
         }
     }
     double cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R;
-    double mem = 8.0 * (double)R * R;         /* single-buffer mode */
+    /* single-buffer mode; 27 October 2026: when P and Q do not fit the budget as R x R matrices (or pass 32 MB) the
+     * route forms them in tiles that stay in a core's cache (solver.c, schur_lowrank_tiles), and its memory is then the
+     * two n x R factors */
+#define LR_MEM(R_) (8.0 * (double)(R_) * (R_) <= par->dense_mem ? 8.0 * (double)(R_) * (R_) : 16.0 * nd * (double)(R_))
+    double mem = LR_MEM(R);
     if (getenv("BRISK_LRDBG")) printf("   [low-rank block: n %d, %d constraints, rank %ld (ok %d): cost %.3g against the routes' %.3g, memory %.3g of %.3g]\n", n, nc, R, ok, cost_lr, cost_now, mem, par->dense_mem);
     if (ok && (par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) {
         lr_rng = rng0;
         long R2 = 0;
+        const long used0 = lr_range_used;
         for (int t = 0; t < nc && ok; t++) {
-            const int r2 = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, &Ws[t], &Ss[t]);
+            const int r2 = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, &Ws[t], &Ss[t], rk[t]);
             if (r2 < 0) ok = 0; else { rk[t] = r2; R2 += r2; }
         }
+        if (getenv("BRISK_LRDBG")) printf("   [low-rank factors: %ld of %d constraints from the range of their matrix]\n", lr_range_used - used0, nc);
         if (ok && R2 != R) {     /* (the vectors' pass found another rank somewhere: decide again on it) */
-            R = R2; cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R; mem = 8.0 * (double)R * R;
+            R = R2; cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R; mem = LR_MEM(R);
             if (!(par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) ok = 0;
         }
     }
@@ -741,6 +833,7 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
     }
     for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); }
     free(Ws); free(Ss); free(rk);
+#undef LR_MEM
 }
 
 /* 5.18: a rank-one factor from the data's pivot column, w = A e_p / sqrt|A_pp| with s = sign A_pp (p the largest
@@ -767,6 +860,7 @@ static void rank1_exact(const SpSym *S, int n, double *W, double *sg) {
 }
 double analyze_sdp_block(Block *B, const Params *par);
 int brisk_block_as_cone(const Params *par, const Block *B);
+int brisk_problem_as_socp(const Params *par, const Problem *P);
 typedef struct { int r, c; double v; } LDTrip;
 static int cmp_ldtrip(const void *a, const void *b) {
     const LDTrip *x = a, *y = b;
@@ -792,12 +886,27 @@ static double lrdict_build(Block *B, const Params *par) {
         const SpSym *S = &B->A[t];
         if (S->ef < 0.25 * n2) continue;
         double *W = NULL, *sg = NULL;
-        int r = lowrank_factor(S, n, 8, &W, &sg);
+        int r = lowrank_factor(S, n, 8, &W, &sg, -1);
         if (r == 1) rank1_exact(S, n, W, sg);
         if (r > 0 && r <= 8 && 4.0 * n * r <= S->ef) { rk[t] = r; Ws[t] = W; Ss[t] = sg; nl++; nv += r; }
         else { free(W); free(sg); }
     }
-    if (nl < 2) { for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); } free(rk); free(Ws); free(Ss); return 1e300; }
+    /* 27 October 2026: the virtual block's X and Zi are dense of order nu + nv: within the budget the low-rank route has
+     * for its P and Q (a metric-learning LMI, lmnn_n1100_d30: 16,500 constraints of rank two, order 33,000, 17.4 GB;
+     * the low-rank route, with the same products, now forms them in panels) */
+    int nu0 = 0;
+    if (nl >= 2) {
+        char *seen = xcalloc(n + 1, 1);
+        for (int t = 0; t < nc; t++) if (!rk[t]) for (int q = 0; q < B->A[t].nnz; q++) {
+            if (!seen[B->A[t].row[q]]) { seen[B->A[t].row[q]] = 1; nu0++; }
+            if (!seen[B->A[t].col[q]]) { seen[B->A[t].col[q]] = 1; nu0++; }
+        }
+        free(seen);
+    }
+    if (nl < 2 || (par->dict < 0 && 16.0 * (double)(nu0 + nv) * (nu0 + nv) > par->dense_mem)) {
+        if (nl >= 2 && getenv("BRISK_LRDBG")) printf("   [low-rank dictionary not built: its virtual block of order %ld needs %.3g bytes, the budget %.3g]\n", nu0 + nv, 16.0 * (double)(nu0 + nv) * (nu0 + nv), par->dense_mem);
+        for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); } free(rk); free(Ws); free(Ss); return 1e300;
+    }
     double *V = xmalloc(sizeof(double) * (size_t)n * nv);
     SpSym *SS = xcalloc(nc, sizeof(SpSym));
     int *ucol = xcalloc(n + 1, sizeof(int)), nu = 0;
@@ -865,20 +974,19 @@ static int cmp_ef_desc(const void *a, const void *b) {
  *   dense route      (t): cb*(2n^3 + nd*n^2) + cs*S_sparse
  *   row-product  (t): cb*nr_t*n^2 + cs*(ef_t*n + suffix_sparse)
  *   sparse-sparse(t): cs*ef_t*suffix_sparse                              */
+static int cmp_u64(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 double analyze_sdp_block(Block *B, const Params *par) {
     const int n = B->n, nc = B->ncon;
     const double n2 = (double)n * n, n3 = n2 * n;
     const double cs = par->c_sparse, cb = par->c_blas;
 
     /* union row set and union full pattern */
-    unsigned char *pat = xcalloc((size_t)n * n, 1);
     char *mark = xcalloc(n, 1);
     double Stot = 0;
     for (int t = 0; t < nc; t++) {
         const SpSym *S = &B->A[t];
         Stot += S->ef;
         for (int q = 0; q < S->nr; q++) mark[S->rows[q]] = 1;
-        for (int q = 0; q < S->ef; q++) pat[S->fr[q] + (size_t)S->fc[q] * n] = 1;
     }
     B->unr = 0;
     for (int p = 0; p < n; p++) B->unr += mark[p];
@@ -886,17 +994,33 @@ double analyze_sdp_block(Block *B, const Params *par) {
     for (int p = 0, c = 0; p < n; p++) if (mark[p]) B->urows[c++] = p;
     free(mark);
     size_t unf = 0;
-    for (size_t k = 0; k < (size_t)n * n; k++) unf += pat[k];
-    B->unf = (int)unf;
-    B->ufr = xmalloc(sizeof(int) * (unf ? unf : 1));
-    B->ufc = xmalloc(sizeof(int) * (unf ? unf : 1));
-    {
+    if (n2 > 64.0 * (Stot + n)) {
+        /* 26 October 2026 (ISSUES 292): a large sparse block, its union pattern by sorting the entries' keys (j n + i, the
+         * order of the scan below) instead of a map of n^2 bytes and a pass over it: a cone of order 20,001 written as
+         * an arrow block (reglmi, SDP with SOCP) had 400 MB and two passes of 4e8 for a pattern of 60,000 entries */
+        uint64_t *key = xmalloc(sizeof(uint64_t) * ((size_t)Stot + 1));
+        size_t nk = 0;
+        for (int t = 0; t < nc; t++) { const SpSym *S = &B->A[t]; for (int q = 0; q < S->ef; q++) key[nk++] = (uint64_t)S->fc[q] * (uint64_t)n + (uint64_t)S->fr[q]; }
+        qsort(key, nk, sizeof(uint64_t), cmp_u64);
+        for (size_t k = 0; k < nk; k++) if (k == 0 || key[k] != key[k - 1]) key[unf++] = key[k];
+        B->unf = (int)unf;
+        B->ufr = xmalloc(sizeof(int) * (unf ? unf : 1));
+        B->ufc = xmalloc(sizeof(int) * (unf ? unf : 1));
+        for (size_t c = 0; c < unf; c++) { B->ufr[c] = (int)(key[c] % (uint64_t)n); B->ufc[c] = (int)(key[c] / (uint64_t)n); }
+        free(key);
+    } else {
+        unsigned char *pat = xcalloc((size_t)n * n, 1);
+        for (int t = 0; t < nc; t++) { const SpSym *S = &B->A[t]; for (int q = 0; q < S->ef; q++) pat[S->fr[q] + (size_t)S->fc[q] * n] = 1; }
+        for (size_t k = 0; k < (size_t)n * n; k++) unf += pat[k];
+        B->unf = (int)unf;
+        B->ufr = xmalloc(sizeof(int) * (unf ? unf : 1));
+        B->ufc = xmalloc(sizeof(int) * (unf ? unf : 1));
         size_t c = 0;
         for (int j = 0; j < n; j++)
             for (int i = 0; i < n; i++)
                 if (pat[i + (size_t)j * n]) { B->ufr[c] = i; B->ufc[c] = j; c++; }
+        free(pat);
     }
-    free(pat);
 
     /* dense classification */
     B->route = xmalloc(nc ? nc : 1);
@@ -919,13 +1043,13 @@ double analyze_sdp_block(Block *B, const Params *par) {
     for (int c = 0; c < ncand; c++) {
         const SpSym *S = &B->A[cand[c].t];
         double dense_cost = cb * (2 * n3 + ncand * n2) + cs * fmax(0.0, Stot - cand[c].ef * ncand);
-        double row_cost = cb * S->nr * n2 + cs * (S->ef * n + 0.5 * Stot);
+        double row_cost = cb * S->nr * n2 + cs * ((double)S->ef * n + 0.5 * Stot);
         int r = 0; double *W = NULL, *sg = NULL;
         /* (where the dense product costs 2e9 flops or more, n >= 1000: below that it takes a tenth of a second an
          * iteration at most, and the old path keeps the rounding of the small files: gpp500-1, n = 500, ended
          * at 1.5e-8 instead of 2.5e-9 by the other order of the operations) */
         if (par->lowrank != 0 && S->ef >= 0.25 * n2 && 2.0 * n3 >= 2e9 && !getenv("BRISK_NODRLR")) {
-            r = lowrank_factor(S, n, 8, &W, &sg);     /* (the randomized range finder samples 8 directions at least) */
+            r = lowrank_factor(S, n, 8, &W, &sg, -1);     /* (the randomized range finder samples 8 directions at least) */
             if (r <= 0 || r > 8) { free(W); free(sg); W = NULL; sg = NULL; r = 0; }
         }
         if (r > 0) dense_cost = cb * 3.0 * n2 * r + cs * fmax(0.0, Stot - cand[c].ef * ncand);
@@ -944,7 +1068,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
             const SpSym *S = &B->A[t];
             suf += S->ef;
             double c3 = cs * S->ef * suf;
-            double cr = cb * S->nr * n2 + cs * (S->ef * n + suf);
+            double cr = cb * S->nr * n2 + cs * ((double)S->ef * n + suf);
             cost_now += (cr < c3) ? cr : c3;
         }
     }
@@ -1011,7 +1135,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
         for (int t = 0; t < nc && okf; t++) {
             if (B->dpos[t] < 0) continue;
             const SpSym *S = &B->A[t];
-            const int r = lowrank_factor(S, n, 8, &Ws[t], &Ss[t]);
+            const int r = lowrank_factor(S, n, 8, &Ws[t], &Ss[t], -1);
             if (r <= 0 || r > 8) { okf = 0; break; }
             if (r == 1) rank1_exact(S, n, Ws[t], Ss[t]);
             double amax = 0, emax = 0;
@@ -1134,8 +1258,8 @@ double analyze_sdp_block(Block *B, const Params *par) {
         const SpSym *S = &B->A[B->slist[a]];
         suf += S->ef;
         double c3 = cs * S->ef * suf;
-        double cr = cb * S->nr * n2 + cs * (S->ef * n + suf);
-        double cu = allow3 ? cs * (S->ef * n + 0.5 * (double)B->unf * S->nr + suf) : 1e300;
+        double cr = cb * S->nr * n2 + cs * ((double)S->ef * n + suf);
+        double cu = allow3 ? cs * ((double)S->ef * n + 0.5 * (double)B->unf * S->nr + suf) : 1e300;
         B->route[B->slist[a]] = (c3 <= cr && c3 <= cu) ? 0 : (cr <= cu ? 1 : 3);
     }
     /* 16 October 2026 (the owner's benchmark, ISSUES 96a): a block whose constraints are all monomial matrices (one
@@ -1415,6 +1539,9 @@ void problem_prepare(Problem *P, const Params *par) {
 
     g_fact_ref = par->c_blas * (double)m * m * m / 3.0;
     if (g_symg_min < 0) { const char *e = getenv("BRISK_SYMGMIN"); g_symg_min = e ? atof(e) : 0.3; }
+    /* (26 October 2026, ISSUES 291: a problem that brisk_solve gives to the SOCP solver, its semidefinite blocks all
+     * second-order cones, gets no route analyses: 200,000 blocks of order 2 had 3 s of low-rank analysis) */
+    const int all_cone = brisk_problem_as_socp(par, P);
     for (int k = 0; k < P->nblk; k++) {
         Block *B = &P->blk[k];
         int n = B->n;
@@ -1438,7 +1565,7 @@ void problem_prepare(Problem *P, const Params *par) {
             free(cnt);
             continue;
         }
-        if (brisk_block_as_cone(par, B)) { Params pc = *par; pc.lowrank = 0; pc.dict = 0; analyze_sdp_block(B, &pc); }
+        if (all_cone || brisk_block_as_cone(par, B)) { Params pc = *par; pc.lowrank = 0; pc.dict = 0; pc.cls = 0; analyze_sdp_block(B, &pc); }   /* (26 October 2026: and no entry classes, 0.55 s on a cone of order 20,001) */
         else analyze_sdp_block(B, par);
     }
 }

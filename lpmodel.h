@@ -66,6 +66,11 @@ typedef struct {
                                    of the method), its basis then taken by the object; 0: the dual simplex method on the
                                    problem as given from the basis of the row activities */
     int verbose;                /* 0 silent (default) */
+    int basis_weights;          /* the dual pricing weights of a basis set by lm_set_basis (and of the first solve's basis
+                                   taken by the object, and after rows are added): 0 (default) the weights of a slack
+                                   basis, 1; 1 each row's exact weight computed the first time it is a candidate to leave
+                                   (fewer iterations from a parent's basis, the cost spread over the solve); 2 all exact
+                                   weights at once (a backward solve a row) */
 } LmOpts;
 void lm_default_opts(LmOpts *o);
 int lm_set_opts(LpModel *M, const LmOpts *o);

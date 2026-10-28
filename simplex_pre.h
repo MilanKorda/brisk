@@ -11,6 +11,10 @@ int  sxpre_presolve_ex(const LpProb *L, LpProb *R, SxPre **P, int verbose, int a
 /* x, y (row duals as minimization) and the basis statuses of L from those of the reduced problem */
 void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const int *cstr, const int *rstr, double *x, double *y, int *cst, int *rst);
 void sxpre_free(SxPre *P);
+/* (27 October 2026) the calling thread's stop flag (NULL: none): once it is set, the presolve returns 6 (stopped) at its
+ * next step and the symmetry search finds nothing; sxpre_get_stop gives the flag in force (to restore it) */
+void sxpre_set_stop(const volatile int *stop);
+const volatile int *sxpre_get_stop(void);
 /* the reduced problem's x and row duals (as minimization) from those of L: the values of the columns and rows it kept,
  * the presolve's merges replayed (y may be NULL: zeros). Not exact in general: an optimal point of L need not be optimal
  * for the reduced problem (a diagnostic: tools/sxpre_restrict_check.c) */

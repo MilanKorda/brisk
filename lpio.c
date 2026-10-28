@@ -34,6 +34,12 @@
 #include <ctype.h>
 #include "lpio.h"
 #include "fastnum.h"
+#ifndef _WIN32
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char **environ;
+#endif
 
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP reader)\n"); exit(1); } return p; }
 static void *xz(size_t n) { void *p = calloc(1, n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (LP reader)\n"); exit(1); } return p; }
@@ -119,9 +125,49 @@ static double mps_num(const char *s) {
     return neg ? -v : v;
 }
 
+/* (28 October 2026, the LP developer) a file opened for reading, through gzip -dc when its name ends in .gz: gzip is
+ * started without a shell (the name an argument of its own, not part of a command line, which a name with a quote broke
+ * and could turn into a command); *pid its process (0 for a plain file). lp_close_in: nonzero when gzip failed (a damaged
+ * or truncated archive) */
+static FILE *lp_open_in(const char *fname, long *pid) {
+    *pid = 0;
+    const size_t fl = strlen(fname);
+    if (!(fl > 3 && !strcmp(fname + fl - 3, ".gz"))) return fopen(fname, "r");
+#ifdef _WIN32
+    return NULL;
+#else
+    { FILE *t = fopen(fname, "r"); if (!t) return NULL; fclose(t); }
+    int fd[2]; if (pipe(fd)) return NULL;
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fd[1], 1); posix_spawn_file_actions_addclose(&fa, fd[0]); posix_spawn_file_actions_addclose(&fa, fd[1]);
+    char *argv[] = { (char *)"gzip", (char *)"-dc", (char *)"--", (char *)fname, NULL };
+    pid_t p;
+    const int e = posix_spawnp(&p, "gzip", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fd[1]);
+    if (e) { close(fd[0]); return NULL; }
+    FILE *f = fdopen(fd[0], "r");
+    if (!f) { close(fd[0]); waitpid(p, NULL, 0); return NULL; }
+    *pid = (long)p;
+    return f;
+#endif
+}
+static int lp_close_in(FILE *f, long pid) {
+    fclose(f);
+    if (!pid) return 0;
+#ifdef _WIN32
+    return 1;
+#else
+    int st = 0;
+    if (waitpid((pid_t)pid, &st, 0) < 0) return 1;
+    return !(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+#endif
+}
+/* (28 October 2026) also a name ending in .mps.gz or .MPS.gz (read through gzip: MIPLIB's files) */
 int lp_is_mps(const char *fname) {
     const size_t l = strlen(fname);
     if (l > 4 && (!strcmp(fname + l - 4, ".mps") || !strcmp(fname + l - 4, ".MPS") || !strcmp(fname + l - 4, ".sif") || !strcmp(fname + l - 4, ".SIF"))) return 1;
+    if (l > 7 && (!strcmp(fname + l - 7, ".mps.gz") || !strcmp(fname + l - 7, ".MPS.gz"))) return 1;
     return 0;
 }
 
@@ -130,6 +176,41 @@ void lp_free(LpProb *L) {
     if (L->rname) { for (int i = 0; i < L->m; i++) free(L->rname[i]); free(L->rname); }
     if (L->cname) { for (int j = 0; j < L->n; j++) free(L->cname[j]); free(L->cname); }
     memset(L, 0, sizeof(*L));
+}
+
+/* (28 October 2026, the night) a column of the problem as read whose cost improves without limit in a direction that no row
+ * and no bound stops: x_j can grow (or fall) alone, every row's activity moving away from its finite sides, so the
+ * direction e_j is a ray and the problem is infeasible or unbounded (dual infeasible), exactly: the test reads only signs
+ * and infinite bounds, so the rounding of the file's digits cannot make it wrong. A cost within 1e-9 (1 + the largest |cost|)
+ * of zero counts as zero (within the dual tolerance it makes no ray). Returns the column, or -1. The presolves found such
+ * columns after their reductions and the problem as read was then solved again to confirm the verdict: 10 to 64 s on four
+ * held-out LPs (neos-3283608-agout, neos-3230376-yser, neos-3699044-maipo, neos-3709489-menik), Gurobi 0.01 to 0.26 s. */
+/* (28 October 2026, the night) the caller's stop flag for the standard presolve's long loops, per thread (the default LP
+ * route's interior-point side, when the dual simplex method beside it has its result): the eliminator stops between two
+ * substitutions, and the problem goes on with those made (neos-4984115-canche, LP: its eliminator took 45 s after the
+ * dual simplex method had ended at 14 s) */
+static _Thread_local const volatile int *g_lp_stopf = NULL;
+void lp_set_stop(const volatile int *f) { g_lp_stopf = f; }
+const volatile int *lp_get_stop(void) { return g_lp_stopf; }
+int lp_ray_column(const LpProb *L) {
+    const double inf = 1e29;
+    double cmax = 0; for (int j = 0; j < L->n; j++) cmax = fmax(cmax, fabs(L->c[j]));
+    const double tol = 1e-9 * (1 + cmax);
+    for (int j = 0; j < L->n; j++) {
+        const double c = L->maxim ? -L->c[j] : L->c[j];
+        if (fabs(c) <= tol) continue;
+        const int up = c < 0;           /* the improving direction */
+        if (up ? L->u[j] < inf : L->l[j] > -inf) continue;
+        int ok = 1;
+        for (int p = L->Ap[j]; p < L->Ap[j + 1] && ok; p++) {
+            const double a = L->Ax[p]; const int i = L->Ai[p];
+            if (a == 0) continue;
+            if ((a > 0) == up) { if (L->ru[i] < inf) ok = 0; }     /* the row's activity grows */
+            else if (L->rl[i] > -inf) ok = 0;                     /* it falls */
+        }
+        if (ok) return j;
+    }
+    return -1;
 }
 
 static int split(char *line, char **tok, int maxt) {
@@ -158,7 +239,7 @@ static char *field(char *line, size_t len, int a, int b, char *save) {
     return p;
 }
 static int split_fixed(char *line, char **tok, int sec) {
-    static char buf[6][64]; static char dflt[] = "_SET_";
+    static _Thread_local char buf[6][64]; static _Thread_local char dflt[] = "_SET_";   /* (per thread: files read on several threads at once) */
     const size_t len = strlen(line);
     static const int fa[6] = { 2, 5, 15, 25, 40, 50 }, fb[6] = { 3, 12, 22, 36, 47, 61 };
     char *f[6];
@@ -211,7 +292,7 @@ int lp_read_mps_mip(const char *fname, LpProb *L, signed char **isint, char *msg
 }
 static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, int fixed, signed char **isint) {
     memset(L, 0, sizeof(*L));
-    FILE *f = fopen(fname, "r");
+    long gzpid; FILE *f = lp_open_in(fname, &gzpid);
     if (!f) { snprintf(msg, nmsg, "cannot open %s", fname); return 1; }
     setvbuf(f, NULL, _IOFBF, 1 << 20);
     enum { S_NONE, S_ROWS, S_COLS, S_RHS, S_RANGES, S_BOUNDS, S_OBJSENSE, S_SKIP } sec = S_NONE;
@@ -262,8 +343,13 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             }
             continue;
         }
-        const int nt = (fixed && (sec == S_ROWS || sec == S_COLS || sec == S_RHS || sec == S_RANGES || sec == S_BOUNDS))
-                       ? split_fixed(line, tok, sec == S_ROWS ? 1 : sec == S_COLS ? 2 : sec == S_BOUNDS ? 4 : 3) : split(line, tok, 7);
+        int nt = (fixed && (sec == S_ROWS || sec == S_COLS || sec == S_RHS || sec == S_RANGES || sec == S_BOUNDS))
+                 ? split_fixed(line, tok, sec == S_ROWS ? 1 : sec == S_COLS ? 2 : sec == S_BOUNDS ? 4 : 3) : split(line, tok, 7);
+        /* (28 October 2026) a name beginning with '$' after the line's first field begins a comment, the rest of the line
+         * (the MPS convention CPLEX's and Gurobi's readers follow): neos-5044663-wairoa (LP, MIPLIB 2017 collection) has
+         * "C0063540  LB_full  0  $ empty column", and the whole file was refused */
+        if (sec == S_COLS || sec == S_RHS || sec == S_RANGES || sec == S_BOUNDS)
+            for (int t = 1; t < nt; t++) if (tok[t][0] == '$') { nt = t; break; }
         if (nt == 0) continue;
         if (!fixed && sec == S_ROWS && nt > 2) { rc = 3; break; }
         if (sec == S_OBJSENSE) { if ((tok[0][0] == 'M' || tok[0][0] == 'm') && (tok[0][1] == 'A' || tok[0][1] == 'a')) L->maxim = 1; continue; }
@@ -330,7 +416,8 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             else { snprintf(msg, nmsg, "%s, line %ld: unknown bound type %s", fname, lineno, tok[0]); rc = 1; break; }
         }
     }
-    free(line); fclose(f);
+    free(line);
+    if (lp_close_in(f, gzpid) && !rc) { snprintf(msg, nmsg, "%s: the decompression failed (gzip -dc: the file is damaged or cut short)", fname); rc = 1; }
     /* (24 October 2026) a file that ends before ENDATA is an error: cut at a line boundary it would be read as a smaller
      * problem (the QPS and CBF readers likewise) */
     if (!rc && !ended) { snprintf(msg, nmsg, "%s: the file ends before ENDATA (cut short?)", fname); rc = 1; }
@@ -392,7 +479,7 @@ struct LpPs { PsOp *op; int nop, cap; int *rows, nrows, rcap, vcap; double *vals
 
 void lp_map_free(LpMap *M) { free(M->ckind); free(M->cpos); free(M->cval); free(M->rpos); free(M->rsgn); memset(M, 0, sizeof(*M)); }
 
-static struct LpPs g_ps;       /* the operations of the last presolve (one LP at a time: the command line) */
+static _Thread_local struct LpPs g_ps;   /* the operations of the last presolve (per thread: LPs may be solved on several threads at once, ISSUES 526) */
 static void ps_push(int kind, int j, int i, double v) {
     if (g_ps.nop == g_ps.cap) { g_ps.cap = 2 * g_ps.cap + 256; g_ps.op = realloc(g_ps.op, sizeof(PsOp) * g_ps.cap); }
     g_ps.op[g_ps.nop].kind = kind; g_ps.op[g_ps.nop].j = j; g_ps.op[g_ps.nop].i = i; g_ps.op[g_ps.nop].v = v; g_ps.nop++;
@@ -401,6 +488,98 @@ static void ps_push(int kind, int j, int i, double v) {
 int lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M) { return lp_to_std(L, presolve, verbose, S, M, NULL); }
 /* ub != NULL: the bounded form - upper bounds stay bounds (*ub, one per column of the standard
  * form, LP_INF: none) and a range row gets one slack with the bound ru - rl: no bound rows */
+/* (28 October 2026, the night; ISSUES 626) linearly dependent equality rows (Andersen and Andersen 1995, section 4.7; Gurobi's
+ * and HiGHS's presolves remove them), for both presolves (lpio.c's and simplex_pre.c's): the caller's equality rows, by rows
+ * (ep, ej, ev: the active entries; eb: the sides; columns in [0, n)). Each row, the shortest first, is reduced by Gaussian
+ * elimination against the pivot rows found before it; a row that reduces to zero is a combination of rows that stay, and
+ * when its side reduces to zero too, dep[t] = 1 (the caller drops it: its dual 0, its logical basic, which keeps a basis
+ * nonsingular). A side that does not reduce to zero is a contradiction the solve then finds; the row stays. The pivot: an
+ * entry within a tenth of the row's largest, in the column of the fewest equations. Stops at a work cap (the pivot rows'
+ * fill; what was found stands: each row found is a combination of pivot rows, which stay) and at the stop flag. Returns the
+ * number found. The robustness copies of an independent tester's LPs with a tenth more rows each the sum of two equations
+ * took 5 to 12 times the original's time (the quantile regressions: the dual form's 899 free variables; the coupled
+ * networks: the dependent rows joined the network's parts in the factorization, the solves 10 times dearer), where
+ * Gurobi's time hardly changed */
+static _Thread_local int g_lp_nodep = 0;
+void lp_set_nodeprows(int v) { g_lp_nodep = v; }
+int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double *ev, const double *eb, char *dep, const volatile int *stop) {
+    memset(dep, 0, (size_t)me);
+    if (me < 2) return 0;
+    const long nze = ep[me];
+    int *rows = xm(sizeof(int) * (size_t)me), *cnt = xz(sizeof(int) * ((size_t)n + 1));
+    {   int mx = 0; for (int t = 0; t < me; t++) if (ep[t + 1] - ep[t] > mx) mx = (int)(ep[t + 1] - ep[t]);
+        int *b = xz(sizeof(int) * ((size_t)mx + 2));
+        for (int t = 0; t < me; t++) b[ep[t + 1] - ep[t] + 1]++;
+        for (int k = 0; k <= mx; k++) b[k + 1] += b[k];
+        for (int t = 0; t < me; t++) rows[b[ep[t + 1] - ep[t]]++] = t;
+        free(b); }
+    for (long q = 0; q < nze; q++) if (ev[q] != 0) cnt[ej[q]]++;
+    int *pk = xm(sizeof(int) * ((size_t)n + 1)); for (int j = 0; j < n; j++) pk[j] = -1;   /* the pivot of column j */
+    int *pc = xm(sizeof(int) * (size_t)me); long *ps = xm(sizeof(long) * ((size_t)me + 1));
+    double *pval = xm(sizeof(double) * (size_t)me), *pb = xm(sizeof(double) * (size_t)me), *pmx = xm(sizeof(double) * (size_t)me);
+    long cap = 2 * nze + 1024, used = 0; int *pi = xm(sizeof(int) * (size_t)cap); double *pv = xm(sizeof(double) * (size_t)cap);
+    double *acc = xz(sizeof(double) * ((size_t)n + 1)); int *lst = xm(sizeof(int) * ((size_t)n + 1)); char *inl = xz((size_t)n + 1);
+    int *heap = xm(sizeof(int) * ((size_t)me + 1)); int *hst = xm(sizeof(int) * ((size_t)me + 1)); for (int k = 0; k < me; k++) hst[k] = -1;
+    /* (the work: entries of pivot rows applied and stored; capped at 4 nnz + 50,000: the copies' dependent rows were found within
+     * 1.5 nnz, while a transportation problem's rows taken by length fill until the cap, 40 nnz at first: n_transport_07, LP,
+     * 0.016 -> 0.041 s for none found) */
+    const long wcap = 4 * nze + 50000;
+    long work = 0; int npiv = 0, ndep = 0, aborted = 0;
+    for (int tt = 0; tt < me && !aborted; tt++) {
+        if ((tt & 255) == 0 && stop && *stop) { aborted = 1; break; }
+        const int t = rows[tt];
+        int nl = 0, nh = 0; double smax = 0, rhs = eb[t], bmag = fabs(rhs);
+        for (long q = ep[t]; q < ep[t + 1]; q++) {
+            const int j = ej[q]; const double a = ev[q];
+            if (a == 0) continue;
+            if (!inl[j]) { inl[j] = 1; lst[nl++] = j; }
+            acc[j] += a; if (fabs(a) > smax) smax = fabs(a);
+            const int k = pk[j];
+            if (k >= 0 && hst[k] != tt) { hst[k] = tt; int r = nh++; while (r > 0 && heap[(r - 1) / 2] > k) { heap[r] = heap[(r - 1) / 2]; r = (r - 1) / 2; } heap[r] = k; }
+        }
+        double mag = smax;
+        while (nh > 0) {
+            const int k = heap[0];       /* (the earliest pivot first: its row holds no column of an earlier pivot) */
+            { const int last = heap[--nh]; int r = 0; for (;;) { int c = 2 * r + 1; if (c >= nh) break; if (c + 1 < nh && heap[c + 1] < heap[c]) c++; if (heap[c] >= last) break; heap[r] = heap[c]; r = c; } if (nh > 0) heap[r] = last; }
+            const int jp = pc[k];
+            const double f = acc[jp] / pval[k];
+            if (f == 0) continue;
+            rhs -= f * pb[k]; if (fabs(f * pb[k]) > bmag) bmag = fabs(f * pb[k]);
+            if (fabs(f) * pmx[k] > mag) mag = fabs(f) * pmx[k];
+            for (long q = ps[k]; q < ps[k + 1]; q++) {
+                const int j = pi[q];
+                if (!inl[j]) { inl[j] = 1; lst[nl++] = j; }
+                acc[j] -= f * pv[q];
+                const int k2 = pk[j];
+                if (k2 > k && hst[k2] != tt) { hst[k2] = tt; int r = nh++; while (r > 0 && heap[(r - 1) / 2] > k2) { heap[r] = heap[(r - 1) / 2]; r = (r - 1) / 2; } heap[r] = k2; }
+            }
+            acc[jp] = 0;
+            work += ps[k + 1] - ps[k];
+        }
+        /* what is left on the columns not yet pivots (a pivot column's entry is eliminated; its residue is rounding) */
+        double rmax = 0;
+        for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] >= 0) acc[j] = 0; else if (fabs(acc[j]) > rmax) rmax = fabs(acc[j]); }
+        if (rmax <= 1e-11 * mag) {
+            if (fabs(rhs) <= 1e-9 * (1.0 + bmag)) { dep[t] = 1; ndep++; }
+        } else {
+            int jb = -1;
+            for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] < 0 && fabs(acc[j]) >= 0.1 * rmax && (jb < 0 || cnt[j] < cnt[jb])) jb = j; }
+            long need = 0; for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] < 0 && j != jb && fabs(acc[j]) > 1e-14 * rmax) need++; }
+            if (used + need + 1 > cap) { cap = 2 * (used + need + 1); int *pi2 = realloc(pi, sizeof(int) * (size_t)cap); double *pv2 = realloc(pv, sizeof(double) * (size_t)cap);
+                if (!pi2 || !pv2) { fprintf(stderr, "brisk: out of memory (LP presolve)\n"); exit(1); } pi = pi2; pv = pv2; }
+            const int k = npiv++;
+            pc[k] = jb; pval[k] = acc[jb]; pb[k] = rhs; pmx[k] = rmax; ps[k] = used;
+            for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] < 0 && j != jb && fabs(acc[j]) > 1e-14 * rmax) { pi[used] = j; pv[used++] = acc[j]; } }
+            ps[k + 1] = used; pk[jb] = k;
+            work += need;
+        }
+        for (int q = 0; q < nl; q++) { acc[lst[q]] = 0; inl[lst[q]] = 0; }
+        if (work > wcap) aborted = 1;
+    }
+    if (getenv("BRISK_LPDEPDBG")) fprintf(stderr, "  [dependent rows: %d equations, %d pivots, %d dependent%s; work %ld of %ld]\n", me, npiv, ndep, aborted ? ", stopped at the work cap or the stop flag" : "", work, wcap);
+    free(rows); free(cnt); free(pk); free(pc); free(ps); free(pval); free(pb); free(pmx); free(pi); free(pv); free(acc); free(lst); free(inl); free(heap); free(hst);
+    return ndep;
+}
 int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, double **ub) {
     const int bform = ub != NULL;
     const int m = L->m, n = L->n;
@@ -471,6 +650,18 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             if (!imax && rl[i] > -LP_INF && fabs(amax - rl[i]) <= ftol * (sc + fabs(rl[i]))) force = 1;       /* at amax */
             else if (!imin && ru[i] < LP_INF && fabs(amin - ru[i]) <= ftol * (sc + fabs(ru[i]))) force = -1;   /* at amin */
             if (force && getenv("BRISK_LPNOFORCING")) force = 0;     /* (experiments) */
+            /* (27 October 2026, the night) only when the points the fixing removes lie within each column's tolerance of
+             * its bound: they have activities between the side and the extreme one (gap apart), column j at most
+             * gap / |a_ij| from its bound. The gap's test against the row's tolerance alone depends on the row's scale (a
+             * row of coefficients 1e-10 met at 0 by x = 0 forced its columns to the far bounds: dell, LP, in the simplex
+             * method's presolve, which has the same test) */
+            const double fgap = force > 0 ? amax - rl[i] : force < 0 ? ru[i] - amin : 0;
+            if (force && fgap > 0)
+                for (int q = Rp[i]; q < Rp[i + 1]; q++) {
+                    const int j = Rj[q]; if (!ca[j]) continue;
+                    const double v = ((Rx[q] > 0) == (force > 0)) ? u[j] : l[j];
+                    if (fgap > fabs(Rx[q]) * ftol * (1.0 + fabs(v))) { force = 0; break; }
+                }
             if (force) {
                 for (int q = Rp[i]; q < Rp[i + 1]; q++) {
                     const int j = Rj[q]; if (!ca[j]) continue;
@@ -713,6 +904,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
         for (int round = 0; round < 6; round++) {
             int did = 0;
             for (int i = 0; i < m; i++) {
+                if (g_lp_stopf && *g_lp_stopf) break;
                 if (!ra[i] || rl[i] != ru[i] || rn[i] < 2) continue;
                 const int lr = rn[i];
                 /* the activity of the row without one column: the sums over the finite bounds and the counts of infinite ones */
@@ -753,10 +945,16 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                         const int new_l = ak > 0 ? needs_lo : needs_hi, new_u = ak > 0 ? needs_hi : needs_lo;
                         if ((new_l && l[k2] <= -LP_INF) || (new_u && u[k2] >= LP_INF && !(dbl2 && udrop && udrop[k2] < LP_INF))) { dbg[2 + (lo_ok ? 1 : 0)]++; d2[2]++; continue; }
                     }
-                    /* a pivot that is not small in its column either */
-                    double cmaxa = 0;
-                    for (int t = 0; t < cn[j]; t++) { const int r = cr[j][t]; if (!ra[r]) continue; for (int e = 0; e < rn[r]; e++) if (rc[r][e] == j) { cmaxa = fmax(cmaxa, fabs(rv[r][e])); break; } }
-                    if (fabs(a) < 1e-2 * cmaxa && (lr != 2 || dbl2 == 0)) { if (lr == 2) d2[3]++; continue; }
+                    /* a pivot that is not small in its column either. (28 October 2026, the night) The column's largest
+                     * entry only where the test applies: a row of two entries takes candidate columns of any length,
+                     * and the scan of each of their rows for the column was made for every such row and never used;
+                     * neos-4984115-canche (LP, MIPLIB 2017 collection; 119,078 rows of two entries taken) spent 45 s
+                     * of its 46 s presolve here. The same substitutions */
+                    if (lr != 2 || dbl2 == 0) {
+                        double cmaxa = 0;
+                        for (int t = 0; t < cn[j]; t++) { const int r = cr[j][t]; if (!ra[r]) continue; for (int e = 0; e < rn[r]; e++) if (rc[r][e] == j) { cmaxa = fmax(cmaxa, fabs(rv[r][e])); break; } }
+                        if (fabs(a) < 1e-2 * cmaxa) { if (lr == 2) d2[3]++; continue; }
+                    }
                     bj = j; bq = q; blc = lc;
                 }
                 if (bj < 0) { if (lr == 2) dbg[4]++; continue; }
@@ -815,7 +1013,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 for (int q = 0; q < lr; q++) if (q != bq) cl[rc[i][q]]--;
                 ra[i] = 0; nrowrm++; ca[j] = 0; nfixed++; nelim++; did = 1;
             }
-            if (!did || status) break;
+            if (!did || status || (g_lp_stopf && *g_lp_stopf)) break;
         }
         free(pos);
         if (getenv("BRISK_LPDBG")) printf("   [eliminator: %d taken; candidates refused: column too long %ld, fill %ld, lower bound not implied %ld, upper bound not implied %ld; rows of two entries: %ld refused, %ld taken (candidates refused: long %ld, small in the row %ld, a new bound on a free column %ld, small in the column %ld)]\n", nelim, dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], d2[0], d2[1], d2[2], d2[3]);
@@ -840,6 +1038,16 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             for (int p = A2p[j]; p < A2p[j + 1]; p++) { const int i = A2i[p]; if (!ra[i] || v == 0.0) continue; if (rl[i] > -LP_INF) rl[i] -= A2x[p] * v; if (ru[i] < LP_INF) ru[i] -= A2x[p] * v; }
             c0 += c[j] * v; ca[j] = 0; xfix[j] = v; nfixed++;
         }
+    /* (27 October 2026, the night) the upper bounds dropped as implied come back on the columns the eliminator did not
+     * substitute: they were dropped so that it could take those columns, and the interior-point method starts infeasible,
+     * so a bound that a row implies does not hold for its iterates until that row does. neos-914441 (LP, MIPLIB 2017
+     * collection): 14,884 bounds dropped, none of their columns substituted; the method's steps fell below 0.03 from the
+     * fourth iteration and it stopped at the iteration limit, its objective 2.9e6 for 5.66e6; with the bounds it ends
+     * optimal. A bound implied by the rows leaves the feasible set as it is. BRISK_LPREDBALL=1: all stay dropped, as before */
+    int nredb_back = 0;
+    if (udrop && status == 0 && !getenv("BRISK_LPREDBALL"))
+        for (int j = 0; j < n; j++) if (ca[j] && udrop[j] < u[j]) { u[j] = udrop[j]; nredb_back++; }
+    if (nredb_back && verbose > 0) printf("presolve: %d of the %d upper bounds dropped as implied kept (their columns not substituted)\n", nredb_back, nredb);
     /* ---- bounds far larger than the bounds the rows imply tightened to those (the interior-point method's form, at
      * every level of the presolve). The standard form shifts a column to its bound; a bound far from every feasible point (triptim1's
      * objective sum, x >= -9,999,999, while the rows keep it in [0, 204]) then gives values and an objective constant of
@@ -901,6 +1109,25 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
     M->rpos = xm(sizeof(int) * (m + 1)); M->rsgn = xm(sizeof(int) * (m + 1));
     for (int j = 0; j < n; j++) { M->ckind[j] = 3; M->cpos[j] = -1; M->cval[j] = xfix[j]; }
     for (int i = 0; i < m; i++) { M->rpos[i] = -1; M->rsgn[i] = 1; }
+    /* (28 October 2026, the night; ISSUES 626) the linearly dependent equality rows, once after the passes (lp_dependent_rows
+     * above): dropped as the redundant rows are, their duals 0. BRISK_LPDEPROWS=0: kept */
+    if (status == 0 && presolve > 0 && !g_lp_nodep && !(g_lp_stopf && *g_lp_stopf) && !(getenv("BRISK_LPDEPROWS") && atoi(getenv("BRISK_LPDEPROWS")) == 0)) {
+        int me = 0; for (int i = 0; i < m; i++) if (ra[i] && rcnt[i] > 0 && rl[i] == ru[i] && rl[i] > -LP_INF) me++;
+        if (me >= 2) {
+            int *erow = xm(sizeof(int) * (size_t)me), *ei = xm(sizeof(int) * ((size_t)m + 1)); long *ep = xz(sizeof(long) * ((size_t)me + 2));
+            for (int i = 0, t = 0; i < m; i++) { ei[i] = -1; if (ra[i] && rcnt[i] > 0 && rl[i] == ru[i] && rl[i] > -LP_INF) { ei[i] = t; erow[t++] = i; } }
+            for (int j = 0; j < n; j++) if (ca[j]) for (int p = A2p[j]; p < A2p[j + 1]; p++) if (ei[A2i[p]] >= 0 && A2x[p] != 0) ep[ei[A2i[p]] + 2]++;
+            for (int t = 0; t < me; t++) ep[t + 2] += ep[t + 1];
+            int *ej = xm(sizeof(int) * ((size_t)ep[me + 1] + 1)); double *ev = xm(sizeof(double) * ((size_t)ep[me + 1] + 1)), *eb = xm(sizeof(double) * (size_t)me);
+            for (int j = 0; j < n; j++) if (ca[j]) for (int p = A2p[j]; p < A2p[j + 1]; p++) if (ei[A2i[p]] >= 0 && A2x[p] != 0) { const long q = ep[ei[A2i[p]] + 1]++; ej[q] = j; ev[q] = A2x[p]; }
+            for (int t = 0; t < me; t++) eb[t] = rl[erow[t]];
+            char *dep = xm((size_t)me);
+            const int nd = lp_dependent_rows(me, n, ep, ej, ev, eb, dep, g_lp_stopf);
+            if (nd > 0) { for (int t = 0; t < me; t++) if (dep[t]) { ra[erow[t]] = 0; nrowrm++; }
+                          if (verbose > 0) printf("presolve: %d linearly dependent equality rows removed\n", nd); }
+            free(erow); free(ei); free(ep); free(ej); free(ev); free(eb); free(dep);
+        }
+    }
     M->nrow_removed = nrowrm; M->ncol_removed = nfixed;
     if (status) {
         if (verbose > 0) printf("presolve: the problem is %s\n", status == 1 ? "primal infeasible" : "unbounded or infeasible (a column with a cost and no bound in its direction)");
@@ -1108,19 +1335,25 @@ int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out
 int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, char *msg, size_t nmsg) {
     return cbf_read_ex(fname, S, c0_out, maxim_out, nint_out, NULL, NULL, msg, nmsg);
 }
+static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, int **vmap, signed char **vmsgn, int *nvar_out, char *msg, size_t nmsg);
 int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, char *msg, size_t nmsg) {
+    return cbf_read_core(fname, S, c0_out, maxim_out, nint_out, intcol, intsgn, NULL, NULL, NULL, msg, nmsg);
+}
+/* (27 October 2026, the SOCP developer) cbf_read_vmap: also the SeDuMi column of every CBF variable (vmap, -1 for an L=
+ * variable, which is zero) and its sign (vmsgn: -1 for an L- variable), so that a solution can be written in the file's
+ * own variables (the command line's -x) */
+int cbf_read_vmap(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **vmap, signed char **vmsgn, int *nvar_out, char *msg, size_t nmsg) {
+    return cbf_read_core(fname, S, c0_out, maxim_out, nint_out, NULL, NULL, vmap, vmsgn, nvar_out, msg, nmsg);
+}
+static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, int **vmap, signed char **vmsgn, int *nvar_out, char *msg, size_t nmsg) {
     memset(S, 0, sizeof(*S)); *c0_out = 0; *maxim_out = 0; *nint_out = 0;
     int *intv = NULL; int nintv = 0;
     if (intcol) *intcol = NULL;
     if (intsgn) *intsgn = NULL;
-    const size_t fl = strlen(fname);
-    const int gz = fl > 3 && !strcmp(fname + fl - 3, ".gz");
-    FILE *f;
-    if (gz) {
-        char *cmd = xm(fl + 32); snprintf(cmd, fl + 32, "gzip -dc '%s'", fname);
-        { FILE *t = fopen(fname, "r"); if (!t) { snprintf(msg, nmsg, "cannot open %s", fname); free(cmd); return 1; } fclose(t); }
-        f = popen(cmd, "r"); free(cmd);
-    } else f = fopen(fname, "r");
+    if (vmap) *vmap = NULL;
+    if (vmsgn) *vmsgn = NULL;
+    if (nvar_out) *nvar_out = 0;
+    long gzpid; FILE *f = lp_open_in(fname, &gzpid);
     if (!f) { snprintf(msg, nmsg, "cannot open %s", fname); return 1; }
     int nvar = 0, ncon = 0, nvg = 0, ncg = 0;
     int *vgk = NULL, *vgd = NULL, *cgk = NULL, *cgd = NULL;       /* cone groups: kind, dimension */
@@ -1185,10 +1418,8 @@ int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out
 #undef NEXTLINE
 #undef SKIPLINE
     free(line);
-    if (gz) {   /* gzip's exit status: a damaged or truncated archive is an error, not the part that could be read */
-        const int st = pclose(f);
-        if (!rc && st != 0) { snprintf(msg, nmsg, "%s: the decompression failed (gzip -dc: the file is damaged or cut short)", fname); rc = 1; }
-    } else fclose(f);
+    /* gzip's exit status: a damaged or truncated archive is an error, not the part that could be read */
+    if (lp_close_in(f, gzpid) && !rc) { snprintf(msg, nmsg, "%s: the decompression failed (gzip -dc: the file is damaged or cut short)", fname); rc = 1; }
     if (!rc && nvar == 0) { snprintf(msg, nmsg, "%s: no variables (not a CBF file?)", fname); rc = 1; }
     if (!rc) {
         /* columns of the SeDuMi form: [free | nonnegative | Q cones | QR cones]; var j -> column vcol[j] (or -1), sign vsg[j] */
@@ -1246,6 +1477,10 @@ int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out
                 if (intsgn) (*intsgn)[t] = (j >= 0 && j < nvar && vk[j] == 2) ? -1 : 1;
             }
             *nint_out = nintv;
+        }
+        if (vmap) {
+            *vmap = vcol; vcol = NULL; *nvar_out = nvar;
+            if (vmsgn) { *vmsgn = xm(nvar + 1); for (int j = 0; j < nvar; j++) (*vmsgn)[j] = vk[j] == 2 ? -1 : 1; }
         }
         free(cnt); free(nx); free(vk); free(ck); free(vcol); free(ccol); free(crow);
         *c0_out = c0;

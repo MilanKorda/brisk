@@ -200,7 +200,7 @@ static int qp_solve_ipm_dbl(const QpProb *P, const QpOpts *o, QpRes *R) {
  * stays with the interior-point method (the active-set method needs its proximal-point loop for it, with no bound on
  * its solves). When the active-set method does not end optimal, the interior-point method solves the problem (the
  * Summary says so). -qpipm or -qpas: that method */
-static int as_small(const QpProb *P) {
+int qp_as_small(const QpProb *P) {
     const double n = P->n, w = 2 * n * n * n + 2 * n * ((double)P->Ap[P->n] + n + P->m);
     /* (24 October 2026) 4e6 instead of 2e6: measured again after the active-set method's J = L^-T was made three times
      * cheaper (bench/qp/small/small_ab2.txt, 129 QPs of n <= 300, both methods in C): the rule's choice is the faster
@@ -295,7 +295,7 @@ int qp_solve(const QpProb *P, const QpOpts *o, QpRes *R) {
     if (P->nqc > 0) return qcqp_solve(P, o, R);
     if (o->method == QP_METHOD_ACTIVESET) { const int st = qp_solve_activeset(P, o, R); R->method = QP_METHOD_ACTIVESET; return st; }
     double t_as = 0;
-    if (o->method == QP_METHOD_AUTO && as_small(P)) {
+    if (o->method == QP_METHOD_AUTO && qp_as_small(P)) {
         const int st = qp_solve_activeset_pd(P, o, R);
         if (st == QP_OPTIMAL) { R->method = QP_METHOD_ACTIVESET; return st; }
         if (st >= 0) {

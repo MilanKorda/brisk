@@ -9,8 +9,10 @@ B=${1:-./brisk}; F=examples/theta3.dat-s
 fail=0
 check() {   # name, expected minimum number of distinct processors, environment...
     local name=$1 want=$2; shift 2
-    # the masks are read as soon as both threads exist (the solve takes under a second)
-    env "$@" "$B" $F -threads 2 -maxit 100000 -tol 1e-30 -q > /dev/null 2>&1 &
+    # the masks are read as soon as both threads exist (the solve takes under a second); BRISK_NOBUSY=1: the two threads
+    # asked for, also on a busy machine (28 October 2026: the busy-machine rule ran one thread while other jobs ran, and
+    # the test, which checks where threads sit, failed on the load instead)
+    env BRISK_NOBUSY=1 "$@" "$B" $F -threads 2 -maxit 100000 -tol 1e-30 -q > /dev/null 2>&1 &
     local p=$! nthr=0 masks="" i
     for i in $(seq 1 400); do
         sleep 0.02

@@ -3,6 +3,11 @@
  *   [y, X, Z, info] = brisk_mex(filename, args)
  *   [y, X, Z, info] = brisk_mex(m, blocksizes, b, T, args)
  *   [x, y, z, info] = brisk_mex('sedumi', A, b, c, Kf, Kl, Kq, Kr, Ks, args)
+ *   [x, y, z, info] = brisk_mex('qp', H, f, A, l, u, lb, ub, args)
+ *   h = brisk_mex('qp_create', H, f, A, l, u, lb, ub, args); brisk_mex('qp_set_var_bounds', h, j, lo, hi);
+ *   brisk_mex('qp_set_row_bounds', h, i, lo, hi); brisk_mex('qp_set_cost', h, f);
+ *   [x, y, z, info] = brisk_mex('qp_solve', h); brisk_mex('qp_free', h)
+ *   [x, y, z, info] = brisk_mex('qp_file', 'problem.qps', args)
  *
  * filename   an SDPA sparse file (.dat-s)
  * m          number of constraints
@@ -20,6 +25,12 @@
  * cone as K.f, K.l (scalars) and K.q, K.r, K.s (vectors of dimensions); x, y and z = c - A'y
  * are returned. Problems without semidefinite blocks go to the second-order cone solver.
  * The MATLAB wrappers brisk_sdpa.m and brisk_sedumi.m build these arguments.
+ * 'qp': the convex QP min 1/2 x'Hx + f'x s.t. l <= A x <= u, lb <= x <= ub (H and A sparse, H symmetric or one
+ * triangle of it; the vectors full, +-Inf for an absent bound), solved by the C library's brisk_solve_qp; 'qp_create'
+ * keeps it as a QP model (brisk_qp_create) whose bounds, row bounds and cost can be changed and which 'qp_solve'
+ * re-solves from the previous active set (j and i 1-based; h the model's number); 'qp_file' solves a QPS file as the command
+ * line does (brisk_solve_file). brisk_qp.m and BriskQpModel.m
+ * build these arguments.
  *
  * The data goes to brisk_run_data in memory (4.39; until 4.38 a temporary SDPA file) and is
  * solved by the same code as the command-line solver (brisk_run in main.c, built with
@@ -231,8 +242,183 @@ static void mex_sedumi(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[
     sedumi_result_free(&R);
 }
 
+/* ---- QPs: the C library's functions (capi.c) ------------------------------------------------------------ */
+BriskResult *brisk_result_new(void);
+void brisk_result_delete(BriskResult *r);
+int brisk_result_status(const BriskResult *r);
+const char *brisk_result_status_str(const BriskResult *r);
+int brisk_result_iterations(const BriskResult *r);
+int brisk_result_m(const BriskResult *r);
+int brisk_result_sn(const BriskResult *r);
+double brisk_result_pobj(const BriskResult *r);
+double brisk_result_time(const BriskResult *r);
+void brisk_result_dimacs(const BriskResult *r, double *err);
+const double *brisk_result_sx(const BriskResult *r);
+const double *brisk_result_sz(const BriskResult *r);
+const double *brisk_result_y(const BriskResult *r);
+void brisk_set_output(int mode, int (*cb)(const char *s, int is_err));
+int brisk_solve_file(const char *fname, int nopt, const char *const *opts, BriskResult *res);
+int brisk_solve_qp(int n, int m, const int *Hp, const int *Hi, const double *Hx, const double *c, double c0,
+                   const int *Ap, const int *Ai, const double *Ax, const double *rl, const double *ru,
+                   const double *xl, const double *xu, int nopt, const char *const *opts, BriskResult *res);
+long brisk_qp_lower(int n, const int *Hp, const int *Hi, const double *Hx, int *Lp, int *Li, double *Lx);
+void *brisk_qp_create(int n, int m, const int *Hp, const int *Hi, const double *Hx, const double *c, double c0,
+                      const int *Ap, const int *Ai, const double *Ax, const double *rl, const double *ru,
+                      const double *xl, const double *xu, int nopt, const char *const *opts);
+int brisk_qp_set_var_bounds(void *h, int j, double lo, double hi);
+int brisk_qp_set_row_bounds(void *h, int i, double lo, double hi);
+int brisk_qp_set_cost(void *h, const double *c);
+int brisk_qp_resolve(void *h, BriskResult *res);
+void brisk_qp_destroy(void *h);
+
+/* the QP models of this MEX file, numbered from 1; freed by 'qp_free' and when the MEX file is cleared */
+#define QP_MODELS 4096
+static void *g_qp[QP_MODELS];
+static int g_qp_silent[QP_MODELS], g_qp_n[QP_MODELS];
+static const char *const qp_modes[] = { "qp", "qp_create", "qp_set_var_bounds", "qp_set_row_bounds", "qp_set_cost", "qp_solve", "qp_free", "qp_file" };
+static void qp_free_all(void) { for (int k = 0; k < QP_MODELS; k++) if (g_qp[k]) { brisk_qp_destroy(g_qp[k]); g_qp[k] = NULL; } }
+
+/* a QP's data from H, f, A, l, u, lb, ub (prhs[0..6]): H's lower triangle and A by columns as int arrays */
+typedef struct { int n, m, *Hp, *Hi, *Ap, *Ai; double *Hx, *f, *Ax, *l, *u, *lb, *ub; } MexQp;
+static void qp_vec(const mxArray *a, int k, const char *name) {
+    if (!mxIsDouble(a) || mxIsComplex(a) || mxIsSparse(a) || (int)mxGetNumberOfElements(a) != k) {
+        char msg[160]; snprintf(msg, sizeof msg, "brisk_mex: %s must be a full real vector of length %d", name, k); fail("brisk:input", msg);
+    }
+}
+static void qp_data(const mxArray *const *a, MexQp *Q) {
+    const mxArray *H = a[0], *A = a[2];
+    if (!mxIsSparse(H) || !mxIsDouble(H) || mxIsComplex(H) || mxGetM(H) != mxGetN(H)) fail("brisk:input", "brisk_mex: H must be a real sparse square matrix");
+    if (!mxIsSparse(A) || !mxIsDouble(A) || mxIsComplex(A)) fail("brisk:input", "brisk_mex: A must be a real sparse matrix");
+    Q->n = (int)mxGetN(H); Q->m = (int)mxGetM(A);
+    if ((int)mxGetN(A) != Q->n) fail("brisk:input", "brisk_mex: A must have as many columns as H");
+    qp_vec(a[1], Q->n, "f"); qp_vec(a[3], Q->m, "l"); qp_vec(a[4], Q->m, "u"); qp_vec(a[5], Q->n, "lb"); qp_vec(a[6], Q->n, "ub");
+    Q->f = mxGetPr(a[1]); Q->l = mxGetPr(a[3]); Q->u = mxGetPr(a[4]); Q->lb = mxGetPr(a[5]); Q->ub = mxGetPr(a[6]);
+    const mwIndex *jc = mxGetJc(H), *ir = mxGetIr(H);
+    const size_t hz = (size_t)jc[Q->n];
+    int *Hp = mxCalloc((size_t)Q->n + 1, sizeof(int)), *Hi = mxCalloc(hz + 1, sizeof(int));
+    for (int j = 0; j <= Q->n; j++) Hp[j] = (int)jc[j];
+    for (size_t p = 0; p < hz; p++) Hi[p] = (int)ir[p];
+    Q->Hp = mxCalloc((size_t)Q->n + 1, sizeof(int)); Q->Hi = mxCalloc(hz + 1, sizeof(int)); Q->Hx = mxCalloc(hz + 1, sizeof(double));
+    if (brisk_qp_lower(Q->n, Hp, Hi, mxGetPr(H), Q->Hp, Q->Hi, Q->Hx) < 0) fail("brisk:input", "brisk_mex: H is neither symmetric nor triangular");
+    jc = mxGetJc(A); ir = mxGetIr(A);
+    const size_t az = (size_t)jc[Q->n];
+    Q->Ap = mxCalloc((size_t)Q->n + 1, sizeof(int)); Q->Ai = mxCalloc(az + 1, sizeof(int));
+    for (int j = 0; j <= Q->n; j++) Q->Ap[j] = (int)jc[j];
+    for (size_t p = 0; p < az; p++) Q->Ai[p] = (int)ir[p];
+    Q->Ax = mxGetPr(A);
+}
+/* the options from a cell array of strings; '-silent' is the MEX's own (no output but errors) */
+static char **qp_args(const mxArray *acell, int *na, int *silent) {
+    int nargs = 0;
+    if (acell) { if (!mxIsCell(acell)) fail("brisk:input", "brisk_mex: args must be a cell array of strings"); nargs = (int)mxGetNumberOfElements(acell); }
+    char **av = mxCalloc((size_t)nargs + 2, sizeof(char *));
+    *na = 0; *silent = 0;
+    for (int i = 0; i < nargs; i++) {
+        const mxArray *e = mxGetCell(acell, (mwIndex)i);
+        if (!e || !mxIsChar(e)) fail("brisk:input", "brisk_mex: every element of args must be a string");
+        char *t = mxArrayToString(e);
+        if (!strcmp(t, "-silent")) { *silent = 1; mxFree(t); continue; }
+        av[(*na)++] = t;
+    }
+    return av;
+}
+/* x, y, z and info from a QP result */
+static void qp_outputs(int nlhs, mxArray *plhs[], BriskResult *r) {
+    if (brisk_result_status(r) < 0) {
+        brisk_result_delete(r);
+        mexErrMsgIdAndTxt("brisk:input", "BRISK did not solve the QP (not convex, or an unknown option): see the messages above");
+    }
+    const int n = brisk_result_sn(r), m = brisk_result_m(r);
+    plhs[0] = vec_or_empty(brisk_result_sx(r), n);
+    if (nlhs > 1) plhs[1] = m > 0 ? vec_or_empty(brisk_result_y(r), m) : mxCreateDoubleMatrix(0, 1, mxREAL);
+    if (nlhs > 2) plhs[2] = vec_or_empty(brisk_result_sz(r), n);
+    if (nlhs > 3) {
+        const char *fields[] = { "status", "statuscode", "obj", "iter", "time", "errors", "version" };
+        mxArray *info = mxCreateStructMatrix(1, 1, 7, fields);
+        double err[6]; brisk_result_dimacs(r, err);
+        mxArray *e = mxCreateDoubleMatrix(1, 3, mxREAL);
+        mxGetPr(e)[0] = err[0]; mxGetPr(e)[1] = err[2]; mxGetPr(e)[2] = err[4];
+        mxSetField(info, 0, "status", mxCreateString(brisk_result_status_str(r)));
+        mxSetField(info, 0, "statuscode", mxCreateDoubleScalar(brisk_result_status(r)));
+        mxSetField(info, 0, "obj", mxCreateDoubleScalar(brisk_result_pobj(r)));
+        mxSetField(info, 0, "iter", mxCreateDoubleScalar(brisk_result_iterations(r)));
+        mxSetField(info, 0, "time", mxCreateDoubleScalar(brisk_result_time(r)));
+        mxSetField(info, 0, "errors", e);
+        mxSetField(info, 0, "version", mxCreateString(BRISK_VERSION));
+        plhs[3] = info;
+    }
+    brisk_result_delete(r);
+}
+static int qp_model(const mxArray *a) {
+    const int k = (int)scalar_arg(a, "the QP model") - 1;
+    if (k < 0 || k >= QP_MODELS || !g_qp[k]) fail("brisk:input", "brisk_mex: not a QP model (freed, or never created)");
+    return k;
+}
+static void mex_qp(const char *mode, int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
+    mexAtExit(qp_free_all);
+    brisk_set_output(2, mex_print);
+    if (!strcmp(mode, "qp_file")) {
+        if (nrhs < 2 || nrhs > 3 || !mxIsChar(prhs[1])) fail("brisk:input", "brisk_mex: usage brisk_mex('qp_file', 'problem.qps', args)");
+        char *fname = mxArrayToString(prhs[1]);
+        int na, silent; char **av = qp_args(nrhs == 3 ? prhs[2] : NULL, &na, &silent);
+        g_silent = silent;
+        if (silent) av[na++] = "-q";
+        BriskResult *r = brisk_result_new();
+        brisk_solve_file(fname, na, (const char *const *)av, r);
+        mxFree(fname);
+        qp_outputs(nlhs, plhs, r);
+        return;
+    }
+    if (!strcmp(mode, "qp") || !strcmp(mode, "qp_create")) {
+        if (nrhs < 8 || nrhs > 9) fail("brisk:input", "brisk_mex: usage brisk_mex('qp', H, f, A, l, u, lb, ub, args)");
+        MexQp Q; qp_data(prhs + 1, &Q);
+        int na, silent; char **av = qp_args(nrhs == 9 ? prhs[8] : NULL, &na, &silent);
+        g_silent = silent;
+        if (silent) av[na++] = "-q";
+        if (!strcmp(mode, "qp")) {
+            BriskResult *r = brisk_result_new();
+            brisk_solve_qp(Q.n, Q.m, Q.Hp, Q.Hi, Q.Hx, Q.f, 0.0, Q.Ap, Q.Ai, Q.Ax, Q.l, Q.u, Q.lb, Q.ub, na, (const char *const *)av, r);
+            qp_outputs(nlhs, plhs, r);
+            return;
+        }
+        int k = 0; while (k < QP_MODELS && g_qp[k]) k++;
+        if (k == QP_MODELS) fail("brisk:input", "brisk_mex: too many QP models (free some with 'qp_free')");
+        g_qp[k] = brisk_qp_create(Q.n, Q.m, Q.Hp, Q.Hi, Q.Hx, Q.f, 0.0, Q.Ap, Q.Ai, Q.Ax, Q.l, Q.u, Q.lb, Q.ub, na, (const char *const *)av);
+        if (!g_qp[k]) fail("brisk:input", "brisk_mex: the QP model was not created (an unknown option, or bad data)");
+        g_qp_silent[k] = silent; g_qp_n[k] = Q.n;
+        plhs[0] = mxCreateDoubleScalar(k + 1);
+        return;
+    }
+    if (nrhs < 2) fail("brisk:input", "brisk_mex: the QP model is missing");
+    const int k = qp_model(prhs[1]);
+    if (!strcmp(mode, "qp_set_var_bounds") || !strcmp(mode, "qp_set_row_bounds")) {
+        if (nrhs != 5) fail("brisk:input", "brisk_mex: usage brisk_mex('qp_set_var_bounds' or 'qp_set_row_bounds', h, index, lo, hi)");
+        const int i = (int)scalar_arg(prhs[2], "the index") - 1;
+        const double lo = scalar_arg(prhs[3], "lo"), hi = scalar_arg(prhs[4], "hi");
+        const int rc = mode[7] == 'v' ? brisk_qp_set_var_bounds(g_qp[k], i, lo, hi) : brisk_qp_set_row_bounds(g_qp[k], i, lo, hi);
+        if (rc) fail("brisk:input", "brisk_mex: the index is out of range");
+    } else if (!strcmp(mode, "qp_set_cost")) {
+        if (nrhs != 3) fail("brisk:input", "brisk_mex: usage brisk_mex('qp_set_cost', h, f)");
+        qp_vec(prhs[2], g_qp_n[k], "f");
+        brisk_qp_set_cost(g_qp[k], mxGetPr(prhs[2]));
+    } else if (!strcmp(mode, "qp_solve")) {
+        g_silent = g_qp_silent[k];
+        BriskResult *r = brisk_result_new();
+        brisk_qp_resolve(g_qp[k], r);
+        qp_outputs(nlhs, plhs, r);
+    } else if (!strcmp(mode, "qp_free")) {
+        brisk_qp_destroy(g_qp[k]); g_qp[k] = NULL;
+    } else fail("brisk:input", "brisk_mex: unknown QP mode");
+}
+
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     const mxArray *acell = NULL;
+    if (nrhs >= 1 && mxIsChar(prhs[0])) {
+        char *mode = mxArrayToString(prhs[0]);
+        for (size_t q = 0; mode && q < sizeof qp_modes / sizeof *qp_modes; q++)
+            if (!strcmp(mode, qp_modes[q])) { mxFree(mode); mex_qp(qp_modes[q], nlhs, plhs, nrhs, prhs); return; }
+        mxFree(mode);
+    }
     if (nrhs > 2 && mxIsChar(prhs[0])) {
         char *mode = mxArrayToString(prhs[0]);
         const int sd = mode && !strcmp(mode, "sedumi");

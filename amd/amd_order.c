@@ -18,6 +18,11 @@
 /* === AMD_order =========================================================== */
 /* ========================================================================= */
 
+/* (BRISK, 28 October 2026) stopped by the caller's flag or deadline (amd_2.c): the ordering is not made, brisk_amd_capped
+ * is 2 and the counts are 0, as when AMD_2 stops */
+extern int brisk_amd_stopped (void) ;
+extern __thread int brisk_amd_capped ;
+
 GLOBAL Int AMD_order
 (
     Int n,
@@ -87,6 +92,12 @@ GLOBAL Int AMD_order
 	if (info) Info [AMD_STATUS] = AMD_INVALID ;
 	return (AMD_INVALID) ;	    /* matrix is invalid */
     }
+    if (brisk_amd_stopped ())
+    {
+	brisk_amd_capped = 2 ;
+	if (info) { Info [AMD_LNZ] = 0 ; Info [AMD_NMULTSUBS_LU] = 0 ; }
+	return (AMD_OK) ;
+    }
 
     /* allocate two size-n integer workspaces */
     Len  = SuiteSparse_malloc (n, sizeof (Int)) ;
@@ -138,7 +149,27 @@ GLOBAL Int AMD_order
     /* determine the symmetry and count off-diagonal nonzeros in A+A' */
     /* --------------------------------------------------------------------- */
 
+    if (brisk_amd_stopped ())
+    {
+	SuiteSparse_free (Rp) ;
+	SuiteSparse_free (Ri) ;
+	SuiteSparse_free (Len) ;
+	SuiteSparse_free (Pinv) ;
+	brisk_amd_capped = 2 ;
+	if (info) { Info [AMD_LNZ] = 0 ; Info [AMD_NMULTSUBS_LU] = 0 ; }
+	return (AMD_OK) ;
+    }
     nzaat = AMD_aat (n, Cp, Ci, Len, P, Info) ;
+    if (brisk_amd_stopped ())
+    {
+	SuiteSparse_free (Rp) ;
+	SuiteSparse_free (Ri) ;
+	SuiteSparse_free (Len) ;
+	SuiteSparse_free (Pinv) ;
+	brisk_amd_capped = 2 ;
+	if (info) { Info [AMD_LNZ] = 0 ; Info [AMD_NMULTSUBS_LU] = 0 ; }
+	return (AMD_OK) ;
+    }
     AMD_DEBUG1 (("nzaat: %g\n", (double) nzaat)) ;
     ASSERT ((MAX (nz-n, 0) <= nzaat) && (nzaat <= 2 * (size_t) nz)) ;
 

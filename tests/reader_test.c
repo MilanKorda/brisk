@@ -32,6 +32,11 @@ int main(void) {
     put("full.qps", buf); put("cut.qps", MPS);
     { QpProb P; int rc = qp_read_qps(path("full.qps"), &P, msg, sizeof msg); CHECK(rc == 0, "the complete QPS file is read"); if (rc == 0) qp_prob_free(&P); }
     { QpProb P; int rc = qp_read_qps(path("cut.qps"), &P, msg, sizeof msg); CHECK(rc != 0 && strstr(msg, "cut short"), "the QPS file without ENDATA is refused (%s)", rc ? msg : "read"); if (rc == 0) qp_prob_free(&P); }
+    /* (28 October 2026) a name beginning with '$' after the first field begins a comment (neos-5044663-wairoa, MIPLIB 2017) */
+    snprintf(buf, sizeof buf, "NAME T\nROWS\n N obj\n L c1\nCOLUMNS\n x obj 1 c1 1\n z c1 0 $ empty column\nRHS\n rhs c1 4 $ a comment\nENDATA\n");
+    put("dollar.mps", buf); put("dollar.qps", buf);
+    { LpProb L; int rc = lp_read_mps(path("dollar.mps"), &L, msg, sizeof msg); CHECK(rc == 0 && L.n == 2 && L.ru[0] == 4, "the MPS reader takes a '$' name as the start of a comment (%s)", rc ? msg : "read"); if (rc == 0) lp_free(&L); }
+    { QpProb P; int rc = qp_read_qps(path("dollar.qps"), &P, msg, sizeof msg); CHECK(rc == 0, "the QPS reader takes a '$' name as the start of a comment (%s)", rc ? msg : "read"); if (rc == 0) qp_prob_free(&P); }
     printf("2. CBF (the SOCP reader): the sections' counts and the gzip archive\n");
     put("full.cbf", CBF);
     { char cut[2048]; snprintf(cut, sizeof cut, "%s", CBF); *strstr(cut, "0 2 1\n") = 0; put("cut.cbf", cut); }
@@ -45,7 +50,7 @@ int main(void) {
         f = fopen(path("cut.cbf.gz"), "wb"); if (f) { fwrite(gz, 1, ng > 4 ? ng - 4 : 0, f); fclose(f); }       /* its last four bytes (the length) cut */
         { int rc = cbf_read(path("cut.cbf.gz"), &S, &c0, &maxim, &nint, msg, sizeof msg); CHECK(rc != 0, "the archive without its end is refused (%s)", rc ? msg : "read"); if (rc == 0) sedumi_free(&S); }
     } else printf("  (no gzip on this host: the archive checks skipped)\n");
-    const char *names[] = {"full.mps", "cut.mps", "full.qps", "cut.qps", "full.cbf", "cut.cbf", "full.cbf.gz", "cut.cbf.gz"};
+    const char *names[] = {"full.mps", "cut.mps", "full.qps", "cut.qps", "dollar.mps", "dollar.qps", "full.cbf", "cut.cbf", "full.cbf.gz", "cut.cbf.gz"};
     for (size_t k = 0; k < sizeof names / sizeof *names; k++) remove(path(names[k]));
     remove(dir);
     printf(fails ? "reader_test: %d failures\n" : "reader_test: all checks passed\n", fails);

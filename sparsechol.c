@@ -26,9 +26,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #else
-#include <time.h>
-static double omp_get_wtime(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
-static int __attribute__((unused)) omp_in_parallel(void) { return 0; }
+#include <time.h>   /* the runtime's queries without OpenMP: omp/ompstub.h (ISSUES 713) */
 #endif
 
 struct SChol {
@@ -65,6 +63,8 @@ struct SChol {
     double tinypiv;                  /* > 0: pivots below tinypiv * original diagonal are
                                       * replaced by a huge value (that direction is dropped) */
     int ntiny;
+    unsigned char *tflag;            /* (26 October 2026, the SOCP developer) with schol_set_tinyflags: 1 at each column (permuted
+                                      * order) whose tiny pivot the last factorization regularized (schol_set_tinyreg) */
     int tinydag;                     /* 18 October 2026 (LP/SOCP): with tinypiv, large nodes by the tile task graph too
                                       * (fnode_dag, the tiny-pivot rule in its diagonal tiles); set by the LP method only */
     int lpsmall;                     /* (26 October 2026, the merge for 1.6) the LP method's small sources straight into the
@@ -102,6 +102,21 @@ struct SChol {
     double *swk, *ssub;      /* node work estimate, subtree work */
     double tps_par;          /* (the solve) its entries over those of the longest root-to-leaf path; 0: not computed */
     int fail;
+    struct SWk *wk;          /* (26 October 2026, ISSUES 526) the work buffers of the factorization and the solves */
+};
+/* (26 October 2026, ISSUES 526) the work buffers of the factorization and the solves, held by each factor object. They
+ * were the process's own (one factorization at a time: the command line), indexed by the thread's number in the team:
+ * the mixed-integer solver's parallel search factors several LP objects at once, its workers all thread 0 of their own
+ * (inactive) teams, and one's buffer grew, and was freed, under another's factorization (a crash in fnode_upd). A factor
+ * object is used by one thread at a time; its own parallel regions index the buffers by the thread's number there. */
+#define SR_MAXT 256
+struct SWk {
+    struct FScr_ *fscr; int nfscr, fscr_m;            /* the factorization's scratch, per thread of its team */
+    int *fcnt;                                        /* the parallel factorization's children left per node */
+    struct SPool_ *spool; int nspool;                 /* the tree-parallel solve's pools, per thread */
+    double **ext; int next; char *extp; int *scnt;    /* its contribution vectors and children left per node */
+    double *sr_buf[SR_MAXT]; size_t sr_cap[SR_MAXT];  /* the many-right-hand-side solve's chunks, per thread */
+    double *sr_xt; size_t sr_xtcap;
 };
 
 static const double DONE = 1.0, DZERO = 0.0;
@@ -154,7 +169,9 @@ static int cmp_ll(const void *a, const void *b) { const long long x = *(const lo
 /* optional cap on the factorization flops (sum of squared column counts): orderings stop
  * as soon as the factor cannot beat the dense path, instead of finishing the analysis
  * only to be rejected (e_moment_stable_17: 0.8 s per analysis) */
-static double g_flopcap = 0;
+/* (26 October 2026, ISSUES 526: per thread, as the other caps below; set by a caller for its own analyses, which run on
+ * several threads at once: the dense-column candidates' estimates of the LP method) */
+static _Thread_local double g_flopcap = 0;
 void schol_set_flopcap(double cap) { g_flopcap = cap; }
 /* 17 October 2026: what the caps did in an analysis (schol_analyze_sym): whether an attempt stopped at one, and the
  * largest fill and flops an attempt reached; an analysis that met no cap is the one any caps above those give
@@ -182,13 +199,13 @@ static inline int an_over(size_t total, double flops, size_t fillcap) {
 /* the ordering mode of the next analyses (BRISK_AMD: 0 own, 1 automatic, 2 AMD alone; 3 AMD alone without the own
  * orderings when it gives up, for an estimate under a cap: the LP method's cost model, 22 October 2026); returns the
  * previous one (-1: not yet set) */
-static int g_amd;
+static _Thread_local int g_amd;   /* (per thread, ISSUES 454: a caller sets it around its own analysis, and analyses run on several threads at once) */
 int schol_set_amd(int mode) { const int old = g_amd; g_amd = mode; return old; }
 /* AMD's dense-row parameter for the next analyses (0: its default, 10): rows with more than this times sqrt(n) entries are ordered last */
-static double g_amd_dense = 0;
+static _Thread_local double g_amd_dense = 0;
 /* an ordering given by the caller for the next analysis in AMD mode (perm[new] = old; NULL: AMD) */
-static const int *g_force_perm = NULL;
-static int g_peo_try = 0, g_zf = 0, g_an_peo = 0;   /* (the chordal ordering's switch, its check mode, its use: see mcs_order) */
+static _Thread_local const int *g_force_perm = NULL;
+static _Thread_local int g_peo_try = 0, g_zf = 0, g_an_peo = 0;   /* (the chordal ordering's switch, its check mode, its use: see mcs_order) */
 void schol_set_perm(const int *perm) { g_force_perm = perm; }
 void schol_set_amd_dense(double d) { g_amd_dense = d; }
 
@@ -544,13 +561,13 @@ void schol_set_signs(SChol *S, const signed char *sgn_orig) {
     for (int j = 0; j < S->m; j++) S->sgn[j] = sgn_orig[S->perm[j]] < 0 ? -1 : 1;
 }
 
-static double g_amalg = 0.0;
+static _Thread_local double g_amalg = 0.0;   /* (per thread, as the other settings of an analysis: ISSUES 454) */
 double schol_set_amalg(double f) { const double o = g_amalg; g_amalg = f; return o; }
 /* (21 October 2026, LP/SOCP) the relaxed amalgamation also merges consecutive siblings whose row patterns below the
  * diagonal are the same (their diagonal block stored with explicit zeros): set by the LP method only (0 elsewhere: no
  * change); a transportation LP's 1,000 supply columns were 1,000 one-column nodes, each a rank-one update of the same
  * dense block */
-static int g_amalg_sib = 0;
+static _Thread_local int g_amalg_sib = 0;
 int schol_set_amalg_siblings(int on) { const int o = g_amalg_sib; g_amalg_sib = on; return o; }
 static unsigned an_settings(void);
 static int an_amd_competes(int m);
@@ -649,7 +666,7 @@ SChol *schol_analyze_adj(int m, int *deg, int **nbr, size_t fillcap) {
  * caller that knows the factor's size only after the analysis (the QP method: its factors with long columns run their
  * narrow exact supernodes at a fraction of the dense kernels' rate). The pattern is the one attached to S. Returns the new
  * analysis, S freed; S itself when the new one fails */
-static int g_nd_try;           /* (defined below with the dissection's settings) */
+static _Thread_local int g_nd_try;           /* (defined below with the dissection's settings) */
 SChol *schol_reanalyze_amalg(SChol *S, double f) {
     if (!S || !S->mcp || !S->mri || !S->perm) return S;
     const int m = S->m;
@@ -681,7 +698,7 @@ SChol *schol_reanalyze_amalg(SChol *S, double f) {
  * AC-OPF moment forms (case6468: m = 77,459). Same outputs as schol_order.            */
 static int schol_symb_perm(int m, SAdj *adj, size_t fillcap, int *P, int **perm_out, int **cpat_len,
                            int ***cpat, double *flops_out, size_t *nnz_out);
-static int g_amd = -1;
+static _Thread_local int g_amd = -1;
 static int schol_order_amd(int m, SAdj *adj, size_t fillcap, int **perm_out, int **cpat_len,
                            int ***cpat, double *flops_out, size_t *nnz_out) {
     size_t nz = 0;
@@ -712,6 +729,7 @@ static int schol_order_amd(int m, SAdj *adj, size_t fillcap, int **perm_out, int
 #ifdef HAVE_AMD
 extern __thread const volatile double *brisk_amd_cap;
 extern __thread int brisk_amd_capped;
+int brisk_amd_stopped(void);
 #endif
 /* (25 October 2026) with cap (may be NULL): the ordering stops once its count of the factor's work passes *cap (read as
  * it runs; the caller may lower it from another thread); the counts so far are then returned, a lower bound, and 2 */
@@ -723,6 +741,7 @@ int schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatil
 #ifndef HAVE_AMD
     (void)m; (void)deg; (void)nbr; (void)cap; (void)flops_out; (void)nnz_out; return 1;
 #else
+    if (brisk_amd_stopped()) return 3;      /* (28 October 2026: stopped before the copy, as AMD_order stops before its passes) */
     size_t nz = 0;
     for (int i = 0; i < m; i++) nz += (size_t)deg[i];
     int *Ap = malloc(sizeof(int) * ((size_t)m + 1)), *Ai = malloc(sizeof(int) * (nz + 1)), *P = malloc(sizeof(int) * ((size_t)m + 1));
@@ -740,7 +759,7 @@ int schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatil
     if (st != AMD_OK && st != AMD_OK_BUT_JUMBLED) return 1;
     *flops_out = Info[AMD_NMULTSUBS_LU] + 2.0 * Info[AMD_LNZ] + m;
     *nnz_out = Info[AMD_LNZ] + m;
-    return capped ? 2 : 0;
+    return capped == 2 ? 3 : capped ? 2 : 0;     /* (26 October 2026: 3, stopped by the deadline or the stop flag) */
 #endif
 }
 /* symbolic factorization along the elimination order P (P[k] = vertex eliminated k-th;
@@ -852,12 +871,14 @@ static int schol_order_metis(int m, SAdj *adj, size_t fillcap, int **perm_out, i
 
 /* 5.5: the own nested dissection (nd.c); the order is kept when its factorization is cheaper than AMD's */
 int nd_order(int n, const int *xadj, const int *adjncy, int *perm);
-static int g_nd_try = 0, g_nd_used = 0;
-static int *g_ordc_P = NULL, g_ordc_m = 0, g_ordc_used = 0; static double g_ordc_ned = 0; static uint64_t g_ordc_h = 0; static unsigned g_ordc_set = 0;   /* (the order cache, schol_analyze) */
+static _Thread_local int g_nd_try = 0, g_nd_used = 0;
+/* (26 October 2026, ISSUES 526: per thread; analyses run on several threads at once, and one's realloc freed the order
+ * another was copying) */
+static _Thread_local int *g_ordc_P = NULL, g_ordc_m = 0, g_ordc_used = 0; static _Thread_local double g_ordc_ned = 0; static _Thread_local uint64_t g_ordc_h = 0; static _Thread_local unsigned g_ordc_set = 0;   /* (the order cache, schol_analyze) */
 void schol_set_nd(int on) { g_nd_try = on; }
 /* the dissection's time budget in factorizations' worth of AMD's flops (at 2e10 a second, at least a second; 10 for the LP
  * method; a caller that expects fewer factorizations sets fewer; 0: the default) */
-static double g_nd_budget = 0;
+static _Thread_local double g_nd_budget = 0;
 void schol_set_nd_budget(double factorizations) { g_nd_budget = factorizations; }
 extern int g_nd_block;
 static unsigned an_settings(void) { return (unsigned)(g_amd + 2) | (unsigned)(g_nd_try != 0) << 8 | (unsigned)(g_nd_block != 0) << 9 | (unsigned)(g_force_perm != NULL) << 10 | (unsigned)(g_peo_try != 0) << 11; }
@@ -875,6 +896,10 @@ static int schol_order_nd(int m, SAdj *adj, size_t fillcap, int **perm_out, int 
         for (int q = 0; q < adj[i].n; q++) if (adj[i].a[q] != i) adjncy[w++] = adj[i].a[q];
         xadj[i + 1] = (int)w;
     }
+    { const char *dp = getenv("BRISK_NDDUMP");     /* (27 October 2026, the SOCP developer, experiments: the graph handed to the
+                                                     * dissection, as bench/simplex_dev/ndtest.c reads it; file.k for the k-th) */
+      if (dp) { static int k_ = 0; char fn[512]; snprintf(fn, sizeof fn, "%s.%d", dp, k_++); FILE *fd = fopen(fn, "w");
+        if (fd) { fprintf(fd, "%d\n", m); for (int i = 0; i < m; i++) { for (int q = xadj[i]; q < xadj[i + 1]; q++) fprintf(fd, "%d ", adjncy[q]); fputc('\n', fd); } fclose(fd); } } }
     const int st = nd_order(m, xadj, adjncy, P);
     free(xadj); free(adjncy);
     if (st) { free(P); return 1; }
@@ -1086,28 +1111,36 @@ static SChol *schol_analyze(int m, SAdj *adj, size_t fillcap) {
         int rs = 1;
         ND_BUDGET_ON(ndcap);
         if (ndpar) {
-            const int ph0 = g_an_ph; const size_t fc0 = g_an_fillcap; const double fo0 = g_flopcap_own;
+            const int ph0 = g_an_ph; const size_t fc0 = g_an_fillcap; const double fo0 = g_flopcap_own, gc0 = g_flopcap;
             int bhit = 0, bhito = 0; size_t btot = 0, bamdt = SIZE_MAX, bownt = 0; double bfl = 0, bamdf = 1e300, bownf = 0;
             const size_t cap1 = (size_t)(1.2 * (double)nnz) + (size_t)m;
+            /* (28 October 2026, the LP developer) the caller's stop flag of the dissection is per thread (nd.c): given to the
+             * second try's thread too, or a stopped analysis waited here for that try to end (satellites2-25, LP: 6 s) */
+            extern void nd_set_stop(const volatile int *f); extern const volatile int *nd_get_stop(void);
+            const volatile int *ndstop0 = nd_get_stop();
             #pragma omp parallel num_threads(2)
             {
                 const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
+                if (tid == 1) nd_set_stop(ndstop0);
                 if (tid == 0) { nd_set_target(flops); rs = schol_order_nd(m, adj, cap1, &perm2, &plen2, &pat2, &flops2, &nnz2); nd_set_target(0); }
                 if ((nt == 1 && tid == 0) || tid == 1) {
                     const int other = tid == 1;
                     int s_ph = 0, s_hit = 0, s_hito = 0; size_t s_tot = 0, s_fc = 0, s_amdt = 0, s_ownt = 0; double s_fl = 0, s_fo = 0, s_amdf = 0, s_ownf = 0;
                     if (!other) { s_ph = g_an_ph; s_hit = g_an_hit; s_hito = g_an_hit_other; s_tot = g_an_tot; s_fc = g_an_fillcap; s_fl = g_an_fl; s_fo = g_flopcap_own;
                                   s_amdt = g_an_amd_tot; s_amdf = g_an_amd_fl; s_ownt = g_an_own_tot; s_ownf = g_an_own_fl; }
+                    const double gc_s = g_flopcap; g_flopcap = gc0;   /* (the caller's cap, per thread: given to the other thread) */
                     g_an_ph = ph0; g_an_fillcap = fc0; g_flopcap_own = fo0; g_an_hit = 0; g_an_hit_other = 0; g_an_tot = 0; g_an_fl = 0;
                     g_an_amd_tot = SIZE_MAX; g_an_amd_fl = 1e300; g_an_own_tot = 0; g_an_own_fl = 0;
                     const double w0 = nd_work_count();
                     nd_set_hubs(0); nd_set_deadline(ndcap); nd_set_target(flops);
                     rsB = schol_order_nd(m, adj, cap1, &permB, &plenB, &patB, &flopsB, &nnzB);
                     nd_set_hubs(1); nd_set_deadline(0); nd_set_target(0);
+                    if (tid == 1) nd_set_stop(NULL);     /* (the worker keeps no pointer to the caller's flag) */
                     workB = nd_work_count() - w0;
                     bhit = g_an_hit; bhito = g_an_hit_other; btot = g_an_tot; bfl = g_an_fl; bamdt = g_an_amd_tot; bamdf = g_an_amd_fl; bownt = g_an_own_tot; bownf = g_an_own_fl;
                     if (!other) { g_an_ph = s_ph; g_an_hit = s_hit; g_an_hit_other = s_hito; g_an_tot = s_tot; g_an_fillcap = s_fc; g_an_fl = s_fl; g_flopcap_own = s_fo;
                                   g_an_amd_tot = s_amdt; g_an_amd_fl = s_amdf; g_an_own_tot = s_ownt; g_an_own_fl = s_ownf; }
+                    g_flopcap = gc_s;
                 }
             }
             /* (the second trial's accounting merged: as if it had run in this thread) */
@@ -1356,6 +1389,7 @@ ordered:
         perm = perm2; plen = plen2; pat = pat2;
     }
     SChol *S = sx(sizeof(SChol));
+    S->wk = sx(sizeof(struct SWk));
     { static long g_uid = 0;
       #pragma omp atomic capture
       S->uid = ++g_uid; }
@@ -1522,7 +1556,9 @@ void schol_free(SChol *S) {
     free(S->snhead); free(S->snnext); free(S->snptr); free(S->hkey); free(S->hval);
     free(S->mv_c); free(S->mv_zo); free(S->mv_z); free(S->mva); free(S->mv_za); free(S->mv2w); free(S->mv_z2); free(S->sch_ptr); free(S->sch_idx);
     free(S->ul_ptr); free(S->ul_j); free(S->ul_p); free(S->ul_a); free(S->spar); free(S->sfd); free(S->swk); free(S->ssub);
+    free(S->tflag);
     { extern void schol_part_free(SChol *S_); schol_part_free(S); }
+    { extern void schol_wk_free(struct SWk *W); schol_wk_free(S->wk); }
     free(S);
 }
 
@@ -2178,7 +2214,19 @@ static int g_tinyloop = -1;          /* BRISK_TINYLOOP: the column loop for ever
  * dgemm: BLAS-3 speed instead of the column loop over the whole panel (roa_vdp_d8_I, 4
  * supernodes of up to 2,000 columns: that loop was 38% of the run). Returns the number
  * of replaced pivots.                                                                 */
-int chol_tiny_blocked(int nr, int w, double *P, int ld, const double *d0, int d0stride, double tinypiv) {
+/* (26 October 2026, the SOCP developer, a test: schol_set_tinyreg(eps) > 0) a tiny pivot replaced by eps times its original
+ * diagonal, its column kept, instead of 1e128 with its column zeroed: the factor of a nearby nonsingular matrix, whose
+ * difference the caller's refinement against the true operator removes, rather than one that has lost the direction */
+static _Thread_local double g_tinyreg = 0.0;     /* (per thread, as the other settings of an analysis or a factorization) */
+void schol_set_tinyreg(double eps) { g_tinyreg = eps; }
+static inline int tiny_replace(double *d, double dd) {     /* 1: the column is dropped (1e128), 0: kept */
+    if (g_tinyreg > 0 && dd > 0) { *d = g_tinyreg * dd; return 0; }
+    *d = 1e128; return 1;
+}
+static int chol_tiny_blocked_f(int nr, int w, double *P, int ld, const double *d0, int d0stride, double tinypiv, unsigned char *tf);
+int chol_tiny_blocked(int nr, int w, double *P, int ld, const double *d0, int d0stride, double tinypiv) { return chol_tiny_blocked_f(nr, w, P, ld, d0, d0stride, tinypiv, NULL); }
+/* (tf: when not NULL, tf[c] = 1 for each column whose tiny pivot is regularized and kept) */
+static int chol_tiny_blocked_f(int nr, int w, double *P, int ld, const double *d0, int d0stride, double tinypiv, unsigned char *tf) {
     const int nb = 64;
     int ntiny = 0;
     for (int c0 = 0; c0 < w; c0 += nb) {
@@ -2191,7 +2239,7 @@ int chol_tiny_blocked(int nr, int w, double *P, int ld, const double *d0, int d0
             double d = col[c];
             const double dd = fabs(d0[(size_t)c * d0stride]);
             int tiny = 0;
-            if (!(d > tinypiv * dd) || !(d > 0)) { d = 1e128; ntiny++; tiny = 1; }
+            if (!(d > tinypiv * dd) || !(d > 0)) { ntiny++; tiny = tiny_replace(&d, dd); if (!tiny && tf) tf[c] = 1; }
             const double l = sqrt(d), il = 1.0 / l;
             col[c] = l;
             if (tiny) { for (int r = c + 1; r < c0 + b; r++) col[r] = 0; }
@@ -2349,14 +2397,14 @@ static int schol_factor_ll(SChol *S, double shift) {
              * sums), so the drop threshold sits 10x higher (at 1e-14 the drop decisions were
              * noise: attr_lorenz_d8_I 36 -> 75 iterations) */
             if (g_tinyloop < 0) g_tinyloop = getenv("BRISK_TINYLOOP") != NULL;
-            if (w > 96 && !g_tinyloop) S->ntiny += chol_tiny_blocked(nr, w, Pk, nr, ip0 ? S->dg0 + j0 : P0, ip0 ? 1 : nr + 1, 10.0 * S->tinypiv);
+            if (w > 96 && !g_tinyloop) S->ntiny += chol_tiny_blocked_f(nr, w, Pk, nr, ip0 ? S->dg0 + j0 : P0, ip0 ? 1 : nr + 1, 10.0 * S->tinypiv, S->tflag ? S->tflag + j0 : NULL);
             else
             for (int c = 0; c < w; c++) {
                 double *col = Pk + (size_t)c * nr;
                 sc_colupd(col, Pk, nr, 0, c, c, nr);
                 double d = col[c];
                 const double d0 = fabs(ip0 ? S->dg0[j0 + c] : P0[(size_t)c * nr + c]);
-                if (!(d > S->tinypiv * d0) || !(d > 0)) { d = 1e128; S->ntiny++; for (int r = c + 1; r < nr; r++) col[r] = 0; }
+                if (!(d > S->tinypiv * d0) || !(d > 0)) { S->ntiny++; if (tiny_replace(&d, d0)) for (int r = c + 1; r < nr; r++) col[r] = 0; else if (S->tflag) S->tflag[j0 + c] = 1; }
                 const double l = sqrt(d), il = 1.0 / l;
                 col[c] = l;
                 for (int r = c + 1; r < nr; r++) col[r] *= il;
@@ -2422,24 +2470,32 @@ static int (*const BL(openblas_get_num_threads))(void) = 0;
 extern void BL(openblas_set_num_threads)(int) __attribute__((weak));
 extern int BL(openblas_get_num_threads)(void) __attribute__((weak));
 #endif
-typedef struct { int *relind; double *upd; size_t updcap; double *sw; size_t swcap; double *ib; size_t ibcap; double *br; size_t brcap; double *bc; size_t bccap; double *ism; size_t ismcap; int *ri; size_t ricap; } FScr;
-static FScr *g_fscr = NULL; static int g_nfscr = 0, g_fscr_m = 0;
+typedef struct FScr_ { int *relind; double *upd; size_t updcap; double *sw; size_t swcap; double *ib; size_t ibcap; double *br; size_t brcap; double *bc; size_t bccap; double *ism; size_t ismcap; int *ri; size_t ricap; } FScr;
 static int g_fpar = -1;             /* BRISK_FACTLL=1: the previous left-looking code */
 static double g_fcut = -1;
-static FScr *fscr_get(void) {
+/* the scratch of the calling thread: its number in the team of the object's own parallel region; outside one (a caller's
+ * team, of which only this thread uses the object) the first */
+static FScr *fscr_get(const SChol *S) {
+    struct SWk *W = S->wk;
 #ifdef _OPENMP
-    return &g_fscr[omp_get_thread_num()];
+    const int t = omp_get_thread_num();
+    return &W->fscr[t < W->nfscr ? t : 0];
 #else
-    return &g_fscr[0];
+    return &W->fscr[0];
 #endif
 }
-static void fscr_ensure(int nt, int m) {
-    if (nt > g_nfscr || m > g_fscr_m) {
-        for (int t = 0; t < g_nfscr; t++) { free(g_fscr[t].relind); free(g_fscr[t].upd); free(g_fscr[t].sw); free(g_fscr[t].ib); free(g_fscr[t].br); free(g_fscr[t].bc); free(g_fscr[t].ism); free(g_fscr[t].ri); }
-        free(g_fscr);
-        g_nfscr = nt > g_nfscr ? nt : g_nfscr; g_fscr_m = m > g_fscr_m ? m : g_fscr_m;
-        g_fscr = sx(sizeof(FScr) * g_nfscr);
-        for (int t = 0; t < g_nfscr; t++) g_fscr[t].relind = sx(sizeof(int) * (g_fscr_m + 1));
+static void fscr_free(struct SWk *W) {
+    for (int t = 0; t < W->nfscr; t++) { free(W->fscr[t].relind); free(W->fscr[t].upd); free(W->fscr[t].sw); free(W->fscr[t].ib); free(W->fscr[t].br); free(W->fscr[t].bc); free(W->fscr[t].ism); free(W->fscr[t].ri); }
+    free(W->fscr); W->fscr = NULL; W->nfscr = 0; W->fscr_m = 0;
+}
+static void fscr_ensure(const SChol *S, int nt, int m) {
+    struct SWk *W = S->wk;
+    if (nt > W->nfscr || m > W->fscr_m) {
+        const int nn = nt > W->nfscr ? nt : W->nfscr, mm = m > W->fscr_m ? m : W->fscr_m;
+        fscr_free(W);
+        W->nfscr = nn; W->fscr_m = mm;
+        W->fscr = sx(sizeof(FScr) * W->nfscr);
+        for (int t = 0; t < W->nfscr; t++) W->fscr[t].relind = sx(sizeof(int) * (W->fscr_m + 1));
     }
 }
 static double *fscr_buf(double **b, size_t *cap, size_t need) {
@@ -2486,8 +2542,8 @@ static void sc_build_tree(SChol *S) {
 static double g_batchd = 0.9;
 static int g_lpsmall = -1;
 static int g_batchw = -1;       /* (18 October 2026, LP/SOCP: the widest source batched, cone solver only; BRISK_BATCHW, 4 as before) */
-static int g_ftime = -1; static double g_ft[6], g_pansz_dbg, g_ftd[2];   /* (g_ftd: thread seconds of fnode_dag's trsm and gemm tasks) */   /* BRISK_FTIME: seconds in the update products, their scatter, the panel factor */
-void schol_ftime_print(void) { if (g_ftime > 0) printf("   [sparse factor: update products %.2fs, scatter %.2fs, panels %.2fs (thread seconds; the task graph: trsm %.2fs, gemm %.2fs); wall: the calls %.2fs, their parallel regions %.2fs, the copy of the values %.2fs; pansz %.3g]\n", g_ft[0], g_ft[1], g_ft[2], g_ftd[0], g_ftd[1], g_ft[3], g_ft[4], g_ft[5], g_pansz_dbg); }
+static int g_ftime = -1; static double g_ft[6], g_pansz_dbg, g_ftd[2], g_ftb[3];   /* (g_ftd: thread seconds of fnode_dag's trsm and gemm tasks) */   /* BRISK_FTIME: seconds in the update products, their scatter, the panel factor */
+void schol_ftime_print(void) { if (g_ftime > 0) printf("   [sparse factor: the batched sources %.2fs, their products %.2fs, %.3g flops]\n", g_ftb[0], g_ftb[1], g_ftb[2]); if (g_ftime > 0) printf("   [sparse factor: update products %.2fs, scatter %.2fs, panels %.2fs (thread seconds; the task graph: trsm %.2fs, gemm %.2fs); wall: the calls %.2fs, their parallel regions %.2fs, the copy of the values %.2fs; pansz %.3g]\n", g_ft[0], g_ft[1], g_ft[2], g_ftd[0], g_ftd[1], g_ft[3], g_ft[4], g_ft[5], g_pansz_dbg); }
 static void fnode_upd(SChol *S, int k, int R0, int R1, int C0, int C1, FScr *w) {
     if (g_ftime < 0) g_ftime = getenv("BRISK_FTIME") ? atoi(getenv("BRISK_FTIME")) : 0;
     if (g_batchw < 0) { const char *e = getenv("BRISK_BATCHW"); g_batchw = e ? atoi(e) : 64; e = getenv("BRISK_BATCHD"); g_batchd = e ? atof(e) : 0.9; }
@@ -2663,6 +2719,7 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, int C0, int C1, FScr *w) 
     if (nbatch) {
         /* the batch: Urow (tile rows x K) and Ucol (w x K) zero-padded, signs on Ucol, one dgemm per
          * chunk of K <= BATCH_K columns: P[R0:R1, :] -= Urow Ucol' */
+        const double tb0_ = g_ftime > 0 ? omp_get_wtime() : 0; double tbg_ = 0, fbg_ = 0;
         const int ntile = R1 - R0;
         int t = 0;
         while (t < nbatch) {
@@ -2686,9 +2743,24 @@ static void fnode_upd(SChol *S, int k, int R0, int R1, int C0, int C1, FScr *w) 
                     for (int cc = 0; cc < a; cc++) uc[rwj[cc] - j0] = sg * Uj[cc];
                 }
             }
-            BL(dgemm_)("N", "T", &ntile, &wk, &K, &mone, Ur, &ntile, Uc, &wk, &DONE, Pk + R0, &nr);
+            const double tg0_ = g_ftime > 0 ? omp_get_wtime() : 0;
+            /* (27 October 2026, the SOCP developer) only the columns left of the tile's last row: the factor is lower
+             * triangular, and a tile of the node's diagonal block wrote its upper part too (a soft-margin classification of
+             * the owner's independent benchmark, 2,048 data rows into a block of 1,025: 5.2e10 flops in 12 factorizations,
+             * half of them above the diagonal). Each entry is the same sum: the same bits. BRISK_BATCHFULL=1: as before */
+            static int bfull = -1; if (bfull < 0) bfull = getenv("BRISK_BATCHFULL") != NULL;
+            const int ncol = bfull ? wk : (R1 < wk ? R1 : wk);
+            BL(dgemm_)("N", "T", &ntile, &ncol, &K, &mone, Ur, &ntile, Uc, &wk, &DONE, Pk + R0, &nr);
+            if (g_ftime > 0) { tbg_ += omp_get_wtime() - tg0_; fbg_ += 2.0 * ntile * (double)ncol * K; }
             t = t1;
         }
+        if (g_ftime > 0) { const double tb1_ = omp_get_wtime();
+            #pragma omp atomic
+            g_ftb[0] += tb1_ - tb0_;
+            #pragma omp atomic
+            g_ftb[1] += tbg_;
+            #pragma omp atomic
+            g_ftb[2] += fbg_; }
     }
 }
 /* tiled right-looking Cholesky of the (nr x w) panel P (ld nr), lower part */
@@ -2751,14 +2823,14 @@ static int fnode_factor(SChol *S, int k, FScr *wsc, int par) {
         const int ip0 = S->pan == S->pmat;              /* (in place: the saved diagonals) */
         int nt = 0;
         if (g_tinyloop < 0) g_tinyloop = getenv("BRISK_TINYLOOP") != NULL;
-        if (w > 96 && !g_tinyloop) nt = chol_tiny_blocked(nr, w, Pk, nr, ip0 ? S->dg0 + j0 : P0, ip0 ? 1 : nr + 1, 10.0 * S->tinypiv);
+        if (w > 96 && !g_tinyloop) nt = chol_tiny_blocked_f(nr, w, Pk, nr, ip0 ? S->dg0 + j0 : P0, ip0 ? 1 : nr + 1, 10.0 * S->tinypiv, S->tflag ? S->tflag + j0 : NULL);
         else
         for (int c = 0; c < w; c++) {
             double *col = Pk + (size_t)c * nr;
             sc_colupd(col, Pk, nr, 0, c, c, nr);
             double d = col[c];
             const double d0 = fabs(ip0 ? S->dg0[j0 + c] : P0[(size_t)c * nr + c]);
-            if (!(d > S->tinypiv * d0) || !(d > 0)) { d = 1e128; nt++; for (int r = c + 1; r < nr; r++) col[r] = 0; }
+            if (!(d > S->tinypiv * d0) || !(d > 0)) { nt++; if (tiny_replace(&d, d0)) for (int r = c + 1; r < nr; r++) col[r] = 0; else if (S->tflag) S->tflag[j0 + c] = 1; }
             const double l = sqrt(d), il = 1.0 / l;
             col[c] = l;
             for (int r = c + 1; r < nr; r++) col[r] *= il;
@@ -3398,7 +3470,7 @@ int brisk_dpotri_full(int n, double *A, int lda) {
      * one thread, with a work array of its own). Until 5.15 LAPACK's dpotri ran there: a block of
      * order >= 768 among several blocks got other bits at one thread (no active region) than at
      * two or more (a user's f24_fixed__007: 32 iterations at one thread, 28 at two). */
-    static double *Ws = NULL; static size_t wn = 0;
+    static _Thread_local double *Ws = NULL; static _Thread_local size_t wn = 0;   /* (per thread: two solves outside any parallel region on two threads, ISSUES 454) */
     const int inner = omp_in_parallel();
     double *W;
     if (inner) { W = malloc(sizeof(double) * (size_t)n * n); if (!W) { int info; BL(dpotri_)("L", &n, A, &lda, &info); return info; } }
@@ -3594,10 +3666,81 @@ static void accel_single(void) {
     (void)accel_set(1u);
 }
 #endif
+#if !defined(__APPLE__) && !defined(_WIN32)
+/* 27 October 2026 (a user's report, ISSUES 708): MKL, MATLAB's BLAS and LAPACK in the MEX file. Inside MATLAB MKL and
+ * BRISK share one OpenMP runtime (Intel's libiomp5), and MKL takes its thread count from it, i.e. from BRISK's own
+ * omp_set_num_threads: the same dsyevd of a 60 x 60 block returned other eigenvectors at -threads 1, 4 and 16, a threaded
+ * dpotrf of the Schur matrix other bits from call to call, and a cut SDP of PolyOpt took 30 iterations at one thread
+ * and 32 at four, with Intel's runtime and MKL under the command-line solver too (the busy-machine rule also changes the
+ * count during a solve). MKL_NUM_THREADS and MATLAB's maxNumCompThreads(1) (which sets the OpenMP count that BRISK sets
+ * again) change nothing; MKL's per-thread setting does. As for OpenBLAS: one MKL thread on the calling thread during
+ * the call (in BRISK's parallel regions MKL runs on one thread by itself), the caller's setting given back at the end.
+ * Looked up at run time: without MKL nothing happens. (The user's fix, judged here: the same iterates at 1 to 16
+ * threads on his laptop; this host has no MKL by default.) */
+#include <dlfcn.h>
+static int (*mkl_set_local)(int) = NULL;
+static int mkl_looked = 0, mkl_host = -1;    /* the caller's setting, to give back (-1: none saved) */
+static int mkl_unrepro = 0;                  /* MKL found without its reproducible mode, which could not be set */
+/* 27 October 2026 (ISSUES 708): with one MKL thread a call, MKL still took other code paths from run to run at more
+ * than one BRISK thread (a user's cut SDP, cutsdp_4, under MKL 2026.2 and Intel's OpenMP runtime: 29, 30, 31 and 33
+ * iterations in four runs at 4 threads, with MKL_NUM_THREADS=1 too): outside its reproducible mode MKL chooses kernels
+ * by the alignment of the arrays in memory, which BRISK's threads allocate in an order of their own. MKL_CBWR=AUTO (the
+ * mode of the processor's own code path, documented by Intel for run-to-run reproducibility) gave one result at 1, 2, 3
+ * and 4 threads on three of the user's SDPs, at the same speed. The command line sets MKL_CBWR=AUTO in its environment
+ * unless the user set it (main.c, before MKL's first call); a library host (MATLAB, Python) has started MKL before
+ * BRISK runs, when the mode can no longer change: BRISK asks for it, and when it is refused says so in the log. */
+static int mkl_sym2(const char *a, const char *b, void **out) {
+    static const char *const lib[] = { "mkl.so", "libmkl_rt.so.3", "libmkl_rt.so.2", "libmkl_rt.so",
+                                       "libmkl_intel_lp64.so.3", "libmkl_intel_lp64.so.2", "libmkl_intel_lp64.so",
+                                       "libmkl_intel_thread.so.3", "libmkl_intel_thread.so.2", "libmkl_gnu_thread.so.3",
+                                       "libmkl_gnu_thread.so.2", "libmkl_core.so.3", "libmkl_core.so.2", "libmkl_core.so" };
+    const char *sym[2] = { a, b };
+    *out = NULL;
+    /* (RTLD_DEFAULT is the null pointer on Linux: the process-wide lookup is made apart, not through a handle test) */
+    for (int j = 0; j < 2 && !*out; j++) *out = dlsym(RTLD_DEFAULT, sym[j]);
+    for (int i = 0; i < (int)(sizeof lib / sizeof *lib) && !*out; i++) {
+        void *h = dlopen(lib[i], RTLD_NOW | RTLD_NOLOAD);
+        for (int j = 0; h && j < 2 && !*out; j++) *out = dlsym(h, sym[j]);
+        if (h && !*out) dlclose(h);    /* (a handle that gave the function stays open) */
+    }
+    return *out != NULL;
+}
+int brisk_blas_unreproducible(void) { return mkl_unrepro; }
+static void mkl_single(void) {
+    if (!mkl_looked) {
+        /* MATLAB's mkl.so exports only mkl_serv_set_num_threads_local and is opened by libmwblas without RTLD_GLOBAL,
+         * so it is also looked for by name (never loaded here: RTLD_NOLOAD) */
+        /* (MKL 2025 and later name their libraries .so.3; the setting is exported by the interface library
+         * libmkl_intel_lp64 or by libmkl_rt, by the threading library as mkl_serv_set_num_threads_local) */
+        /* the reproducible mode (MKL_CBWR_BRANCH = 1 asks for the branch; MKL_CBWR_BRANCH_OFF = 1 is off, MKL_CBWR_OFF = 0
+         * unset, MKL_CBWR_AUTO = 2; success 0): asked for before
+         * BRISK's first BLAS call when MKL is already in the process (a host where BRISK is MKL's first user), and again
+         * after it (MATLAB's libmwblas opens mkl.so at its first call), when MKL refuses a change once it has run */
+        void *fg = NULL, *fs = NULL;
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass) { const int one = 1; const double x = 0; (void)BL(ddot_)(&one, &x, &one, &x, &one); }
+            if (mkl_sym2("MKL_CBWR_Get", "mkl_serv_cbwr_get", &fg) && ((int (*)(int))fg)(1) <= 1)
+                mkl_unrepro = !(mkl_sym2("MKL_CBWR_Set", "mkl_serv_cbwr_set", &fs) && ((int (*)(int))fs)(2) == 0);
+            else if (fg) mkl_unrepro = 0;
+        }
+        void *f = NULL;
+        if (mkl_sym2("MKL_Set_Num_Threads_Local", "mkl_serv_set_num_threads_local", &f)) mkl_set_local = (int (*)(int))f;
+        mkl_looked = 1;
+    }
+    if (getenv("BRISK_NTDBG")) printf("   [threads: MKL's per-thread setting %s%s]\n", mkl_set_local ? "found" : "not found", mkl_unrepro ? "; its reproducible mode is off and could not be set" : "");
+    if (!mkl_set_local) return;
+    const int prev = mkl_set_local(1);
+    if (mkl_host < 0) mkl_host = prev;
+}
+#else
+int brisk_blas_unreproducible(void) { return 0; }
+#endif
 void brisk_threads_init(void) {
     if (getenv("BRISK_BLASMT")) return;
 #ifdef __APPLE__
     accel_single();
+#elif !defined(_WIN32)
+    mkl_single();
 #endif
     if (BL(openblas_set_num_threads)) {
         if (BL(openblas_get_num_threads) && blas_T_host == 0) { const int t = BL(openblas_get_num_threads)(); if (t > 1) blas_T_host = t; }
@@ -3612,6 +3755,9 @@ void brisk_threads_restore(void) {
 #ifdef __APPLE__
     if (accel_set && accel_host >= 0) (void)accel_set((unsigned)accel_host);
     accel_host = -1;
+#elif !defined(_WIN32)
+    if (mkl_set_local && mkl_host >= 0) (void)mkl_set_local(mkl_host);
+    mkl_host = -1;
 #endif
     if (blas_T_host > 1 && BL(openblas_set_num_threads)) BL(openblas_set_num_threads)(blas_T_host);
     blas_T_host = 0;
@@ -3714,8 +3860,9 @@ static void pd_fast(int symm, const char *a, const char *b, int m, int n, const 
     }
 }
 #define PD_NV 64
-static struct { int kind, m, n, k, T; signed char ok; } pd_ver[PD_NV];
-static int pd_nver = 0;
+/* (per thread, ISSUES 526: entries appended from several threads at once) */
+static _Thread_local struct { int kind, m, n, k, T; signed char ok; } pd_ver[PD_NV];
+static _Thread_local int pd_nver = 0;
 /* -1 unknown, 0 the reference, 1 the fast way (for this kind, size and thread count) */
 static int pd_lookup(int kind, int m, int n, int k, int T) {
     for (int i = 0; i < pd_nver; i++)
@@ -3782,7 +3929,24 @@ void pdgemm(const char *ta, const char *tb, const int *m_, const int *n_, const 
             const double *A, const int *lda_, const double *B, const int *ldb_, const double *beta, double *C, const int *ldc_) {
     const int m = *m_, n = *n_, k = *k_;
     pd_env();
-    if ((double)m * n * k < PD_MIN || getenv_cached_pd()) { BL(dgemm_)(ta, tb, m_, n_, k_, alpha, A, lda_, B, ldb_, beta, C, ldc_); return; }
+    if ((double)m * n * k < PD_MIN || getenv_cached_pd()) {
+        /* 27 October 2026: a small A'B ("T", "N") takes OpenBLAS's general path, which allocates its buffers under one lock
+         * for all threads: 0.10 us a call on one thread and 1.7-1.8 us from four, against 0.03-0.05 for "NN", "NT" and
+         * "TT", which its small-matrix kernels serve (orders 3-5). The NT scaling of 50,000 blocks of order 2-5 (tiny_lmi,
+         * SDP) waited at that lock. A' is copied into a buffer on the stack and the product made as "NN" */
+        static int tn_env = -1;
+        if (tn_env < 0) { const char *e = getenv("BRISK_PDTN"); tn_env = !(e && atoi(e) == 0); }
+        if (tn_env && (ta[0] == 'T' || ta[0] == 't' || ta[0] == 'C' || ta[0] == 'c') && (tb[0] == 'N' || tb[0] == 'n')
+            && m > 0 && k > 0 && m * k <= 1024) {
+            double At[1024];
+            const int lda = *lda_;
+            for (int j = 0; j < k; j++) for (int i = 0; i < m; i++) At[i + (size_t)j * m] = A[j + (size_t)i * lda];
+            BL(dgemm_)("N", "N", m_, n_, k_, alpha, At, m_, B, ldb_, beta, C, ldc_);
+            return;
+        }
+        BL(dgemm_)(ta, tb, m_, n_, k_, alpha, A, lda_, B, ldb_, beta, C, ldc_);
+        return;
+    }
     pd_run(0, ta, tb, m, n, k_, alpha, A, lda_, B, *ldb_, beta, C, *ldc_);
 }
 void pdsymm(const char *side, const char *uplo, const int *m_, const int *n_, const double *alpha,
@@ -3915,7 +4079,7 @@ static int fnode_dag(SChol *S, int k, int par) {
             const int R0 = r0[i], R1 = r0[i + 1], C0 = r0[j], C1 = r0[j + 1];
             (void)Cij;                                   /* (read by the depend clause only) */
             #pragma omp task if(par) depend(out: Cij[0]) firstprivate(R0, R1, C0, C1)
-            fnode_upd(S, k, R0, R1, C0, C1, fscr_get());
+            fnode_upd(S, k, R0, R1, C0, C1, fscr_get(S));
         }
     for (int c = 0; c < nct; c++) {
         double *D = FT(c, c);
@@ -3927,7 +4091,7 @@ static int fnode_dag(SChol *S, int k, int par) {
             const double *D0 = ip0 ? S->dg0 + S->ss[k] + r0[c] : S->pmat + S->pbase[k] + (size_t)r0[c] * nr + r0[c];
             const int d0s = ip0 ? 1 : nr + 1;
             #pragma omp task if(par) depend(inout: D[0]) firstprivate(D, D0, cb, d0s)
-            { const int nt = chol_tiny_blocked(cb, cb, D, nr, D0, d0s, 10.0 * S->tinypiv);
+            { const int nt = chol_tiny_blocked_f(cb, cb, D, nr, D0, d0s, 10.0 * S->tinypiv, S->tflag ? S->tflag + S->ss[k] + r0[c] : NULL);
               if (nt) {
                 #pragma omp atomic
                 S->ntiny += nt; } }
@@ -4005,7 +4169,7 @@ static void fnode(SChol *S, int k, double shift, int par) {
         for (int b = 0; b < nblk; b++)
             for (int cb = 0; cb < ncb; cb++) {
                 #pragma omp task firstprivate(b, cb)
-                fnode_upd(S, k, b * FB_RB, (b + 1) * FB_RB < nr ? (b + 1) * FB_RB : nr, cb * cbw, (cb + 1) * cbw < w ? (cb + 1) * cbw : w, fscr_get());
+                fnode_upd(S, k, b * FB_RB, (b + 1) * FB_RB < nr ? (b + 1) * FB_RB : nr, cb * cbw, (cb + 1) * cbw < w ? (cb + 1) * cbw : w, fscr_get(S));
             }
         #pragma omp taskwait
     } else {
@@ -4016,21 +4180,20 @@ static void fnode(SChol *S, int k, double shift, int par) {
             #pragma omp parallel for schedule(dynamic, 1) num_threads(tn)
             for (int bc = 0; bc < nblk * ncb; bc++) {
                 const int b = bc / ncb, cb = bc % ncb;
-                fnode_upd(S, k, b * FB_RB, (b + 1) * FB_RB < nr ? (b + 1) * FB_RB : nr, cb * cbw, (cb + 1) * cbw < w ? (cb + 1) * cbw : w, fscr_get());
+                fnode_upd(S, k, b * FB_RB, (b + 1) * FB_RB < nr ? (b + 1) * FB_RB : nr, cb * cbw, (cb + 1) * cbw < w ? (cb + 1) * cbw : w, fscr_get(S));
             }
         } else
             for (int b = 0; b < nblk; b++)
                 for (int cb = 0; cb < ncb; cb++)
-                    fnode_upd(S, k, b * FB_RB, (b + 1) * FB_RB < nr ? (b + 1) * FB_RB : nr, cb * cbw, (cb + 1) * cbw < w ? (cb + 1) * cbw : w, fscr_get());
+                    fnode_upd(S, k, b * FB_RB, (b + 1) * FB_RB < nr ? (b + 1) * FB_RB : nr, cb * cbw, (cb + 1) * cbw < w ? (cb + 1) * cbw : w, fscr_get(S));
     }
     const double tp0 = g_ftime > 0 ? omp_get_wtime() : 0;
-    if (fnode_factor(S, k, fscr_get(), par)) S->fail = 1;
+    if (fnode_factor(S, k, fscr_get(S), par)) S->fail = 1;
     if (g_ftime > 0) { const double tp1 = omp_get_wtime();
         #pragma omp atomic
         g_ft[2] += tp1 - tp0; }
 }
 /* task driver: a finished node releases its parent once all children are done */
-static int *g_fcnt = NULL;
 static void fnode_chain(SChol *S, int k, double shift, const char *big) {
     for (;;) {
         fnode(S, k, shift, big[k]);
@@ -4039,7 +4202,7 @@ static void fnode_chain(SChol *S, int k, double shift, const char *big) {
         int left;
         #pragma omp flush
         #pragma omp atomic capture
-        left = --g_fcnt[p];
+        left = --S->wk->fcnt[p];
         if (left != 0) return;
         #pragma omp flush
         k = p;                                   /* the last child continues with the parent */
@@ -4048,7 +4211,7 @@ static void fnode_chain(SChol *S, int k, double shift, const char *big) {
 static void fsubtree(SChol *S, int u, double shift) {
     for (int k = S->sfd[u]; k <= u; k++) fnode(S, k, shift, 0);
 }
-static int g_solve_seq;       /* (defined with the solve routines) */
+static _Thread_local int g_solve_seq;       /* (defined with the solve routines) */
 static int schol_factor_(SChol *S, double shift);
 int schol_factor(SChol *S, double shift) {
     if (g_ftime < 0) g_ftime = getenv("BRISK_FTIME") ? atoi(getenv("BRISK_FTIME")) : 0;
@@ -4095,7 +4258,7 @@ static int schol_factor_(SChol *S, double shift) {
     nt = omp_get_max_threads();
     if (omp_in_parallel()) nt = 1;
 #endif
-    fscr_ensure(nt > g_panel_nt ? nt : g_panel_nt, S->m);
+    fscr_ensure(S, nt > g_panel_nt ? nt : g_panel_nt, S->m);
     const double tot = ns > 0 ? S->ssub[ns - 1] + 0.0 : 0.0;
     double totw = 0; for (int k = 0; k < ns; k++) if (S->spar[k] < 0) totw += S->ssub[k];
     (void)tot;
@@ -4111,9 +4274,9 @@ static int schol_factor_(SChol *S, double shift) {
      * above it run one by one, large ones with task-parallel row blocks and tiles */
     const double cut = totw / (g_fcut * nt);
     char *big = sx(ns + 1);
-    g_fcnt = sx(sizeof(int) * (ns + 1));
+    int *fcnt = S->wk->fcnt = sx(sizeof(int) * (ns + 1));
     for (int k = 0; k < ns; k++) big[k] = S->ssub[k] >= cut;
-    for (int k = 0; k < ns; k++) if (S->spar[k] >= 0 && big[S->spar[k]]) g_fcnt[S->spar[k]]++;
+    for (int k = 0; k < ns; k++) if (S->spar[k] >= 0 && big[S->spar[k]]) fcnt[S->spar[k]]++;
     /* a node is "big" for intra-node tasks only if its own work is worth splitting */
     char *nodepar = sx(ns + 1);
     for (int k = 0; k < ns; k++) nodepar[k] = big[k] && S->swk[k] >= 4e6;
@@ -4137,7 +4300,7 @@ static int schol_factor_(SChol *S, double shift) {
                     int left;
                     #pragma omp flush
                     #pragma omp atomic capture
-                    left = --g_fcnt[p];
+                    left = --fcnt[p];
                     #pragma omp flush
                     if (left == 0) fnode_chain(S, p, shift, nodepar);
                 }
@@ -4152,7 +4315,7 @@ static int schol_factor_(SChol *S, double shift) {
         /* big nodes whose children are all big and have no units: covered by the chain */
     }
     if (g_ftime > 0) g_ft[4] += omp_get_wtime() - tpr0;
-    free(big); free(nodepar); free(units); free(g_fcnt); g_fcnt = NULL;
+    free(big); free(nodepar); free(units); free(S->wk->fcnt); S->wk->fcnt = NULL;
     if (blas_prev > 1) BL(openblas_set_num_threads)(blas_prev);
     return S->fail;
 }
@@ -4166,10 +4329,9 @@ static int schol_factor_(SChol *S, double shift) {
  * reads its ancestors' final values). Right-hand sides are held transposed (k x m).
  * ------------------------------------------------------------------------------------ */
 static int g_tps = -1;
-typedef struct { double *pool; size_t cap, top; } SPool;
-static SPool *g_spool = NULL; static int g_nspool = 0;
-static double **g_ext = NULL; static int g_next = 0; static char *g_extp = NULL;   /* g_extp[k]: vector on a pool */
-static int *g_scnt = NULL;
+typedef struct SPool_ { double *pool; size_t cap, top; } SPool;
+/* (the pools, the contribution vectors ext (extp[k]: vector on a pool) and the children left scnt: in the factor
+ * object's work buffers, S->wk, ISSUES 526) */
 static void sc_build_children(SChol *S) {
     const int ns = S->ns;
     int *cnt = sx(sizeof(int) * (ns + 2));
@@ -4266,7 +4428,7 @@ static inline __attribute__((always_inline)) void tps_fwd_node_i(const SChol *S,
     if (rest > 0) {
         const size_t need = (size_t)rest * nr_;
         e = pool ? spool_alloc(pool, need) : NULL;
-        g_extp[k] = e != NULL;
+        S->wk->extp[k] = e != NULL;
         if (!e) e = malloc(sizeof(double) * need);
         memset(e, 0, sizeof(double) * need);
         for (int q = w; q < nr; q++) relind[rw[q]] = q - w;
@@ -4275,15 +4437,15 @@ static inline __attribute__((always_inline)) void tps_fwd_node_i(const SChol *S,
         const int c = S->sch_idx[u];
         const int wc = S->ss[c + 1] - S->ss[c], rc = S->pnr[c] - wc;
         const int *rwc = S->prow + S->prp[c] + wc;
-        const double *ec = g_ext[c];
+        const double *ec = S->wk->ext[c];
         for (int q = 0; q < rc; q++) {
             const int R = rwc[q];
             const double *eq = ec + (size_t)q * nr_;
             if (R < j0 + w) { double *d = xs + (size_t)(R - j0) * nr_; for (int r = 0; r < nr_; r++) d[r] -= eq[r]; }
             else { double *d = e + (size_t)relind[R] * nr_; for (int r = 0; r < nr_; r++) d[r] += eq[r]; }
         }
-        if (!g_extp[c]) free(g_ext[c]);
-        g_ext[c] = NULL; g_extp[c] = 0;
+        if (!S->wk->extp[c]) free(S->wk->ext[c]);
+        S->wk->ext[c] = NULL; S->wk->extp[c] = 0;
     }
     for (int c = 0; c < w; c++) {
         const double *col = P + (size_t)c * nr;
@@ -4297,7 +4459,7 @@ static inline __attribute__((always_inline)) void tps_fwd_node_i(const SChol *S,
         }
     }
     if (rest > 0 && nr_ == 1) tps_lmv(e, P + w, (size_t)nr, xs, 0, w, rest);   /* (after the triangle: e and xs apart) */
-    g_ext[k] = e;
+    S->wk->ext[k] = e;
 }
 static inline __attribute__((always_inline)) void tps_bwd_node_i(const SChol *S, int k, double *xt, const int nr_, double *t) {
     const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k], rest = nr - w;
@@ -4366,19 +4528,19 @@ static void tps_fwd_node_par(const SChol *S, int k, double *xt, int *relind) {
     const double *P = S->pan + S->pbase[k];
     double *xs = xt + j0;
     double *e = calloc((size_t)rest, sizeof(double));
-    g_extp[k] = 0;
+    S->wk->extp[k] = 0;
     for (int q = w; q < nr; q++) relind[rw[q]] = q - w;
     for (int u = S->sch_ptr[k]; u < S->sch_ptr[k + 1]; u++) {
         const int c = S->sch_idx[u];
         const int wc = S->ss[c + 1] - S->ss[c], rc = S->pnr[c] - wc;
         const int *rwc = S->prow + S->prp[c] + wc;
-        const double *ec = g_ext[c];
+        const double *ec = S->wk->ext[c];
         for (int q = 0; q < rc; q++) {
             const int R = rwc[q];
             if (R < j0 + w) xs[R - j0] -= ec[q]; else e[relind[R]] += ec[q];
         }
-        if (!g_extp[c]) free(g_ext[c]);
-        g_ext[c] = NULL; g_extp[c] = 0;
+        if (!S->wk->extp[c]) free(S->wk->ext[c]);
+        S->wk->ext[c] = NULL; S->wk->extp[c] = 0;
     }
     if (tps_tri_node(w)) {
         /* 17 October 2026: the triangle too, by blocks of TPS_TB columns: a block's own triangle in turn, then every
@@ -4405,7 +4567,7 @@ static void tps_fwd_node_par(const SChol *S, int k, double *xt, int *relind) {
                 if (ja < i1) tps_lmv(e + (ja - w), P + ja, (size_t)nr, xs, c0, c1, i1 - ja);
             }
         }
-        g_ext[k] = e;
+        S->wk->ext[k] = e;
         return;
     }
     for (int c = 0; c < w; c++) {                       /* the triangle, as in tps_fwd_node_i */
@@ -4420,7 +4582,7 @@ static void tps_fwd_node_par(const SChol *S, int k, double *xt, int *relind) {
         const int q0 = h * 256, q1 = q0 + 256 < rest ? q0 + 256 : rest;
         tps_lmv(e + q0, P + w + q0, (size_t)nr, xs, 0, w, q1 - q0);
     }
-    g_ext[k] = e;
+    S->wk->ext[k] = e;
 }
 static void tps_bwd_node_par(const SChol *S, int k, double *xt, double *t) {
     const int j0 = S->ss[k], w = S->ss[k + 1] - j0, nr = S->pnr[k], rest = nr - w;
@@ -4444,18 +4606,19 @@ static void tps_bwd_node_par(const SChol *S, int k, double *xt, double *t) {
     free(a1);
 }
 static void tps_ensure(const SChol *S, int nt, int nr_) {
-    if (g_nspool < nt) {
-        for (int t = 0; t < g_nspool; t++) free(g_spool[t].pool);
-        free(g_spool); g_spool = sx(sizeof(SPool) * nt); g_nspool = nt;
+    struct SWk *W = S->wk;
+    if (W->nspool < nt) {
+        for (int t = 0; t < W->nspool; t++) free(W->spool[t].pool);
+        free(W->spool); W->spool = sx(sizeof(SPool) * nt); W->nspool = nt;
     }
-    if (g_next < S->ns) { free(g_ext); g_ext = sx(sizeof(double *) * (S->ns + 1)); free(g_scnt); g_scnt = sx(sizeof(int) * (S->ns + 1)); free(g_extp); g_extp = sx(S->ns + 1); g_next = S->ns; }
+    if (W->next < S->ns) { free(W->ext); W->ext = sx(sizeof(double *) * (S->ns + 1)); free(W->scnt); W->scnt = sx(sizeof(int) * (S->ns + 1)); free(W->extp); W->extp = sx(S->ns + 1); W->next = S->ns; }
     (void)nr_;
 }
 /* unit: whole subtree of u, right-looking into x for rows inside the subtree (its columns
  * are the contiguous range [ss[sfd[u]], ss[u+1]) in postorder); rows outside go to the
  * unit's contribution vector, in node order */
 static inline __attribute__((always_inline)) void tps_fwd_unit_i(const SChol *S, int u, double *xt, const int nr_) {
-    int *relind = fscr_get()->relind;
+    int *relind = fscr_get(S)->relind;
     const int wu = S->ss[u + 1] - S->ss[u], ru = S->pnr[u] - wu, hi = S->ss[u + 1];
     const int *rwu = S->prow + S->prp[u] + wu;
     double *e = NULL;
@@ -4490,7 +4653,7 @@ static inline __attribute__((always_inline)) void tps_fwd_unit_i(const SChol *S,
             else { double *d = e + (size_t)relind[R] * nr_; for (int r = 0; r < nr_; r++) d[r] += tq[r]; }
         }
     }
-    g_ext[u] = e; g_extp[u] = 0;
+    S->wk->ext[u] = e; S->wk->extp[u] = 0;
 }
 #define TPS_DISPATCH(call1, callk) do { switch (nr_) { case 1: call1(1); break; case 2: call1(2); break; case 3: call1(3); break; case 4: call1(4); break; default: callk; } } while (0)
 static void tps_fwd_node(const SChol *S, int k, double *xt, int nr_, SPool *pool, int *relind) {
@@ -4510,13 +4673,13 @@ static void tps_fwd_unit(const SChol *S, int u, double *xt, int nr_) {
 }
 static void tps_fwd_chain(const SChol *S, int k, double *xt, int nr_) {
     for (;;) {
-        tps_fwd_node(S, k, xt, nr_, NULL, fscr_get()->relind);
+        tps_fwd_node(S, k, xt, nr_, NULL, fscr_get(S)->relind);
         const int p = S->spar[k];
         if (p < 0) return;
         int left;
         #pragma omp flush
         #pragma omp atomic capture
-        left = --g_scnt[p];
+        left = --S->wk->scnt[p];
         if (left != 0) return;
         #pragma omp flush
         k = p;
@@ -4586,7 +4749,7 @@ static void tps_fwd_units(const SChol *S, const int *ub, int a, int b, double *x
         if (p >= 0) { int left;
             #pragma omp flush
             #pragma omp atomic capture
-            left = --g_scnt[p];
+            left = --S->wk->scnt[p];
             #pragma omp flush
             if (left == 0) tps_fwd_chain(S, p, xt, nr_); }
     }
@@ -4602,7 +4765,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
 #ifdef _OPENMP
     nt = omp_in_parallel() ? 1 : omp_get_max_threads();
 #endif
-    fscr_ensure(nt, m);
+    fscr_ensure(S, nt, m);
     tps_ensure(S, nt, nr_);
     double *xt = malloc(sizeof(double) * (size_t)m * nr_);
     for (int r = 0; r < nr_; r++) for (int i = 0; i < m; i++) xt[(size_t)i * nr_ + r] = B[(size_t)S->perm[i] + (size_t)r * m];
@@ -4612,8 +4775,8 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
     /* the units are fixed (not by the thread count): they define the order of additions */
     const double cut = totw / 256.0;
     char *big = sx(ns + 1);
-    for (int k = 0; k < ns; k++) { big[k] = S->ssub[k] >= cut; g_scnt[k] = 0; }
-    for (int k = 0; k < ns; k++) if (S->spar[k] >= 0 && big[S->spar[k]]) g_scnt[S->spar[k]]++;
+    for (int k = 0; k < ns; k++) { big[k] = S->ssub[k] >= cut; S->wk->scnt[k] = 0; }
+    for (int k = 0; k < ns; k++) if (S->spar[k] >= 0 && big[S->spar[k]]) S->wk->scnt[S->spar[k]]++;
     static int tdbg = -1; if (tdbg < 0) tdbg = getenv("BRISK_TPSDBG") != NULL;
     double tt0 = tdbg ? omp_get_wtime() : 0, tt1 = 0, tt2 = 0;
     long ntk[4] = {0, 0, 0, 0};                         /* (BRISK_TPSDBG: units under big nodes, -, big nodes) */
@@ -4644,7 +4807,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
         const int npar = nt > 1 && nr_ == 1;          /* (one right-hand side: the nodes' off-diagonal parts on the threads) */
         for (int k = 0; k < ns; k++) {
             if (!big[k] && (S->spar[k] < 0 || big[S->spar[k]])) tps_fwd_unit(S, k, xt, nr_);
-            else if (big[k]) { if (npar && tps_par_node(S, k)) tps_fwd_node_par(S, k, xt, fscr_get()->relind); else tps_fwd_node(S, k, xt, nr_, NULL, fscr_get()->relind); }
+            else if (big[k]) { if (npar && tps_par_node(S, k)) tps_fwd_node_par(S, k, xt, fscr_get(S)->relind); else tps_fwd_node(S, k, xt, nr_, NULL, fscr_get(S)->relind); }
         }
         if (S->sgn) for (int i = 0; i < m; i++) if (S->sgn[i] < 0) for (int r = 0; r < nr_; r++) xt[(size_t)i * nr_ + r] = -xt[(size_t)i * nr_ + r];
         if (tdbg) tt1 = omp_get_wtime();
@@ -4652,7 +4815,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
         for (int k = ns - 1; k >= 0; k--) { if (npar && tps_par_node(S, k)) tps_bwd_node_par(S, k, xt, t); else tps_bwd_node(S, k, xt, nr_, t); }
         free(t);
         if (tdbg) { tt2 = omp_get_wtime(); static int cnt = 0; if (cnt++ < 3) printf("   [tps serial: fwd %.1f ms bwd %.1f ms]\n", 1e3 * (tt1 - tt0), 1e3 * (tt2 - tt1)); }
-        for (int k = 0; k < ns; k++) if (S->spar[k] < 0 && g_ext[k]) { free(g_ext[k]); g_ext[k] = NULL; }
+        for (int k = 0; k < ns; k++) if (S->spar[k] < 0 && S->wk->ext[k]) { free(S->wk->ext[k]); S->wk->ext[k] = NULL; }
     } else {
         if (tdbg) { for (int k = 0; k < ns; k++) { if (!big[k] && S->spar[k] >= 0 && big[S->spar[k]]) ntk[0]++; if (big[k]) ntk[2]++; } }
         /* 24 October 2026: the independent trees below the cut (a root that is not big) go in batches of about the cut's
@@ -4707,7 +4870,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
                 tps_fwd_units(S, ub, a, b, xt, nr_);
             }
         }
-        for (int k = 0; k < ns; k++) if (S->spar[k] < 0 && g_ext[k]) { free(g_ext[k]); g_ext[k] = NULL; }
+        for (int k = 0; k < ns; k++) if (S->spar[k] < 0 && S->wk->ext[k]) { free(S->wk->ext[k]); S->wk->ext[k] = NULL; }
         if (S->sgn) for (int i = 0; i < m; i++) if (S->sgn[i] < 0) for (int r = 0; r < nr_; r++) xt[(size_t)i * nr_ + r] = -xt[(size_t)i * nr_ + r];
         if (tdbg) tt1 = omp_get_wtime();
         #pragma omp parallel
@@ -4753,7 +4916,7 @@ static void schol_solve_tp_(const SChol *S, double *B, int nr_) {
 static size_t g_solve_blas = 0;     /* panels above this many entries use BLAS in the solve */
 /* solve M x = b in place (original indexing) */
 /* 1: single right-hand sides by the sequential supernode loops (the cone solver: 1.2 to 1.5 times faster on one thread) */
-static int g_solve_seq = 0;
+static _Thread_local int g_solve_seq = 0;   /* (per thread: set around a caller's own solve, ISSUES 454) */
 void schol_set_solve_seq(int on) { g_solve_seq = on; }
 void schol_solve(const SChol *S, double *b, double *work) {
     if (!S->pan) { static int w = 0; if (!w++) fprintf(stderr, "brisk: internal: sparse solve without a factor\n"); memset(b, 0, sizeof(double) * S->m); return; }
@@ -5108,9 +5271,7 @@ void schol_solve2(const SChol *S, double *b1, double *b2, double *work) {
  * 2 m^2 nrow of a product with a dense Z^{-1}. */
 #define SR_CB 64
 /* one chunk of CB lanes (CB a constant after inlining: the lane loops stay in registers) */
-#define SR_MAXT 256
-static double *g_sr_buf[SR_MAXT];
-static size_t g_sr_cap[SR_MAXT];
+/* (SR_MAXT, the chunks per thread sr_buf and sr_cap: in the factor object's work buffers, S->wk, ISSUES 526) */
 static int g_sr_wb = 0;      /* supernodes at least this wide go through BLAS (dtrsm, dgemm on the chunk) */
 /* a > 0 (the inverse): entries below a are zero on entry and not wanted on exit, so the work
  * starts at a's supernode, inside it at column a; mk != NULL: the forward visits only the
@@ -5325,7 +5486,7 @@ static void sr_top_solve(const double *Lt, int mt, double *X, int pw) {
         BL(dtrsm_)("R", "L", "N", "N", &pw, &nb, &one, Lt + j0 + (size_t)j0 * mt, &mt, X + (size_t)j0 * pw, &pw);
     }
 }
-static double *g_sr_xt = NULL; static size_t g_sr_xtcap = 0;
+/* (the top's panels sr_xt, sr_xtcap: in S->wk, ISSUES 526) */
 static double g_srti[4];
 void schol_solve_rows(const SChol *S, double *T, int ldt, int nrow) {
     const int m = S->m, ns = S->ns;
@@ -5396,8 +5557,8 @@ void schol_solve_rows(const SChol *S, double *T, int ldt, int nrow) {
     double *XT = NULL, *XF = NULL;       /* the top rows by panels; the other rows by chunks (contiguous) */
     if (kt < ns) {
         const size_t need = (size_t)m * nrp;
-        if (need > g_sr_xtcap) { free(g_sr_xt); g_sr_xt = NULL; g_sr_xtcap = 0; if (!posix_memalign((void **)&g_sr_xt, 64, sizeof(double) * need)) g_sr_xtcap = need; }
-        if (g_sr_xt) { XT = g_sr_xt; XF = XT + (size_t)mt * nrp; } else kt = kt2 = ns;
+        if (need > S->wk->sr_xtcap) { free(S->wk->sr_xt); S->wk->sr_xt = NULL; S->wk->sr_xtcap = 0; if (!posix_memalign((void **)&S->wk->sr_xt, 64, sizeof(double) * need)) S->wk->sr_xtcap = need; }
+        if (S->wk->sr_xt) { XT = S->wk->sr_xt; XF = XT + (size_t)mt * nrp; } else kt = kt2 = ns;
     }
     const int *iperm = S->iperm;
     static int srt = -1; if (srt < 0) srt = getenv("BRISK_SRTIME") != NULL;
@@ -5414,12 +5575,12 @@ void schol_solve_rows(const SChol *S, double *T, int ldt, int nrow) {
         double *Wc = NULL, *A = NULL;
         if (tid < SR_MAXT) {
             const size_t need = (size_t)m * CB + (size_t)wmax * CB;
-            if (need > g_sr_cap[tid]) {
-                free(g_sr_buf[tid]); g_sr_buf[tid] = NULL; g_sr_cap[tid] = 0;
-                if (!posix_memalign((void **)&g_sr_buf[tid], 64, sizeof(double) * need)) g_sr_cap[tid] = need;
-                else g_sr_buf[tid] = NULL;
+            if (need > S->wk->sr_cap[tid]) {
+                free(S->wk->sr_buf[tid]); S->wk->sr_buf[tid] = NULL; S->wk->sr_cap[tid] = 0;
+                if (!posix_memalign((void **)&S->wk->sr_buf[tid], 64, sizeof(double) * need)) S->wk->sr_cap[tid] = need;
+                else S->wk->sr_buf[tid] = NULL;
             }
-            if (g_sr_buf[tid]) { Wc = g_sr_buf[tid]; A = Wc + (size_t)m * CB; }
+            if (S->wk->sr_buf[tid]) { Wc = S->wk->sr_buf[tid]; A = Wc + (size_t)m * CB; }
         }
         double *own = NULL;
         if (!Wc) { own = sx(sizeof(double) * ((size_t)m * CB + (size_t)wmax * CB)); Wc = own; A = own + (size_t)m * CB; }
@@ -5522,13 +5683,13 @@ void schol_inverse(const SChol *S, double *Zi, int ldz) {
     if (kt < kt2 && !sr_top_inverse((SChol *)S, kt, kt2)) kt = kt2 = ns;
     if (kt < ns) {
         const size_t need = (size_t)m * (((size_t)S->ss[kt] + CB - 1) / CB * CB);
-        if (need > g_sr_xtcap) { free(g_sr_xt); g_sr_xt = NULL; g_sr_xtcap = 0; if (!posix_memalign((void **)&g_sr_xt, 64, sizeof(double) * need)) g_sr_xtcap = need; }
-        if (!g_sr_xt) kt = kt2 = ns;
+        if (need > S->wk->sr_xtcap) { free(S->wk->sr_xt); S->wk->sr_xt = NULL; S->wk->sr_xtcap = 0; if (!posix_memalign((void **)&S->wk->sr_xt, 64, sizeof(double) * need)) S->wk->sr_xtcap = need; }
+        if (!S->wk->sr_xt) kt = kt2 = ns;
     }
     const int top = kt < ns, m0 = S->ss[kt], m1 = S->ss[kt2], mt = m1 - m0;
     const int nf = (m0 + CB - 1) / CB, nch = nf + (m - m1 + CB - 1) / CB;
     const int PR = g_sr_pr > CB ? g_sr_pr / CB * CB : CB, nrp = nf * CB, npan = (nrp + PR - 1) / PR;
-    double *XT = top ? g_sr_xt : NULL, *XF = top ? g_sr_xt + (size_t)mt * nrp : NULL;
+    double *XT = top ? S->wk->sr_xt : NULL, *XF = top ? S->wk->sr_xt + (size_t)mt * nrp : NULL;
     #pragma omp parallel if (nch > 1 && !outer)
     {
 #ifdef _OPENMP
@@ -5539,12 +5700,12 @@ void schol_inverse(const SChol *S, double *Zi, int ldz) {
         double *Wc = NULL, *A = NULL;
         if (tid < SR_MAXT) {
             const size_t need = (size_t)m * CB + (size_t)wmax * CB;
-            if (need > g_sr_cap[tid]) {
-                free(g_sr_buf[tid]); g_sr_buf[tid] = NULL; g_sr_cap[tid] = 0;
-                if (!posix_memalign((void **)&g_sr_buf[tid], 64, sizeof(double) * need)) g_sr_cap[tid] = need;
-                else g_sr_buf[tid] = NULL;
+            if (need > S->wk->sr_cap[tid]) {
+                free(S->wk->sr_buf[tid]); S->wk->sr_buf[tid] = NULL; S->wk->sr_cap[tid] = 0;
+                if (!posix_memalign((void **)&S->wk->sr_buf[tid], 64, sizeof(double) * need)) S->wk->sr_cap[tid] = need;
+                else S->wk->sr_buf[tid] = NULL;
             }
-            if (g_sr_buf[tid]) { Wc = g_sr_buf[tid]; A = Wc + (size_t)m * CB; }
+            if (S->wk->sr_buf[tid]) { Wc = S->wk->sr_buf[tid]; A = Wc + (size_t)m * CB; }
         }
         double *own = NULL;
         if (!Wc) { own = sx(sizeof(double) * ((size_t)m * CB + (size_t)wmax * CB)); Wc = own; A = own + (size_t)m * CB; }
@@ -5877,7 +6038,19 @@ double schol_logdet(const SChol *S) {
 }
 long schol_uid(const SChol *S) { return S ? S->uid : 0; }
 const int *schol_perm(const SChol *S) { return S->perm; }      /* perm[new] = old */
-void schol_set_tinypiv(SChol *S, double t) { S->tinypiv = t; S->ntiny = 0; }
+void schol_set_tinypiv(SChol *S, double t) { S->tinypiv = t; S->ntiny = 0; if (S->tflag) memset(S->tflag, 0, (size_t)S->m); }
+/* (26 October 2026, the SOCP developer) the columns whose tiny pivots a factorization regularized (schol_set_tinyreg), for
+ * a caller that corrects the factored matrix exactly: on (allocated, cleared by schol_set_tinypiv), off (freed) */
+void schol_set_tinyflags(SChol *S, int on) {
+    if (!on) { free(S->tflag); S->tflag = NULL; return; }
+    if (!S->tflag) S->tflag = (unsigned char *)calloc((size_t)S->m + 1, 1);
+}
+/* rows[0 .. k-1]: the original indices of the regularized pivots of the last factorization (at most kmax); returns k */
+int schol_tiny_rows(const SChol *S, int *rows, int kmax) {
+    int k = 0; if (!S->tflag) return 0;
+    for (int j = 0; j < S->m && k < kmax; j++) if (S->tflag[j]) rows[k++] = S->perm[j];
+    return k;
+}
 void schol_set_tinydag(SChol *S, int on) { S->tinydag = on; }
 void schol_set_lpsmall(SChol *S, int on) { S->lpsmall = on; }
 void schol_set_dynpiv(SChol *S, double p) { S->dynpiv = p; S->ndyn = 0; }
@@ -5963,4 +6136,17 @@ void schol_solve_many_t(const SChol *S, double *Bm, int nrhs, double *work) {
     const int o = g_tps; g_tps = 0;
     schol_solve_many(S, Bm, nrhs, work);
     g_tps = o;
+}
+
+/* (26 October 2026, ISSUES 526) the factor object's work buffers */
+void schol_wk_free(struct SWk *W) {
+    if (!W) return;
+    fscr_free(W);
+    free(W->fcnt);
+    for (int t = 0; t < W->nspool; t++) free(W->spool[t].pool);
+    free(W->spool);
+    free(W->ext); free(W->extp); free(W->scnt);
+    for (int t = 0; t < SR_MAXT; t++) free(W->sr_buf[t]);
+    free(W->sr_xt);
+    free(W);
 }

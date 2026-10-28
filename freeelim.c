@@ -51,6 +51,39 @@ static int cmp_re(const void *a, const void *b) {
     uint64_t x = ((const RE *)a)->k, y = ((const RE *)b)->k;
     return x < y ? -1 : x > y;
 }
+/* 27 October 2026: the clique density of the Schur complement's block pattern, the sum over the semidefinite blocks of the
+ * squared number of constraints on each over m^2, with the blocks that carry the same constraints counted once: they form
+ * one clique of the pattern, not two. A FIR filter design (the independent benchmark, SDP) has six groups of 601
+ * constraints, each group on its own two blocks: 1/6 of the pattern, counted 1/3 when each block was its own clique */
+typedef struct { uint64_t h; int k; } BlkSet;
+static int cmp_blkset(const void *a, const void *b) {
+    const BlkSet *x = a, *y = b;
+    return x->h < y->h ? -1 : x->h > y->h ? 1 : (x->k > y->k) - (x->k < y->k);
+}
+static double fe_clique_density(const Problem *P) {
+    const int nb = P->nblk;
+    BlkSet *s = malloc(sizeof(BlkSet) * (nb + 1)); int n = 0;
+    for (int k = 0; k < nb; k++) {           /* a hash of each block's constraint list (ascending) */
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_SDP) continue;
+        uint64_t x = 1469598103934665603ULL ^ (uint64_t)B->ncon;
+        for (int t = 0; t < B->ncon; t++) { x ^= (uint64_t)B->con[t]; x *= 1099511628211ULL; }
+        s[n].h = x; s[n].k = k; n++;
+    }
+    qsort(s, n, sizeof(BlkSet), cmp_blkset);
+    double cl2 = 0;
+    for (int a = 0; a < n; a++) {
+        const Block *B = &P->blk[s[a].k];
+        int dup = 0;
+        for (int b = a - 1; b >= 0 && s[b].h == s[a].h && !dup; b--) {
+            const Block *C = &P->blk[s[b].k];
+            dup = C->ncon == B->ncon && !memcmp(C->con, B->con, sizeof(int) * (size_t)B->ncon);
+        }
+        if (!dup) cl2 += (double)B->ncon * B->ncon;
+    }
+    free(s);
+    return P->m > 0 ? cl2 / ((double)P->m * P->m) : 0;
+}
 static void row_push(Row *R, uint64_t k, double v) {
     if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 8; R->e = realloc(R->e, sizeof(RE) * R->cap); }
     R->e[R->n].k = k; R->e[R->n].v = v; R->n++;
@@ -477,10 +510,19 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         const long mn_est = m - nelim - nempty;
         double cl2 = 0;
         for (int k = 0; k < nb; k++) { const double c = P->blk[k].ncon; if (P->blk[k].type == BLK_SDP) cl2 += c * c; }
-        const double dens = cl2 / ((double)m * m);
+        /* 27 October 2026: blocks that carry the same constraints counted once (fe_clique_density). FIR filter designs (the
+         * independent benchmark, SDP): 602 filter coefficients shared by six groups of 601 constraints, each group on two
+         * blocks; density 1/6, counted 1/3 before, so the dense estimate 0.96 accepted the elimination. Eliminated through
+         * one group, every remaining row touches that group's blocks and the Schur complement is dense: r2_fir_bp_D600
+         * 201 s at 5.4e-7, kept as free variables 80 s at 2.2e-8 (MOSEK 73 s here). The sparse estimate is 1.39: refused.
+         * (Measured and not kept: an estimate from the assembly's work, the rows touching a block times its entries; on
+         * the kernel forms of the occupation measures the elimination grows that work 13-35 times per row and still wins
+         * by accuracy, roa_vdp_d12_K 2.3e-9 against 1.8e-6 kept.) BRISK_FECLIQ=0: each block its own clique, as before */
+        static int fq_env = -1; if (fq_env < 0) { const char *e = getenv("BRISK_FECLIQ"); fq_env = !(e && atoi(e) == 0); }
+        const double dens0 = cl2 / ((double)m * m), dens = fq_env ? fe_clique_density(P) : dens0;
         const double rm = (double)mn_est / m, rn = (double)fill1 / fmax(1.0, (double)fill0);
         cost_ratio = dens >= 0.3 ? rm * rm * rm * rn : rm * rn;
-        if (fedbg) printf("   [free-elim: cost ratio %.3f (rows %d -> %ld, nonzeros %ld -> %ld, clique density %.3f)]\n", cost_ratio, m, mn_est, fill0, fill1, dens);
+        if (fedbg) printf("   [free-elim: cost ratio %.3f (rows %d -> %ld, nonzeros %ld -> %ld, clique density %.3f; each block its own clique %.3f)]\n", cost_ratio, m, mn_est, fill0, fill1, dens, dens0);
     }
     if (automatic && !cheap && (fill1 > 8 * fill0 || 4 * nelim < 3 * npr || cost_ratio > 1.0)) {
         if (verbose && !bycost)
@@ -697,7 +739,19 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
 
 /* map a solution of the reduced problem back: y (reduced rows -> file rows, pivot rows
  * recovered) and the eliminated pairs' slots of X (Xo in the file's block layout) */
-void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile) {
+/* 26 October 2026 (ISSUES 292): xc, the cone-vector blocks of Xo (brisk.h): their entries read from the vector as the
+ * dense completion holds them (xc_entry), without forming it */
+static double *xc_factors(const PSOrig *O, double **Xo, const int *xc) {
+    if (!xc || !Xo) return NULL;
+    double *f = fx(sizeof(double) * ((size_t)O->nblk + 1));
+    for (int k = 0; k < O->nblk; k++) f[k] = xc[k] >= 0 ? xc_entry_f(O->bs[k], Xo[k]) : 0.0;
+    return f;
+}
+static inline double xo_entry(const PSOrig *O, double **Xo, const int *xc, const double *xf, int bk, int i, int j) {
+    const int n = O->bs[bk];
+    return xc && xc[bk] >= 0 ? xc_entry(n, xc[bk], Xo[bk], xf[bk], i, j) : Xo[bk][i + (size_t)j * n];
+}
+void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile, const int *xc) {
     if (Xo && F->lpmap) {
         /* the compacted LP blocks back to the file layout */
         for (int k = 0; k < F->nblk; k++) {
@@ -708,8 +762,21 @@ void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const
             free(Xo[k]); Xo[k] = x;
         }
     }
+    double *xf = xc_factors(Ofile, Xo, xc);
     for (int i = 0; i < F->mfile; i++) yfile[i] = 0;
     for (int i = 0; i < F->mnew; i++) yfile[F->row2file[i]] = yred[i];
+    /* 27 October 2026: the '-' slot of each pair's '+' slot, by a table per LP block (was a scan over all the pairs for
+     * every LP entry of every pivot row: freectl_T200, SDP with 6,030 free variables, 0.48 s of its 1.05 s) */
+    int **mslot = NULL;
+    if (Xo && F->np > 0) {
+        mslot = fx(sizeof(int *) * (F->nblk + 1));
+        for (int g = 0; g < F->np; g++) {
+            const int bk = F->pb[g];
+            if (bk < 0 || bk >= F->nblk || Ofile->bs[bk] >= 0) continue;
+            if (!mslot[bk]) { const int n = -Ofile->bs[bk]; mslot[bk] = malloc(sizeof(int) * (n + 1)); for (int l = 0; l < n; l++) mslot[bk][l] = -1; }
+            if (F->pp[g] >= 0 && F->pp[g] < -Ofile->bs[bk] && mslot[bk][F->pp[g]] < 0) mslot[bk][F->pp[g]] = F->pm[g];
+        }
+    }
     for (int s = F->ns - 1; s >= 0; s--) {
         const PSFreeStep *S = &F->st[s];
         /* dual of the pivot row */
@@ -726,11 +793,10 @@ void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const
             if (Ofile->bs[bk] < 0) {
                 x = Xo[bk][i];
                 /* a free variable (by its '+' slot): its value is + minus - */
-                for (int g = 0; g < F->np; g++)
-                    if (F->pb[g] == bk && F->pp[g] == i) { x = Xo[bk][i] - Xo[bk][F->pm[g]]; break; }
+                if (mslot && mslot[bk] && mslot[bk][i] >= 0) x = Xo[bk][i] - Xo[bk][mslot[bk][i]];
             } else {
-                const int n = Ofile->bs[bk];
-                x = (i == j) ? Xo[bk][i + (size_t)i * n] : 2.0 * Xo[bk][i + (size_t)j * n];
+                const double e = xo_entry(Ofile, Xo, xc, xf, bk, i, j);
+                x = (i == j) ? e : 2.0 * e;
             }
             v -= S->rv[q] * x;
         }
@@ -738,6 +804,8 @@ void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const
         Xo[S->blk][S->ip] = v > 0 ? v : 0.0;
         Xo[S->blk][S->im] = v < 0 ? -v : 0.0;
     }
+    if (mslot) { for (int k = 0; k < F->nblk; k++) free(mslot[k]); free(mslot); }
+    free(xf);
 }
 
 /* ---- 4.30: trace bound. On kernel-form SOS problems the Gram matrices (the primal X)
@@ -790,14 +858,22 @@ void tracebound_add(Problem *P, double R) {
  * The chain of eliminations (roa_acrobot_d6_K: 742 pairs, multipliers up to 10) amplifies
  * the reduced residual (1e-13) to 3.5e-6 on the file rows; one least-squares pass on the
  * nf x nf normal equations (dense Cholesky) removes that. */
-void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose) {
+void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int verbose, const int *xc) {
     const int m = O->m, nf = F->np;
     if (!Xo || nf <= 0 || nf > 6000) return;
+    double *xf = xc_factors(O, Xo, xc);
     /* free index of an LP slot (block, index) of a '+' half */
     int *slot = malloc(sizeof(int) * (nf + 1)), *sblk = malloc(sizeof(int) * (nf + 1));
     for (int g = 0; g < nf; g++) { slot[g] = F->pp[g]; sblk[g] = F->pb[g]; }
     double *r = malloc(sizeof(double) * (m + 1));
     for (int i = 0; i < m; i++) r[i] = O->b[i];
+    /* map (blk, slot) -> g by a table over LP slots (27 October 2026: built before the count, which had scanned all the
+     * pairs for every LP entry) */
+    int maxlp = 0; for (int k = 0; k < O->nblk; k++) if (O->bs[k] < 0 && -O->bs[k] > maxlp) maxlp = -O->bs[k];
+    const size_t ngof = (size_t)(maxlp + 1) * (size_t)O->nblk;
+    int *gof = malloc(sizeof(int) * (ngof + 1));
+    for (size_t q = 0; q < ngof; q++) gof[q] = -1;
+    for (int g = 0; g < nf; g++) gof[slot[g] + (size_t)(maxlp + 1) * sblk[g]] = g;
     /* A_f as column lists: (row, value) per free variable, from the '+' slots */
     int *cnt = calloc(nf + 1, sizeof(int));
     for (size_t q = 0; q < O->nnz; q++) {
@@ -806,10 +882,11 @@ void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int ver
         double x;
         if (O->bs[bk] < 0) {
             x = Xo[bk][i];
-            for (int g = 0; g < nf; g++) if (sblk[g] == bk && slot[g] == i) cnt[g]++;
+            const int g = gof[i + (size_t)(maxlp + 1) * bk];
+            if (g >= 0) cnt[g]++;
         } else {
-            const int n = O->bs[bk];
-            x = (i == j) ? Xo[bk][i + (size_t)i * n] : 2.0 * Xo[bk][i + (size_t)j * n];
+            const double e = xo_entry(O, Xo, xc, xf, bk, i, j);
+            x = (i == j) ? e : 2.0 * e;
         }
         r[c] -= O->v[q] * x;
     }
@@ -831,12 +908,6 @@ void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int ver
     for (int g = 0; g < nf; g++) off[g + 1] = off[g] + cnt[g];
     int *crow = malloc(sizeof(int) * (off[nf] + 1)); double *cval = malloc(sizeof(double) * (off[nf] + 1));
     int *fill = calloc(nf + 1, sizeof(int));
-    /* map (blk, slot) -> g by a small hash over LP slots */
-    int maxlp = 0; for (int k = 0; k < O->nblk; k++) if (O->bs[k] < 0 && -O->bs[k] > maxlp) maxlp = -O->bs[k];
-    const size_t ngof = (size_t)(maxlp + 1) * (size_t)O->nblk;
-    int *gof = malloc(sizeof(int) * (ngof + 1));
-    for (size_t q = 0; q < ngof; q++) gof[q] = -1;
-    for (int g = 0; g < nf; g++) gof[slot[g] + (size_t)(maxlp + 1) * sblk[g]] = g;
     for (size_t q = 0; q < O->nnz; q++) {
         const int c = O->con[q], bk = O->blk[q];
         if (c < 0 || O->bs[bk] >= 0) continue;
@@ -911,5 +982,5 @@ void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int ver
         if (verbose > 0) printf("postsolve: free values refined by least squares: residual %.2e -> %.2e\n", sqrt(r0), sqrt(r1));
     }
     free(slot); free(sblk); free(r); free(cnt); free(off); free(crow); free(cval); free(fill); free(gof); free(G); free(rhs);
-    free(rowg); free(rowv); free(rcnt); free(roff); free(rg); free(rv); free(rfill);
+    free(rowg); free(rowv); free(rcnt); free(roff); free(rg); free(rv); free(rfill);    free(xf);
 }

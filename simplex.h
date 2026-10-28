@@ -43,6 +43,11 @@ typedef struct {
                                    the interior-point method and the crossover on the dual, which is not dualized again) */
     int ipm_kcorr;              /* the interior-point method's centrality correctors per iteration, plus one (0: chosen
                                    from the cost of a factorization against a solve; k + 1: k, the command line's -lpcorr k) */
+    int aggb_only;              /* (28 October 2026) 1: only the problem presolved once more with the bounded substitution
+                                   (the race's second simplex job); the status -1 when it does not apply or ends without a
+                                   result (a job beside other methods: they decide then) */
+    int no_dual_route;          /* (28 October 2026) 1: not through the dual problem of a tall problem (the direct job beside
+                                   another simplex job that takes that route) */
 } SimplexOpts;
 
 /* basis status of a column or row */
@@ -72,11 +77,19 @@ typedef struct {
     double work;                /* entries touched by the solves, the pricing and the factorizations (the same on every
                                    run and at every thread count: a clock for decisions that must not depend on time) */
     char why[96];
+    int asread_check;           /* 1: the presolved problem was found infeasible (st_presolved 1) or unbounded (2) in t_presolved
+                                   seconds, and the result is that of the problem as read solved without the presolve */
+    int st_presolved; double t_presolved;
 } SimplexInfo;
 
 /* x (n), the row activities ax (m, may be NULL), the row duals y (m) and the reduced costs z (n) with z = c - A'y
  * (for a maximization: of the problem as written, so that z >= 0 at a lower bound means optimal for the minimum of -c);
  * the basis status of the columns cstat (n) and of the rows rstat (m) (may be NULL). Returns the status. */
+/* (28 October 2026) whether the bounded substitution can remove enough columns to be tried on L (an upper bound by a scan,
+ * no presolve): the default LP route starts its job (SimplexOpts.aggb_only) only then */
+int simplex_aggb_possible(const LpProb *L);
+/* (28 October 2026) whether the simplex method would solve L through its dual problem (its size rule on L as read) */
+int simplex_dual_route_possible(const LpProb *L);
 int simplex_solve(const LpProb *L, const SimplexOpts *o, double *x, double *ax, double *y, double *z, int *cstat, int *rstat,
                   SimplexInfo *info);
 /* a linear program in the cone form min c'x, A x = b, x = (free part K.f, nonnegative part K.l), as the interfaces give it

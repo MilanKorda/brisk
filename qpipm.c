@@ -98,10 +98,10 @@ typedef struct {
 void   schol_zero(SChol *S);
 void   schol_add(SChol *S, size_t r, size_t c, double v);
 void   schol_pivots(const SChol *S, double *d);
-static int g_qp_ray = 0;           /* (reduce: 2) the empty column of an unbounded direction, 1-based, signed */
-static int g_qp_ndep = 0;          /* dependent equality rows dropped by reduce */
+static _Thread_local int g_qp_ray = 0;           /* (reduce: 2) the empty column of an unbounded direction, 1-based, signed */
+static _Thread_local int g_qp_ndep = 0;          /* dependent equality rows dropped by reduce */
 static const double *g_qp_rowprio = NULL;   /* (the second solve) the rows' priorities for the choice of the dropped rows */
-static char *g_qp_dead = NULL;              /* the original rows reduce dropped as dependent (when not NULL) */
+static _Thread_local char *g_qp_dead = NULL;              /* the original rows reduce dropped as dependent (when not NULL) */
 
 /* (23 October 2026) the equality rows that are linear combinations of others: nr rows (rp, rj, rv by rows over ncol columns)
  * with right-hand sides b. The method of the LP and SDP presolve (presolve.c, remove_dependent_rows, which the QP method's
@@ -1352,7 +1352,7 @@ static void extract(const QpProb *P, const Red *R, const Ipm *I, const double *f
  * that the normal equations then replaced). On the 17 of the 288 QPs where it runs: the shifted geometric mean of the
  * time 6.00 -> 5.34 s (QPLIB_8602 66.3 -> 47.6 s, the CVXQP*_L family 1.5-1.7 times faster; NNLS_100, whose augmented
  * system is nearly dense, 26.4 -> 29.3 s), the same statuses and iterations on all 288 */
-static int qp_nd_now = 0;
+static _Thread_local int qp_nd_now = 0;   /* (per thread: QP solves on several threads at once, as the SOCP solver's state, ISSUES 291) */
 static int k_build_offsets(Ipm *I);
 /* (24 October 2026, the SOCP developer) the largest factor the machine can hold: its physical memory at 12 bytes an entry
  * (the value and its row index), or the process's own memory limit when smaller; an analysis beyond it fails, and the method says so, instead of the allocation stopping

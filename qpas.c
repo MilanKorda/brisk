@@ -432,14 +432,26 @@ int qp_resolve(QpSolver *Q, QpRes *Res) {
     if (!Res->x) { Res->x = xz(sizeof(double) * (P->n + 1)); Res->y = xz(sizeof(double) * (P->m + 1)); Res->z = xz(sizeof(double) * (P->n + 1)); }
     if (!Q->convex) Q->convex = qp_convex_exact(P) ? -1 : 1;        /* (H does not change between solves) */
     if (Q->convex < 0) { Res->status = QP_INPUT; Res->iter = 0; Res->time = now() - t0; return Res->status; }
-    if (Q->o.method == QP_METHOD_IPM) { qp_res_free(Res); return qp_solve_ipm(P, &Q->o, Res); }
+    /* (26 October 2026, the integrator) QP_METHOD_AUTO (-qpauto): the choice of the one-shot solve (qp_solve), so that a
+     * caller that does not choose (JuMP) is never held to the active-set method: within the default's size bound
+     * (qp_as_small) the active-set method from the previous active set, else, for an H that is not positive definite (its
+     * Cholesky factor fails; H does not change between solves, so for good) and after an active-set solve that does not end
+     * optimal, the interior-point method from the start */
+    const int autom = Q->o.method == QP_METHOD_AUTO;
+    if (Q->o.method == QP_METHOD_IPM || (autom && !qp_as_small(P))) { qp_res_free(Res); return qp_solve_ipm(P, &Q->o, Res); }
     if (!Q->built) {
         as_alloc(&Q->S, P);
-        if (as_factor(&Q->S)) { Res->status = QP_NUMERICAL; return Res->status; }
+        if (as_factor(&Q->S)) {
+            if (!autom) { Res->status = QP_NUMERICAL; return Res->status; }
+            as_free(&Q->S); Q->o.method = QP_METHOD_IPM;
+            qp_res_free(Res); return qp_solve_ipm(P, &Q->o, Res);
+        }
         as_reset(&Q->S);
         Q->built = 1;
     }
     Q->S.P = P; Q->S.iters = 0;
-    return as_run(&Q->S, &Q->o, Res, t0);
+    const int st = as_run(&Q->S, &Q->o, Res, t0);
+    if (autom && st != QP_OPTIMAL && st >= 0) { qp_res_free(Res); return qp_solve_ipm(P, &Q->o, Res); }
+    return st;
 }
 void qp_destroy(QpSolver *Q) { if (!Q) return; if (Q->built) as_free(&Q->S); qp_prob_free(&Q->P); free(Q); }

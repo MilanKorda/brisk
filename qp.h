@@ -95,6 +95,7 @@ int qp_psd_exact(int n, int ne, const int *qi, const int *qj, const double *qv, 
 /* one solve */
 int qp_solve(const QpProb *P, const QpOpts *o, QpRes *R);
 int qp_solve_ipm(const QpProb *P, const QpOpts *o, QpRes *R);
+int qp_as_small(const QpProb *P);   /* the default's size bound for the active-set method (qp.c) */
 int qp_solve_activeset(const QpProb *P, const QpOpts *o, QpRes *R);
 int qp_solve_activeset_pd(const QpProb *P, const QpOpts *o, QpRes *R);   /* only for H positive definite; else -1, nothing solved */
 

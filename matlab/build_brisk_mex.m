@@ -47,7 +47,8 @@ tok = regexp(mk, '(?m)^SRC\s*=\s*([^\n]*)', 'tokens', 'once');
 if isempty(tok), error('brisk:build', 'no SRC line in %s', fullfile(src, 'Makefile')); end
 names = regexp(tok{1}, '\S+', 'match');
 names = names(cellfun(@(f) numel(f) > 2 && strcmp(f(end-1:end), '.c'), names));
-files = [cellfun(@(f) fullfile(src, f), names, 'UniformOutput', false), {fullfile(here, 'brisk_mex.c')}];
+% capi.c: the C library's functions (the QP solve and the QP model of brisk_qp and BriskQpModel)
+files = [cellfun(@(f) fullfile(src, f), names, 'UniformOutput', false), {fullfile(src, 'capi.c'), fullfile(here, 'brisk_mex.c')}];
 for k = 1:numel(files)
     if ~exist(files{k}, 'file'), error('brisk:build', 'missing source file %s', files{k}); end
 end
@@ -135,6 +136,9 @@ switch omp
             fprintf('OpenMP: the compiler''s runtime (gcc: libgomp)\n');
         end
     otherwise
+        % the runtime's queries the solvers call outside their regions, for one thread (ISSUES 713)
+        cflags = [cflags ' -include ' fullfile(src, 'omp', 'ompstub.h')];
+        files{end + 1} = fullfile(src, 'omp', 'ompstub.c');
         fprintf('OpenMP: off (BLAS threads only)\n');
 end
 

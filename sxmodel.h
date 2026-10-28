@@ -22,6 +22,10 @@ void sxm_cost(SxModel *M, int j, double c);
 /* the basis (statuses of simplex.h); set: repaired by the factorization, returns the number of columns replaced */
 void sxm_get_basis(const SxModel *M, int *cstat, int *rstat);
 int  sxm_set_basis(SxModel *M, const int *cstat, const int *rstat);
+/* (28 October 2026) the same with the pricing weights of the basis chosen (wmode): 0 the slack basis's 1 (sxm_set_basis;
+ * BRISK_SXMLAZYW=1 or BRISK_SXMEXACTW=1 for experiments), 1 each computed the first time its row is a candidate to leave, 2 all
+ * computed at once (a backward solve a row) */
+int  sxm_set_basis_w(SxModel *M, const int *cstat, const int *rstat, int wmode);
 
 typedef struct {
     long maxit; double timelimit; const volatile int *stop;

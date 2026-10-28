@@ -10,7 +10,9 @@ Two levels:
   * `Brisk.solve_sdpa(file; options...)` and `Brisk.solve_sdpa_data(m, blocksizes, c, mat,
     blk, i, j, v; options...)`: the problem as an SDPA file or as the numbers of one, the
     result as a [`Brisk.Result`](@ref); `Brisk.solve_sedumi(A, b, c, K; options...)`: a
-    problem in SeDuMi format (linear, second-order and semidefinite cones).
+    problem in SeDuMi format (linear, second-order and semidefinite cones); `Brisk.solve_qp(H, c, A, l, u, lb, ub)`
+    and `Brisk.QpModel` (re-solves from the previous active set): convex QPs; `Brisk.solve_file(file)`: any file
+    the command line reads.
   * `Brisk.Optimizer`: a MathOptInterface optimizer, so `JuMP.Model(Brisk.Optimizer)` works
     (see `src/MOI_wrapper.jl`).
 
@@ -325,6 +327,14 @@ function _check(rc, res)
     return res
 end
 
+# a QP's exit code is 0 (optimal, reduced accuracy) or 1 (any other status), as on the command line: the run failed only
+# when it returned no solution (status -1: a QP that is not convex, invalid data, an unknown option)
+function _check_qp(rc, res)
+    rc < 0 && throw(BriskError(rc, "BRISK stopped (out of memory); see the messages above"))
+    res.status < 0 && throw(BriskError(rc, "the QP solver returned no solution (a QP that is not convex, invalid data or an option it does not take); see the messages above"))
+    return res
+end
+
 function _with_result(f, reader = _read_result)
     r = ccall(_fn(:brisk_result_new), Ptr{Cvoid}, ())
     r == C_NULL && throw(OutOfMemoryError())
@@ -384,7 +394,7 @@ function _tagged(args::Vector{String}, tag::String)
     return vcat(args, ["-caller", tag])
 end
 
-function _call(f, args::Vector{String}, output::Symbol, reader = _read_result)
+function _call(f, args::Vector{String}, output::Symbol, reader = _read_result, check = _check)
     lock(_LOCK) do
         _set_output(output)
         flush(stdout); flush(stderr)
@@ -393,7 +403,7 @@ function _call(f, args::Vector{String}, output::Symbol, reader = _read_result)
             rc, res = _interruptible(() -> _with_result(r -> f(r, cargs), reader))
         end
         _set_output(:stdout)
-        return _check(rc, res)
+        return check(rc, res)
     end
 end
 
@@ -578,6 +588,217 @@ function solve_sedumi(file::AbstractString; output::Symbol = :julia, options...)
     return _call(args, output, _read_cone_result) do r, cargs
         Int(ccall(_fn(:brisk_solve_file), Cint, (Cstring, Cint, Ptr{Cstring}, Ptr{Cvoid}),
                   file, length(cargs), cargs, r))
+    end
+end
+
+# ---- quadratic programs ---------------------------------------------------------------------------
+
+"""
+    Brisk.QpResult
+
+The solution of a convex QP (`Brisk.solve_qp`, `Brisk.solve!` of a `Brisk.QpModel`, `Brisk.solve_file` on a QPS
+file): `status` (0 optimal, 1 primal infeasible, 2 dual infeasible, 3 iteration limit, 4 numerical difficulties, 5
+reduced accuracy, 6 time limit), `status_string`, `objective`, `x`, `y` (the rows' multipliers), `z` (the bounds'
+multipliers), with `H x + c - A'y - z = 0`, `y[i] > 0` where row i is at its lower bound and `< 0` at its upper bound,
+`z[j]` likewise for the bounds of `x[j]`; `iterations`, `solve_time`, `dimacs` (the relative primal, dual and gap
+errors on the data given in entries 1, 3 and 5; the others 0).
+"""
+struct QpResult
+    status::Int
+    status_string::String
+    iterations::Int
+    objective::Float64
+    x::Vector{Float64}
+    y::Vector{Float64}
+    z::Vector{Float64}
+    dimacs::NTuple{6,Float64}
+    solve_time::Float64
+end
+
+function Base.show(io::IO, r::QpResult)
+    print(io, "Brisk.QpResult(", r.status_string, ", ", r.iterations, " iterations, objective ", r.objective,
+          ", max error ", maximum(abs, r.dimacs), ")")
+end
+
+function _read_qp_result(r::Ptr{Cvoid})
+    vec(p, k) = p == C_NULL || k == 0 ? zeros(k) : copy(unsafe_wrap(Array, p, k))
+    n = Int(ccall(_fn(:brisk_result_sn), Cint, (Ptr{Cvoid},), r))
+    m = Int(ccall(_fn(:brisk_result_m), Cint, (Ptr{Cvoid},), r))
+    err = zeros(6)
+    ccall(_fn(:brisk_result_dimacs), Cvoid, (Ptr{Cvoid}, Ptr{Cdouble}), r, err)
+    return QpResult(Int(ccall(_fn(:brisk_result_status), Cint, (Ptr{Cvoid},), r)),
+                    unsafe_string(ccall(_fn(:brisk_result_status_str), Cstring, (Ptr{Cvoid},), r)),
+                    Int(ccall(_fn(:brisk_result_iterations), Cint, (Ptr{Cvoid},), r)),
+                    ccall(_fn(:brisk_result_pobj), Cdouble, (Ptr{Cvoid},), r),
+                    vec(ccall(_fn(:brisk_result_sx), Ptr{Cdouble}, (Ptr{Cvoid},), r), n),
+                    vec(ccall(_fn(:brisk_result_y), Ptr{Cdouble}, (Ptr{Cvoid},), r), m),
+                    vec(ccall(_fn(:brisk_result_sz), Ptr{Cdouble}, (Ptr{Cvoid},), r), n),
+                    Tuple(err), ccall(_fn(:brisk_result_time), Cdouble, (Ptr{Cvoid},), r))
+end
+
+function _bound_vector(v, k::Int, absent::Float64, name::String)
+    v === nothing && return fill(absent, k)
+    length(v) == k || throw(DimensionMismatch("$name has $(length(v)) entries, expected $k"))
+    return Vector{Cdouble}(v)
+end
+
+# the QP's data as the C library takes them: H's lower triangle (brisk_qp_lower: H symmetric, or one triangle of it) and
+# A by columns, 0-based; an absent bound vector: no bounds of that kind
+function _qp_arrays(H, c, A, l, u, lb, ub)
+    n = length(c)
+    Hs = H === nothing ? SparseArrays.spzeros(n, n) : SparseArrays.sparse(H)
+    size(Hs) == (n, n) || throw(DimensionMismatch("H is $(size(Hs, 1)) x $(size(Hs, 2)), c has $n entries"))
+    As = A === nothing ? SparseArrays.spzeros(0, n) : SparseArrays.sparse(A)
+    size(As, 2) == n || throw(DimensionMismatch("A has $(size(As, 2)) columns, c has $n entries"))
+    m = size(As, 1)
+    Hp, Hi, Hx = Vector{Cint}(Hs.colptr .- 1), Vector{Cint}(Hs.rowval .- 1), Vector{Cdouble}(Hs.nzval)
+    Lp, Li, Lx = zeros(Cint, n + 1), zeros(Cint, length(Hi) + 1), zeros(Cdouble, length(Hx) + 1)
+    k = ccall(_fn(:brisk_qp_lower), Clong, (Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}),
+              n, Hp, Hi, Hx, Lp, Li, Lx)
+    k < 0 && throw(ArgumentError("H must be symmetric, or one triangle of a symmetric matrix"))
+    return (n = n, m = m, Hp = Lp, Hi = Li, Hx = Lx, c = Vector{Cdouble}(c),
+            Ap = Vector{Cint}(As.colptr .- 1), Ai = Vector{Cint}(As.rowval .- 1), Ax = Vector{Cdouble}(As.nzval),
+            rl = _bound_vector(l, m, -Inf, "l"), ru = _bound_vector(u, m, Inf, "u"),
+            xl = _bound_vector(lb, n, -Inf, "lb"), xu = _bound_vector(ub, n, Inf, "ub"))
+end
+
+"""
+    Brisk.solve_qp(H, c, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
+                   c0 = 0.0, output = :julia, options...) -> Brisk.QpResult
+
+Solve the convex QP
+
+    min 1/2 x'Hx + c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub
+
+by BRISK's QP solver: its dual active-set method for a small QP with H positive definite, its interior-point method
+otherwise (`qpas = true`, `qpipm = true`: that method; other options `tol`, `maxit`, `timelimit`, `threads`). H (n x n,
+symmetric, or one triangle of it) and A (m x n) dense or sparse; `nothing` for a bound vector: no bounds of that kind,
+and `-Inf`, `Inf` for an absent bound; an equality row has `l[i] == u[i]`. A QP that is not convex is refused (a
+`BriskError`). For re-solves after changes of bounds or the cost, see [`Brisk.QpModel`](@ref).
+"""
+function solve_qp(H, c::AbstractVector{<:Real}, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
+                  c0::Real = 0.0, output::Symbol = :julia, options...)
+    D = _qp_arrays(H, c, A, l, u, lb, ub)
+    args = _tagged(option_args(options), "julia:solve_qp")
+    return _call(args, output, _read_qp_result, _check_qp) do r, cargs
+        Int(ccall(_fn(:brisk_solve_qp), Cint,
+                  (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble},
+                   Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Ptr{Cstring}, Ptr{Cvoid}),
+                  D.n, D.m, D.Hp, D.Hi, D.Hx, D.c, Float64(c0), D.Ap, D.Ai, D.Ax, D.rl, D.ru, D.xl, D.xu,
+                  length(cargs), cargs, r))
+    end
+end
+
+"""
+    mdl = Brisk.QpModel(H, c, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
+                        c0 = 0.0, output = :silent, options...)
+    r = Brisk.solve!(mdl)                       # a Brisk.QpResult
+    Brisk.set_var_bounds!(mdl, j, lo, hi)       # lb[j] = lo, ub[j] = hi
+    Brisk.set_row_bounds!(mdl, i, lo, hi)       # l[i] = lo, u[i] = hi
+    Brisk.set_cost!(mdl, c)                     # the linear cost
+    r = Brisk.solve!(mdl)                       # from the previous active set
+
+A convex QP (the data as in [`Brisk.solve_qp`](@ref)) kept for re-solves after changes of its bounds or its linear
+cost, each solve starting from the previous active set (BRISK's dual active-set method): model predictive control,
+branch and bound. `qpipm = true`: the interior-point method, every solve from the start. Options `tol`, `maxit`,
+`timelimit`; `output = :julia` prints each solve's line. The C object is freed with the model (or by `Brisk.free!`).
+"""
+mutable struct QpModel
+    ptr::Ptr{Cvoid}
+    n::Int
+    m::Int
+    output::Symbol
+    function QpModel(ptr::Ptr{Cvoid}, n::Int, m::Int, output::Symbol)
+        mdl = new(ptr, n, m, output)
+        finalizer(free!, mdl)
+        return mdl
+    end
+end
+
+function QpModel(H, c::AbstractVector{<:Real}, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
+                 c0::Real = 0.0, output::Symbol = :silent, options...)
+    D = _qp_arrays(H, c, A, l, u, lb, ub)
+    return _qp_model(D, Float64(c0), option_args(options), output)
+end
+
+# (also the JuMP wrapper's: brisk_qp_create's options are -qpas (its default), -qpipm, -qpauto, -tol, -maxit,
+# -timelimit, -q, -caller <tag>)
+function _qp_model(D, c0::Float64, args::Vector{String}, output::Symbol)
+    output == :silent && !("-q" in args) && (args = vcat(args, ["-q"]))
+    cargs = [Base.unsafe_convert(Cstring, a) for a in args]
+    ptr = lock(_LOCK) do        # (its messages, an unknown option's, through the output chosen)
+        _set_output(output)
+        try
+            GC.@preserve args cargs ccall(_fn(:brisk_qp_create), Ptr{Cvoid},
+                (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble},
+                 Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Ptr{Cstring}),
+                D.n, D.m, D.Hp, D.Hi, D.Hx, D.c, c0, D.Ap, D.Ai, D.Ax, D.rl, D.ru, D.xl, D.xu, length(cargs), cargs)
+        finally
+            _set_output(:stdout)
+        end
+    end
+    ptr == C_NULL && throw(ArgumentError("Brisk: the QP model was not created (bad data, or an option it does not take: " *
+                                         join(args, ' ') * ")"))
+    return QpModel(ptr, D.n, D.m, output)
+end
+
+"""
+    Brisk.free!(mdl::Brisk.QpModel)
+
+Free the model's C object now (the garbage collector does it otherwise); the model cannot be solved afterwards.
+"""
+free!(mdl::QpModel) = (mdl.ptr != C_NULL && ccall(_fn(:brisk_qp_destroy), Cvoid, (Ptr{Cvoid},), mdl.ptr); mdl.ptr = C_NULL; nothing)
+
+_live(mdl::QpModel) = (mdl.ptr == C_NULL && throw(ArgumentError("Brisk: the QP model was freed")); mdl.ptr)
+
+function set_var_bounds!(mdl::QpModel, j::Integer, lo::Real, hi::Real)
+    1 <= j <= mdl.n || throw(BoundsError(1:mdl.n, j))
+    ccall(_fn(:brisk_qp_set_var_bounds), Cint, (Ptr{Cvoid}, Cint, Cdouble, Cdouble), _live(mdl), j - 1, lo, hi)
+    return mdl
+end
+
+function set_row_bounds!(mdl::QpModel, i::Integer, lo::Real, hi::Real)
+    1 <= i <= mdl.m || throw(BoundsError(1:mdl.m, i))
+    ccall(_fn(:brisk_qp_set_row_bounds), Cint, (Ptr{Cvoid}, Cint, Cdouble, Cdouble), _live(mdl), i - 1, lo, hi)
+    return mdl
+end
+
+function set_cost!(mdl::QpModel, c::AbstractVector{<:Real})
+    length(c) == mdl.n || throw(DimensionMismatch("c has $(length(c)) entries, the model $(mdl.n) variables"))
+    cc = Vector{Cdouble}(c)
+    ccall(_fn(:brisk_qp_set_cost), Cint, (Ptr{Cvoid}, Ptr{Cdouble}), _live(mdl), cc)
+    return mdl
+end
+
+function solve!(mdl::QpModel)
+    ptr = _live(mdl)
+    res = lock(_LOCK) do
+        _set_output(mdl.output)
+        flush(stdout); flush(stderr)
+        try
+            _with_result(r -> Int(ccall(_fn(:brisk_qp_resolve), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), ptr, r)), _read_qp_result)[2]
+        finally
+            _set_output(:stdout)
+        end
+    end
+    res.status < 0 && throw(BriskError(-1, "the QP solver refused the model (a QP that is not convex); see the messages above"))
+    return res
+end
+
+"""
+    Brisk.solve_file(file; output = :julia, options...)
+
+Solve a problem file as the command line `./brisk file options...` does: an SDPA file (`.dat-s`, and MPS or CBF
+files) gives a [`Brisk.Result`](@ref), a MAT-file in SeDuMi format (`.mat`) a [`Brisk.ConeResult`](@ref), a QPS file
+(`.qps`: a convex QP or QCQP) a [`Brisk.QpResult`](@ref).
+"""
+function solve_file(file::AbstractString; output::Symbol = :julia, options...)
+    isfile(file) || throw(ArgumentError("no such file: $file"))
+    ext = lowercase(splitext(file)[2])
+    reader = ext == ".mat" ? _read_cone_result : ext == ".qps" ? _read_qp_result : _read_result
+    args = _tagged(option_args(options), "julia:solve_file")
+    return _call(args, output, reader, ext == ".qps" ? _check_qp : _check) do r, cargs
+        Int(ccall(_fn(:brisk_solve_file), Cint, (Cstring, Cint, Ptr{Cstring}, Ptr{Cvoid}), file, length(cargs), cargs, r))
     end
 end
 
