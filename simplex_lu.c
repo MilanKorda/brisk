@@ -317,13 +317,17 @@ void sxlu_copy(SxLU *dst, const SxLU *src) {
     dst->ridx = dup_arr(src->ridx, I * (size_t)src->rcap); dst->rval = dup_arr(src->rval, D * (size_t)src->rcap);
     dst->rthead = dup_arr(src->rthead, I * (m + 1)); dst->rtcnt = dup_arr(src->rtcnt, I * (m + 1));
     dst->rnext = dup_arr(src->rnext, I * (size_t)src->rcap); dst->reta = dup_arr(src->reta, I * (size_t)src->rcap);
+    /* (1 November 2026) the sweep's bitmaps (kept zero between solves): fresh ones, not the source's (shared, they were freed
+     * twice: lpmodel.c's trials, a saved factorization restored and freed; the re-solve interface's test aborted) */
+    dst->ubm = src->ubm ? xcalloc(2 * m / 64 + 2, sizeof(unsigned long long)) : NULL;
+    dst->ubs = src->ubs ? xcalloc(2 * m / 4096 + 2, sizeof(unsigned long long)) : NULL;
 }
 void sxlu_free(SxLU *F) {
     free(F->lrow); free(F->lstart); free(F->lidx); free(F->lval); free(F->lrstart); free(F->lridx); free(F->lrval); free(F->lpos);
     free(F->uord); free(F->uordpos); free(F->uz); free(F->uzpos); free(F->udiag); free(F->urecip); free(F->ucs); free(F->ucl); free(F->ucc); free(F->uci); free(F->ucv);
     free(F->urs); free(F->url); free(F->urc); free(F->uri); free(F->urv);
     free(F->rpiv); free(F->rstart); free(F->ridx); free(F->rval); free(F->rthead); free(F->rtcnt); free(F->rnext); free(F->reta);
-    free(F->stack); free(F->wmark); free(F->wlist); free(F->wval); free(F->dfs_pos); free(F->dmark);
+    free(F->stack); free(F->wmark); free(F->wlist); free(F->wval); free(F->dfs_pos); free(F->dmark); free(F->ubm); free(F->ubs);
     free(F->lcs_row); free(F->lcl_row); free(F->lrorder); free(F->lrlen);
     memset(F, 0, sizeof *F);
 }
@@ -491,6 +495,7 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         F->stack = xmalloc(sizeof(int) * (2 * (size_t)m + 2)); F->wmark = xcalloc((size_t)m + 1, sizeof(int));
         F->wlist = xmalloc(sizeof(int) * ((size_t)m + 1)); F->wval = xcalloc((size_t)m + 1, sizeof(double)); F->dfs_pos = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->dmark = xcalloc((size_t)m + 1, 1);
+        F->ubm = xcalloc(2 * (size_t)m / 64 + 2, sizeof(unsigned long long)); F->ubs = xcalloc(2 * (size_t)m / 4096 + 2, sizeof(unsigned long long));
         F->lpos = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lcs_row = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lcl_row = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->lrstart = xmalloc(sizeof(int) * ((size_t)m + 2)); F->lrlen = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lrorder = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->lrow = xmalloc(sizeof(int) * ((size_t)m + 1)); F->lstart = xmalloc(sizeof(int) * ((size_t)m + 2));
@@ -781,8 +786,12 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         if (F->ucap < need) { F->ucap = need; F->uci = xrealloc(F->uci, sizeof(int) * need); F->ucv = xrealloc(F->ucv, sizeof(double) * need); }
         if (F->urcap < need) { F->urcap = need; F->uri = xrealloc(F->uri, sizeof(int) * need); F->urv = xrealloc(F->urv, sizeof(double) * need); }
         int ec = 0, er = 0;
+        /* (3 November 2026) the columns stored in pivot order and without spare room: an update never adds to a column (its
+         * spike is a new column, stored at the end of the storage, which is also the end of the order), so the forward
+         * solve with U reads the columns in one backward sweep through memory. The row lists keep their room (the spikes
+         * add to them). satellites2-25 (LP), dual simplex method: the forward solves 3.27 -> 2.88 s, the same bits */
+        for (int k = 0; k < np; k++) { const int i = prow[k]; F->ucs[i] = ec; F->ucc[i] = F->ucl[i]; ec += F->ucc[i]; F->ucl[i] = 0; }
         for (int i = 0; i < m; i++) {
-            F->ucs[i] = ec; F->ucc[i] = F->ucl[i] + 4; ec += F->ucc[i]; F->ucl[i] = 0;
             F->urs[i] = er; F->urc[i] = F->url[i] + 4; er += F->urc[i]; F->url[i] = 0;
         }
         F->ucend = ec; F->urend = er;
@@ -860,6 +869,9 @@ static int dfs(SxWs *W, const SxVec *x, const int *start, const int *len, const 
             if (p < l) {
                 const int nx = adj[s + p];
                 pos[top] = p + 1;
+                /* (31 October 2026) the next candidate's start and length fetched ahead: each row reached costs two cache
+                 * misses there, and the search was 31 % of a multicommodity flow's dual simplex method (S_mc2, LP) */
+                if (p + 1 < l) { const int nn = adj[s + p + 1]; __builtin_prefetch(start + nn); __builtin_prefetch(len + nn); }
                 mark[nx] = 1; top++; stk[top] = nx; pos[top] = 0; ed += len[nx];
             } else { outl[nout++] = r; top--; }
         }
@@ -869,13 +881,14 @@ static int dfs(SxWs *W, const SxVec *x, const int *start, const int *len, const 
 }
 static void unmark(SxWs *W, int nout) { for (int k = 0; k < nout; k++) W->dmark[W->wlist[k]] = 0; }
 /* the factorization's own scratch space, as a workspace */
-static SxWs own_ws(SxLU *F) { SxWs W; W.m = F->m; W.stack = F->stack; W.wmark = F->wmark; W.wlist = F->wlist; W.dfs_pos = F->dfs_pos; W.dmark = F->dmark; W.nflops = 0; W.nedges = 0; return W; }
+static SxWs own_ws(SxLU *F) { SxWs W; W.m = F->m; W.stack = F->stack; W.wmark = F->wmark; W.wlist = F->wlist; W.dfs_pos = F->dfs_pos; W.dmark = F->dmark; W.nflops = 0; W.nedges = 0; W.ubm = F->ubm; W.ubs = F->ubs; return W; }
 void sxws_init(SxWs *W, int m) {
     W->m = m; W->stack = malloc(sizeof(int) * (2 * (size_t)m + 2)); W->wmark = calloc((size_t)m + 1, sizeof(int));
     W->wlist = malloc(sizeof(int) * ((size_t)m + 1)); W->dfs_pos = malloc(sizeof(int) * ((size_t)m + 1)); W->dmark = calloc((size_t)m + 1, 1); W->nflops = 0; W->nedges = 0;
+    W->ubm = calloc(2 * (size_t)m / 64 + 2, sizeof(unsigned long long)); W->ubs = calloc(2 * (size_t)m / 4096 + 2, sizeof(unsigned long long));
     if (!W->stack || !W->wmark || !W->wlist || !W->dfs_pos || !W->dmark) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); }
 }
-void sxws_free(SxWs *W) { free(W->stack); free(W->wmark); free(W->wlist); free(W->dfs_pos); free(W->dmark); memset(W, 0, sizeof *W); }
+void sxws_free(SxWs *W) { free(W->stack); free(W->wmark); free(W->wlist); free(W->dfs_pos); free(W->dmark); free(W->ubm); free(W->ubs); memset(W, 0, sizeof *W); }
 
 /* the forward solve keeps its list of nonzeros as it goes when the pivots of U with work are fewer than half the rows
  * (a basis mostly of logicals: a pass over all rows to find the nonzeros would cost more than the solve); otherwise
@@ -986,9 +999,50 @@ static void ftran_r(SxLU *F, SxWs *W, SxVec *x) {
     }
     W->nflops += F->rstart[F->nr];
 }
+/* (31 October 2026) x <- U^{-1} x by a sweep over the positions of U's order, downward, through a bitmap of the rows reached
+ * (and a bitmap of its nonzero words): a row is taken once every later pivot has added to it (the rows a column reaches lie
+ * before it, so one downward sweep serves), and its column is applied only when its value is not zero, so a part of the
+ * reach where the contributions cancel exactly is not entered. A heap in place of the bitmap cost more than the search it
+ * saved (S_mc2's solves 19.6 -> 26.5 s). On a network basis (entries of one size and both signs) the
+ * solve for an arc reaches the paths from its two ends to the root of the spanning tree, and above the point where they
+ * meet the two contributions cancel: the depth-first search visited about twice the nonzeros it produced (S_mc2, a
+ * multicommodity flow, LP: 1,900-2,900 rows reached, 890 nonzero), at about 20 ns an edge, 31 % of the dual simplex
+ * method's time. Each row's sum is taken in the order of the positions, the same on every run. */
+static void ftran_u_bits(SxLU *F, SxWs *W, SxVec *x) {
+    double *v = x->val; unsigned long long *bm = W->ubm, *bs = W->ubs; int *out = W->wlist;
+    int nout = 0, shi = -1; long work = 0;
+#define UB_SET(pos_) do { const int p_ = (pos_), w_ = p_ >> 6; const unsigned long long b_ = 1ULL << (p_ & 63); \
+        if (!(bm[w_] & b_)) { if (!bm[w_]) { bs[w_ >> 6] |= 1ULL << (w_ & 63); if ((w_ >> 6) > shi) shi = w_ >> 6; } bm[w_] |= b_; } } while (0)
+    for (int k = 0; k < x->cnt; k++) UB_SET(F->uordpos[x->idx[k]]);
+    for (int sw = shi; sw >= 0; sw--)
+        while (bs[sw]) {
+            const int wb = 63 - __builtin_clzll(bs[sw]), w = (sw << 6) | wb;
+            while (bm[w]) {
+                const int b = 63 - __builtin_clzll(bm[w]);
+                bm[w] &= ~(1ULL << b);
+                const int r = F->uord[(w << 6) | b];
+                out[nout++] = r;
+                if (v[r] == 0) continue;
+                const double xr = v[r] * F->urecip[r];
+                v[r] = xr;
+                const int s0 = F->ucs[r], l = F->ucl[r];
+                work += l;
+                for (int p = s0; p < s0 + l; p++) { const int i = F->uci[p]; UB_SET(F->uordpos[i]); v[i] -= F->ucv[p] * xr; }
+            }
+            bs[sw] &= ~(1ULL << wb);
+        }
+#undef UB_SET
+    for (int k = 0; k < nout; k++) x->idx[k] = out[k];
+    x->cnt = nout; sxv_prune(x);
+    W->nflops += work + nout;
+}
+static int uheap_on(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXUHEAP"); c = !(e && atoi(e) == 0); } return c; }
 /* x <- U^{-1} x */
 static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper, int track) {
     double *v = x->val;
+    /* (31 October 2026) the sweep while the depth-first solves find a third or more of their reach ending zero;
+     * every 16th solve by the depth-first search, to follow the basis (BRISK_SXUHEAP=0: never) */
+    if (hyper && x->cnt >= 0 && uheap_on() && W->ubm && F->nord <= 2 * F->m && F->hy_canc >= 0.3 && --F->hy_cp > 0) { ftran_u_bits(F, W, x); return; }
     if (hyper) {
         const int nr = dfs(W, x, F->ucs, F->ucl, F->uci);
         for (int k = nr - 1; k >= 0; k--) {
@@ -1002,6 +1056,7 @@ static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper, int track) {
         for (int k = 0; k < nr; k++) x->idx[k] = W->wlist[k];
         x->cnt = nr; unmark(W, nr); sxv_prune(x);
         W->nflops += nr;
+        if (nr >= 64) { F->hy_canc = 0.9 * F->hy_canc + 0.1 * (double)(nr - x->cnt) / nr; F->hy_cp = 16; }
     } else if (track && TRACK(F) && x->cnt >= 0) {
         /* the pivots with an empty column and a unit diagonal (the logicals) change nothing: only the others (uz) */
         int *idx = x->idx, cnt = x->cnt;
@@ -1056,6 +1111,139 @@ void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike) {
 void sxlu_ftran(SxLU *F, SxVec *x, double expdens, SxVec *spike) {
     SxWs W = own_ws(F);
     sxlu_ftran_ws(F, &W, x, expdens, spike);
+    F->nflops += W.nflops; F->nedges += W.nedges;
+}
+/* (3 November 2026) two forward solves through the factor in one pass over L and one over U, for the dual simplex method's
+ * entering column and the steepest-edge weights' vector, when neither solve is hypersparse. Each vector goes through the
+ * same operations in the same order as in its own solve (sxlu_ftran_ws: L, then the row etas R, then U), so the results
+ * and the counted work are the same bits; what is shared is the pass over the factor: its indices and values are read
+ * once, and the pivot loop's bookkeeping is done once. On satellites2-25 (LP) both vectors are dense (the entering column
+ * a third of the rows, the weights' vector three quarters) and the two forward solves were 43 % of the dual method's time,
+ * most of it in the loops over U's pivots, about two entries a column. */
+static void ftran_l_pair(SxLU *F, SxWs *W, SxVec *x1, SxVec *x2) {
+    double *v1 = x1->val, *v2 = x2->val;
+    const int *lrow = F->lrow, *lstart = F->lstart, *lidx = F->lidx; const double *lval = F->lval;
+    long fl = 0;
+    if (TRACK(F)) {
+        int *i1 = x1->idx, *i2 = x2->idx, c1 = x1->cnt, c2 = x2->cnt;
+        for (int l = 0; l < F->nl; l++) {
+            const double a = v1[lrow[l]], b = v2[lrow[l]];
+            const int s = lstart[l], e = lstart[l + 1];
+            if (a != 0 && b != 0) {
+                fl += 2L * (e - s);
+                for (int p = s; p < e; p++) {
+                    const int i = lidx[p]; const double lv = lval[p];
+                    if (v1[i] == 0) i1[c1++] = i;
+                    v1[i] -= lv * a; if (v1[i] == 0) v1[i] = 1e-300;
+                    if (v2[i] == 0) i2[c2++] = i;
+                    v2[i] -= lv * b; if (v2[i] == 0) v2[i] = 1e-300;
+                }
+            } else if (a != 0) {
+                fl += e - s;
+                for (int p = s; p < e; p++) { const int i = lidx[p]; if (v1[i] == 0) i1[c1++] = i; v1[i] -= lval[p] * a; if (v1[i] == 0) v1[i] = 1e-300; }
+            } else if (b != 0) {
+                fl += e - s;
+                for (int p = s; p < e; p++) { const int i = lidx[p]; if (v2[i] == 0) i2[c2++] = i; v2[i] -= lval[p] * b; if (v2[i] == 0) v2[i] = 1e-300; }
+            }
+        }
+        x1->cnt = c1; x2->cnt = c2;
+    } else {
+        for (int l = 0; l < F->nl; l++) {
+            const double a = v1[lrow[l]], b = v2[lrow[l]];
+            const int s = lstart[l], e = lstart[l + 1];
+            if (a != 0 && b != 0) {
+                fl += 2L * (e - s);
+                for (int p = s; p < e; p++) { const int i = lidx[p]; const double lv = lval[p]; v1[i] -= lv * a; v2[i] -= lv * b; }
+            } else if (a != 0) {
+                fl += e - s;
+                for (int p = s; p < e; p++) v1[lidx[p]] -= lval[p] * a;
+            } else if (b != 0) {
+                fl += e - s;
+                for (int p = s; p < e; p++) v2[lidx[p]] -= lval[p] * b;
+            }
+        }
+        x1->cnt = -1; x2->cnt = -1;
+    }
+    W->nflops += fl + 2L * F->nl;
+}
+/* U for both vectors, the plain sweep (track 0) or the sweep that keeps the lists (track 1), as ftran_u does for each */
+static void ftran_u_pair(SxLU *F, SxWs *W, SxVec *x1, SxVec *x2, int track) {
+    double *v1 = x1->val, *v2 = x2->val;
+    const int *uz = F->uz, *ucs = F->ucs, *ucl = F->ucl, *uci = F->uci; const double *ucv = F->ucv, *urc = F->urecip;
+    long fl = 0;
+    if (track) {
+        int *i1 = x1->idx, *i2 = x2->idx, c1 = x1->cnt, c2 = x2->cnt;
+        for (int k = F->nuz - 1; k >= 0; k--) {
+            const int r = uz[k];
+            if (r < 0) continue;
+            double a = v1[r], b = v2[r];
+            if (a == 0 && b == 0) continue;
+            const int s = ucs[r], e = s + ucl[r];
+            if (a != 0) { a *= urc[r]; v1[r] = a; fl += e - s; }
+            if (b != 0) { b *= urc[r]; v2[r] = b; fl += e - s; }
+            if (a != 0 && b != 0) {
+                for (int p = s; p < e; p++) {
+                    const int i = uci[p]; const double uv = ucv[p];
+                    if (v1[i] == 0) i1[c1++] = i;
+                    v1[i] -= uv * a; if (v1[i] == 0) v1[i] = 1e-300;
+                    if (v2[i] == 0) i2[c2++] = i;
+                    v2[i] -= uv * b; if (v2[i] == 0) v2[i] = 1e-300;
+                }
+            } else if (a != 0) {
+                for (int p = s; p < e; p++) { const int i = uci[p]; if (v1[i] == 0) i1[c1++] = i; v1[i] -= ucv[p] * a; if (v1[i] == 0) v1[i] = 1e-300; }
+            } else {
+                for (int p = s; p < e; p++) { const int i = uci[p]; if (v2[i] == 0) i2[c2++] = i; v2[i] -= ucv[p] * b; if (v2[i] == 0) v2[i] = 1e-300; }
+            }
+        }
+        x1->cnt = c1; x2->cnt = c2; sxv_prune(x1); sxv_prune(x2);
+    } else {
+        for (int k = F->nuz - 1; k >= 0; k--) {
+            const int r = uz[k];
+            if (r < 0) continue;
+            double a = v1[r], b = v2[r];
+            if (a == 0 && b == 0) continue;
+            const int s = ucs[r], e = s + ucl[r];
+            if (a != 0 && b != 0) {
+                a *= urc[r]; b *= urc[r]; v1[r] = a; v2[r] = b; fl += 2L * (e - s);
+                for (int p = s; p < e; p++) { const int i = uci[p]; const double uv = ucv[p]; v1[i] -= uv * a; v2[i] -= uv * b; }
+            } else if (a != 0) {
+                a *= urc[r]; v1[r] = a; fl += e - s;
+                for (int p = s; p < e; p++) v1[uci[p]] -= ucv[p] * a;
+            } else {
+                b *= urc[r]; v2[r] = b; fl += e - s;
+                for (int p = s; p < e; p++) v2[uci[p]] -= ucv[p] * b;
+            }
+        }
+        sxv_reindex(x1); sxv_reindex(x2);
+    }
+    W->nflops += fl + 2L * F->nuz;
+}
+/* both vectors as sxlu_ftran(x1, d1, spike1) then sxlu_ftran(x2, d2, NULL) would solve them; in one pass when neither is
+ * hypersparse (BRISK_SXFTRANPAIR=0: always the two solves) */
+static int ftran_pair_on(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXFTRANPAIR"); c = !(e && atoi(e) == 0); } return c; }
+void sxlu_ftran_pair(SxLU *F, SxVec *x1, double d1, SxVec *spike1, SxVec *x2, double d2) {
+    const int m = F->m; const double ht = hyper_thr();
+    if (x1->cnt < 0) sxv_reindex(x1);
+    if (x2->cnt < 0) sxv_reindex(x2);
+    /* (the hypersparse test of sxlu_ftran_ws, its cheap part first, so that its cost rule is not consulted: when it is
+     * false for both, neither solve would be hypersparse, and the rule's counters are left as the two solves leave them) */
+    if (!ftran_pair_on() || (x1->cnt < ht * m && d1 < ht) || (x2->cnt < ht * m && d2 < ht)) {
+        sxlu_ftran(F, x1, d1, spike1); sxlu_ftran(F, x2, d2, NULL); return;
+    }
+    SxWs W = own_ws(F);
+    ftran_l_pair(F, &W, x1, x2);
+    SxVec *xs[2] = { x1, x2 };
+    for (int t = 0; t < 2; t++) {
+        SxVec *x = xs[t];
+        if (x->cnt >= 0) sxv_prune(x);
+        if (F->nr && x->cnt < 0) sxv_reindex(x);
+        if (F->nr) ftran_r(F, &W, x);
+        if (x->cnt < 0) sxv_reindex(x); else sxv_prune(x);
+    }
+    if (spike1) sxv_copy(spike1, x1);
+    const int tr1 = d1 < 0.3 && TRACK(F) && x1->cnt >= 0, tr2 = d2 < 0.3 && TRACK(F) && x2->cnt >= 0;
+    if (tr1 == tr2) ftran_u_pair(F, &W, x1, x2, tr1);
+    else { ftran_u(F, &W, x1, 0, d1 < 0.3); ftran_u(F, &W, x2, 0, d2 < 0.3); }
     F->nflops += W.nflops; F->nedges += W.nedges;
 }
 /* a depth-first search that can be advanced by steps (sxlu_ftran_part runs two at the same pace) */
@@ -1257,6 +1445,19 @@ void sxlu_btran(SxLU *F, SxVec *y, double expdens, SxVec *upart) {
     F->nflops += W0.nflops; F->nedges += W0.nedges;
 }
 
+/* y <- B^{-T} y with the given scratch space, the sparse or the full sweeps chosen by the expected density alone (the
+ * factorization's statistics of past solves neither read nor changed: the solve can run beside another one, and it
+ * does not steer that one's choices); the counts in W */
+void sxlu_btran_ws(SxLU *F, SxWs *W, SxVec *y, double expdens) {
+    const int m = F->m;
+    if (y->cnt < 0) sxv_reindex(y);
+    const double ht = hyper_thr(); const int hyper = y->cnt < ht * m && expdens < ht;
+    btran_u(F, W, y, hyper);
+    if (F->nr) btran_r(F, W, y);
+    if (y->cnt >= 0) sxv_prune(y);
+    btran_l(F, W, y, hyper && y->cnt >= 0 && y->cnt < ht * m);
+}
+
 /* only the part of y <- B^{-T} y that the Forrest-Tomlin update needs (the solve with U^T, copied to upart), when the
  * whole row of B^{-1} is not wanted (the crossover's primal pushes); y is left partly solved */
 void sxlu_btran_upart(SxLU *F, SxVec *y, double expdens, SxVec *upart) {
@@ -1286,7 +1487,11 @@ static void ucompact(SxLU *F, int rows, int extra) {   /* rows: the row lists, e
     long cap = 2 * tot + extra + 64; const int oldcap = rows ? F->urcap : F->ucap; if (cap < oldcap) cap = oldcap;
     int *ni = xmalloc(sizeof(int) * cap); double *nv = xmalloc(sizeof(double) * cap);
     int e = 0;
-    for (int i = 0; i < m; i++) { memcpy(ni + e, idx + s[i], sizeof(int) * l[i]); memcpy(nv + e, val + s[i], sizeof(double) * l[i]); s[i] = e; c[i] = l[i] + 4; e += c[i]; }
+    if (rows) for (int i = 0; i < m; i++) { memcpy(ni + e, idx + s[i], sizeof(int) * l[i]); memcpy(nv + e, val + s[i], sizeof(double) * l[i]); s[i] = e; c[i] = l[i] + 4; e += c[i]; }
+    else for (int k = 0; k < F->nord; k++) {   /* (the columns in pivot order, without spare room: see the factorization) */
+        const int i = F->uord[k]; if (i < 0) continue;
+        memcpy(ni + e, idx + s[i], sizeof(int) * l[i]); memcpy(nv + e, val + s[i], sizeof(double) * l[i]); s[i] = e; c[i] = l[i]; e += c[i];
+    }
     free(idx); free(val);
     if (rows) { F->uri = ni; F->urv = nv; F->urend = e; F->urcap = (int)cap; } else { F->uci = ni; F->ucv = nv; F->ucend = e; F->ucap = (int)cap; }
 }

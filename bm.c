@@ -51,6 +51,7 @@ static double g_bm_rndfac = 1e-1;     /* BRISK_BMRNDFAC: a trust-region round cu
 static int g_bm_verify = 1;           /* BRISK_BMVERIFY=0: the bound not checked by a factorization */
 static int g_bm_lzk = 100;            /* BRISK_BMLZK: Lanczos steps a cycle (at most; 150 before: 100 was faster on 9 of 9 graphs, 60 lost on a random one) */
 static int g_bm_fuse = 1;             /* BRISK_BMFUSE=0: the trust region's CG in separate passes (as before the fused kernels) */
+static int g_bm_stall_stop = 0;    /* the automatic attempt: a stall of the primal error ends the augmented Lagrangian path (gen_alm) */
 
 typedef struct {
     int k, n, r;
@@ -591,7 +592,15 @@ static double fd_cert(BB *s, const Problem *P, double *y, double *v, double c1, 
     const double lm = lmin_est(s, s->ws, v, c1 / (s->np > 0 ? s->np : 1));
     s->vwarm = 1;
     M->cert = 0; M->pobj = f; M->dobj = dobj; M->lmin = lm;
-    M->e1 = 0; M->e2 = fmax(0, -lm) / (1 + c1); M->e3 = fabs(f - dobj) / (1 + fabs(f) + fabs(dobj));
+    /* (3 November 2026, the owner: "Is it possible that the dimacs errors are 0?") the rows of R are scaled to the fixed
+     * diagonal, so A(X) = b up to rounding: measured, not set to 0 */
+    double r2 = 0, b1 = 0;
+    for (int i = 0; i < P->m; i++) b1 += fabs(P->b[i]);
+    for (int i = 0; i < n; i++) {
+        const double *ri = s->R + (size_t)i * r; double d = 0; for (int l = 0; l < r; l++) d += ri[l] * ri[l];
+        const double e = s->adiag[i] * d - P->b[s->crow[i]]; r2 += e * e;
+    }
+    M->e1 = sqrt(r2) / (1 + b1); M->e2 = fmax(0, -lm) / (1 + c1); M->e3 = fabs(f - dobj) / (1 + fabs(f) + fabs(dobj));
     /* the certified bound: y + min(lambda_min, 0)/a makes Z positive semidefinite, b'y then drops by |lambda_min| sum rho */
     double rs = 0; for (int i = 0; i < n; i++) rs += s->rho[i];
     M->lb = dobj + fmin(lm, 0) * rs;
@@ -607,6 +616,7 @@ static int fd_verify_(BB *s, double delta);
 static int fd_verify(BB *s, double delta) { const double t = wtime(); const int v = fd_verify_(s, delta); g_bm_tvf += wtime() - t; return v; }
 static int fd_verify_(BB *s, double delta) {
     const int n = s->n;
+    if (brisk_fault("bmverify")) return -1;
     if (s->vstate < 0) return -1;
     if (s->vstate == 0) {
         s->vstate = -1;
@@ -694,7 +704,7 @@ static int fixed_diag(BB *s, const Problem *P, double tol, int verbose, double t
     g_bm_work = 0;
     double f = sweep(s), fprev = f;
     g_bm_work += (double)s->np * s->r;
-    int it = 0, nesc = 0, rc = 1, ntr = 0, nver = 0;
+    int it = 0, nesc = 0, rc = 1, ntr = 0, nver = 0, bm_rows = 0;   /* (bm_rows: the default log's rows, ISSUES 725) */
     if (verbose >= 0) printf("bm: fixed diagonal, n = %d, rank %d, %d colours\n", n, s->r, s->ncol);
     int dosweep = 1, fresh = 0;
     for (;;) {
@@ -709,7 +719,10 @@ static int fixed_diag(BB *s, const Problem *P, double tol, int verbose, double t
         int escape = 0;
         for (int round = 0; ; round++) {
             const double gn = fd_cert(s, P, y, v, c1, M);
-            if (verbose >= 0) printf("bm: %6d sweeps %4d TR  rank %3d  obj %.10e  lambda_min(Z) %.2e  |ZR| %.1e  err2 %.1e  %.2fs\n", it, ntr, s->r, M->pobj, M->lmin, gn, M->e2, wtime() - t0);
+            if (verbose >= 0 && g_log_brief) {   /* (ISSUES 725: the default log's row) */
+                if (!bm_rows) log_user(" STEP  OBJECTIVE          RANK  MIN EIG(Z)  ERROR    TIME\n");
+                log_user("%4d  %+.10e  %4d  %+.2e  %.1e %6.2f\n", bm_rows++, M->pobj, s->r, M->lmin, M->e2, wtime() - t0);
+            } else if (verbose >= 0) printf("bm: %6d sweeps %4d TR  rank %3d  obj %.10e  lambda_min(Z) %.2e  |ZR| %.1e  err2 %.1e  %.2fs\n", it, ntr, s->r, M->pobj, M->lmin, gn, M->e2, wtime() - t0);
             if (M->e2 <= tol && M->e3 <= tol && (!g_bm_cert || M->cgap <= tol)) {
                 /* check the bound: the smallest delta = max(-lambda_min, 0) + eta 4^q for which Z + delta I
                  * factors (eta: a twentieth of the tolerance's room); a Lanczos estimate can be too high */
@@ -911,6 +924,18 @@ static int gen_alm(BB *s, const Problem *P, GA *LPd, double tol, int verbose, do
         if (ab > 0 && bb > 0) { const double k = sqrt(sqrt(bb / ab)); for (size_t q = 0; q < N; q++) s->R[q] *= k; } }
     G.sigma = g_bm_sigma0 > 0 ? g_bm_sigma0 : 1.0 / sqrt((double)n);
     double pinf_prev = 1e300; int rc = 1, nesc = 0, nstall = 0; long nit = 0, nit_prev = -1;
+    /* 31 October 2026: the attempt ends when the penalty rises and the primal error does not fall. The escape below adds a
+     * column only near feasibility (pinf <= 10 tol), which a factor of too small a rank never reaches: its missing rank
+     * shows as a primal error that the penalty cannot lower (the benchmark's MovieLens completions, n = 1,500, m = 37,196:
+     * rank 24 against an optimal X of rank 131, pinf 1.7e-3 from the 10th outer iteration to the 182nd, 600 s; four such
+     * files 600-1,200 s each). Growing the rank on such a stall was tried: feasible but slow at the end (a synthetic
+     * completion of the same structure, n = 1,500: 813 s against 67 s with the stop, 580 s before), so the method that
+     * follows takes over instead. The test: over the last five outer iterations the penalty rose 32 times and the primal
+     * error did not halve. Only in the automatic attempt (another method follows): with -bm 1 the user asked for this
+     * method, and the escapes still make slow progress (a correlation completion, n = 2,000: gap 2.2e-4 after 300 s,
+     * rank 26 -> 42). BRISK_BMNOSTALL=1: no test. */
+    double hist_p[6], hist_s[6]; int nhist = 0;
+    const int stall_test = g_bm_stall_stop && !getenv("BRISK_BMNOSTALL");
     const double sigma0 = G.sigma;
     for (int outer = 0; outer < 300; outer++) {
         /* inner: L-BFGS */
@@ -957,7 +982,10 @@ static int gen_alm(BB *s, const Problem *P, GA *LPd, double tol, int verbose, do
         M->pobj = f * fsc; M->dobj = dobj * fsc; M->e1 = pinf; M->lmin = lm * (P->scaled ? P->cs : 1.0); M->e2 = fmax(0, -M->lmin) / (1 + c1o); M->e3 = fabs(f - dobj) / (1 + fabs(f) + fabs(dobj));
         M->e3 = fabs(M->pobj - M->dobj) / (1 + fabs(M->pobj) + fabs(M->dobj));
         M->lb = M->dobj; M->cgap = M->e3;
-        if (verbose >= 0) printf("bm: alm %3d  its %6ld  rank %3d  sigma %.1e  obj %.10e  pinf %.1e  gap %.1e  lmin %s%.2e  %.2fs\n", outer, nit, s->r, G.sigma, M->pobj, pinf, M->e3, check ? "" : "~", M->lmin, wtime() - t0);
+        if (verbose >= 0 && g_log_brief) {
+            if (outer == 0) log_user(" ITE  OBJECTIVE          RANK  PFEAS    GAP      MIN EIG(Z)  TIME\n");
+            log_user("%4d  %+.10e  %4d  %.1e  %.1e  %+.2e %6.2f\n", outer, M->pobj, s->r, pinf, M->e3, M->lmin, wtime() - t0);
+        } else if (verbose >= 0) printf("bm: alm %3d  its %6ld  rank %3d  sigma %.1e  obj %.10e  pinf %.1e  gap %.1e  lmin %s%.2e  %.2fs\n", outer, nit, s->r, G.sigma, M->pobj, pinf, M->e3, check ? "" : "~", M->lmin, wtime() - t0);
         if (check && pinf <= tol && M->e2 <= tol && M->e3 <= tol) { rc = 0; break; }
         if (tlim > 0 && wtime() - t0 > tlim) break;
         if (check && pinf <= 10 * tol && lm < 0 && M->e2 > 10 * tol && nesc < 20) {
@@ -970,6 +998,13 @@ static int gen_alm(BB *s, const Problem *P, GA *LPd, double tol, int verbose, do
             free(s->R); s->R = Rx; s->r = r1; G.N = (size_t)n * r1; N = N1; nesc++;
             if (N > cap) { cap = N + (size_t)n * 8; Gr = realloc(Gr, sizeof(double) * cap); Gn = realloc(Gn, sizeof(double) * cap); D = realloc(D, sizeof(double) * cap); Rn = realloc(Rn, sizeof(double) * cap); free(Sv); free(Yv); Sv = bx(sizeof(double) * cap * MEM); Yv = bx(sizeof(double) * cap * MEM); }
             continue;
+        }
+        /* the stall test over the last five outer iterations (see above) */
+        if (nhist == 6) { memmove(hist_p, hist_p + 1, sizeof(double) * 5); memmove(hist_s, hist_s + 1, sizeof(double) * 5); nhist = 5; }
+        hist_p[nhist] = pinf; hist_s[nhist] = G.sigma; nhist++;
+        if (stall_test && nhist == 6 && G.sigma >= 32.0 * hist_s[0] && pinf >= 0.5 * hist_p[0]) {
+            if (verbose >= 0 && !g_log_brief) printf("bm: the primal error stays at %.1e while the penalty rose %.0fx: the rank (%d) is too small for this problem; stopping\n", pinf, G.sigma / hist_s[0], s->r);
+            break;
         }
         if (pinf > 0.25 * pinf_prev && G.sigma < 1e8 * sigma0) G.sigma *= g_bm_sigfac;
         if (nit == nit_prev && ++nstall >= 3) break;   /* the inner solver no longer moves */
@@ -1004,7 +1039,11 @@ int bm_auto_candidate(const char *fname, const BriskData *data, const Params *pa
     }
     if (nb != 1 || n0 < 2) return 0;
     if (need_dense && n0 > 20000) return 0;   /* (X would be returned dense) */
-    if (n0 >= nmin && m == n0) return 1;                                   /* a fixed diagonal, perhaps */
+    /* (1 November 2026: m > n0 too, a fixed diagonal with dependent rows; bm_run_x removes them first when every row
+     * touches diagonal entries only. The price on a problem of this shape that is no fixed diagonal: one more reading of
+     * the file before the interior-point method) */
+    const int depok = !(getenv("BRISK_BMDEP") && atoi(getenv("BRISK_BMDEP")) == 0);   /* (BRISK_BMDEP=0: m = n0 only, as before) */
+    if (n0 >= nmin && (m == n0 || (depok && m > n0))) return 1;            /* a fixed diagonal, perhaps */
     if (8.0 * (double)m * (double)m > 0.5 * brisk_mem_limit()) return 2;  /* the Schur complement does not fit: entry fixings, perhaps */
     return 0;
 }
@@ -1024,10 +1063,27 @@ int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfil
     g_read_maxn = maxn0;
     if (!P->b0) { P->b0 = bx(sizeof(double) * (P->m + 1)); memcpy(P->b0, P->b, sizeof(double) * P->m); }
     const double tread = wtime() - t0;
-    const int m = P->m, verbose = par->verbose;
+    const int verbose = par->verbose;
     const double tol = par->tol;   /* (-lrtol is -lralm's) */
     int nsdp = 0, nlp = 0; for (int k = 0; k < P->nblk; k++) { if (P->blk[k].type == BLK_SDP) nsdp++; else nlp++; }
     double tlim_auto = 0;
+    const int mread = P->m; int dep_removed = 0;   /* (the constraints as read, and those the check below removed) */
+    if (autom == 1 && nsdp == 1 && !nlp && P->blk[0].ncon == mread && mread > P->blk[0].n && par->deprows > 0) {
+        /* 1 November 2026 (the problems written differently, held-out set): a fixed diagonal written with more rows than
+         * the order, rows repeated or added as sums of others (max-cut with 1,082 such rows: 4.1 s here, 56.9 s by the
+         * interior-point method, because this test saw the rows as read). When every constraint touches diagonal entries
+         * only, the presolve's removal of linearly dependent rows runs first, as on the interior-point path (the removed
+         * rows' dual values are 0); the test below then sees the problem the presolve would have handed on */
+        int dg = 1;
+        for (int t = 0; dg && t < P->blk[0].ncon; t++) { const SpSym *A = &P->blk[0].A[t]; for (int q = 0; q < A->nnz; q++) if (A->row[q] != A->col[q]) { dg = 0; break; } }
+        if (dg) {
+            int ninc = 0;
+            const double dtol = getenv("BRISK_DEPTOL") ? atof(getenv("BRISK_DEPTOL")) : 1e-8;
+            dep_removed = remove_dependent_rows(P, verbose >= 1 ? verbose : -1, dtol, &ninc);
+            if (ninc > 0) { problem_free(P); return -1; }   /* (inconsistent rows: the main path reports them) */
+        }
+    }
+    const int m = P->m;
     if (autom) {   /* 1: every constraint fixes a diagonal entry of the one block; 2: every constraint fixes one entry */
         int fx = nsdp == 1 && !nlp && P->blk[0].ncon == m;
         for (int t = 0; fx && t < P->blk[0].ncon; t++) { const SpSym *A = &P->blk[0].A[t]; if (A->nnz != 1 || (autom == 1 && (A->row[0] != A->col[0] || A->val[0] <= 0 || P->b[P->blk[0].con[t]] <= 0))) fx = 0; }
@@ -1114,38 +1170,42 @@ int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfil
     double *yv = bz(sizeof(double) * (m + 1));
     int *bs0 = bx(sizeof(int) * (P->nblk + 1));
     for (int k = 0; k < P->nblk; k++) bs0[k] = P->blk[k].type == BLK_LP ? -P->blk[k].n : P->blk[k].n;
-    if (verbose >= 0) printf("bm: %s, n = %d, m = %d, rank %d\n", fixed ? "fixed diagonal" : "general constraints (augmented Lagrangian)", s.n, m, s.r);
+    if (verbose >= 0 && g_log_brief) {
+        char pz[200]; brisk_log_problem(pz, sizeof pz, P); log_user("Problem:  %s\n", pz);
+        brisk_log_method("Burer-Monteiro: X = R R' with R of %d columns, %s", s.r, fixed ? "for a fixed diagonal" : "by an augmented Lagrangian method");
+    } else if (verbose >= 0) printf("bm: %s, n = %d, m = %d, rank %d\n", fixed ? "fixed diagonal" : "general constraints (augmented Lagrangian)", s.n, m, s.r);
+    g_bm_stall_stop = autom;
     const int rc = fixed ? fixed_diag(&s, P, tol, verbose, autom ? tlim_auto : par->timelimit, t0, &M, yv) : gen_alm(&s, P, nlp ? &LPd : NULL, tol, verbose, autom ? tlim_auto : par->timelimit, t0, &M, yv);
     const double tt = wtime() - t0;
+    /* y in the numbering of the rows as read (the removed dependent rows: 0, as the presolve's postsolve gives them) */
+    double *yo = yv;
+    if (dep_removed > 0 && P->orig) {
+        yo = bz(sizeof(double) * (mread + 1));
+        for (int i = 0; i < m; i++) if (P->orig[i] >= 0 && P->orig[i] < mread) yo[P->orig[i]] = yv[i];
+    }
     /* the DIMACS errors: X = R R' is positive semidefinite (err2 = 0), Z = C - A'y exactly (err3 = 0) */
     double err[7] = { 0, M.e1, 0, 0, M.e2, M.e3, M.e3 };
-    const double acc = fmax(fmax(err[1], err[4]), err[5]);
-    const int st = rc == 0 ? ST_OPTIMAL : acc <= par->red_acc ? ST_REDUCED : (par->timelimit > 0 && tt >= par->timelimit) ? ST_TIME : ST_MAXIT;
+    const double acc = brisk_nmax(brisk_nmax(err[1], err[4]), err[5]);
+    /* (31 October 2026, the owner's external SDP benchmark, audit A8) on the fixed-diagonal path the dual cone error is a Lanczos
+     * estimate unless a factorization of Z + delta I checked it (M.cert); without that check (no factor affordable) the
+     * result is not called OPTIMAL */
+    const int uncert = fixed && !M.cert;
+    const int st = rc == 0 && !uncert && acc <= tol ? ST_OPTIMAL : acc <= par->red_acc ? ST_REDUCED : (par->timelimit > 0 && tt >= par->timelimit) ? ST_TIME : ST_MAXIT;
     const char *sn = st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : "ITERATION LIMIT";
-    if (verbose >= 0) {
-        printf("status: %s (max rel error %.1e)   rank %d\n", sn, acc, s.r);
-        printf("optimal value (SDPA/SDPLIB convention, max <F0,Y>): %.10e\n", -M.pobj);
-        printf("primal objective %.12e  dual objective %.12e\n", M.pobj, M.dobj);
-        printf("errors: primal %.1e  dual (lambda_min) %.1e  gap %.1e\n", M.e1, M.e2, M.e3);
-        printf("  DIMACS errors: %.1e %.1e %.1e %.1e %.1e %.1e\n", err[1], err[2], err[3], err[4], err[5], err[6]);
-        if (fixed && M.cert) printf("certified lower bound %.12e (Z + %.2e I factored): gap to the objective %.1e\n", M.lb, M.vdelta, M.cgap);
-        else if (fixed) printf("lower bound %.12e with lambda_min(Z) %.2e estimated by Lanczos (not checked): gap to the objective %.1e\n", M.lb, M.lmin, M.cgap);
-        printf("  Time:              %.2f s (reading %.2f s)\n", tt, tread);
-    }
     if (res) {   /* the library interface: status, objectives, errors and y; no X (X = R R' is not formed) */
         static const int ecode[7] = { 0, 11, 12, 13, 14, 10, 15 };
         res->status = st; res->exit_code = ecode[st];
         snprintf(res->status_str, sizeof(res->status_str), "%s", sn);
         res->iters = 0; res->pobj = M.pobj; res->dobj = M.dobj;
         for (int e = 1; e <= 6; e++) res->err[e] = err[e];
-        res->time = tt; res->m = m; res->nblk = P->nblk;
+        res->time = tt; res->m = mread; res->nblk = P->nblk;
         res->bs = malloc(sizeof(int) * (P->nblk + 1)); memcpy(res->bs, bs0, sizeof(int) * P->nblk);
-        res->y = malloc(sizeof(double) * (m + 1)); memcpy(res->y, yv, sizeof(double) * m);
+        res->y = malloc(sizeof(double) * (mread + 1)); memcpy(res->y, yo, sizeof(double) * mread);
         res->have_x = 0; res->X = NULL; res->Z = NULL;
         res->bound_side = 0; res->bound_rigorous = NAN;
-        snprintf(res->cause, sizeof(res->cause), "%s", st == ST_OPTIMAL ? "" : "Burer-Monteiro (-bm): the target accuracy was not reached");
+        snprintf(res->cause, sizeof(res->cause), "%s", st == ST_OPTIMAL ? "" : rc == 0 && uncert ? "Burer-Monteiro (-bm): the dual cone error is an estimate (no factorization of Z was affordable to check it)" : "Burer-Monteiro (-bm): the target accuracy was not reached");
     }
-    if (yfile) { FILE *f = fopen(yfile, "w"); if (f) { for (int i = 0; i < m; i++) fprintf(f, "%.17g\n", yv[i]); fclose(f); } }
+    if (yfile) { FILE *f = brisk_out_open(yfile); if (f) { for (int i = 0; i < mread; i++) fprintf(f, "%.17g\n", yo[i]); brisk_out_close(f, yfile); } }
     if ((res || xfile || zfile) && P->nblk == 1 && s.n <= 20000) {
         /* X = R R' and Z = C - A'y dense, as the interior-point path returns them */
         const int n = s.n, r = s.r; const size_t nn = (size_t)n * n;
@@ -1161,16 +1221,33 @@ int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfil
             for (int w = 0; w < 2; w++) {
                 const char *fn = w == 0 ? xfile : zfile; const double *M = w == 0 ? X : Z;
                 if (!fn) continue;
-                FILE *f = fopen(fn, "w"); if (!f) { fprintf(stderr, "brisk: cannot write %s\n", fn); continue; }
+                FILE *f = brisk_out_open(fn); if (!f) continue;
                 for (int j = 0; j < n; j++) for (int i = 0; i <= j; i++) { const double v = M[i + (size_t)j * n]; if (v != 0) fprintf(f, "1 %d %d %.17g\n", i + 1, j + 1, v); }
-                fclose(f);
+                brisk_out_close(f, fn);
             }
             if (res) { res->X = malloc(sizeof(double *) * 2); res->X[0] = X; X = NULL; res->Z = malloc(sizeof(double *) * 2); res->Z[0] = Z; Z = NULL; res->have_x = 1; }
         }
         free(X); free(Z); free(Rc);
     }
+    /* (5 November 2026, ISSUES 820) the Summary after the files are written: a file not written completely is said in it */
+    if (verbose >= 0 && g_log_brief) {
+        char pz[200], sv[300], ex[300] = ""; brisk_log_problem(pz, sizeof pz, P);
+        snprintf(sv, sizeof sv, "Burer-Monteiro (X = R R' with R of %d columns), %s", s.r, fixed ? "fixed diagonal" : "augmented Lagrangian method");
+        if (dep_removed > 0) snprintf(pz + strlen(pz), sizeof pz - strlen(pz), " (%d as read; %d linearly dependent ones removed, dual values 0)", mread, dep_removed);
+        if (fixed && M.cert) snprintf(ex, sizeof ex, "certified lower bound on the optimal value: %.12e", M.lb);
+        brisk_log_summary(pz, sv, tt, sn, acc, "", M.pobj, M.dobj, err, ex);
+    } else if (verbose >= 0) {
+        printf("status: %s (max rel error %.1e)   rank %d\n", sn, acc, s.r);
+        printf("optimal value (SDPA/SDPLIB convention, max <F0,Y>): %.10e\n", -M.pobj);
+        printf("primal objective %.12e  dual objective %.12e\n", M.pobj, M.dobj);
+        printf("errors: primal %.1e  dual (lambda_min) %.1e  gap %.1e\n", M.e1, M.e2, M.e3);
+        printf("  DIMACS errors: %.1e %.1e %.1e %.1e %.1e %.1e\n", err[1], err[2], err[3], err[4], err[5], err[6]);
+        if (fixed && M.cert) printf("certified lower bound %.12e (Z + %.2e I factored): gap to the objective %.1e\n", M.lb, M.vdelta, M.cgap);
+        else if (fixed) printf("lower bound %.12e with lambda_min(Z) %.2e estimated by Lanczos (not checked): gap to the objective %.1e\n", M.lb, M.lmin, M.cgap);
+        printf("  Time:              %.2f s (reading %.2f s)\n", tt, tread);
+    }
     bb_free(&s);
-    free(LPd.lp_ptr); free(LPd.lp_con); free(LPd.lp_val); free(LPd.lp_c); free(yv); free(bs0);
+    free(LPd.lp_ptr); free(LPd.lp_con); free(LPd.lp_val); free(LPd.lp_c); if (yo != yv) free(yo); free(yv); free(bs0);
     problem_free(P);
     return st == ST_OPTIMAL ? 0 : st == ST_REDUCED ? 10 : st == ST_TIME ? 15 : 13;
 }

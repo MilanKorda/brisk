@@ -1,4 +1,6 @@
 #!/bin/bash
+# (ISSUES 725, 31 October 2026: the lines read below are those of the diagnosis log, the default log until then)
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}
 # The dual after a facial reduction (ISSUES 93, the owner's benchmark of 15 October 2026; the policy of 16 October).
 # On a sparse SOS relaxation (pop_wood_20: chained Wood, correlative sparsity, order 2) the reduction removes 312
 # constraints whose duals cannot be rebuilt from the reduced solve. Checks that
@@ -21,7 +23,7 @@ da=$(echo "$a" | dual); db=$(echo "$b" | dual); dc=$(echo "$c" | dual); dd=$(ech
 va=$(echo "$a" | val); vb=$(echo "$b" | val); vc=$(echo "$c" | val); vd=$(echo "$d" | val)
 sa=$(echo "$a" | st); sb=$(echo "$b" | st); sc=$(echo "$c" | st); sd=$(echo "$d" | st)
 if [ "$sa" != "OPTIMAL" ] && [ -n "$sa" ] && ! echo "$a" | grep -q "re-solving without facial reduction" \
-   && echo "$a" | grep -q "^  -nofr   solves without the facial reduction" && echo "$a" | grep -q "Dual: *not recovered for the 312 constraints removed by the facial reduction" && ok "$da >= 1e-3"; then
+   && echo "$a" | grep -qE "^  -nofr +solves without the facial reduction" && echo "$a" | grep -q "Dual: *not recovered for the 312 constraints removed by the facial reduction" && ok "$da >= 1e-3"; then
     echo "ok   pop_wood_20: no re-solve, '$sa', dual error $da on the problem as read, the failure and -nofr in the log"
 else echo "FAIL pop_wood_20: status '$sa', dual error $da (expected no re-solve, not OPTIMAL, the failure and -nofr in the log)"; fail=1; fi
 if [ "$sb" = "OPTIMAL" ] && ok "$db <= 1e-6"; then

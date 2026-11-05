@@ -1,4 +1,4 @@
-# BRISK 1.6.1: the solver in detail
+# BRISK 1.6.5: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -79,6 +79,9 @@ reduction.
 
 **Accuracy:**
 - `-acc low|default|high` sets the tolerance to 1e-6 / 1e-8 / 1e-10. `-tol` sets it directly.
+  For a second-order cone program, `-acc low` also stops at the limit of double precision and returns the best point
+  at reduced accuracy. At the default and high accuracy the solve goes on: on the normal equations when every free
+  variable could be substituted away (their matrix is then positive definite), otherwise in double-double arithmetic.
 - The returned X, y and Z, the printed DIMACS errors and the status all refer to the problem
   as read. Presolve reductions are undone, and the errors are measured on the original data.
 - The printed optimal value uses the SDPA/SDPLIB convention (max tr(F0 Y)), so it compares
@@ -120,7 +123,7 @@ option strings `"-acc", "high"`; what was already asked for is not advised again
 | 15 | time limit |
 | 1 / 2 | usage / input error |
 
-**Threads:** `-threads k` or `OMP_NUM_THREADS` (default: all cores), an upper limit. Tiny
+**Threads:** `-threads k` or `OMP_NUM_THREADS` (default: all cores, within the container's CPU quota on Linux), an upper limit. Tiny
 problems run on one thread, and on Linux the interior-point solve uses fewer threads while other
 processes occupy the cores it may use, and more again when they are free (`-v` shows the
 changes; `BRISK_NOBUSY=1` keeps the count exactly as asked). On macOS, with a machine where

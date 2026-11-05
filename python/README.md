@@ -153,7 +153,7 @@ The other examples:
 ## CVXPY
 
 ```python
-prob.solve(solver=brisk.BRISK(), verbose=True, acc="high", timelimit=600, threads=4)
+prob.solve(solver=brisk.BRISK(), log=True, acc="high", timelimit=600, threads=4)
 ```
 
 Pass an instance of `brisk.BRISK` as the solver; CVXPY 1.9 or later is required.
@@ -174,6 +174,7 @@ prints the same list. The interface's own:
 | `form` | `"auto"` | how the model is handed to BRISK: `"image"`, `"kernel"` or `"auto"` (below) |
 | `soc` | `"auto"` | second-order cones as `"arrow"` blocks, as a `"tree"` of 2×2 blocks, or `"auto"` (arrow in the image form, tree in the kernel form) |
 | `soc_arrow_max` | none | with `soc="arrow"`: cones larger than this use the tree |
+| `log` | `False` | `True`: BRISK's log, without CVXPY's own messages (CVXPY's `verbose=True` prints both) |
 | `options` | none | raw command-line strings, e.g. `options=["-acc", "high"]` |
 | `write_sdpa` | none | a file name: write the SDPA problem handed to BRISK, for `./brisk` or other solvers |
 | `bound` | none | `"primal"` or `"sos"` (a feasible point of the model, e.g. the SOS Gram matrices: a guaranteed bound on the value), `"dual"` (a feasible dual), `"both"` (both sides in one solve). Always checked rigorously; the solution stays the solve's own. The bound, on CVXPY's minimisation form min c'x + offset, is in `extra_stats["bound"]` (`value`, `kind` upper/lower, `valid`, `certified`, `rigorous`; with `"both"`: `extra_stats["bounds"]["upper"]` and `["lower"]`); for a Maximize model CVXPY minimises −f, so the sign and kind flip |
@@ -235,7 +236,9 @@ a hundred variables, such as those of model predictive control), the interior-po
 `options=["-qpas"]` asks for the active-set method, `options=["-qpipm"]` for the interior-point method. `brisk.solve_file("problem.qps")` reads a QPS file (also with quadratic
 constraints, QCMATRIX: a convex QCQP) and returns a `QpResult`.
 
-From CVXPY, a problem with a quadratic objective and linear constraints goes to the QP method with
+From CVXPY, a problem with a quadratic objective and linear constraints goes to the QP method, with
+`prob.solve(solver=brisk.BRISK())` (a quadratic objective with second-order or semidefinite cones goes to the cones, as
+CVXPY writes it) or with the QP class, which also takes the method's choice:
 
 ```python
 prob.solve(solver=brisk.BRISK_QP())                    # the solver's choice of method

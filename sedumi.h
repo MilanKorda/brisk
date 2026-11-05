@@ -25,6 +25,9 @@ typedef struct {
     double err[6];                  /* DIMACS errors 1..6 */
     double time;
     int cone;                       /* 1: solved by the cone solver (0: by the semidefinite solver, which reports itself) */
+    int lpm;                        /* (3 November 2026) a problem without cones: 1 solved by the LP interior-point method;
+                                       2 that method tried first (lpm_time, lpm_why) and the SOCP solver gave the result */
+    double lpm_time; char lpm_why[160];
     /* bound mode (-bound p|d|pd), per side as BriskResult's bnd: [0] p, an upper bound c'x from the
      * certificate x (n); [1] d, a lower bound b'y from the certificate y (m). The returned x, y
      * above are the solve's own point */
@@ -41,6 +44,9 @@ void sedumi_free(SedumiProb *P);
 int  sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
                   int (*run_sdp)(const BriskData *d, int argc, char **argv, BriskResult *res));
 void sedumi_result_free(SedumiRes *R);
+/* (3 November 2026) 1: a problem without cones goes to the SOCP solver directly, not first to the LP interior-point
+ * method (set by the LP method's own route, whose call here follows that method's failure) */
+extern int g_sedumi_nolpm;
 /* main.c: solve with the options argv[0..argc-1] (no program name); in the library build the
  * call is protected as brisk_run */
 int  brisk_run_sedumi(const SedumiProb *P, int argc, char **argv, SedumiRes *R);

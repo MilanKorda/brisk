@@ -6,6 +6,7 @@
 typedef struct SxPre SxPre;
 /* reduces L into R (a minimization; R's arrays allocated, free with lp_free); returns 0, 1 if L is primal infeasible,
  * 2 if dual infeasible (why: the reason). *P holds what the postsolve needs (free with sxpre_free) */
+int  sxpre_set_for_simplex(int v);   /* (BRISK_SXPRE_AGGI=3: marks the presolve called for the simplex methods) */
 int  sxpre_presolve(const LpProb *L, LpProb *R, SxPre **P, int verbose, char *why, size_t nwhy);
 int  sxpre_presolve_ex(const LpProb *L, LpProb *R, SxPre **P, int verbose, int aggbmode, char *why, size_t nwhy);
 /* x, y (row duals as minimization) and the basis statuses of L from those of the reduced problem */

@@ -32,6 +32,9 @@ static int ibits(Infl *s, int need) {
     return (int)(val & ((1L << need) - 1));
 }
 static int iout(Infl *s, size_t extra) {
+    /* (31 October 2026, audit A9) deflate expands at most 1032 times (258 bytes from two 1-bit codes): more output than
+     * that is a corrupt stream, refused before it is allocated */
+    if (s->outcnt + extra > s->inlen * 1032 + 65536) { s->err = 2; return 1; }
     if (s->outcnt + extra > s->outlen) {
         size_t nl = s->outlen * 2 + extra + 65536;
         unsigned char *p = (unsigned char *)realloc(s->out, nl);
@@ -100,6 +103,8 @@ static int sd_inflate(const unsigned char *src, size_t srclen, unsigned char **d
             S.bitbuf = 0; S.bitcnt = 0;
             if (S.incnt + 4 > S.inlen) { S.err = 1; break; }
             const unsigned len = S.in[S.incnt] | ((unsigned)S.in[S.incnt + 1] << 8);
+            const unsigned nlen = S.in[S.incnt + 2] | ((unsigned)S.in[S.incnt + 3] << 8);
+            if (len != (~nlen & 0xffffu)) { S.err = 1; break; }      /* (31 October 2026, audit A9: the stored block's check word) */
             S.incnt += 4;
             if (S.incnt + len > S.inlen || iout(&S, len)) { S.err = 1; break; }
             memcpy(S.out + S.outcnt, S.in + S.incnt, len); S.outcnt += len; S.incnt += len;
@@ -175,7 +180,10 @@ static size_t mat_tag(const unsigned char *p, size_t avail, unsigned *type, size
     if (w >> 16) { *type = w & 0xffff; *len = w >> 16; *data = p + 4; if (*len > 4) return 0; return 8; }
     *type = w; *len = rd32(p + 4); *data = p + 8;
     if (*len > avail - 8) return 0;
-    return 8 + ((*len + 7) & ~(size_t)7);
+    /* (31 October 2026, audit A9) the padding is counted only where the bytes are there: a caller subtracts the result
+     * from what is left, which must not wrap around */
+    const size_t padded = 8 + ((*len + 7) & ~(size_t)7);
+    return padded <= avail ? padded : 8 + *len;
 }
 static long mat_count(unsigned type, size_t len) {
     const int sz = type == 1 || type == 2 ? 1 : type == 3 || type == 4 ? 2 : type == 5 || type == 6 || type == 7 ? 4 : type == 9 || type == 12 || type == 13 ? 8 : 0;
@@ -208,7 +216,8 @@ static int mat_matrix(const unsigned char *p, size_t len, MatVar *v) {
     p += used; len -= used;
     if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;                   /* dimensions */
     v->nd = (int)(l / 4); if (v->nd > 4) return 3;
-    for (int i = 0; i < v->nd; i++) v->dims[i] = (int)rd32(d + 4 * i);
+    if (v->nd < 2) return 1;
+    for (int i = 0; i < v->nd; i++) { const unsigned dd = rd32(d + 4 * i); if (dd > 2147483647u) return 1; v->dims[i] = (int)dd; }
     p += used; len -= used;
     if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;                   /* name */
     { const size_t c = l < 63 ? l : 63; memcpy(v->name, d, c); v->name[c] = 0; }
@@ -216,19 +225,26 @@ static int mat_matrix(const unsigned char *p, size_t len, MatVar *v) {
     if (v->cls == 5) {                                                        /* sparse */
         v->sparse = 1;
         if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;
+        if (type != 5 && type != 6) return 1;                                 /* indices are 32-bit integers */
         const long nir = (long)(l / 4);
         v->ir = (int *)malloc(sizeof(int) * (size_t)(nir + 1));
+        if (!v->ir) return 1;
         for (long i = 0; i < nir; i++) v->ir[i] = (int)rd32(d + 4 * i);
         p += used; len -= used;
         if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;
         const long njc = (long)(l / 4);
-        if (njc < (long)v->dims[1] + 1) return 1;
+        if ((type != 5 && type != 6) || njc < (long)v->dims[1] + 1) return 1;
         v->jc = (int *)malloc(sizeof(int) * (size_t)(njc + 1));
+        if (!v->jc) return 1;
         for (long i = 0; i < njc; i++) v->jc[i] = (int)rd32(d + 4 * i);
         p += used; len -= used;
+        /* (31 October 2026, audit A9) column pointers from 0, nondecreasing, within the row indices */
+        if (v->jc[0] != 0) return 1;
+        for (int j = 0; j < v->dims[1]; j++) if (v->jc[j + 1] < v->jc[j]) return 1;
         if (v->jc[v->dims[1]] > nir) return 1;
         const long nnz = v->jc[v->dims[1]];
         v->pr = (double *)calloc((size_t)(nnz + 1), sizeof(double)); v->npr = nnz;
+        if (!v->pr) return 1;
         if (len >= 8) {
             if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;
             const long cnt = mat_count(type, l);
@@ -239,17 +255,26 @@ static int mat_matrix(const unsigned char *p, size_t len, MatVar *v) {
     } else if (v->cls >= 6 && v->cls <= 15) {                                 /* numeric */
         if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;
         const long cnt = mat_count(type, l);
-        long want = 1; for (int i = 0; i < v->nd; i++) want *= v->dims[i];
+        long want = 1;
+        for (int i = 0; i < v->nd; i++) {         /* (31 October 2026, audit A9) the product checked against the data's count as it grows */
+            if (v->dims[i] == 0) { want = 0; break; }
+            if (want > cnt / v->dims[i]) return 1;
+            want *= v->dims[i];
+        }
         if (cnt < want) return 1;
         v->pr = (double *)malloc(sizeof(double) * (size_t)(want + 1)); v->npr = want;
+        if (!v->pr) return 1;
         for (long i = 0; i < want; i++) v->pr[i] = mat_get(type, d, i);
     } else if (v->cls == 2) {                                                 /* struct (1 x 1) */
-        if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;
-        const int fl = (int)rd32(d);
+        if (!(used = mat_tag(p, len, &type, &l, &d)) || l < 4) return 1;
+        const unsigned flu = rd32(d);
+        if (flu < 1 || flu > 4096) return 1;
+        const int fl = (int)flu;
         p += used; len -= used;
-        if (!(used = mat_tag(p, len, &type, &l, &d)) || fl < 1) return 1;
+        if (!(used = mat_tag(p, len, &type, &l, &d))) return 1;
         v->nfields = (int)(l / (size_t)fl);
         v->fname = calloc((size_t)v->nfields + 1, 64); v->fdata = calloc((size_t)v->nfields + 1, sizeof(*v->fdata)); v->flen = calloc((size_t)v->nfields + 1, sizeof(size_t));
+        if (!v->fname || !v->fdata || !v->flen) return 1;
         for (int f = 0; f < v->nfields; f++) { const size_t c = (size_t)(fl < 63 ? fl : 63); memcpy(v->fname[f], d + (size_t)f * fl, c); v->fname[f][c] = 0; }
         p += used; len -= used;
         for (int f = 0; f < v->nfields; f++) {
@@ -268,7 +293,9 @@ void sedumi_free(SedumiProb *P) {
 /* the dense column vector of a variable (sparse or full, any shape), length *n */
 static double *mat_vector(const MatVar *v, long *n) {
     const long tot = (long)v->dims[0] * (v->nd > 1 ? v->dims[1] : 1);
+    if (tot > 2147483647L) { *n = -1; return NULL; }      /* (31 October 2026, audit A9) more entries than an int counts */
     double *x = (double *)calloc((size_t)(tot + 1), sizeof(double));
+    if (!x) { *n = -1; return NULL; }
     if (v->sparse) { for (int j = 0; j < v->dims[1]; j++) for (int p = v->jc[j]; p < v->jc[j + 1]; p++) x[(long)j * v->dims[0] + v->ir[p]] = v->pr[p]; }
     else for (long i = 0; i < tot && i < v->npr; i++) x[i] = v->pr[i];
     *n = tot;
@@ -289,6 +316,7 @@ int sedumi_read_mat(const char *fname, SedumiProb *P, char *msg, size_t nmsg) {
     FILE *f = fopen(fname, "rb");
     if (!f) { snprintf(msg, nmsg, "cannot open %s", fname); return 1; }
     fseek(f, 0, SEEK_END); const long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); snprintf(msg, nmsg, "cannot read %s", fname); return 1; }
     unsigned char *buf = (unsigned char *)malloc((size_t)sz + 16);
     if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); snprintf(msg, nmsg, "cannot read %s", fname); return 1; }
     fclose(f);
@@ -335,16 +363,28 @@ int sedumi_read_mat(const char *fname, SedumiProb *P, char *msg, size_t nmsg) {
         long nbv, ncv;
         P->b = mat_vector(&vb, &nbv); P->c = mat_vector(&vc, &ncv);
         P->m = (int)nbv; P->n = (int)ncv;
+        int kbad = !P->b || !P->c;
+        if (kbad) snprintf(msg, nmsg, "%s: b or c too large", fname);
         /* K */
         for (int fld = 0; fld < vK.nfields; fld++) {
             MatVar v;
             if (vK.flen[fld] == 0 || mat_matrix(vK.fdata[fld], vK.flen[fld], &v)) continue;
             const char *nm = vK.fname[fld];
-            if (v.pr && v.npr > 0 && !v.sparse) {
+            if (v.pr && v.npr > 0 && !v.sparse && (!strcmp(nm, "f") || !strcmp(nm, "l") || !strcmp(nm, "q") || !strcmp(nm, "r") || !strcmp(nm, "s"))) {
+                /* (31 October 2026, the owner's external benchmark, audit A3/A9: a size 5.9 was read as 5, a negative one
+                 * dropped) every cone size a nonnegative integer */
+                for (long i = 0; i < v.npr; i++)
+                    if (!(v.pr[i] >= 0) || v.pr[i] != floor(v.pr[i]) || v.pr[i] > 2147483647.0) {
+                        if (!kbad) snprintf(msg, nmsg, "%s: K.%s must hold nonnegative integers (cone sizes)", fname, nm);
+                        kbad = 1; break;
+                    }
+            }
+            if (!kbad && v.pr && v.npr > 0 && !v.sparse) {
                 if (!strcmp(nm, "f")) P->nf = (int)v.pr[0];
                 else if (!strcmp(nm, "l")) P->nl = (int)v.pr[0];
                 else if (!strcmp(nm, "q") || !strcmp(nm, "r") || !strcmp(nm, "s")) {
                     int *a = (int *)malloc(sizeof(int) * (size_t)(v.npr + 1)); int cnt = 0;
+                    if (!a) { kbad = 1; snprintf(msg, nmsg, "%s: out of memory", fname); matvar_free(&v); break; }
                     for (long i = 0; i < v.npr; i++) if (v.pr[i] > 0) a[cnt++] = (int)v.pr[i];
                     if (nm[0] == 'q') { P->q = a; P->nq = cnt; } else if (nm[0] == 'r') { P->r = a; P->nr = cnt; } else { P->s = a; P->ns = cnt; }
                 }
@@ -355,7 +395,8 @@ int sedumi_read_mat(const char *fname, SedumiProb *P, char *msg, size_t nmsg) {
         const int ar = vA.dims[0], ac = vA.dims[1];
         int tr = At;
         if (!At && ar != P->m && ac == P->m && ar == P->n) tr = 1;
-        if ((tr ? ac : ar) != P->m || (tr ? ar : ac) != P->n) snprintf(msg, nmsg, "%s: A is %d x %d, b has %d entries, c %d", fname, ar, ac, P->m, P->n);
+        if (kbad) ;
+        else if ((tr ? ac : ar) != P->m || (tr ? ar : ac) != P->n) snprintf(msg, nmsg, "%s: A is %d x %d, b has %d entries, c %d", fname, ar, ac, P->m, P->n);
         else {
             long nnz = 0;
             if (vA.sparse) nnz = vA.jc[ac]; else for (long i = 0; i < vA.npr; i++) nnz += vA.pr[i] != 0.0;
@@ -397,8 +438,26 @@ static const int g_exit_of_status[8] = { 0, 11, 12, 13, 14, 10, 15, 2 };
 
 /* options of the SOCP solver from the command line's words; returns 0, 1 with a message, or 2:
  * the options ask for the semidefinite solver (-conesolver 0, high precision, bounds, first-order methods) */
+extern int brisk_options_valid(int argc, char **argv);   /* (main.c) */
+/* 2 November 2026: the command line's and the interfaces' default log (main.c sets it for a run of the SOCP solver): the
+ * solver's own lines (its header, status and errors) are the diagnosis (-v); the run prints the problem, the method and
+ * the Summary, as the semidefinite and LP solvers do */
+int g_cone_brief = 0;
+int g_sedumi_nolpm = 0;
 static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nmsg) {
     socp_default_opts(o);
+    if (g_cone_brief) o->verbose = 0;
+    {   /* 31 October 2026 (the SOCP audit's A3): every word checked by the one option parser; an unknown option is an
+         * error here as on the other routes (-coneretry, the QCQP route's internal option, is this parser's own) */
+        char **av = malloc(sizeof(char *) * ((size_t)argc + 1)); int ac = 0;
+        for (int i = 0; av && i < argc; i++) {
+            if (argv[i] && (!strcmp(argv[i], "-coneretry") || !strcmp(argv[i], "-lpmethod"))) { i++; continue; }   /* (-lpmethod 0: the SOCP solver directly for a problem without cones, below) */
+            av[ac++] = argv[i];
+        }
+        const int ok = !av || brisk_options_valid(ac, av);
+        free(av);
+        if (!ok) { snprintf(msg, nmsg, "invalid options (see above)"); return 1; }
+    }
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
         if (!a) continue;
@@ -426,16 +485,45 @@ static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nm
 
 /* Solves P. argv: the option words (argc of them). The result's vectors are allocated here
  * (sedumi_result_free). run_sdp solves an SDPA problem given in memory with the same options. */
+static int sedumi_solve_body(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
+                             int (*run_sdp)(const BriskData *d, int argc, char **argv, BriskResult *res));
 int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
                  int (*run_sdp)(const BriskData *d, int argc, char **argv, BriskResult *res)) {
+    const double dl0 = brisk_deadline();   /* (the body may set or shorten the deadline from its options: restored here) */
+    const int rc = sedumi_solve_body(P, argc, argv, R, run_sdp);
+    brisk_deadline_restore(dl0);
+    return rc;
+}
+static int sedumi_solve_body(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
+                             int (*run_sdp)(const BriskData *d, int argc, char **argv, BriskResult *res)) {
     memset(R, 0, sizeof(*R));
     R->status = -1;
     const int m = P->m, n = P->n;
     R->m = m; R->n = n;
     SocpOpts o; char msg[200];
+    {   /* (31 October 2026, the owner's external benchmarks, audits A02/A3/A9) every input in this form (MAT files, MATLAB's
+         * brisk_sedumi, Python, the C library) passes here: the column pointers from 0 and nondecreasing, the row indices in
+         * range, no NaN or infinity in A, b or c; an error, not a solve on data the solver cannot read */
+        const char *bad = NULL;
+        if (m < 0 || n < 0 || !P->Ap || (P->Ap[0] != 0)) bad = "the column pointers of A must start at 0";
+        for (int j = 0; !bad && j < n; j++) if (P->Ap[j + 1] < P->Ap[j]) bad = "the column pointers of A must not decrease";
+        const long nz = bad ? 0 : (long)P->Ap[n];
+        for (long p = 0; !bad && p < nz; p++) {
+            if (P->Ai[p] < 0 || P->Ai[p] >= m) bad = "a row index of A is out of range";
+            else if (!isfinite(P->Ax[p])) bad = "A holds a NaN or an infinity";
+        }
+        for (int i = 0; !bad && i < m; i++) if (!isfinite(P->b[i])) bad = "b holds a NaN or an infinity";
+        for (int j = 0; !bad && j < n; j++) if (!isfinite(P->c[j])) bad = "c holds a NaN or an infinity";
+        if (bad) { fprintf(stderr, "brisk: invalid problem data: %s\n", bad); R->exit_code = 2; return 2; }   /* (2: invalid data, as the interfaces read it; the SOCP developer, 31 October) */
+    }
     const int orc = P->ns == 0 ? socp_options(argc, argv, &o, msg, sizeof msg) : 2;
     if (orc == 1) { fprintf(stderr, "brisk: %s\n", msg); R->exit_code = 1; return 1; }
     if (orc == 0) {
+        /* (31 October 2026, audit A6) the time limit of this call joins the one deadline, and the SOCP solver gets the time
+         * left of it: a caller that spent time before this call (the LP method's routes, the QCQP route, a file's reading)
+         * no longer hands the full limit over again */
+        if (o.timelimit > 0) (void)brisk_deadline_tighten(wtime() + o.timelimit);
+        if (brisk_deadline() > 0) o.timelimit = fmax(1e-3, brisk_time_left());
         SocpProb Q = { m, n, P->Ap, P->Ai, P->Ax, P->b, P->c, P->nf, P->nl, P->nq, P->q, P->nr, P->r };
         SocpRes S;
 #ifdef BRISK_LIBRARY
@@ -448,6 +536,64 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
          * as the LP method's path (IMPLEMENTATION 26.8); the interfaces' linear programs and the LP method's fallback
          * come here. BRISK_LPNOFOLD=1 turns it off.) */
         int st; int folded = 0;
+        /* (3 November 2026, the owner: "Change it now", ISSUES 751 (5)) a problem without cones is a linear program: the LP
+         * interior-point method solves it, with its dual, as the command line's LP route does (the interfaces' LPs in this
+         * form: Python's and Julia's solve_sedumi, MATLAB's brisk_sedumi, CVXPY, JuMP), not the SOCP solver. The SOCP solver
+         * follows when the method does not end optimal on the problem as given (an infeasible problem: its certificate).
+         * -lpmethod 0: the SOCP solver directly, as on the LP route. Not on the LP route's own call (g_sedumi_nolpm), which
+         * comes after that method's failure. */
+        double lpm_t = 0; int lpm_tried = 0; char lpm_why[160] = "";
+        int lpm_off = g_sedumi_nolpm || Q.nq != 0 || Q.nr != 0 || m <= 0 || n <= 0;
+        for (int i = 0; i + 1 < argc; i++) if (argv[i] && !strcmp(argv[i], "-lpmethod") && atoi(argv[i + 1]) == 0) lpm_off = 1;
+        if (!lpm_off) {
+            LpIpmOpts lo; LpIpmInfo li; memset(&lo, 0, sizeof lo); memset(&li, 0, sizeof li);
+            lo.tol = o.tol; lo.maxit = o.maxit; lo.verbose = o.verbose >= 2 ? 2 : o.verbose > 0 ? 1 : 0; lo.kcorr = -1;
+            lo.timelimit = o.timelimit > 0 ? o.timelimit : 0; lo.stop = socp_stop;
+            double *x = (double *)calloc((size_t)n + 1, sizeof(double)), *y = (double *)calloc((size_t)m + 1, sizeof(double)), *z = (double *)calloc((size_t)n + 1, sizeof(double));
+            const double ta = wtime();
+            const int itab0 = g_itab; if (g_cone_brief) g_itab = 1;   /* (3 November 2026: the default log's iteration table) */
+            const int lst = x && y && z ? lpipm_solve(m, n, Q.nf, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, NULL, &lo, x, y, z, &li) : -1;
+            g_itab = itab0;
+            lpm_t = wtime() - ta; lpm_tried = 1;
+            if (lst == 0) {
+                /* the DIMACS errors of the point on the problem as given, as the SOCP solver measures them (the norms of b
+                 * and c by their largest entries): z = c - A'y on the nonnegative columns, 0 on the free ones (whose part of
+                 * c - A'y is the dual residual) */
+                double nb = 0, nc = 0, rp = 0, rd = 0, xneg = 0, zneg = 0, pobj = 0, dobj = 0, xz = 0;
+                for (int i = 0; i < m; i++) nb = fmax(nb, fabs(Q.b[i]));
+                for (int j = 0; j < n; j++) nc = fmax(nc, fabs(Q.c[j]));
+                double *ra = (double *)calloc((size_t)m + 1, sizeof(double));
+                for (int i = 0; i < m; i++) ra[i] = -Q.b[i];
+                for (int j = 0; j < n; j++) {
+                    double s = 0;
+                    for (int p = Q.Ap[j]; p < Q.Ap[j + 1]; p++) { ra[Q.Ai[p]] += Q.Ax[p] * x[j]; s += Q.Ax[p] * y[Q.Ai[p]]; }
+                    const double zj = Q.c[j] - s;
+                    if (j < Q.nf) { rd += zj * zj; z[j] = 0; }
+                    else { z[j] = zj; if (-zj > zneg) zneg = -zj; if (-x[j] > xneg) xneg = -x[j]; xz += x[j] * zj; }
+                    pobj += Q.c[j] * x[j];
+                }
+                for (int i = 0; i < m; i++) { rp += ra[i] * ra[i]; dobj += Q.b[i] * y[i]; }
+                free(ra);
+                const double den = 1.0 + fabs(pobj) + fabs(dobj);
+                R->err[0] = sqrt(rp) / (1.0 + nb); R->err[1] = xneg / (1.0 + nb); R->err[2] = sqrt(rd) / (1.0 + nc);
+                R->err[3] = zneg / (1.0 + nc); R->err[4] = (pobj - dobj) / den; R->err[5] = xz / den;
+                double e = 0; for (int k = 0; k < 6; k++) e = fmax(e, fabs(R->err[k]));
+                /* (the method's own measures and DIMACS's differ in their scales: a point the method calls optimal is
+                 * taken when its DIMACS errors are within ten times the tolerance; the SOCP solver otherwise) */
+                if (e <= 10.0 * o.tol) {
+                    R->status = 0; snprintf(R->status_str, sizeof R->status_str, "OPTIMAL");
+                    R->cone = 1; R->lpm = 1; R->lpm_time = lpm_t;
+                    R->x = x; R->y = y; R->z = z; R->pobj = pobj; R->dobj = dobj; R->iters = li.iters; R->time = lpm_t; R->have_x = 1;
+                    R->exit_code = 0;
+                    return 0;
+                }
+                snprintf(lpm_why, sizeof lpm_why, "its point's DIMACS error %.1e on the problem as given", e);
+                memset(R->err, 0, sizeof R->err);
+            } else snprintf(lpm_why, sizeof lpm_why, "%.150s", li.why[0] ? li.why : lst == 3 ? "the iteration limit" : lst == 6 ? "stopped" : "no progress");
+            free(x); free(y); free(z);
+            if (o.verbose > 0) socp_printf("the LP interior-point method did not end optimal (%s, %.2f s): the SOCP solver follows\n", lpm_why, lpm_t);
+            if (brisk_deadline() > 0) o.timelimit = fmax(1e-3, brisk_time_left());
+        }
         if (getenv("BRISK_FOLDMEASURE") && m > 0 && n > 0) {      /* (test: the partition's size with every column as a linear one: an upper bound of a cone fold) */
             int *rcl = (int *)malloc(sizeof(int) * ((size_t)m + 1)), *ccl = (int *)malloc(sizeof(int) * ((size_t)n + 1)); int nr = m, nc = n;
             lp_fold_partition(m, n, Q.nf, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, NULL, rcl, ccl, &nr, &nc);
@@ -464,7 +610,7 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
                 if (rcnt && ccnt && lp_fold_quotient(m, n, Q.nf, Q.Ap, Q.Ai, Q.Ax, Q.b, Q.c, NULL, rcl, ccl, nr, nc, &nfh, &Aph, &Aih, &Axh, &bh, &ch, &uh, rcnt, ccnt)) {
                     if (o.verbose > 0) socp_printf("folding: %d rows -> %d, %d columns -> %d (the coarsest equitable partition of the constraint graph)\n", m, nr, n, nc);
                     SocpProb Qh = { nr, nc, Aph, Aih, Axh, bh, ch, nfh, nc - nfh, 0, NULL, 0, NULL };
-                    st = socp_solve(&Qh, &o, &S);
+                    { const int itab0 = g_itab; if (g_cone_brief) g_itab = 1; st = socp_solve(&Qh, &o, &S); g_itab = itab0; }
                     if (st != SOCP_INPUT && S.x && S.y && S.z) {
                         double *x = (double *)calloc((size_t)n + 1, sizeof(double)), *y = (double *)calloc((size_t)m + 1, sizeof(double)), *z = (double *)calloc((size_t)n + 1, sizeof(double));
                         for (int j = 0; j < n; j++) { x[j] = S.x[ccl[j]]; z[j] = S.z[ccl[j]] / (double)ccnt[ccl[j]]; }
@@ -477,11 +623,12 @@ int sedumi_solve(const SedumiProb *P, int argc, char **argv, SedumiRes *R,
             }
             free(rcl); free(ccl);
         }
-        if (!folded) st = socp_solve(&Q, &o, &S);
+        if (!folded) { const int itab0 = g_itab; if (g_cone_brief) g_itab = 1; st = socp_solve(&Q, &o, &S); g_itab = itab0; }
         if (st == SOCP_INPUT) { fprintf(stderr, "brisk: the cone dimensions (K) do not match the number of columns of A\n"); R->exit_code = 2; return 2; }
         R->status = st; snprintf(R->status_str, sizeof R->status_str, "%s", socp_status_str(st));
         R->cone = 1;
-        R->x = S.x; R->y = S.y; R->z = S.z; R->pobj = S.pobj; R->dobj = S.dobj; R->iters = S.iters; R->time = S.time;
+        R->x = S.x; R->y = S.y; R->z = S.z; R->pobj = S.pobj; R->dobj = S.dobj; R->iters = S.iters; R->time = S.time + lpm_t;   /* (the total: the LP method's attempt included) */
+        if (lpm_tried) { R->lpm = 2; R->lpm_time = lpm_t; snprintf(R->lpm_why, sizeof R->lpm_why, "%s", lpm_why); }
         R->err[0] = S.err[0]; R->err[2] = S.err[1]; R->err[4] = S.err[2]; R->err[5] = S.err[3];
         R->exit_code = g_exit_of_status[st];
         return R->exit_code;

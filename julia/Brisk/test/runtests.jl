@@ -101,7 +101,7 @@ end
             flush(io)
             read(path, String)
         end
-        @test occursin("status: OPTIMAL", out)
+        @test occursin(r"Status: +OPTIMAL", out)
     else
         @warn "SDPLIB not found at $SDPLIB (set BRISK_SDPLIB): file tests skipped"
     end
@@ -375,7 +375,7 @@ end
     for (c, conv) in ((-1, true), (0, false), (1, true))
         r, out = run(c)
         @test r.status == 0
-        @test occursin("chordal decomposition", out) == conv
+        @test occursin(r"chordal decomposition: \d+ blocks? split", out) == conv   # (the default log names it also when off or none applies)
     end
     # returnx = 0 on a chordal problem: no X (verified on the cliques); 1: X returned
     rx0 = Brisk.solve_sdpa_data(n, [n], ones(n), mat, blk, ii, jj, vv; output = :silent, chordal = 1, returnx = 0, threads = 1)
@@ -405,7 +405,7 @@ end
     r1, o1 = runf()
     r0, o0 = runf(symalg = 0)
     @test r1.status == 0 && r0.status == 0
-    @test occursin("algebra symmetry: block 1: 23 -> 5 3(x2) 4(x3)", o1) && !occursin("algebra symmetry", o0)
+    @test occursin("block diagonalisation): blocks 1 -> 3, largest block 23 -> 5", o1) && !occursin("block diagonalisation", o0)
     @test isapprox(r1.primal_objective, r0.primal_objective; rtol = 1e-7)
     set_attribute(model, "nosuchoption", 1)
     @test_throws Exception optimize!(model)

@@ -72,7 +72,7 @@ Build options (combine as needed):
 `./brisk` without arguments lists all solver options; [OPTIONS.md](OPTIONS.md) explains them and
 shows how to pass them from Python, Julia and MATLAB (e.g. chordal decomposition off:
 `-chordal 0`, `options={"chordal": 0}`, `set_attribute(model, "chordal", 0)`, `opts.chordal = 0`). `OMP_NUM_THREADS` sets the thread count
-(default: all cores).
+(default: all cores, within the container's CPU quota on Linux).
 
 The shared library used by Python and Julia, and its self-test:
 

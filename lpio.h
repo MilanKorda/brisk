@@ -37,6 +37,9 @@ void lp_free(LpProb *L);
 /* a column whose cost improves without limit in a direction no row or bound stops (the problem as read is then infeasible or
  * unbounded, exactly, by the signs of the data): its index, or -1 */
 int  lp_ray_column(const LpProb *L);
+/* (3 November 2026) dual infeasibility by the bounds on the duals that the rows' sides and the singleton columns imply: a
+ * column whose reduced cost cannot take its sign; its index and the checked primal ray in d (n, may be NULL), or -1 */
+int  lp_ray_singletons(const LpProb *L, double *d);
 /* the caller's stop flag for the standard presolve (per thread; NULL: none): its eliminator stops between substitutions */
 void lp_set_stop(const volatile int *f);
 const volatile int *lp_get_stop(void);

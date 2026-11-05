@@ -25,7 +25,9 @@ struct SocpModel {
     SmBound *bd; int nb, cap;                           /* the bound rows, in their order */
     /* the last optimal point, over the node problem it was solved on: its bound rows (keys), x, y, z */
     int have, pnb; SmBound *pbd; double *px, *py, *pz;
+    unsigned long id;                                   /* (31 October 2026) the model's identity: a saved point is restored only into its own model */
 };
+static unsigned long g_model_id = 0;
 
 static void *xmal(size_t s) { void *p = malloc(s ? s : 1); return p; }
 
@@ -48,6 +50,7 @@ SocpModel *socpm_create(const SocpProb *P, const SocpOpts *o) {
     M->o.wx = M->o.wy = M->o.wz = NULL; M->o.wsave = 0;
     if (!(M->o.wlam > 0 && M->o.wlam < 1)) M->o.wlam = 0.99;
     M->cutoff = INFINITY;
+    M->id = __atomic_add_fetch(&g_model_id, 1, __ATOMIC_RELAXED);
     return M;
 }
 
@@ -90,26 +93,51 @@ void socpm_set_cutoff(SocpModel *M, double cutoff) { if (M) M->cutoff = isnan(cu
 /* the node problem: the original columns with the bound rows' slacks after the nonnegative block */
 typedef struct { SocpProb P; int *Ap, *Ai; double *Ax, *b, *c; } Node;
 static int nslack(const SmBound *bd, int nb) { int s = 0; for (int k = 0; k < nb; k++) s += bd[k].side != 0; return s; }
+static const SmBound *g_sort_bd;          /* (the bounds the next qsort orders; one solve at a time per model) */
+static int bd_key_cmp(const void *a, const void *b) {
+    const SmBound *x = &g_sort_bd[*(const int *)a], *y = &g_sort_bd[*(const int *)b];
+    if (x->col != y->col) return x->col < y->col ? -1 : 1;
+    if (x->side != y->side) return x->side < y->side ? -1 : 1;
+    return *(const int *)a - *(const int *)b;
+}
+static int bd_bsearch(const SmBound *bd, const int *ord, int nb, int col, int side) {
+    int lo = 0, hi = nb - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2; const SmBound *b = &bd[ord[mid]];
+        if (b->col == col && b->side == side) return ord[mid];
+        if (b->col < col || (b->col == col && b->side < side)) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
 static int node_build(const SocpModel *M, Node *N) {
     const int ns = nslack(M->bd, M->nb), n = M->n + ns, m = M->m + M->nb, e0 = M->nf + M->nl;
     const long nz = (long)M->Ap[M->n] + M->nb + (long)ns;
     N->Ap = xmal(sizeof(int) * ((size_t)n + 1)); N->Ai = xmal(sizeof(int) * ((size_t)nz + 1)); N->Ax = xmal(sizeof(double) * ((size_t)nz + 1));
     N->b = xmal(sizeof(double) * ((size_t)m + 1)); N->c = calloc((size_t)n + 1, sizeof(double));
     if (!N->Ap || !N->Ai || !N->Ax || !N->b || !N->c) return -1;
+    /* (31 October 2026; the audit's A11) each column's bound rows and each slack's bound row by counting, not by a scan of
+     * the bounds for every column: the assembly in time linear in the columns and the bounds */
+    int *cb = calloc((size_t)M->n + 2, sizeof(int)), *ck = xmal(sizeof(int) * ((size_t)M->nb + 1)), *sk = xmal(sizeof(int) * ((size_t)ns + 1));
+    if (!cb || !ck || !sk) { free(cb); free(ck); free(sk); return -1; }
+    for (int k = 0; k < M->nb; k++) cb[M->bd[k].col + 2]++;
+    for (int j = 0; j < M->n; j++) cb[j + 2] += cb[j + 1];
+    for (int k = 0; k < M->nb; k++) ck[cb[M->bd[k].col + 1]++] = k;        /* (cb[j] .. cb[j + 1]: column j's bound rows, ascending k) */
+    for (int k = 0, t = 0; k < M->nb; k++) if (M->bd[k].side != 0) sk[t++] = k;
     long w = 0;
     for (int jn = 0; jn < n; jn++) {
         N->Ap[jn] = (int)w;
         const int j = jn < e0 ? jn : jn >= e0 + ns ? jn - ns : -1;
         if (j >= 0) {
             for (int p = M->Ap[j]; p < M->Ap[j + 1]; p++) { N->Ai[w] = M->Ai[p]; N->Ax[w] = M->Ax[p]; w++; }
-            for (int k = 0; k < M->nb; k++) if (M->bd[k].col == j) { N->Ai[w] = M->m + k; N->Ax[w] = 1.0; w++; }
+            for (int t = cb[j]; t < cb[j + 1]; t++) { N->Ai[w] = M->m + ck[t]; N->Ax[w] = 1.0; w++; }
             N->c[jn] = M->c[j];
         } else {      /* the slack of the (jn - e0)-th bound row with a side */
-            int k = -1; for (int t = jn - e0; t >= 0; ) { k++; if (M->bd[k].side != 0) t--; }
+            const int k = sk[jn - e0];
             N->Ai[w] = M->m + k; N->Ax[w] = M->bd[k].side > 0 ? 1.0 : -1.0; w++;
         }
     }
     N->Ap[n] = (int)w;
+    free(cb); free(ck); free(sk);
     memcpy(N->b, M->b, sizeof(double) * (size_t)M->m);
     for (int k = 0; k < M->nb; k++) N->b[M->m + k] = M->bd[k].v;
     SocpProb *P = &N->P;
@@ -134,26 +162,30 @@ int socpm_solve(SocpModel *M, SocpRes *R) {
         if (!wx || !wy || !wz) { free(wx); free(wy); free(wz); node_free(&N); R->status = SOCP_INPUT; return SOCP_INPUT; }
         for (int j = 0; j < M->n; j++) { const int jp = j < e0 ? j : j + pns, jn = j < e0 ? j : j + ns; wx[jn] = M->px[jp]; wz[jn] = M->pz[jp]; }
         memcpy(wy, M->py, sizeof(double) * (size_t)M->m);
+        /* (31 October 2026; A11) the saved bounds by key (column, side), sorted, and their slacks' prefix counts: each bound
+         * found by bisection, not by a scan */
+        int *ord = xmal(sizeof(int) * ((size_t)M->pnb + 1)), *pre = xmal(sizeof(int) * ((size_t)M->pnb + 1));
+        if (!ord || !pre) { free(ord); free(pre); free(wx); free(wy); free(wz); node_free(&N); R->status = SOCP_INPUT; return SOCP_INPUT; }
+        for (int k = 0, t = 0; k < M->pnb; k++) { ord[k] = k; pre[k] = t; t += M->pbd[k].side != 0; }
+        g_sort_bd = M->pbd; qsort(ord, (size_t)M->pnb, sizeof(int), bd_key_cmp);
         for (int k = 0, sk = 0; k < M->nb; k++) {      /* sk: this bound row's slack, if it has one */
-            const int kp = bound_find(M->pbd, M->pnb, M->bd[k].col, M->bd[k].side), col = M->bd[k].col, side = M->bd[k].side;
+            const int kp = bd_bsearch(M->pbd, ord, M->pnb, M->bd[k].col, M->bd[k].side), col = M->bd[k].col, side = M->bd[k].side;
             const double xc = M->px[col < e0 ? col : col + pns];
             const int same = kp >= 0 && M->pbd[kp].v == M->bd[k].v;
             wy[M->m + k] = same ? M->py[M->m + kp] : 0.0;
             if (side == 0) continue;
-            if (same) { const int skp = nslack(M->pbd, kp); wx[e0 + sk] = M->px[e0 + skp]; wz[e0 + sk] = M->pz[e0 + skp]; }
+            if (same) { const int skp = pre[kp]; wx[e0 + sk] = M->px[e0 + skp]; wz[e0 + sk] = M->pz[e0 + skp]; }
             else { wx[e0 + sk] = fmax(0.0, side > 0 ? M->bd[k].v - xc : xc - M->bd[k].v); wz[e0 + sk] = 0.0; }
             sk++;
         }
+        free(ord); free(pre);
         o.wx = wx; o.wy = wy; o.wz = wz;
     }
     SocpRes Rn; memset(&Rn, 0, sizeof Rn);
+    /* (31 October 2026; the audit's A7) one retry policy: a warm start that breaks down or reaches its limit is solved again
+     * from the usual start inside the solver (socp_solve_warm), its iterations and time counted with the first attempt's;
+     * this layer no longer repeats it a third time with the attempts' accounting dropped */
     int st = socp_solve(&N.P, &o, &Rn);
-    /* a warm start that broke down: the usual start, once (the warm-started iteration's failure is not the node's) */
-    if (M->have && (st == SOCP_NUMERR || st == SOCP_MAXIT)) {
-        socp_result_free(&Rn); memset(&Rn, 0, sizeof Rn);
-        o.wx = o.wy = o.wz = NULL;
-        st = socp_solve(&N.P, &o, &Rn);
-    }
     free(wx); free(wy); free(wz);
     /* keep the point after an optimal solve */
     if (st == SOCP_OPTIMAL && Rn.x && Rn.y && Rn.z) {
@@ -180,26 +212,32 @@ int socpm_solve(SocpModel *M, SocpRes *R) {
     return st;
 }
 
-struct SocpmPoint { int nb, nn, mm; SmBound *bd; double *x, *y, *z; };
+struct SocpmPoint { int nb, nn, mm; SmBound *bd; double *x, *y, *z; unsigned long owner; int n, m; };
 SocpmPoint *socpm_save_point(const SocpModel *M) {
     if (!M || !M->have) return NULL;
     SocpmPoint *p = calloc(1, sizeof *p); if (!p) return NULL;
     const int ns = nslack(M->pbd, M->pnb);
-    p->nb = M->pnb; p->nn = M->n + ns; p->mm = M->m + M->pnb;
+    p->nb = M->pnb; p->nn = M->n + ns; p->mm = M->m + M->pnb; p->owner = M->id; p->n = M->n; p->m = M->m;
     p->bd = xmal(sizeof(SmBound) * (size_t)(p->nb + 1)); p->x = xmal(sizeof(double) * (size_t)p->nn); p->z = xmal(sizeof(double) * (size_t)p->nn); p->y = xmal(sizeof(double) * ((size_t)p->mm + 1));
     if (!p->bd || !p->x || !p->y || !p->z) { socpm_point_free(p); return NULL; }
     if (p->nb) memcpy(p->bd, M->pbd, sizeof(SmBound) * (size_t)p->nb);
     memcpy(p->x, M->px, sizeof(double) * (size_t)p->nn); memcpy(p->z, M->pz, sizeof(double) * (size_t)p->nn); memcpy(p->y, M->py, sizeof(double) * (size_t)p->mm);
     return p;
 }
-void socpm_restore_point(SocpModel *M, const SocpmPoint *p) {
-    if (!M || !p) return;
+/* (31 October 2026; the audit's A1) a point is restored only into the model that saved it: its vectors are laid out over that
+ * model's columns, rows and bounds, and another model's solve would read them with its own sizes. Returns 0, or 1 when the
+ * point is refused (another model, or one of another shape), the model's own point then unchanged; -1 out of memory */
+int socpm_restore_point(SocpModel *M, const SocpmPoint *p) {
+    if (!M || !p) return 1;
+    if (p->owner != M->id || p->n != M->n || p->m != M->m) return 1;
+    for (int k = 0; k < p->nb; k++) if (p->bd[k].col < 0 || p->bd[k].col >= M->n) return 1;
     double *x = xmal(sizeof(double) * (size_t)p->nn), *z = xmal(sizeof(double) * (size_t)p->nn), *y = xmal(sizeof(double) * ((size_t)p->mm + 1));
     SmBound *bd = xmal(sizeof(SmBound) * (size_t)(p->nb + 1));
-    if (!x || !y || !z || !bd) { free(x); free(y); free(z); free(bd); return; }
+    if (!x || !y || !z || !bd) { free(x); free(y); free(z); free(bd); return -1; }
     memcpy(x, p->x, sizeof(double) * (size_t)p->nn); memcpy(z, p->z, sizeof(double) * (size_t)p->nn); memcpy(y, p->y, sizeof(double) * (size_t)p->mm);
     if (p->nb) memcpy(bd, p->bd, sizeof(SmBound) * (size_t)p->nb);
     free(M->px); free(M->py); free(M->pz); free(M->pbd);
     M->px = x; M->py = y; M->pz = z; M->pbd = bd; M->pnb = p->nb; M->have = 1;
+    return 0;
 }
 void socpm_point_free(SocpmPoint *p) { if (!p) return; free(p->bd); free(p->x); free(p->y); free(p->z); free(p); }

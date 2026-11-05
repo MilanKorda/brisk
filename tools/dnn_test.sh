@@ -1,4 +1,6 @@
 #!/bin/bash
+# (ISSUES 725, 31 October 2026: the lines read below are those of the diagnosis log, the default log until then)
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}
 # Doubly nonnegative programs (ISSUES 288): a k-means relaxation (Peng and Wei) of 96 points in 4 clusters, generated
 # here (a fixed integer generator, the same file on every platform), whose 4,560 bounds X_ij >= 0 are rows with an
 # extra variable each. Checks that

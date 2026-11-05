@@ -22,19 +22,27 @@ chk() { # chk <name> <strings that must appear, separated by |> <strings that mu
     if [ -z "$bad" ]; then echo "ok   $1"; else echo "FAIL $1:$bad"; fail=1; fi
 }
 A="For higher accuracy:"; G="For a guaranteed bound on the optimal value"; R="For a rigorous check of the bound:"
-out=$($B $D/truss1.dat-s -threads 1 2>&1);                 chk "default: accuracy and bound (checked rigorously anyway)" "$A|  -acc high |  -prec dd |$G|  -bound d " "$R|  -certify |as keywords|set_attribute"
-out=$($B $D/truss1.dat-s -threads 1 -acc high 2>&1);       chk "-acc high is not advised again" "$A|  -prec dd |$G" "  -acc high "
-out=$($B $D/truss1.dat-s -threads 1 -bound d 2>&1);        chk "-bound d: no bound advice (the bound is checked anyway)" "$A" "$G|$R|  -certify |  -bound d "
-out=$($B $D/truss1.dat-s -threads 1 -bound d -certify 2>&1); chk "-bound d -certify: no bound advice" "$A" "$G|$R"
-out=$($B $D/truss1.dat-s -threads 1 -prec dd 2>&1);        chk "-prec dd: the bound only" "$G|  -bound d " "$A|  -certify "
-out=$($B $D/truss1.dat-s -threads 1 -prec dd -bound d 2>&1); chk "-prec dd -bound d: nothing" "certif" "$A|$G|$R"
-out=$($B $D/afiro.mps -threads 1 2>&1);                    chk "linear program: the tolerance only" "$A|  -tol <t> " "  -prec dd |$G"
-out=$($B $D/soc_small.mat -threads 1 2>&1);                chk "second-order cones, SOCP solver" "SOCP solver|$A|  -prec dd |$G" ""
+# (31 October 2026, ISSUES 725: the default log gives no advice after an OPTIMAL result; 1 November 2026, the owner: the
+#  accuracy and bound lines after an OPTIMAL result too, so that the high-precision solver is known)
+out=$($B $D/truss1.dat-s -threads 1 2>&1);                 chk "default log, OPTIMAL: the accuracy and bound advice" "Status:            OPTIMAL|$A|  -prec dd |$G" ""
+out=$($B $D/truss1.dat-s -threads 1 -bound d 2>&1);        chk "default log, -bound d: the bound printed" "Bound: guaranteed lower bound " "CERTIFIED|SDPA convention|certificate"
+out=$($B $D/truss1.dat-s -threads 1 -v 2>&1);              chk "default: accuracy and bound (checked rigorously anyway)" "$A|  -acc high |  -prec dd |$G|  -bound d " "$R|  -certify |as keywords|set_attribute"
+out=$($B $D/truss1.dat-s -threads 1 -acc high -v 2>&1);       chk "-acc high is not advised again" "$A|  -prec dd |$G" "  -acc high "
+out=$($B $D/truss1.dat-s -threads 1 -bound d -v 2>&1);        chk "-bound d: no bound advice (the bound is checked anyway)" "$A" "$G|$R|  -certify |  -bound d "
+out=$($B $D/truss1.dat-s -threads 1 -bound d -certify -v 2>&1); chk "-bound d -certify: no bound advice" "$A" "$G|$R"
+out=$($B $D/truss1.dat-s -threads 1 -prec dd -v 2>&1);        chk "-prec dd: the bound only" "$G|  -bound d " "$A|  -certify "
+out=$($B $D/truss1.dat-s -threads 1 -prec dd -bound d -v 2>&1); chk "-prec dd -bound d: nothing" "certif" "$A|$G|$R"
+out=$($B $D/afiro.mps -threads 1 2>&1);                    chk "linear program, OPTIMAL: no advice in the default log (ISSUES 639)" "Status:            OPTIMAL" "$A|  -tol <t> |  -prec dd |$G"
+out=$($B $D/afiro.mps -threads 1 -v 2>&1);                 chk "linear program -v: the tolerance only" "$A|  -tol <t> " "  -prec dd |$G"
+# (5 November 2026, the merge for 1.6.5) the SOCP developer's check "second-order cones, OPTIMAL: no advice in the default log"
+# left out: the owner decided on 1 November that the accuracy advice follows an optimal solve too, in the default log, so that
+# the high-precision solver is known (CHANGES: "The default log: the accuracy advice after an optimal solve too")
+out=$($B $D/soc_small.mat -threads 1 -v 2>&1);             chk "second-order cones -v, SOCP solver" "SOCP solver|$A|  -prec dd |$G" ""
 [ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL SOCP solver: not exactly one summary"; fail=1; }
-out=$($B $D/soc_small.mat -threads 1 -conesolver 0 2>&1);  chk "second-order cones, SDP solver" "$A|  -prec dd |$G" ""
+out=$($B $D/soc_small.mat -threads 1 -conesolver 0 -v 2>&1);  chk "second-order cones, SDP solver" "$A|  -prec dd |$G" ""
 [ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL -conesolver 0: not exactly one summary"; fail=1; }
 out=$($B $D/truss1.dat-s -threads 1 -q 2>&1);              chk "-q: no advice" "" "$A|$G"
-S="whose blocks are badly scaled"
+S="The blocks are badly scaled"
 out=$($B $D/control1.dat-s -threads 1 -tol 1e-13 2>&1);    chk "badly scaled blocks, tolerance missed: -blkscale -2" "$S|  -blkscale -2 |$A" ""
 out=$($B $D/control1.dat-s -threads 1 2>&1);               chk "badly scaled blocks, OPTIMAL: no -blkscale advice" "" "$S"
 out=$($B $D/control1.dat-s -threads 1 -tol 1e-13 -blkscale -2 2>&1); chk "-blkscale -2 is not advised again" "" "$S"

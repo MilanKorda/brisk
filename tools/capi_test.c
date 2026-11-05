@@ -161,18 +161,19 @@ int main(void) {
          * strings by default, an interface's command when the options name it (-caller), and the
          * tag does not stay for the next call; a bound that was asked for is not advised again (and it
          * is checked rigorously anyway: -certify is not advised either) */
-        const char *tag[] = { "-caller", "python:solve_sdpa" }, *bnd[] = { "-bound", "d" };
+        /* (31 October 2026, ISSUES 725: the default log gives no advice after an OPTIMAL result; -v, the diagnosis, does) */
+        const char *tag[] = { "-caller", "python:solve_sdpa", "-v" }, *bnd[] = { "-bound", "d", "-v" }, *diag[] = { "-v" };
         g_nlog = 0; g_log[0] = 0; brisk_set_output(2, log_cb);
-        brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 0, NULL, rm);
+        brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 1, diag, rm);
         CHECK(strstr(g_log, "For higher accuracy, in the option strings of the call:") && strstr(g_log, "\"-acc\", \"high\"")
               && strstr(g_log, "\"-prec\", \"dd\"") && strstr(g_log, "For a guaranteed bound") && strstr(g_log, "\"-bound\", \"d\""),
               "advice in C syntax");
         g_nlog = 0; g_log[0] = 0;
-        int rct = brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 2, tag, rm);
+        int rct = brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 3, tag, rm);
         CHECK(rct == 0 && strstr(g_log, "in brisk.solve_sdpa(..., options={...})") && strstr(g_log, "\"acc\": \"high\"")
               && strstr(g_log, "\"bound\": \"d\""), "advice in the syntax of the named caller (rc %d)", rct);
         g_nlog = 0; g_log[0] = 0;
-        brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 2, bnd, rm);
+        brisk_solve_data(M, NB, bs, cc, nnz, mat, blk, ii, jj, vv, 3, bnd, rm);
         CHECK(strstr(g_log, "in the option strings of the call") && !strstr(g_log, "For a guaranteed bound")
               && !strstr(g_log, "For a rigorous check of the bound"), "advice after a bound, and the caller's tag gone");
         brisk_set_output(1, NULL);

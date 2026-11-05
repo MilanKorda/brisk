@@ -13,6 +13,7 @@ variable is x = -y, the SDPA slack F(x) is Z, and X is the SDPA dual matrix.
 import ctypes
 import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ _lib = None
 _lib_path = None
 _lock = threading.Lock()          # libbrisk is not reentrant: one solve at a time per process
 _PRINT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+_NOPRINT = _PRINT(0)      # (28 October 2026: one null callback for every quiet solve; a new one cost about 1 us a call)
 
 
 def _default_path():
@@ -117,6 +119,9 @@ def load_library(path=None):
         if hasattr(L, "brisk_qp_lower"):     # (23 October 2026) H's lower triangle and the symmetry check in C
             L.brisk_qp_lower.argtypes = [I, P, P, P, P, P, P]
             L.brisk_qp_lower.restype = ctypes.c_long
+        if hasattr(L, "brisk_solve_qp_lean"):      # (28 October 2026) the lean route for small QPs (_qp_lean)
+            L.brisk_solve_qp_lean.argtypes = [I, I, P, P, P, P, D, P, P, P, P, P, P, P, I, ppc, P, P, P, P]
+            L.brisk_solve_qp_lean.restype = I
         L.brisk_solve_qp_addr = L["brisk_solve_qp"]
         L.brisk_solve_qp_addr.argtypes = [I, I, P, P, P, P, D, P, P, P, P, P, P, P, I, ppc, P]
         L.brisk_solve_qp_addr.restype = I
@@ -125,8 +130,11 @@ def load_library(path=None):
         L.brisk_qp_create.restype = ctypes.c_void_p
         for f in ("brisk_qp_set_var_bounds", "brisk_qp_set_row_bounds"):
             getattr(L, f).argtypes = [ctypes.c_void_p, I, D, D]; getattr(L, f).restype = I
-        L.brisk_qp_set_cost.argtypes = [ctypes.c_void_p, pd]; L.brisk_qp_set_cost.restype = I
+        L.brisk_qp_set_cost.argtypes = [ctypes.c_void_p, P]; L.brisk_qp_set_cost.restype = I
         L.brisk_qp_resolve.argtypes = [ctypes.c_void_p, P]; L.brisk_qp_resolve.restype = I
+        if hasattr(L, "brisk_qp_set_bounds"):        # (28 October 2026) every bound at once, the re-solve into arrays
+            L.brisk_qp_set_bounds.argtypes = [ctypes.c_void_p, P, P, P, P]; L.brisk_qp_set_bounds.restype = I
+            L.brisk_qp_resolve_lean.argtypes = [ctypes.c_void_p, P, P, P, P]; L.brisk_qp_resolve_lean.restype = I
         L.brisk_qp_destroy.argtypes = [ctypes.c_void_p]; L.brisk_qp_destroy.restype = None
     if hasattr(L, "brisk_socp_create"):      # the SOCP model (warm starts for branch and bound)
         L.brisk_socp_create.argtypes = [I, I, pi, pi, pd, pd, pd, I, I, I, pi, I, pi, I, ppc]
@@ -138,7 +146,7 @@ def load_library(path=None):
         L.brisk_socp_destroy.argtypes = [ctypes.c_void_p]; L.brisk_socp_destroy.restype = None
         if hasattr(L, "brisk_socp_save_point"):
             L.brisk_socp_save_point.argtypes = [ctypes.c_void_p]; L.brisk_socp_save_point.restype = ctypes.c_void_p
-            L.brisk_socp_restore_point.argtypes = [ctypes.c_void_p, ctypes.c_void_p]; L.brisk_socp_restore_point.restype = None
+            L.brisk_socp_restore_point.argtypes = [ctypes.c_void_p, ctypes.c_void_p]; L.brisk_socp_restore_point.restype = ctypes.c_int
             L.brisk_socp_point_free.argtypes = [ctypes.c_void_p]; L.brisk_socp_point_free.restype = None
     L.brisk_interrupt.argtypes, L.brisk_interrupt.restype = [], None
     L.brisk_interrupted.argtypes, L.brisk_interrupted.restype = [], I
@@ -192,8 +200,43 @@ class Result:
         return None if self.y is None else -self.y
 
     def __repr__(self):
-        return (f"brisk.Result({self.status_str}, pobj={self.pobj:.10g}, dobj={self.dobj:.10g}, "
-                f"max DIMACS {np.max(np.abs(self.dimacs)):.1e}, {self.iterations} it, {self.time:.2f} s)")
+        return _result_text("Result", self)
+
+
+def _result_text(cls, r):
+    """The printed result (4 November 2026, the owner on the printed results: "last lines weird"): two short lines; the
+    objectives as the log's Summary prints them (the same digits for both); none for an infeasible problem, where they
+    mean nothing."""
+    head = f"brisk.{cls}: {r.status_str}, {r.iterations} iterations, {r.time:.2f} s"
+    if "INFEASIBLE" in r.status_str:
+        return head
+    return (head + f"\n  primal objective {r.pobj:.10e}, dual objective {r.dobj:.10e}, "
+            f"DIMACS error {np.max(np.abs(r.dimacs)):.1e}")
+
+def _ints(x, what):
+    """Integers from x, checked before they cross into C (31 October 2026, the owner's external SDP benchmark, audit A3:
+    np.intc truncated 3.9 to 3 and 1.9 to 1, and a different problem was solved): whole numbers within int32, else
+    ValueError. Booleans and complex numbers are refused."""
+    a = np.atleast_1d(np.asarray(x)).ravel()
+    if a.size == 0:
+        return np.zeros(0, dtype=np.intc)
+    if a.dtype == bool or np.iscomplexobj(a) or a.dtype == object:
+        raise ValueError("%s: integers expected" % what)
+    if not np.issubdtype(a.dtype, np.integer):
+        a = a.astype(np.float64)
+        if not np.all(np.isfinite(a)) or np.any(a != np.floor(a)):
+            raise ValueError("%s: integers expected (a value is not a whole number)" % what)
+    lo, hi = np.iinfo(np.intc).min, np.iinfo(np.intc).max
+    if np.any(a > hi) or np.any(a < lo):
+        raise ValueError("%s: a value is out of range" % what)
+    return np.ascontiguousarray(a, dtype=np.intc)
+
+
+def _finite(x, what):
+    a = np.ascontiguousarray(x, dtype=np.float64)
+    if not np.all(np.isfinite(a)):
+        raise ValueError("%s: a value is not finite (NaN or infinity)" % what)
+    return a
 
 
 def options_to_argv(options):
@@ -280,26 +323,31 @@ def _run(call, options, verbose, collect=None, caller=None, small=False):
     def cb(s, is_err):
         (sys.stderr if is_err else sys.stdout).write(s.decode(errors="replace"))
         return 0
-    cbp = _PRINT(cb)
+    cbp = _PRINT(cb) if verbose else _NOPRINT
     r = L.brisk_result_new()
     if not r:
         raise MemoryError("brisk_result_new failed")
     state = {}
     done = threading.Event()
     guard = threading.Lock()
+    # (31 October 2026, the owner's SDP benchmark: a fixed sleep of 50 ms between the tests of the flag added up to 50 ms
+    # to the time of every solve handed to the worker thread) the worker writes one byte to a pipe when it ends and
+    # the main thread waits on it with select, which a Ctrl-C interrupts without holding any lock (the reason for the
+    # sleep instead of done.wait, ISSUES 444); not on Windows, where select does not take pipes
+    wake = os.pipe() if os.name != "nt" else None
 
     def cleanup():
         # (24 October 2026) the lock released however the calls before it end: a Ctrl-C that arrived while the main
         # thread ran them left the lock held, and the next solve waited for it forever (test_ctrl_c hung once, ISSUES 272)
         try:
-            L.brisk_set_output(0, _PRINT(0))
+            L.brisk_set_output(0, _NOPRINT)
             L.brisk_result_delete(r)
         finally:
             _lock.release()
 
     def job():
         try:
-            L.brisk_set_output(2 if verbose else 1, cbp if verbose else _PRINT(0))
+            L.brisk_set_output(2 if verbose else 1, cbp if verbose else _NOPRINT)
             state["rc"] = call(L, len(av), arr, r)
             state["interrupted"] = bool(L.brisk_interrupted())
         except BaseException as e:          # noqa: B036 (ctypes errors, re-raised by the caller)
@@ -307,6 +355,12 @@ def _run(call, options, verbose, collect=None, caller=None, small=False):
         finally:
             with guard:
                 done.set()
+                if wake is not None:
+                    try:
+                        os.write(wake[1], b"x")
+                    except OSError:
+                        pass
+                    os.close(wake[1])
                 if state.get("abandoned"):
                     cleanup()
 
@@ -330,7 +384,10 @@ def _run(call, options, verbose, collect=None, caller=None, small=False):
                     while not done.is_set():
                         if stopping:
                             L.brisk_interrupt()
-                        time.sleep(0.05)
+                        if wake is not None:
+                            select.select([wake[0]], [], [], 0.05)
+                        else:
+                            time.sleep(0.05)
                     break
                 except KeyboardInterrupt:
                     if not stopping:
@@ -347,9 +404,13 @@ def _run(call, options, verbose, collect=None, caller=None, small=False):
         else:
             job()
     except BaseException:
+        if wake is not None:
+            os.close(wake[0])       # (an abandoned worker's write then fails quietly and closes its end)
         if not state.get("abandoned"):
             cleanup()
         raise
+    if wake is not None:
+        os.close(wake[0])
     try:
         sys.stdout.flush()
         if "exc" in state:
@@ -458,8 +519,7 @@ class ConeResult:
     bounds: Optional[dict] = None    # per side asked for (-bound p|d|pd), as Result.bounds; certificate x (p) or y (d)
 
     def __repr__(self):
-        return (f"brisk.ConeResult({self.status_str}, pobj={self.pobj:.10g}, dobj={self.dobj:.10g}, "
-                f"max error={np.max(np.abs(self.dimacs)):.1e}, {self.iterations} iterations, {self.time:.2f}s)")
+        return _result_text("ConeResult", self)
 
 
 def _collect_sedumi(L, r, rc):
@@ -492,11 +552,14 @@ class QpResult:
         self.__dict__.update(kw)
 
     def __repr__(self):
-        return f"QpResult({self.status_str}, obj={self.obj:.12g}, iterations={self.iterations})"
+        return f"brisk.QpResult(status {self.status_str}, objective {self.obj:.10g}, {self.iterations} iterations)"
+
+
+_ERR6 = (ctypes.c_double * 6)()       # (read under _lock: one solve at a time)
 
 
 def _collect_qp(L, r, rc):
-    err = (ctypes.c_double * 6)()
+    err = _ERR6
     L.brisk_result_dimacs(r, err)
     status = L.brisk_result_status(r)
     if rc < 0 or (status == -1 and rc not in (0, 1)):
@@ -508,7 +571,7 @@ def _collect_qp(L, r, rc):
     for name, ptr, k in (("x", L.brisk_result_sx(r), n), ("y", L.brisk_result_y(r), m), ("z", L.brisk_result_sz(r), n)):
         if ptr and k > 0:
             v = np.empty(k)                       # (a copy by memmove: as_array builds a ctypes array type, 4 us each)
-            ctypes.memmove(v.ctypes.data, ptr, 8 * k)
+            ctypes.memmove(_addr(v), ptr, 8 * k)
             setattr(res, name, v)
     if res.y is None:
         res.y = np.zeros(0)
@@ -567,7 +630,7 @@ def _qp_data(P, q, A, l, u, lb, ub, c0):
         if hasattr(L0, "brisk_qp_lower"):
             Hp0, Hi0, Hx0 = fastP; nz = int(Hp0[-1])
             Lp, Li, Lx = np.empty(n + 1, dtype=np.intc), np.empty(max(nz, 1), dtype=np.intc), np.empty(max(nz, 1))
-            k = L0.brisk_qp_lower(n, Hp0.ctypes.data, Hi0.ctypes.data, Hx0.ctypes.data, Lp.ctypes.data, Li.ctypes.data, Lx.ctypes.data)
+            k = L0.brisk_qp_lower(n, _addr(Hp0), _addr(Hi0), _addr(Hx0), _addr(Lp), _addr(Li), _addr(Lx))
             HL = None if k < 0 else (Lp, Li[:k], Lx[:k])
         else:
             HL = _lower_of_canonical(*fastP, n)
@@ -625,20 +688,157 @@ def solve_qp(P=None, q=None, A=None, l=None, u=None, lb=None, ub=None, c0=0.0, o
     command line for a QP file: -tol, -maxit, -timelimit, -threads, -v). P: n x n, symmetric (both triangles), or
     one triangle of it (upper or lower); None: an LP. A: m x n (scipy sparse or dense); l, u, lb, ub: arrays, None
     or +-inf for an absent bound (an equality row has l = u). Returns a QpResult."""
-    d = _qp_data(P, q, A, l, u, lb, ub, c0)
     L0 = load_library()
+    if not verbose and hasattr(L0, "brisk_solve_qp_lean"):
+        r = _qp_lean(L0, P, q, A, l, u, lb, ub, c0, options, _caller)
+        if r is not None:
+            return r
+    d = _qp_data(P, q, A, l, u, lb, ub, c0)
     if not hasattr(L0, "brisk_solve_qp"):
         raise RuntimeError("this libbrisk has no QP solver (brisk_solve_qp): rebuild it")
     small = d["Hp"][-1] + d["Ap"][-1] + d["n"] + d["m"] < _SMALL_NZ
+    if small and not verbose and hasattr(L0, "brisk_solve_qp_addr"):
+        return _qp_small(L0, d, options_to_argv(options) + _caller_args(_caller))
     return _run(lambda L, k, a, r: L.brisk_solve_qp_addr(d["n"], d["m"], *_qp_addrs(d), k, a, r), options, verbose, _collect_qp,
                 caller=_caller, small=small)
 
 
+_ARGV = {}                # (the options' C arrays, by their strings: built once)
+_QP_STATUS = {0: "OPTIMAL", 1: "PRIMAL INFEASIBLE", 2: "DUAL INFEASIBLE (unbounded)", 3: "ITERATION LIMIT", 4: "NUMERICAL DIFFICULTIES",
+              5: "SOLVED TO REDUCED ACCURACY", 6: "TIME LIMIT", -1: "INPUT ERROR"}
+_F8, _I4 = np.dtype(np.float64), np.dtype(np.intc)
+
+
+_CSC_TYPES = None
+
+
+def _csc_parts(M, nr, nc):
+    """a scipy CSC matrix's arrays as C arrays (int32 indices, float64 values), or None for anything else (the type checked
+    against scipy's CSC classes, cached: the format property is Python code, read on every call)"""
+    global _CSC_TYPES
+    if _CSC_TYPES is None:
+        import scipy.sparse as sp
+        _CSC_TYPES = tuple(t for t in (getattr(sp, "csc_matrix", None), getattr(sp, "csc_array", None)) if t is not None)
+    if type(M) not in _CSC_TYPES or M.shape != (nr, nc):
+        return None
+    p, i, x = M.indptr, M.indices, M.data
+    if p.dtype != _I4: p = p.astype(np.intc)
+    if i.dtype != _I4: i = i.astype(np.intc)
+    if x.dtype != _F8: x = x.astype(np.float64)
+    return np.ascontiguousarray(p), np.ascontiguousarray(i), np.ascontiguousarray(x)
+
+
+def _vec(v, k):
+    if v is None:
+        return None
+    v = np.asarray(v)
+    if v.dtype != _F8: v = v.astype(np.float64)
+    v = np.ascontiguousarray(v.ravel()) if v.ndim != 1 else np.ascontiguousarray(v)
+    return v if v.size == k else False
+
+
+def _qp_lean(L, P, q, A, l, u, lb, ub, c0, options, caller):
+    """(28 October 2026, the SOCP developer) solve_qp for scipy CSC data without output: the arrays handed to the library as
+    they are (it checks their form, takes H's lower triangle and solves the QP without the general route: brisk_solve_qp_lean),
+    x, y, z and the numbers of the result written into arrays made here. None when the data or the options need the general
+    route (other matrix types, wrong sizes, options outside the QP's), which then gives its own messages. On the owner's
+    independent QP benchmark, a QP of ten variables: 325 us a call through the general route (cold caches: the Python
+    conversions and the whole command-line program around a 20 us solve)"""
+    if q is None:
+        return None
+    q = np.ascontiguousarray(np.asarray(q, dtype=np.float64).ravel())
+    n = q.shape[0]
+    if A is None:
+        return None
+    m = A.shape[0] if hasattr(A, "shape") and len(A.shape) == 2 else -1
+    pa = _csc_parts(A, m, n)
+    pp = _csc_parts(P, n, n) if P is not None else (None, None, None)
+    if pa is None or pp is None:
+        return None
+    if (pp[2].size if pp[2] is not None else 0) + pa[2].size + n + m >= _SMALL_NZ:     # (the general route above the small size)
+        return None
+    vs = [_vec(l, m), _vec(u, m), _vec(lb, n), _vec(ub, n)]
+    if any(v is False for v in vs):
+        return None
+    # (the options' C array cached by the options themselves: a dict of plain values, a list or a string, with the caller)
+    try:
+        okey = (tuple(options.items()) if isinstance(options, dict) else tuple(options) if isinstance(options, list) else options, caller)
+        arr = _ARGV.get(okey)
+    except TypeError:
+        okey, arr = None, None
+    if arr is None:
+        av = options_to_argv(options) + _caller_args(caller)
+        arr = (ctypes.c_char_p * max(len(av), 1))(*[a.encode() for a in av])
+        arr._n = len(av)
+        if okey is not None and len(_ARGV) < 64:
+            _ARGV[okey] = arr
+    m1 = max(m, 1)
+    buf = np.empty(2 * n + m1 + 9)          # (one allocation: x, y, z and the result's numbers)
+    a = _addr(buf)
+    with _lock:
+        rc = L.brisk_solve_qp_lean(n, m, 0 if pp[0] is None else _addr(pp[0]), 0 if pp[1] is None else _addr(pp[1]),
+                                   0 if pp[2] is None else _addr(pp[2]), _addr(q), float(c0), _addr(pa[0]), _addr(pa[1]),
+                                   _addr(pa[2]), 0 if vs[0] is None else _addr(vs[0]), 0 if vs[1] is None else _addr(vs[1]),
+                                   0 if vs[2] is None else _addr(vs[2]), 0 if vs[3] is None else _addr(vs[3]), arr._n, arr,
+                                   a, a + 8 * n, a + 8 * (n + m1), a + 8 * (2 * n + m1))
+    if rc in (-2, -3):
+        return None
+    info = buf[2 * n + m1:]
+    st, it, obj, _, _, _, tm, _, intr = info.tolist()
+    status = int(st)
+    if rc < 0 or (status == -1 and rc not in (0, 1)):
+        raise RuntimeError(f"BRISK did not solve the problem (exit code {rc})")
+    res = QpResult.__new__(QpResult)          # (without the keyword constructor: see QpModel.solve)
+    res.__dict__ = {"status": status, "status_str": "INTERRUPTED" if intr else _QP_STATUS.get(status, "UNKNOWN"), "exit_code": rc,
+                    "iterations": int(it), "obj": obj, "time": tm, "errors": info[3:6].copy(), "x": buf[:n],
+                    "y": buf[n:n + m] if m > 0 else buf[:0], "z": buf[n + m1:2 * n + m1], "interrupted": bool(intr)}
+    return res
+
+
+def _qp_small(L, d, av):
+    """(28 October 2026, the SOCP developer) a small QP without output, solved in the calling thread with nothing around the
+    call that its size does not need: _run's thread hand-off, callbacks and closures cost about four times the solve of a QP
+    of ten variables (the owner's independent QP benchmark: 146 us a solve against DAQP's 73 us)"""
+    key = tuple(av)
+    arr = _ARGV.get(key)
+    if arr is None:
+        arr = (ctypes.c_char_p * max(len(av), 1))(*[a.encode() for a in av])
+        if len(_ARGV) < 64:
+            _ARGV[key] = arr
+    _lock.acquire()
+    try:
+        L.brisk_clear_interrupt()
+        L.brisk_set_output(1, _NOPRINT)
+        r = L.brisk_result_new()
+        if not r:
+            raise MemoryError("brisk_result_new failed")
+        try:
+            rc = L.brisk_solve_qp_addr(d["n"], d["m"], *_qp_addrs(d), len(av), arr, r)
+            res = _collect_qp(L, r, rc)
+            res.interrupted = bool(L.brisk_interrupted())
+            if res.interrupted:
+                res.status_str = "INTERRUPTED"
+            return res
+        finally:
+            L.brisk_set_output(0, _NOPRINT)
+            L.brisk_result_delete(r)
+    finally:
+        _lock.release()
+
+
+def _addr(a):
+    """a contiguous array's address (28 October 2026: ctypes.c_char.from_buffer, 0.4 us, against 1.4 us for .ctypes.data;
+    a read-only or empty array by .ctypes.data)"""
+    try:
+        return ctypes.addressof(ctypes.c_char.from_buffer(a))
+    except (TypeError, ValueError, BufferError):
+        return a.ctypes.data
+
+
 def _qp_addrs(d):
     """the arrays' addresses (the arrays are contiguous and of the C types: _qp_data makes them so, and d keeps them)"""
-    return (d["Hp"].ctypes.data, d["Hi"].ctypes.data, d["Hx"].ctypes.data, d["q"].ctypes.data, d["c0"], d["Ap"].ctypes.data,
-            d["Ai"].ctypes.data, d["Ax"].ctypes.data, d["l"].ctypes.data, d["u"].ctypes.data, d["lb"].ctypes.data,
-            d["ub"].ctypes.data)
+    return (_addr(d["Hp"]), _addr(d["Hi"]), _addr(d["Hx"]), _addr(d["q"]), d["c0"], _addr(d["Ap"]),
+            _addr(d["Ai"]), _addr(d["Ax"]), _addr(d["l"]), _addr(d["u"]), _addr(d["lb"]), _addr(d["ub"]))
 
 
 def _qp_ptrs(d):
@@ -675,6 +875,11 @@ class QpModel:
         if not self._h:
             raise ValueError("brisk_qp_create failed (an unknown option or bad data): " + " ".join(av))
         self.verbose = verbose
+        self._bdirty = 0
+        d = self._d          # (the setters' arrays and sizes as attributes: they run hundreds of times a re-solve)
+        self._n, self._m, self._lb, self._ub, self._l, self._u = d["n"], d["m"], d["lb"], d["ub"], d["l"], d["u"]
+        self._small = int(d["Hp"][-1]) + int(d["Ap"][-1]) + d["n"] + d["m"] < _SMALL_NZ
+        self._lean = hasattr(L, "brisk_qp_resolve_lean")
 
     @property
     def n(self):
@@ -688,33 +893,95 @@ class QpModel:
         if rc:
             raise IndexError(what)
 
+    # (28 October 2026, the SOCP developer) the setters change the model's own arrays and mark them; the solve hands every
+    # change to the library in one call (brisk_qp_set_bounds): a receding-horizon controller changes hundreds of bounds a
+    # step, and a library call for each cost 2.5 ms of a 4 ms step (a condensed MPC QP of 120 variables, the owner's
+    # independent QP benchmark). The solve of a small model writes into arrays made once (brisk_qp_resolve_lean)
+
     def set_var_bounds(self, j, lo=None, hi=None):
         """the bounds of variable j (None: keep that side; -inf/inf: none)"""
-        lb, ub = self._d["lb"], self._d["ub"]
-        if lo is not None: lb[j] = lo
-        if hi is not None: ub[j] = hi
-        self._check(load_library().brisk_qp_set_var_bounds(self._h, int(j), float(lb[j]), float(ub[j])), f"variable {j}")
+        if not 0 <= j < self._n:
+            raise IndexError(f"variable {j}")
+        if lo is not None: self._lb[j] = lo
+        if hi is not None: self._ub[j] = hi
+        self._bdirty |= 1
 
     def set_row_bounds(self, i, lo=None, hi=None):
         """the bounds of row i (None: keep that side)"""
-        l, u = self._d["l"], self._d["u"]
-        if lo is not None: l[i] = lo
-        if hi is not None: u[i] = hi
-        self._check(load_library().brisk_qp_set_row_bounds(self._h, int(i), float(l[i]), float(u[i])), f"row {i}")
+        if not 0 <= i < self._m:
+            raise IndexError(f"row {i}")
+        if lo is not None: self._l[i] = lo
+        if hi is not None: self._u[i] = hi
+        self._bdirty |= 2
+
+    def update(self, q=None, l=None, u=None, lb=None, ub=None):
+        """new vectors for the next solve (None: kept): the cost q, the row bounds l, u, the variable bounds lb, ub (-inf/inf:
+        none). One call for a receding-horizon controller's step, in place of a setter call per changed row; the setters
+        and update may be mixed. The structure (H, A) is the model's."""
+        d = self._d
+        for key, v, size, flag in (("q", q, self._n, 4), ("l", l, self._m, 2), ("u", u, self._m, 2), ("lb", lb, self._n, 1), ("ub", ub, self._n, 1)):
+            if v is None:
+                continue
+            a = np.asarray(v, dtype=np.float64).ravel()
+            if a.size != size:
+                raise ValueError(f"{key} has {a.size} entries, expected {size}")
+            np.copyto(d[key], a)
+            self._bdirty |= flag
 
     def set_cost(self, q):
-        q = np.ascontiguousarray(np.asarray(q, dtype=np.float64).ravel())
+        q = np.array(q, dtype=np.float64).ravel()           # (a copy: the caller may change its array before the solve)
         if q.size != self.n:
             raise ValueError(f"q has {q.size} entries, expected {self.n}")
         self._d["q"] = q
-        self._check(load_library().brisk_qp_set_cost(self._h, q.ctypes.data_as(ctypes.POINTER(ctypes.c_double))), "cost")
+        self._bdirty |= 4
+
+    def _flush(self, L):
+        f, d, h = self._bdirty, self._d, self._h
+        if not f:
+            return
+        if f & 4:
+            self._check(L.brisk_qp_set_cost(h, _addr(d["q"])), "cost")
+        if f & 3:
+            if hasattr(L, "brisk_qp_set_bounds"):
+                self._check(L.brisk_qp_set_bounds(h, _addr(d["lb"]) if f & 1 else None, _addr(d["ub"]) if f & 1 else None,
+                                                  _addr(d["l"]) if f & 2 else None, _addr(d["u"]) if f & 2 else None), "bounds")
+            else:
+                for j in range(d["n"]) if f & 1 else ():
+                    L.brisk_qp_set_var_bounds(h, j, float(d["lb"][j]), float(d["ub"][j]))
+                for i in range(d["m"]) if f & 2 else ():
+                    L.brisk_qp_set_row_bounds(h, i, float(d["l"][i]), float(d["u"][i]))
+        self._bdirty = 0
 
     def solve(self):
         """the re-solve from the previous active set (the first: cold); returns a QpResult"""
         h = self._h
         d = self._d
-        return _run(lambda L, k, a, r: L.brisk_qp_resolve(h, r), None, self.verbose, _collect_qp,
-                    small=d["Hp"][-1] + d["Ap"][-1] + d["n"] + d["m"] < _SMALL_NZ)
+        L = load_library()
+        small = self._small
+        if not self.verbose and (small or not _interruptible) and self._lean:
+            n, m = self._n, self._m
+            m1 = max(m, 1)
+            buf = np.empty(2 * n + m1 + 9)          # (x, y, z and the result's numbers; one library call writes them)
+            a = _addr(buf)
+            with _lock:
+                if self._bdirty:
+                    self._flush(L)
+                rc = L.brisk_qp_resolve_lean(h, a, a + 8 * n, a + 8 * (n + m1), a + 8 * (2 * n + m1))
+            if rc < 0:
+                raise RuntimeError(f"BRISK did not solve the problem (exit code {rc})")
+            info = buf[2 * n + m1:]
+            st, it, obj, _, _, _, tm, _, intr = info.tolist()
+            status = int(st)
+            # (the result made without QpResult.__init__'s keyword dictionary: 2 us of a 10 us re-solve of a QP of 20
+            # variables)
+            res = QpResult.__new__(QpResult)
+            res.__dict__ = {"status": status, "status_str": "INTERRUPTED" if intr else _QP_STATUS.get(status, "UNKNOWN"),
+                            "exit_code": rc, "iterations": int(it), "obj": obj, "time": tm, "errors": info[3:6].copy(),
+                            "x": buf[:n], "y": buf[n:n + m] if m > 0 else buf[:0], "z": buf[n + m1:2 * n + m1],
+                            "interrupted": bool(intr)}
+            return res
+        self._flush(L)
+        return _run(lambda L, k, a, r: L.brisk_qp_resolve(h, r), None, self.verbose, _collect_qp, small=small)
 
     def close(self):
         if getattr(self, "_h", None):
@@ -746,6 +1013,26 @@ def solve_file(path, options=None, verbose=True, _caller="python:solve_file"):
                 _collect_sedumi if mat else _collect_qp if qps else None, caller=_caller)
 
 
+def _cone_sizes(get):
+    """(31 October 2026; the audit's A4) readers of K's fields: a cone's size must be a finite integer (3.0 is 3; 3.9, a
+    negative size, NaN or Inf are refused with ValueError, where int() had made 3.9 a cone of 3 and dropped a negative one);
+    sizes 0 are left out, as before"""
+    def ints(k):
+        v = get(k)
+        a = np.atleast_1d(np.asarray([] if v is None else v, dtype=np.float64)).ravel()
+        if a.size and (not np.all(np.isfinite(a)) or np.any(a != np.floor(a)) or np.any(a < 0) or np.any(a > 2**31 - 1)):
+            raise ValueError(f"K.{k}: cone sizes must be nonnegative integers, got {v!r}")
+        return a.astype(np.int64)
+
+    def lst(k):
+        a = ints(k)
+        return np.ascontiguousarray(a[a > 0], dtype=np.intc)
+
+    def cnt(k):
+        return int(ints(k).sum())
+    return lst, cnt
+
+
 def solve_sedumi(A, b, c, K, options=None, verbose=True, _caller="python:solve_sedumi"):
     """Solve a problem in SeDuMi format:
 
@@ -769,14 +1056,7 @@ def solve_sedumi(A, b, c, K, options=None, verbose=True, _caller="python:solve_s
     A.sort_indices()
     get = (lambda k: K.get(k)) if isinstance(K, dict) else (lambda k: getattr(K, k, None))
 
-    def lst(k):
-        v = get(k)
-        v = [] if v is None else np.atleast_1d(np.asarray(v)).ravel()
-        return np.ascontiguousarray([int(d) for d in v if int(d) > 0], dtype=np.intc)
-
-    def cnt(k):
-        v = get(k)
-        return 0 if v is None or np.size(v) == 0 else int(np.sum(v))
+    lst, cnt = _cone_sizes(get)
     nf, nl, q, rr, ss = cnt("f"), cnt("l"), lst("q"), lst("r"), lst("s")
     if nf + nl + int(q.sum()) + int(rr.sum()) + int((ss.astype(np.int64) ** 2).sum()) != c.size:
         raise ValueError("K does not match the number of columns of A")
@@ -846,14 +1126,7 @@ class SocpModel:
         A.sum_duplicates(); A.sort_indices()
         get = (lambda k: K.get(k)) if isinstance(K, dict) else (lambda k: getattr(K, k, None))
 
-        def lst(k):
-            v = get(k)
-            v = [] if v is None else np.atleast_1d(np.asarray(v)).ravel()
-            return np.ascontiguousarray([int(d) for d in v if int(d) > 0], dtype=np.intc)
-
-        def cnt(k):
-            v = get(k)
-            return 0 if v is None or np.size(v) == 0 else int(np.sum(v))
+        lst, cnt = _cone_sizes(get)
         if get("s") is not None and np.size(get("s")):
             raise ValueError("SocpModel: semidefinite blocks are not supported")
         nf, nl, q, rr = cnt("f"), cnt("l"), lst("q"), lst("r")
@@ -886,11 +1159,18 @@ class SocpModel:
         return self._a["b"].size
 
     def set_var_bounds(self, j, lo=None, hi=None):
-        """the bounds of column j (None: keep that side; -inf/inf: none)"""
-        if lo is not None: self._lo[j] = lo
-        if hi is not None: self._hi[j] = hi
-        if load_library().brisk_socp_set_var_bounds(self._h, int(j), float(self._lo[j]), float(self._hi[j])):
+        """the bounds of column j (None: keep that side; -inf/inf: none). A rejected call (a column out of range, NaN, or
+        lo > hi) raises and changes nothing"""
+        if isinstance(j, bool) or not isinstance(j, (int, np.integer)) or not 0 <= int(j) < self.n:
+            raise IndexError(f"column {j}: the columns are 0 .. {self.n - 1}")
+        j = int(j)
+        nlo = float(self._lo[j]) if lo is None else float(lo)
+        nhi = float(self._hi[j]) if hi is None else float(hi)
+        if np.isnan(nlo) or np.isnan(nhi) or nlo > nhi:
+            raise ValueError(f"column {j}: bounds lo = {nlo}, hi = {nhi} (NaN or lo > hi)")
+        if load_library().brisk_socp_set_var_bounds(self._h, j, nlo, nhi):
             raise IndexError(f"column {j} (or lo > hi)")
+        self._lo[j] = nlo; self._hi[j] = nhi          # (stored only once the model has taken them)
 
     def set_cost(self, c):
         c = np.ascontiguousarray(np.asarray(c, dtype=np.float64).ravel())
@@ -900,7 +1180,9 @@ class SocpModel:
         load_library().brisk_socp_set_cost(self._h, c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
 
     def set_cutoff(self, value=np.inf):
-        """stop a solve (status 9) once its lower bound exceeds value (a branch and bound's incumbent); inf: off"""
+        """stop a solve (status 9) once an estimate of its lower bound exceeds value (a branch and bound's incumbent); inf:
+        off. The estimate, b'y - |c - A'y - z| max(1, |x|) at the current iterate, counts the iterate's size for that of a
+        feasible point: it is a test, not a proof, so a node stopped by it is not certified to be worse than the incumbent"""
         load_library().brisk_socp_set_cutoff(self._h, float(value))
 
     def save_point(self):
@@ -910,9 +1192,14 @@ class SocpModel:
         return _SocpPoint(p) if p else None
 
     def restore_point(self, point):
-        """the next solve starts from this saved point"""
+        """the next solve starts from this saved point, which must have been saved by this model (save_point); a point of
+        another model is refused with ValueError and the model's own point is kept"""
         if point is not None:
-            load_library().brisk_socp_restore_point(self._h, point._p)
+            rc = load_library().brisk_socp_restore_point(self._h, point._p)
+            if rc == 1:
+                raise ValueError("restore_point: the point was saved by another SocpModel (or one of another shape)")
+            if rc != 0:
+                raise MemoryError("restore_point: out of memory")
 
     def solve(self):
         """the re-solve, warm from the last optimal point (the first: cold); returns a ConeResult"""
@@ -936,10 +1223,10 @@ def solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True, _ca
     """Solve the SDPA problem given by its numbers (see the module docstring): blocksizes
     (LP blocks negative), c (m), and the entries mat (0..m), blk (1..nblk), i, j (1-based
     within the block; i > j is swapped), v."""
-    bs = np.ascontiguousarray(blocksizes, dtype=np.intc)
-    c = np.ascontiguousarray(c, dtype=np.float64)
-    arrs = [np.ascontiguousarray(a, dtype=np.intc) for a in (mat, blk, i, j)]
-    v = np.ascontiguousarray(v, dtype=np.float64)
+    bs = _ints(blocksizes, "blocksizes")
+    c = _finite(c, "c")
+    arrs = [_ints(a, nm) for a, nm in ((mat, "mat"), (blk, "blk"), (i, "i"), (j, "j"))]
+    v = _finite(v, "v")
     nnz = v.size
     if any(a.size != nnz for a in arrs):
         raise ValueError("mat, blk, i, j and v must have the same length")

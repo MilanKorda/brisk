@@ -71,6 +71,7 @@ typedef struct {
 #define HPW 1
 #define HPT double
 #define HPN(x) x##_f64
+static int g_hp_rowoff = 0;   /* (31 October 2026, the owner: the default log numbers the high-precision rows after the double solve's iterations) */
 #define HP_NAME "d"
 #define HP_EPS 1.1e-16
 #define HP_SETD(r, d) (*(r) = (d))
@@ -720,15 +721,14 @@ static void hp_write(const HPJob *J, const char *yfile, const char *xfile, const
     const size_t Wm = (size_t)J->Lm + 2;
     char *s = (char *)malloc((size_t)nd + 64);
     if (yfile) {
-        FILE *f = fopen(yfile, "w");
-        if (f) { for (int p = 0; p < J->m; p++) { mpx_to_str(s, J->y + (size_t)p * Wm, nd); fprintf(f, "%s\n", s); } fclose(f); }
-        else fprintf(stderr, "brisk: cannot write %s\n", yfile);
+        FILE *f = brisk_out_open(yfile);
+        if (f) { for (int p = 0; p < J->m; p++) { mpx_to_str(s, J->y + (size_t)p * Wm, nd); fprintf(f, "%s\n", s); } brisk_out_close(f, yfile); }
     }
     for (int w = 0; w < 2; w++) {
         const char *fn = w ? zfile : xfile;
         if (!fn) continue;
-        FILE *f = fopen(fn, "w");
-        if (!f) { fprintf(stderr, "brisk: cannot write %s\n", fn); continue; }
+        FILE *f = brisk_out_open(fn);
+        if (!f) continue;
         uint64_t *const *V = w ? J->Z : J->X;
         for (int k = 0; k < J->nblk; k++) {
             const int n = abs(J->bs[k]);
@@ -740,7 +740,7 @@ static void hp_write(const HPJob *J, const char *yfile, const char *xfile, const
                     mpx_to_str(s, v, nd); fprintf(f, "%d %d %d %s\n", k + 1, i + 1, j + 1, s);
                 }
         }
-        fclose(f);
+        brisk_out_close(f, fn);
     }
     free(s);
 }
@@ -1312,14 +1312,23 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     const char *lname[4] = { "double", "double-double", "quad-double", "variable precision" };
     if (J->verbose) {
         printf("BRISK %s high precision: %s\n", BRISK_VERSION, J->method == 1 ? "augmented Lagrangian method with semismooth Newton-CG" : J->method == 2 ? "low-rank augmented Lagrangian method" : "interior-point method");
-        brisk_log_threads(1);
         printf("problem %s: m = %d, %d SDP blocks (max n = %d), %d blocks in all, read %.2fs\n", fname, m, nsdp, maxn, nb, wtime() - J->tstart);
+        if (!g_log_brief) brisk_log_threads(1);   /* (31 October 2026, the owner: the problem first, then the threads; the default log prints both below) */
         printf("precision: %s", lname[lk[nl - 1]]);
         if (lk[nl - 1] == 3) printf(" (%d bits, about %d digits)", final_bits, (int)(final_bits * 0.30103));
         printf(", tolerance %.1e%s; ladder:", J->tol, J->tol == 1e-290 && !(tol > 0) ? " (limited to 1e-290: the measures are double-precision numbers)" : "");
         for (int l = 0; l < nl; l++) { if (lk[l] == 3) printf(" mp%d", lb[l]); else printf(" %s", l == 0 ? "d" : lk[l] == 1 ? "dd" : "qd"); }
         printf("\n");
         if (J->verbose > 1) printf("  it prec      pobj                  dobj              pinf     dinf      gap       mu      ap     ad    sigma    time\n");
+    }
+    if (J->verbose > 1 && g_log_brief) {   /* (ISSUES 725: the default log) */
+        log_user("Problem:  %d equality constraints, %d semidefinite block%s (largest of order %d)\n", m, nsdp, nsdp == 1 ? "" : "s", maxn);
+        brisk_log_threads(1);
+        char vp[64] = "";
+        if (lk[nl - 1] == 3) snprintf(vp, sizeof vp, " (%d bits, about %d digits)", final_bits, (int)(final_bits * 0.30103));
+        brisk_log_method("%s in %s arithmetic%s, started from the double-precision solution", J->method == 1 ? "augmented Lagrangian method with semismooth Newton steps" : J->method == 2 ? "low-rank augmented Lagrangian method" : "interior-point method",
+                         lname[lk[nl - 1]], lk[nl - 1] == 1 ? " (about 31 digits)" : lk[nl - 1] == 2 ? " (about 63 digits)" : vp);
+        log_user(" ITE PREC PRIMAL OBJ              DUAL OBJ                  PFEAS   DFEAS     GAP      MU   TIME\n");   /* (4 November 2026, the owner: "Make spacing between columns smaller": one space) */
     }
     int rc = 3, lev, lev0 = 0, skip_pref = 0, lr_rmax = 0, face_dual = 0, levs = 0, next = 0, start_fail = 0;
     struct HPChamp champ_, spare_;
@@ -1413,6 +1422,7 @@ int brisk_hp_run(const char *fname, const BriskData *data, BriskResult *res, con
     for (int l = 0; l < lev0; l++) { tlev[l] = warm ? warm->time : 0; itlev[l] = warm ? warm->iters : 0; }   /* the double solve (default method) */
     double start_err = 1e300, keep_t[40], ext_err = 1e300;
     const int it_warm = lev0 && warm ? warm->iters : 0;
+    g_hp_rowoff = it_warm;
     HPJob keep; int have_keep = 0, keep_lev = 0, keep_it[40];
     if (lev0 == 1 && J->method == 0) start_err = hp_start_err;
     levs = lev0;
@@ -1881,7 +1891,10 @@ hp_again:
         ps_orig_free(Oc);
         t_ray = wtime() - tr0;
     }
-    const char *status = rc == 0 ? "OPTIMAL" : rc == 1 ? "PRECISION LIMIT" : rc == 2 ? (brisk_stop_flag ? "INTERRUPTED" : J->iters >= J->maxit ? "ITERATION LIMIT" : "TIME LIMIT")
+    /* 31 October 2026 (audit A2): a verdict that the ray problem does not certify on the problem as read is not returned
+     * as infeasibility: NUMERICAL DIFFICULTIES, the reason in the log (the lines below say why) */
+    const int hp_unconf = (rc == 4 || rc == 5) && ray_cert != 1 && !g_hp_inray && !bside;
+    const char *status = hp_unconf ? "NUMERICAL DIFFICULTIES" : rc == 0 ? "OPTIMAL" : rc == 1 ? "PRECISION LIMIT" : rc == 2 ? (brisk_stop_flag ? "INTERRUPTED" : J->iters >= J->maxit ? "ITERATION LIMIT" : "TIME LIMIT")
                        : rc == 4 ? "PRIMAL INFEASIBLE" : rc == 5 ? "DUAL INFEASIBLE" : "FAILED";
     /* 24 October 2026 (ISSUES 281): the six DIMACS errors of the result, in the working precision, from the measures
      * above. Those are relative to the 2-norms of b and C; the DIMACS definitions (the standard solver's ps_measure) to
@@ -1926,7 +1939,9 @@ hp_again:
         }
         /* 20 October 2026 (the owner): the values to ten significant digits in the log (all of the working precision's
          * digits with -v, verbosity 2 and more) */
-        const int ndp = J->verbose > 2 || nd < 10 ? nd : 10;   /* (J->verbose is the verbosity + 1) */
+        /* (3 November 2026: since the default log became the brief one (ISSUES 725), -v is verbosity 1 without the brief
+         * log; the digits follow -v again, as the owner asked) */
+        const int ndp = J->verbose > 2 || (J->verbose == 2 && !g_log_brief) || nd < 10 ? nd : 10;   /* (J->verbose is the verbosity + 1) */
         mpx_neg(t, J->pobj); mpx_to_str(s1, t, ndp);
         /* (23 October 2026: after an infeasibility verdict there is no optimal value; the values are those of the last point) */
         if (rc == 4 || rc == 5) printf("the last point's values (no optimal value: the verdict above)\n");
@@ -1959,26 +1974,27 @@ hp_again:
         else printf("  X and Z are positive definite (Cholesky in the working precision)\n");
         printf("time: total %.3fs;", wtime() - J->tstart);
         for (int l = 0; l <= lev; l++) { if (lk[l] == 3) printf(" mp%d", lb[l]); else printf(" %s", l == 0 ? "d" : lk[l] == 1 ? "dd" : "qd"); printf(" %d it %.3fs%s", itlev[l], tlev[l], l < lev ? "," : "\n"); }
+        g_log_user++;   /* (ISSUES 725: the bounds the user asked for) */
         for (int sd = 1; sd <= 2; sd++) {
             if (!tried_cert[sd - 1]) continue;
             const char *SD = sd == 1 ? "P" : "D", *ul = sd == 1 ? "upper" : "lower";
             const HPCertOut *ce = &cert[sd - 1];
             if (have_cert[sd - 1]) {
                 mpx_to_str(s1, ce->value, nd);
-                printf("BOUND (%s): %s bound %s = %s (certificate: %s)\n", SD, ul, sd == 1 ? "<C,X>" : "b'y", s1, cert_src[sd - 1]);
-                hpc_bound_str(s1, ce->bound, nd, sd == 1 ? +1 : -1);
-                mpx_neg(t, ce->bound); hpc_bound_str(s2, t, nd, sd == 1 ? -1 : +1);
-                if (prior_[sd - 1])
-                    printf("CERTIFIED (%s): rigorous %s bound %s on the optimal value of %s\n           (SDPA convention: %s bound %s; by a-priori bounds, in double precision; %.2fs)\n",
-                           SD, ul, s1, sd == 1 ? "(D)" : "(P)", sd == 1 ? "a lower" : "an upper", s2, t_cert[sd - 1]);
-                else
-                printf("CERTIFIED (%s): rigorous %s bound %s on the optimal value of (P)\n           (SDPA convention: %s bound %s; %d-bit arithmetic, distance to the feasible point %.1e; %.2fs)\n",
-                       SD, ul, s1, sd == 1 ? "a lower" : "an upper", s2, 64 * (J->Lm - 1), ce->delta, t_cert[sd - 1]);
-            } else printf("NOT CERTIFIED (%s): %s: no guaranteed %s bound (%.2fs)\n", SD, ce->why[0] ? ce->why : "no certificate", ul, t_cert[sd - 1]);
+                /* (3 November 2026, the owner: one line per bound, in the problem's own terms; no SDPA convention) */
+                /* (3 November 2026, the owner: one line, 7 significant digits rounded in the bound's direction, the certificate
+                 * explained in the options' description) */
+                brisk_fmt_bound(s1, 48, hpc_bound_dbl(ce->bound, sd == 1 ? +1 : -1), sd == 1 ? +1 : -1, 11);   /* (the double moved outward by two units in the last place, then rounded outward at 7 digits) */
+                (void)t; (void)s2; (void)SD; (void)cert_src; (void)prior_;
+                printf("Bound: guaranteed %s bound %s (see the option bound in OPTIONS.md)\n", ul, s1);
+            } else printf("Bound: no guaranteed %s bound: %s\n", ul, ce->why[0] ? ce->why : "no certificate");
         }
+        g_log_user--;
         /* 20 October 2026 (the owner): a Summary as the standard solver's: the problem as read, the preprocessing, the
          * solve, the time and the errors */
         if (!getenv("BRISK_NOSUMMARY")) {
+            g_log_user++;   /* (ISSUES 725: the Summary is the user's) */
+            if (g_log_brief) printf("------------------------------------------------------------------------------------------------\n");   /* (as long as the iteration table: the owner, 3 November 2026) */
             /* (a free variable passed as the difference of two nonnegative ones is counted as free, as the standard
              * Summary does: the pairs the presolve eliminated) */
             const int rd_free = hp_nfree_read, rd_nn = rd_lp - 2 * rd_free;
@@ -1992,26 +2008,36 @@ hp_again:
                    while (*p0) { const char *e = strchr(p0, '\n'); const int len = e ? (int)(e - p0) : (int)strlen(p0);
                                  printf("%s%.*s\n", first ? lab : "                     ", len, p0); first = 0; p0 += len + (e ? 1 : 0); } }
             char pn[64];
-            if (kind == 1) snprintf(pn, sizeof pn, "double-double (about 31 digits)");
-            else if (kind == 2) snprintf(pn, sizeof pn, "quad-double (about 63 digits)");
+            if (kind == 1) snprintf(pn, sizeof pn, "double-double");
+            else if (kind == 2) snprintf(pn, sizeof pn, "quad-double");
             else snprintf(pn, sizeof pn, "%d bits (about %d digits)", final_bits, nd);
-            printf("  Solve:             %s in %s, %d iterations (", J->method == 2 ? "low-rank augmented Lagrangian method" : J->method == 1 ? "augmented Lagrangian method with semismooth Newton steps" : "interior-point method",
+            {   /* (3 November 2026: one line, so that the default log's width applies) */
+            char ln[512]; int o = snprintf(ln, sizeof ln, "  Solve:             %s in %s, %d iterations (", J->method == 2 ? "low-rank augmented Lagrangian method" : J->method == 1 ? "augmented Lagrangian method (semismooth Newton steps)" : "interior-point method",
                    pn, J->iters + it_warm);
             int first = 1;
-            for (int l = 0; l <= lev; l++) {
+            for (int l = 0; l <= lev && o < (int)sizeof ln; l++) {
                 if (itlev[l] == 0) continue;
-                if (lk[l] == 3) printf("%s%d bits %d", first ? "" : ", ", lb[l], itlev[l]);
-                else printf("%s%s %d", first ? "" : ", ", l == 0 ? "double precision" : lk[l] == 1 ? "double-double" : "quad-double", itlev[l]);
+                if (lk[l] == 3) o += snprintf(ln + o, sizeof ln - o, "%s%d in %d bits", first ? "" : ", ", itlev[l], lb[l]);
+                else o += snprintf(ln + o, sizeof ln - o, "%s%d in %s", first ? "" : ", ", itlev[l], l == 0 ? "double" : lk[l] == 1 ? "double-double" : "quad-double");
                 first = 0;
             }
-            printf(")\n");
+            printf("%s)\n", ln);
+            }
             if (res_double > 0 && isfinite(res_double)) printf("                     its result is the double-precision solve's (the high-precision method's own ended at %.1e)\n", res_double);
             else if (res_double > 0) printf("                     its result is the double-precision solve's (the high-precision method ended without a point)\n");
             printf("  Time:              %.2f s\n", wtime() - J->tstart);
-            printf("  Errors:            pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e (on the problem as read, in the working precision)\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);
+            {   /* (2 November 2026: the Summary's lines as the double-precision solvers') */
+                extern int brisk_threads_logged(void); extern const char *brisk_threads_label(int nt);
+                const int nt = brisk_threads_logged(); if (nt > 0) printf("  Number of threads: %d%s\n", nt, brisk_threads_label(nt)); }
+            if (!g_log_brief) printf("  Errors:            pinf %.1e  dinf %.1e  gap %.1e  <X,Z> %.1e (on the problem as read, in the working precision)\n", J->best_pinf, J->best_dinf, J->best_gap, J->best_compl);   /* (31 October 2026, the owner: not in the default log, where the DIMACS line says it) */
+            if (!strcmp(status, "OPTIMAL")) printf("  Status:            %s\n", status);
+            else printf("  Status:            %s (DIMACS error %.1e)\n", status, dim_max);
+            printf("  Objective:         primal <C,X> = %s, dual b'y = %s\n", s1, s2);
             if (J->have_iter && rc != 4 && rc != 5)
                 printf("  DIMACS errors:     pinf %.1e  X>=0 %.1e  dinf %.1e  Z>=0 %.1e  gap %.1e  compl %.1e (in the working precision)\n",
                        dimacs[1], dimacs[2], dimacs[3], dimacs[4], dimacs[5], dimacs[6]);
+            if (g_log_brief && J->have_iter && rc != 4 && rc != 5) printf("Solved to DIMACS error %.1e\n", dim_max);
+            g_log_user--;
         }
         free(s1); free(s2);
     }
@@ -2050,7 +2076,7 @@ hp_again:
         /* the library interface: the same fields as a double solve; X, y and Z rounded to
          * doubles (the full digits are in the -x / -y / -z files) */
         static const int st[6] = { 0, 5, 6, 4, 1, 2 }, ec[6] = { 0, 10, 15, 14, 11, 12 };
-        const int s = rc >= 0 && rc <= 5 ? rc : 3;
+        const int s = hp_unconf ? 3 : rc >= 0 && rc <= 5 ? rc : 3;
         res->status = rc == 2 && J->iters >= J->maxit ? 3 : st[s];
         res->exit_code = rc == 2 && J->iters >= J->maxit ? 13 : ec[s];
         snprintf(res->status_str, sizeof(res->status_str), "%s", status);
@@ -2115,7 +2141,7 @@ hp_again:
     J->X = NULL; J->Z = NULL; J->y = NULL; J->pobj = NULL; J->dobj = NULL;
     free(J->dep); J->dep = NULL;
     lr_free(J); hp_free(J);
-    return rc == 0 ? 0 : rc == 1 ? 10 : rc == 2 ? (J_.iters >= J_.maxit ? 13 : 15) : rc == 4 ? 11 : rc == 5 ? 12 : 14;
+    return hp_unconf ? 14 : rc == 0 ? 0 : rc == 1 ? 10 : rc == 2 ? (J_.iters >= J_.maxit ? 13 : 15) : rc == 4 ? 11 : rc == 5 ? 12 : 14;
 }
 
 /* 5.2: -certify-x / -certify-y with -prec: the rigorous check of a given certificate (the -x /
@@ -2178,8 +2204,9 @@ int brisk_hp_certify_given(const char *fname, const BriskData *data, BriskResult
         if (ok) {
             hpc_bound_str(s1, out.bound, nd, side == 1 ? +1 : -1);
             mpx_neg(t, out.bound); hpc_bound_str(s2, t, nd, side == 1 ? -1 : +1);
-            printf("CERTIFIED (%s): rigorous %s bound %s on the optimal value of (P)\n           (SDPA convention: %s bound %s; %d-bit arithmetic, distance to the feasible point %.1e; %.2fs)\n",
-                   side == 1 ? "P" : "D", side == 1 ? "upper" : "lower", s1, side == 1 ? "a lower" : "an upper", s2, 64 * (J->Lm - 1), out.delta, wtime() - t0);
+            (void)s2; (void)t;
+            printf("Bound (%s): a guaranteed %s bound on the optimal value: %s\n           checked in %d-bit arithmetic; distance to the feasible point %.1e (%.2f s)\n",
+                   side == 1 ? "P" : "D", side == 1 ? "upper" : "lower", s1, 64 * (J->Lm - 1), out.delta, wtime() - t0);
         } else printf("NOT CERTIFIED (%s): %s\n", side == 1 ? "P" : "D", out.why);
         free(s1); free(s2);
     }

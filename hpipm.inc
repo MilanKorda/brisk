@@ -873,7 +873,18 @@ static int HPN(ipm)(HPJob *J) {
             rec[it % 51].pinf = pinf; rec[it % 51].dinf = dinf; rec[it % 51].compl = compl; rec[it % 51].lp = lp_sum; rec[it % 51].ld = ld_sum;
             rec[it % 51].po = po; rec[it % 51].dob = dob; rec[it % 51].gap = gap; rec[it % 51].err = err;
         }
-        if (J->verbose > 1 && !redo) {
+        if (J->verbose > 1 && !redo && g_log_brief) {   /* (ISSUES 725: the default log's row) */
+            /* (31 October 2026, the owner: not the double-precision check of the dependent rows, which evaluates a cold point;
+             * the rows numbered after the double solve's iterations, as the Summary counts them) */
+            if (!J->deponly)
+            {   /* (3 November 2026, the owner: "Do we need the STEP to be reported?") not in the default log, where the
+                 * high-precision steps are 1 almost always; the diagnosis (-v) keeps them */
+            (void)ap; (void)ad;
+            log_user("%4d %-4s %+.16e %+.16e %7.1e %7.1e %7.1e %7.1e %6.2f\n", J->iters + g_hp_rowoff, HPN(name), po, dob, pinf, dinf, gap,
+                     HP_GETD(mu), wtime() - J->tstart);
+            }
+        }
+        else if (J->verbose > 1 && !redo) {
             if (rho_now >= 0) printf("      (rho = |Z Z^-1 - I| = %.1e)\n", rho_now);
             printf("%4d %-3s %+.14e %+.14e %8.1e %8.1e %9.1e %8.1e %6.3f %6.3f %7.1e %7.1fs\n", J->iters, HPN(name), po, dob, pinf, dinf, gap,
                    HP_GETD(mu), ap, ad, sigma, wtime() - J->tstart);

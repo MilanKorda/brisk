@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "qp_fminmax.h"
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -29,6 +31,8 @@ void QP_CAT(BLAS_PREFIX, dsyrk_)(const char *, const char *, const int *, const 
 #define qp_dsyrk QP_CAT(BLAS_PREFIX, dsyrk_)
 #ifdef _OPENMP
 #include <omp.h>
+void brisk_itab_row(int it, double pobj, double dobj, double pinf, double dinf, double gap, double mu, double step);   /* (main.c) */
+void brisk_itab_end(void);
 #endif
 
 typedef struct SChol SChol;
@@ -55,6 +59,34 @@ int    schol_solve_part(SChol *S, double *b, double *work, int nt);
  * a test: BRISK_QPSOLVEPART=1. Not the default: on the 25 QPs over a second at two threads 1.11 of the total time
  * (QPLIB_8500 2.9 with two more iterations, CONT-300 1.35; bench/qp_part/); the cause is not found (the default solve is
  * sequential here too); TRICKS 8 */
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, audit A9: the MPC replays) the analysis of the normal
+ * equations kept between the solves of a persistent model (qpas.c owns it: qp_ipm_memo_use around its interior-point
+ * solves): M's ordering, symbolic factorization and merged supernodes, keyed by the pattern of M (schol_adj_key over its
+ * rows' neighbours, and its order): a re-solve with the same pattern (new bounds or costs, the same rows and columns after
+ * the presolve) takes it instead of analysing again. The analysis is deterministic, so the factor and the bits are those
+ * of a fresh solve. Only for the normal equations without dense columns apart or dense assembly. BRISK_QPMEMO=0: off */
+/* (1 November 2026, the SOCP developer) the persistent model's memory between its interior-point solves: M's analysis (key:
+ * M's pattern), and, under a key of the constraint matrix's own pattern (akey), M's pattern skipped and the row-wise
+ * assembly's table (gmp, gmk, gmo: the places in M's factor) kept; both depend on the pattern alone. The 96-mass MPC
+ * plant (QP): 0.5 s for the pattern and 0.6 s for the table at every re-solve of 5.6 s */
+typedef struct QpIpmMemo { uint64_t key, akey; int m; SChol *M; int *gmp, *gmk; size_t *gmo; } QpIpmMemo;
+static _Thread_local QpIpmMemo *g_qp_memo = NULL;
+void *qp_ipm_memo_new(void) { return calloc(1, sizeof(QpIpmMemo)); }
+static void qp_memo_table_free(QpIpmMemo *Q) { free(Q->gmp); free(Q->gmk); free(Q->gmo); Q->gmp = Q->gmk = NULL; Q->gmo = NULL; Q->akey = 0; }
+void qp_ipm_memo_free(void *p) { QpIpmMemo *Q = p; if (!Q) return; if (Q->M) schol_free(Q->M); qp_memo_table_free(Q); free(Q); }
+/* (a key of the constraint matrix's pattern, its dense columns apart: FNV-1a over the sizes, the column starts, the row
+ * indices and the dense flags) */
+static uint64_t qp_pat_key(int m, int n, const int *Ap, const int *Ai, const char *isd) {
+    uint64_t h = 1469598103934665603ull; const uint64_t P = 1099511628211ull;
+    #define QPK_(v) do { h ^= (uint64_t)(uint32_t)(v); h *= P; } while (0)
+    QPK_(m); QPK_(n);
+    for (int j = 0; j <= n; j++) QPK_(Ap[j]);
+    for (int p = 0; p < Ap[n]; p++) QPK_(Ai[p]);
+    for (int j = 0; j < n; j++) QPK_(isd[j]);
+    #undef QPK_
+    return h ? h : 1;
+}
+void qp_ipm_memo_use(void *p) { static int on = -1; if (on < 0) { const char *e = getenv("BRISK_QPMEMO"); on = !(e && atoi(e) == 0); } g_qp_memo = on ? p : NULL; }
 static int qp_part_nt(void) {
     static int v = -1; if (v < 0) { const char *e = getenv("BRISK_QPSOLVEPART"); v = e ? atoi(e) : 0; }
     if (!v) return 0;
@@ -778,7 +810,7 @@ typedef struct {
      * inequality rows' Ds^-1 (0 on the equality rows) */
     SChol *M; size_t *offMd, *offMp; int *mpst; double *dne;
     int dasm, wdc; double *Md, *Wd; size_t *dmo;   /* M by dsyrk on dense panels of A D^1/2 (wdc columns, Wd) into a dense Md; dmo: the places of its entries below the diagonal, by columns */
-    int *grp, *grq, *grj, *gmp, *gmk; size_t *gmo; double *gw;   /* M formed row by row: A's sparse part by rows (grp, grq: CSC positions), M's entries below the diagonal by rows (gmp, gmk) and their places in the factor (gmo), a dense row (gw) */
+    int *grp, *grq, *grj, *gmp, *gmk; size_t *gmo; double *gw; double *gwt, gwork, tform;   /* (1 November 2026) the threads' dense rows, the assembly's products, its time */   /* M formed row by row: A's sparse part by rows (grp, grq: CSC positions), M's entries below the diagonal by rows (gmp, gmk) and their places in the factor (gmo), a dense row (gw) */
     int nerho;                              /* rho on every column of the normal equations (after a breakdown) */
     /* (22 October 2026) the dense columns kept as unknowns: [M_s A_d; A_d' -D_d^-1] (dy; dx_d), M_s from the sparse
      * columns; offsets of A_d's entries (by A's index) and of the dense unknowns' diagonals */
@@ -977,6 +1009,7 @@ static int ne_factor(Ipm *I) {
         v[I->offDd[a]] = -1.0 / I->dne[j];
         for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) v[I->offAd[p]] = R->Ax[p];
     }
+    const double tf0_ = now();      /* (the forming's time, the dense products included) */
     if (I->dasm) {     /* (25 October 2026) dense panels of A D^1/2 by dsyrk, M's entries copied from the dense result */
         const double one = 1.0; double beta = 0.0; const int md = m;
         for (int c0 = 0; c0 < n; c0 += I->wdc) {
@@ -999,16 +1032,33 @@ static int ne_factor(Ipm *I) {
         goto formed;
     }
     if (I->gmp) {      /* row i of A D A': a_ij d_j times column j below row i, gathered into M's entries of column i */
-        double *w = I->gw;
-        for (int i = 0; i < m; i++) {
-            double di = R->eq[i] ? 0.0 : 1.0 / I->Ds[i];
-            for (int t = I->grp[i]; t < I->grp[i + 1]; t++) {
-                const int p = I->grq[t], j = I->grj[t]; const double d = R->Ax[p] * I->dne[j];
-                di += d * R->Ax[p];
-                for (int q = p + 1; q < R->Ap[j + 1]; q++) w[R->Ai[q]] += d * R->Ax[q];
+        /* (1 November 2026, the SOCP developer; the owner's QP benchmark, the mass-spring MPC plants) the rows on the threads
+         * when the assembly's products exceed 2e7: each row of M is formed by one thread, in the order of its own entries, into
+         * its own places (the same bits at any thread count). The 96-mass plant (QP; 38,592 variables, 7.4 million entries in
+         * A, 193 in a state column): 5.7e8 products an assembly, about 1.5 s on one thread, six assemblies, 9 s of a 15 s solve */
+        int nt_ = 1;
+#ifdef _OPENMP
+        if (!omp_in_parallel() && I->gwork > 2e7) nt_ = omp_get_max_threads();
+#endif
+        if (nt_ > 1 && !I->gwt) { I->gwt = calloc((size_t)nt_ * ((size_t)m + 1), sizeof(double)); if (!I->gwt) nt_ = 1; }
+        #pragma omp parallel num_threads(nt_) if (nt_ > 1)
+        {
+#ifdef _OPENMP
+            double *w = nt_ > 1 ? I->gwt + (size_t)omp_get_thread_num() * ((size_t)m + 1) : I->gw;
+#else
+            double *w = I->gw;
+#endif
+            #pragma omp for schedule(dynamic, 16)
+            for (int i = 0; i < m; i++) {
+                double di = R->eq[i] ? 0.0 : 1.0 / I->Ds[i];
+                for (int t = I->grp[i]; t < I->grp[i + 1]; t++) {
+                    const int p = I->grq[t], j = I->grj[t]; const double d = R->Ax[p] * I->dne[j];
+                    di += d * R->Ax[p];
+                    for (int q = p + 1; q < R->Ap[j + 1]; q++) w[R->Ai[q]] += d * R->Ax[q];
+                }
+                v[I->offMd[i]] = di;
+                for (int t = I->gmp[i]; t < I->gmp[i + 1]; t++) { const int k = I->gmk[t]; v[I->gmo[t]] = w[k]; w[k] = 0; }
             }
-            v[I->offMd[i]] = di;
-            for (int t = I->gmp[i]; t < I->gmp[i + 1]; t++) { const int k = I->gmk[t]; v[I->gmo[t]] = w[k]; w[k] = 0; }
         }
         goto formed;
     }
@@ -1023,6 +1073,7 @@ static int ne_factor(Ipm *I) {
         }
     }
 formed:
+    I->tform += now() - tf0_;
     I->nfact++;
     const double t0 = now();
     int rc = schol_factor(I->M, 0.0);
@@ -1354,6 +1405,15 @@ static void extract(const QpProb *P, const Red *R, const Ipm *I, const double *f
  * system is nearly dense, 26.4 -> 29.3 s), the same statuses and iterations on all 288 */
 static _Thread_local int qp_nd_now = 0;   /* (per thread: QP solves on several threads at once, as the SOCP solver's state, ISSUES 291) */
 static int k_build_offsets(Ipm *I);
+/* (1 November 2026) M leaves the model's memory (the route changes during a solve): its table goes with it; a table this
+ * solve shares is handed to the solve, which frees it */
+static void qp_memo_drop(Ipm *I) {
+    QpIpmMemo *Q = g_qp_memo;
+    if (!Q || Q->M != I->M) return;
+    Q->M = NULL;
+    if (Q->gmp && Q->gmp == I->gmp) { Q->gmp = Q->gmk = NULL; Q->gmo = NULL; Q->akey = 0; }
+    else qp_memo_table_free(Q);
+}
 /* (24 October 2026, the SOCP developer) the largest factor the machine can hold: its physical memory at 12 bytes an entry
  * (the value and its row index), or the process's own memory limit when smaller; an analysis beyond it fails, and the method says so, instead of the allocation stopping
  * the process ("out of memory": QFLOW_100000, QP, a network flow on a random graph whose factor fills at any order) */
@@ -1386,8 +1446,17 @@ static int k_build(Ipm *I) {
      * (their explicit elimination graph's work grows with the flops they reach: CVXQP1_L 2.4 s, QPLIB_8567 2.1 s of a 7 s
      * solve). BRISK_QPOWN=1: as before */
     static int qown = -1; if (qown < 0) { const char *e = getenv("BRISK_QPOWN"); qown = e && atoi(e) == 1; }
-    const int ao_ = qown ? -2 : schol_set_amd(3);
-    I->K = N > 0 ? schol_analyze_adj(N, deg, nbr, qp_fill_cap()) : NULL;
+    /* (1 November 2026, the SOCP developer; the owner's QP benchmark) a nearly complete K (its own lower triangle at least 0.9
+     * of N (N + 1) / 2: a dense H, as the portfolio QPs') analysed as dense: one supernode in the identity order, no
+     * ordering of a complete graph (the portfolio QP of 512 variables and 5 rows: the minimum-degree ordering and the
+     * analysis 37 million instructions a solve, against 18 million a factorization); the SOCP solver's rule for its normal
+     * equations (schol_analyze_dense). BRISK_QPKDENSE=0: never */
+    SChol *schol_analyze_dense(int m, int inplace);
+    static int kdn = -1; if (kdn < 0) { const char *e = getenv("BRISK_QPKDENSE"); kdn = !(e && atoi(e) == 0); }
+    const int kdense_ = kdn && N > 0 && 0.5 * (double)tot + N >= 0.9 * 0.5 * (double)N * (N + 1);
+    const int ao_ = qown || kdense_ ? -2 : schol_set_amd(3);
+    I->K = N > 0 ? (kdense_ ? schol_analyze_dense(N, 0) : schol_analyze_adj(N, deg, nbr, qp_fill_cap())) : NULL;
+    if (kdense_ && !I->K) I->K = schol_analyze_adj(N, deg, nbr, qp_fill_cap());
     if (ao_ != -2) schol_set_amd(ao_);
     schol_set_nd(0);
     I->K = qp_amalg(I->K, N);
@@ -1411,7 +1480,15 @@ static SChol *qp_amalg(SChol *S, int nunk) {
     if (!S || !(qam > 0) || nunk <= 0) return S;
     const double f = qam >= 1 ? 0.3 : qam;
     if (qam >= 1 && (double)schol_nnz(S) < 100.0 * nunk) return S;
-    return schol_reanalyze_amalg(S, f);
+    /* (1 November 2026) the merged width uncapped up to 1024 for this system (sparsechol.c, schol_set_amalg_width): the zero
+     * fraction f bounds the explicit zeros; the cap of 64 kept a chain of wide stage blocks in thousands of narrow
+     * supernodes (the 128-mass MPC plant, QP: 5,185 -> 414 supernodes, the factorizations 6.5 -> 1.45 s). BRISK_QPAMALGW: the cap */
+    int schol_set_amalg_width(int w);
+    static int qw = -1; if (qw < 0) { const char *e = getenv("BRISK_QPAMALGW"); qw = e ? atoi(e) : 1024; }
+    const int ow = schol_set_amalg_width(qw);
+    SChol *S2 = schol_reanalyze_amalg(S, f);
+    schol_set_amalg_width(ow);
+    return S2;
 }
 /* the augmented system's signs and value offsets for the analysis in I->K */
 static int k_build_offsets(Ipm *I) {
@@ -1442,6 +1519,7 @@ static int ne_to_augmented(Ipm *I, int *k_lazy) {
         I->K = NULL; I->M = Ms; *k_lazy = 0;
     }
     if (!I->Kspare) return 0;
+    qp_memo_drop(I);
     schol_free(I->M); I->M = NULL; I->K = I->Kspare; I->Kspare = NULL;
     return 1;
 }
@@ -1452,7 +1530,11 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res);
  * inherits an error of order one against its own (QPLIB_9002, QP: flows to 8e9, the dropped rows' terms 1e-6 to 1e-2, the
  * primal error stuck at 1e-6 while the scaled problem converged). The second solve drops, in each dependence, the row
  * with the largest terms at the first solve's point (qp_dep_rows' priorities); the better result is returned */
-int qp_solve_ipm(const QpProb *P, const QpOpts *opt, QpRes *Res) {
+static int qp_solve_ipm_body(const QpProb *P, const QpOpts *opt, QpRes *Res);
+int qp_solve_ipm(const QpProb *P, const QpOpts *opt, QpRes *Res) {     /* (1 November 2026: the solve's one deadline, qp.c) */
+    qp_deadline_enter(opt, P); const int st = qp_solve_ipm_body(P, opt, Res); qp_deadline_leave(); return st;
+}
+static int qp_solve_ipm_body(const QpProb *P, const QpOpts *opt, QpRes *Res) {
     const double t0 = now();
     const int m0 = P->m, n0 = P->n;
     char *dead = calloc((size_t)m0 + 1, 1);
@@ -1489,6 +1571,12 @@ int qp_solve_ipm(const QpProb *P, const QpOpts *opt, QpRes *Res) {
     Res->time = now() - t0;
     return st;
 }
+/* (31 October 2026, the SOCP developer; ISSUES 725) the default log of the QP route: one row per iteration of the problem as
+ * read (objectives with the constant term, errors, gap, mu, step, time); the method's other lines are the diagnosis (-v) */
+extern int g_log_brief;
+void brisk_log_head(int ipm);
+void brisk_log_row(int it, double po, double dob, double pinf, double dinf, double gap, double mu, double step, double t);
+int g_qp_user_head = 0;     /* (the table's head printed in this run of the log; main.c resets it) */
 static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
     const double t0 = now();
     QpOpts od; if (!opt) { qp_default_opts(&od); opt = &od; }
@@ -1499,7 +1587,11 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
     Res->x = xz(sizeof(double) * (n0 + 1)); Res->y = xz(sizeof(double) * (m0 + 1)); Res->z = xz(sizeof(double) * (n0 + 1));
     double *fixval = xz(sizeof(double) * (n0 + 1)), c0add = 0;
     Red Rd; Red *R = &Rd;
+    static int stmp_ = -1; if (stmp_ < 0) stmp_ = getenv("BRISK_QPSTAMP") != NULL;   /* (2 November 2026, a diagnosis: the setup's steps timed) */
+    if (stmp_) fprintf(stderr, "[qp stamp: the interior-point method entered]\n");
+    const double tst0_ = now();
     const int rrc = reduce(P, R, fixval, &c0add);
+    if (stmp_) fprintf(stderr, "[qp stamp: reduce %.3f s]\n", now() - tst0_);
     if (rrc == 2) {
         const int j = abs(g_qp_ray) - 1; Res->x[j] = g_qp_ray > 0 ? 1.0 : -1.0;
         Res->status = QP_DUAL_INFEASIBLE; Res->time = now() - t0; free(fixval);
@@ -1513,7 +1605,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
         return Res->status;
     }
     const int n = R->n, m = R->m;
-    { const char *e = getenv("BRISK_QPNOSCALE"); equilibrate(R, e ? 0 : 20); }
+    { const double te_ = now(); const char *e = getenv("BRISK_QPNOSCALE"); equilibrate(R, e ? 0 : 20); if (stmp_) fprintf(stderr, "[qp stamp: equilibrate %.3f s]\n", now() - te_); }
     if (verbose) {
         long nh = R->Hp[n], na = R->Ap[n]; int neq = 0, nb = 0; for (int i = 0; i < m; i++) neq += R->eq[i]; for (int j = 0; j < n; j++) nb += R->hl[j] + R->hu[j];
         qp_printf("BRISK QP interior-point method: n = %d, m = %d (%d equalities), %ld entries in H (lower), %ld in A, %d finite bounds; %d fixed columns substituted, %d rows without bounds or entries dropped",
@@ -1617,12 +1709,43 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
             int *mk = xm(sizeof(int) * (mm + 1)), *dg = xz(sizeof(int) * (mm + 1)); for (int i = 0; i < m; i++) mk[i] = -1;
             long tn = 0;
             if (dasm) { for (int i = 0; i < m; i++) dg[i] = m - 1; tn = (long)m * (m - 1); }
-            else for (int i = 0; i < m; i++) { mk[i] = i; for (int q = rp[i]; q < rp[i + 1]; q++) { const int j = rj[q]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int k = R->Ai[p]; if (mk[k] != i) { mk[k] = i; dg[i]++; } } } tn += dg[i]; }
+            /* (1 November 2026, the SOCP developer; the mass-spring MPC plants) the two passes over the pairs of each row on the
+             * threads when they are many (more than 2e7: the 96-mass plant, QP, 5.7e8 pairs, 1.35 s on one thread): each row
+             * with its own marks, its neighbours in the order of its own entries (the same pattern at any thread count) */
+            const uint64_t akey_ = (g_qp_memo && nd <= 0 && !dasm) ? qp_pat_key(m, n, R->Ap, R->Ai, isd) : 0;
+            const int ahit_ = akey_ && g_qp_memo->akey == akey_ && g_qp_memo->M && g_qp_memo->gmp && g_qp_memo->m == mm;
+            int pnt_ = 1; int *mkt_ = NULL;
+#ifdef _OPENMP
+            {   double pw_ = 0; for (int j = 0; j < n; j++) if (!isd[j]) { const double l = R->Ap[j + 1] - R->Ap[j]; pw_ += l * l; }
+                if (!dasm && pw_ > 2e7 && !omp_in_parallel()) pnt_ = omp_get_max_threads();
+                if (pnt_ > 1) { mkt_ = malloc(sizeof(int) * (size_t)pnt_ * ((size_t)mm + 1)); if (!mkt_) pnt_ = 1; } }
+#endif
+            if (ahit_) pnt_ = 0;        /* (the pattern kept: neither pass runs) */
+            if (!dasm && pnt_ > 1) {
+                long tn_ = 0;
+                #pragma omp parallel num_threads(pnt_) reduction(+:tn_)
+                {   int *mk_ = mkt_ + (size_t)omp_get_thread_num() * ((size_t)mm + 1);
+                    for (int i = 0; i < m; i++) mk_[i] = -1;
+                    #pragma omp for schedule(dynamic, 16)
+                    for (int i = 0; i < m; i++) { mk_[i] = i; for (int q = rp[i]; q < rp[i + 1]; q++) { const int j = rj[q]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int k = R->Ai[p]; if (mk_[k] != i) { mk_[k] = i; dg[i]++; } } } tn_ += dg[i]; }
+                }
+                tn += tn_;
+            }
+            if (!dasm && pnt_ == 1) for (int i = 0; i < m; i++) { mk[i] = i; for (int q = rp[i]; q < rp[i + 1]; q++) { const int j = rj[q]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int k = R->Ai[p]; if (mk[k] != i) { mk[k] = i; dg[i]++; } } } tn += dg[i]; }
             for (int j = 0; j < n; j++) if (dpos[j] >= 0) { const int c = R->Ap[j + 1] - R->Ap[j]; dg[dpos[j]] += c; tn += 2 * c; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) dg[R->Ai[p]]++; }
             int **nb = xm(sizeof(int *) * (mm + 1)), *pl = xm(sizeof(int) * (tn + 1));
             { long o = 0; for (int i = 0; i < mm; i++) { nb[i] = pl + o; o += dg[i]; dg[i] = 0; } for (int i = 0; i < m; i++) mk[i] = -1; }
             if (dasm) { for (int i = 0; i < m; i++) for (int k = 0; k < m; k++) if (k != i) nb[i][dg[i]++] = k; }
-            else for (int i = 0; i < m; i++) { mk[i] = i; for (int q = rp[i]; q < rp[i + 1]; q++) { const int j = rj[q]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int k = R->Ai[p]; if (mk[k] != i) { mk[k] = i; nb[i][dg[i]++] = k; } } } }
+            if (!dasm && pnt_ > 1) {
+                #pragma omp parallel num_threads(pnt_)
+                {   int *mk_ = mkt_ + (size_t)omp_get_thread_num() * ((size_t)mm + 1);
+                    for (int i = 0; i < m; i++) mk_[i] = -1;
+                    #pragma omp for schedule(dynamic, 16)
+                    for (int i = 0; i < m; i++) { mk_[i] = i; for (int q = rp[i]; q < rp[i + 1]; q++) { const int j = rj[q]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int k = R->Ai[p]; if (mk_[k] != i) { mk_[k] = i; nb[i][dg[i]++] = k; } } } }
+                }
+            }
+            if (!dasm && pnt_ == 1) for (int i = 0; i < m; i++) { mk[i] = i; for (int q = rp[i]; q < rp[i + 1]; q++) { const int j = rj[q]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int k = R->Ai[p]; if (mk[k] != i) { mk[k] = i; nb[i][dg[i]++] = k; } } } }
+            free(mkt_);
             for (int j = 0; j < n; j++) if (dpos[j] >= 0) { const int d = dpos[j]; for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int i = R->Ai[p]; nb[d][dg[d]++] = i; nb[i][dg[i]++] = d; } }
             free(dpos);
             /* (BRISK_QPCG=2, a test: the conjugate gradients wherever every column has at most two entries) */
@@ -1633,7 +1756,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                   goto pcg_ready;
               } }
             const double tm0 = now();
-            if (verbose >= 2) qp_printf("  the augmented system's analysis %.3f s; M's pattern %.3f s\n", tm0 - ta, 0.0);
+            if (verbose >= 2) qp_printf("  M's pattern %.3f s%s\n", tm0 - ta, ahit_ ? " (kept from the previous solve of this model)" : "");
             /* (22 October 2026) M analysed under the fill the choice below accepts: twice K's own entries (K then not
              * analysed at all); beyond it K is analysed and M again under twice K's factor. Uncapped, M's analysis ran to
              * the end before the comparison: QPLIB_8785 (QP), AMD's 1.6e10 flops against K's 1.9e9, 5.1 s of an analysis
@@ -1643,10 +1766,25 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
             /* (AMD alone under the cap, as the LP method's cost model: when AMD stops at the cap the own orderings would
              * run on to it, 7.6 s on QPLIB_8785) */
             const int amd_old = (necap && nemode != 2) ? schol_set_amd(3) : -2;
-            SChol *Mc = schol_analyze_adj(mm, dg, nb, (necap && nemode != 2) ? 2 * ktril : (size_t)1 << 32);
+            /* (1 November 2026, the SOCP developer) M's pattern kept for qp_amalg's reanalysis below (sparsechol.c: the analysis
+             * freed it, so the reanalysis returned at once and M's relaxed amalgamation never ran on this route) */
+            int schol_set_keep_pattern(int on);
+            const int okp_ = schol_set_keep_pattern(1);
+            uint64_t schol_adj_key(int m, const int *deg, int *const *nbr);
+            const uint64_t mkey_ = ahit_ ? g_qp_memo->key : (g_qp_memo && nd <= 0 && !dasm) ? schol_adj_key(mm, dg, nb) : 0;
+            const int memo_hit_ = mkey_ && g_qp_memo->M && g_qp_memo->key == mkey_ && g_qp_memo->m == mm;
+            /* (2 November 2026) qp_amalg's merge decided by the analysis itself (schol_set_amalg_cond: the same fraction, ratio and
+             * width), not by a second analysis of M (the 96-mass chain's MPC QP, QP: 0.94 s of a 5.7 s solve); BRISK_QPAMALG1=0: off */
+            void schol_set_amalg_cond(double f, double r, int w); int schol_amalg_cond_applied(void);
+            static int am1 = -1; if (am1 < 0) { const char *e_ = getenv("BRISK_QPAMALG1"); am1 = !(e_ && atoi(e_) == 0) && !getenv("BRISK_QPAMALG") && !getenv("BRISK_QPAMALGW"); }
+            if (am1 && !memo_hit_) schol_set_amalg_cond(0.3, 100.0, 1024);
+            SChol *Mc = memo_hit_ ? g_qp_memo->M : schol_analyze_adj(mm, dg, nb, (necap && nemode != 2) ? 2 * ktril : (size_t)1 << 32);
+            const int mam_ = am1 && !memo_hit_ && Mc && schol_amalg_cond_applied();
+            if (am1) schol_set_amalg_cond(0.0, 0.0, 0);
+            if (memo_hit_ && verbose >= 2) qp_printf("  M's analysis kept from the previous solve of this model\n");
             if (verbose >= 2) qp_printf("  M's analysis %.3f s%s\n", now() - tm0, Mc ? "" : " (beyond twice the augmented system's own entries)");
             {   /* K's own entries (its lower triangle): a lower bound of its factor */
-                if (Mc && (nemode == 2 || schol_nnz(Mc) <= 2 * ktril)) k_lazy = 1;
+                if (Mc && (memo_hit_ || nemode == 2 || schol_nnz(Mc) <= 2 * ktril)) k_lazy = 1;
                 else if (k_build(I)) {
                     if (I->K) { schol_free(I->K); I->K = NULL; }
                     const char *ecg = getenv("BRISK_QPCG"); const int cgon = ecg ? atoi(ecg) : 1;   /* (0: never) */
@@ -1666,13 +1804,27 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                 }
             }
             if (amd_old != -2) schol_set_amd(amd_old);
-            Mc = qp_amalg(Mc, mm);
+            if (stmp_) fprintf(stderr, "[qp stamp: before the amalgamation %.3f s after the entry]\n", now() - tst0_);
+            if (!memo_hit_ && !mam_) Mc = qp_amalg(Mc, mm);
+            if (stmp_) fprintf(stderr, "[qp stamp: after it %.3f s]\n", now() - tst0_);
+            schol_set_keep_pattern(okp_);
             /* (22 October 2026) the choice by the factorizations' flops, the cost of each iteration, not by their entries:
              * QPLIB_8602 without its duplicate rows took M for 66.9 against 34.6 million entries, 1.7e11 against 5.2e10 flops
              * (BRISK_QPNEFLOPS=0: by the entries, as before) */
             static int nefl = -1; if (nefl < 0) { const char *e = getenv("BRISK_QPNEFLOPS"); nefl = !(e && atoi(e) == 0); }
             if (Mc && (nemode == 2 || k_lazy || (nefl ? schol_flops(Mc) <= 2 * schol_flops(I->K) : schol_nnz(Mc) <= 2 * schol_nnz(I->K)))) {
-                if (qp_nd_mode() == 1) {          /* the dissection on the system chosen (above) */
+                /* (1 November 2026, the SOCP developer; the owner's QP benchmark) the dissection only where it can pay for itself: it
+                 * is a second analysis, and it saves at most a part of the factorizations' work; below 1e8 flops a factorization
+                 * (milliseconds for all the iterations) it cost more than it could save (the augmented system's own dissection:
+                 * from 1e9). BRISK_QPNDMIN: the bound */
+                static double ndmin = -1; if (ndmin < 0) { const char *e_ = getenv("BRISK_QPNDMIN"); ndmin = e_ ? atof(e_) : 1e8; }   /* (1 November 2026, 23:50: on again; switched off at 22:00 on a suspicion the evidence did not bear out (ISSUES 814). On the quadrotor, mass-spring and network-flow MPC QPs of 332-2,572 variables (QP) the dissection gave exactly AMD's flops and was never taken, its analysis 10-25 % of the call: 2,572 variables 10.5 -> 9.5 ms, 332: 1.28 -> 1.11 ms. 0: the dissection on every M) */
+                /* (2 November 2026, the SOCP developer) and only where a better separator can save much against the second
+                 * analysis's cost: the analysis costs about its pattern (nnz(L)), the factorizations' work it can cut is at
+                 * most their flops; at fewer than BRISK_QPNDRATIO (1000) flops per entry of L the fronts are narrow (the
+                 * 96-mass chain's MPC QP, QP: 2.64e9 flops over 8.9e6 entries, 300 a entry; the dissection 0.57 s of a 5.7 s
+                 * solve for the same flops) */
+                static double ndr = -1; if (ndr < 0) { const char *e_ = getenv("BRISK_QPNDRATIO"); ndr = e_ ? atof(e_) : 1000.0; }
+                if (qp_nd_mode() == 1 && !memo_hit_ && Mc && schol_flops(Mc) >= ndmin && schol_flops(Mc) >= ndr * (double)schol_nnz(Mc)) {          /* the dissection on the system chosen (above) */
                     const int ao = schol_set_amd(3); schol_set_nd(1); schol_set_nd_budget(qp_nd_budget());
                     const double tn = now();
                     SChol *M2 = schol_analyze_adj(mm, dg, nb, schol_nnz(Mc) + (size_t)mm);
@@ -1682,6 +1834,13 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                     if (M2 && schol_flops(M2) < schol_flops(Mc)) { schol_free(Mc); Mc = M2; } else if (M2) schol_free(M2);
                 }
                 I->M = Mc; schol_set_tinypiv(I->M, 1e-16);
+                /* (1 November 2026, the SOCP developer; the owner's QP benchmark, the quadrotor MPC QPs: 1,914 supernodes for 1,932
+                 * unknowns, most of one column) the left-looking factorization's updates of at most 2,048 multiply-adds by its loop,
+                 * without a library product each (schol_set_small_first). BRISK_QPSMALLSRC=k: that bound; 0: the products, as before */
+                { void schol_set_small_first(SChol *S, int maxwork); static int qs_ = -1; if (qs_ < 0) { const char *e_ = getenv("BRISK_QPSMALLSRC"); qs_ = e_ ? atoi(e_) : 2048; }
+                  if (qs_ > 0 && schol_flops(I->M) <= 1e8) schol_set_small_first(I->M, qs_); }   /* (only a small factorization: there the library call's fixed cost is the work; a large one keeps the library's products and their rounding: QPLIB_8500, QP, 1.27e10 flops, needed 274 refinement steps and a second attempt with the loop) */
+                if (mkey_ && !memo_hit_) { if (g_qp_memo->M && g_qp_memo->M != Mc) schol_free(g_qp_memo->M); qp_memo_table_free(g_qp_memo); g_qp_memo->M = Mc; g_qp_memo->key = mkey_; g_qp_memo->m = mm; }
+                if (getenv("BRISK_TREEDBG")) { extern void schol_tree_stats(const SChol *); schol_tree_stats(I->M); }   /* (a diagnosis: the supernodes and the tree's parallelism) */
                 if (nd) {
                     I->nd = nd; I->isd = isd; isd = NULL; I->dcol = xm(sizeof(int) * (nd + 1));
                     { int a = 0; for (int j = 0; j < n; j++) if (I->isd[j]) I->dcol[a++] = j; }
@@ -1694,6 +1853,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                     }
                     if (verbose) qp_printf("normal equations: %d dense columns (more than 200 entries) kept as unknowns\n", nd);
                 }
+                if (stmp_) fprintf(stderr, "[qp stamp: the offsets %.3f s after the entry]\n", now() - tst0_);
                 I->offMd = xm(sizeof(size_t) * (m + 1)); I->dne = xm(sizeof(double) * (n + 1));
                 for (int i = 0; i < m; i++) I->offMd[i] = schol_offset(I->M, i, i);
                 if (dasm) {
@@ -1716,6 +1876,32 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                     { int *f = xm(sizeof(int) * (m + 1)); memcpy(f, I->grp, sizeof(int) * m);
                       for (int j = 0; j < n; j++) if (!(I->nd && I->isd[j])) for (int p = R->Ap[j]; p < R->Ap[j + 1]; p++) { const int t = f[R->Ai[p]]++; I->grq[t] = p; I->grj[t] = j; }
                       free(f); }
+                    if (stmp_) fprintf(stderr, "[qp stamp: the table's start %.3f s after the entry]\n", now() - tst0_);
+                    const double tg0_ = now();
+                    if (ahit_ && g_qp_memo->M == I->M) {        /* (the table kept: the same pattern, the same analysis) */
+                        I->gmp = g_qp_memo->gmp; I->gmk = g_qp_memo->gmk; I->gmo = g_qp_memo->gmo;
+                        if (verbose >= 2) qp_printf("  the row-wise assembly's table kept from the previous solve of this model\n");
+                    } else if (!ahit_ && !(getenv("BRISK_QPTABOLD") && atoi(getenv("BRISK_QPTABOLD")))) {
+                    /* (1 November 2026, the SOCP developer) the same table from M's pattern: row i's neighbours below it (k > i,
+                     * not a dense unknown) in the order the pattern found them, which is the order of the discovery below (both
+                     * walk row i's sparse columns in increasing order and the rows of each column; a row is placed where it is
+                     * first met, and every row below i is met in the same column by both); then the places in the factor, row by
+                     * row on the threads (each row's own slots: the same table at any thread count). The 96-mass MPC plant (QP):
+                     * 8.8 million entries, 0.59 s on one thread (BRISK_QPTABOLD=1: the discovery, as before) */
+                    int ntt_ = 1;
+#ifdef _OPENMP
+                    if ((double)tn > 4e6 && !omp_in_parallel()) ntt_ = omp_get_max_threads();
+#endif
+                    I->gmp = xm(sizeof(int) * (m + 2)); I->gmp[0] = 0;
+                    #pragma omp parallel for num_threads(ntt_) schedule(static)
+                    for (int i = 0; i < m; i++) { int c = 0; for (int t = 0; t < dg[i]; t++) { const int k = nb[i][t]; c += k > i && k < m; } I->gmp[i + 1] = c; }
+                    for (int i = 0; i < m; i++) I->gmp[i + 1] += I->gmp[i];
+                    const size_t ne = (size_t)I->gmp[m];
+                    I->gmk = xm(sizeof(int) * (ne + 1)); I->gmo = xm(sizeof(size_t) * (ne + 1));
+                    #pragma omp parallel for num_threads(ntt_) schedule(dynamic, 64)
+                    for (int i = 0; i < m; i++) { int w = I->gmp[i]; for (int t = 0; t < dg[i]; t++) { const int k = nb[i][t]; if (k > i && k < m) { I->gmk[w] = k; I->gmo[w] = schol_offset(I->M, k, i); w++; } } }
+                    if (akey_ && g_qp_memo->M == I->M) { qp_memo_table_free(g_qp_memo); g_qp_memo->gmp = I->gmp; g_qp_memo->gmk = I->gmk; g_qp_memo->gmo = I->gmo; g_qp_memo->akey = akey_; }
+                    } else {
                     /* M's entries below the diagonal, row by row: the rows k > i sharing a sparse column with row i */
                     int *mk2 = xm(sizeof(int) * (m + 1)); for (int i = 0; i < m; i++) mk2[i] = -1;
                     size_t cap = (size_t)m + 16, ne = 0; I->gmp = xm(sizeof(int) * (m + 2)); I->gmk = xm(sizeof(int) * cap);
@@ -1727,7 +1913,11 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                     I->gmp[m] = (int)ne; free(mk2);
                     I->gmo = xm(sizeof(size_t) * (ne + 1));
                     for (int i = 0; i < m; i++) for (int t = I->gmp[i]; t < I->gmp[i + 1]; t++) I->gmo[t] = schol_offset(I->M, I->gmk[t], i);
+                    if (akey_ && g_qp_memo->M == I->M) { qp_memo_table_free(g_qp_memo); g_qp_memo->gmp = I->gmp; g_qp_memo->gmk = I->gmk; g_qp_memo->gmo = I->gmo; g_qp_memo->akey = akey_; }
+                    }
                     I->gw = xz(sizeof(double) * (m + 1));
+                    if (verbose >= 2 && !ahit_) qp_printf("  the row-wise assembly's table: %.0f entries, %.3f s\n", (double)I->gmp[m], now() - tg0_);
+                    { double w_ = 0; for (int i = 0; i < m; i++) for (int t = I->grp[i]; t < I->grp[i + 1]; t++) w_ += R->Ap[I->grj[t] + 1] - I->grq[t]; I->gwork = w_; }
                 } else {
                 I->mpst = xm(sizeof(int) * (n + 1)); long np = 0;
                 for (int j = 0; j < n; j++) { I->mpst[j] = (int)np; const long c = (I->nd && I->isd[j]) ? 0 : R->Ap[j + 1] - R->Ap[j]; np += c * (c - 1) / 2; }
@@ -1768,6 +1958,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
         const char *e = getenv("BRISK_QPCORR");
         if (e) I->kcorr = atoi(e) >= 0 ? atoi(e) : ratio > 50 ? 3 : ratio > 30 ? 2 : ratio > 10 ? 1 : 0;
         if (verbose && I->pcg) qp_printf("normal equations: %d rows, solved by conjugate gradients; analysis %.3fs; %d corrector%s\n", m, now() - ta, I->kcorr, I->kcorr == 1 ? "" : "s");
+        if (stmp_) fprintf(stderr, "[qp stamp: the analysis done %.3f s after the entry]\n", now() - tst0_);
         else if (verbose) qp_printf("factorization: %d unknowns, nnz(L) = %zu, %.2e flops (%.0f solves), analysis %.3fs; %d corrector%s\n", I->M ? m : N, Fk ? schol_nnz(Fk) : (size_t)0,
                             ff, ratio, now() - ta, I->kcorr, I->kcorr == 1 ? "" : "s"); }
     I->rho = 1e-8; I->delta = 1e-8; I->rho_ref = 1e-14; I->delta_ref = 1e-14; I->tol = tol; I->e_prev = HUGE_VAL;
@@ -1801,6 +1992,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
                 const double tc = sv * fmax(k, 1.0) * cit;
                 if (verbose >= 2) qp_printf("  the normal equations: the factor's work an iteration %.3g s, the conjugate gradients' %.3g s (%.0f iterations a solve)\n", tf, tc, k);
                 if (tc < tf) {
+                    qp_memo_drop(I);
                     schol_free(I->M); I->M = NULL; if (I->Kspare) { schol_free(I->Kspare); I->Kspare = NULL; }
                     if (verbose) qp_printf("normal equations: by conjugate gradients preconditioned by the spanning tree of the columns' weights over\n"
                                            "  the matrix's diagonal (every column has at most two entries), less work an iteration than the factor\n");
@@ -2021,6 +2213,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
         edu_prev = edu;
         mu = I->N > 0 ? complementarity(I) / I->N : 0;
         if (verbose > 1) qp_printf("%4d %+15.8e %+15.8e %8.1e %8.1e %8.1e %8.1e %6.3f\n", it, pobj / R->cs, dobj / R->cs, epr, edu, egp, mu, alpha);
+        brisk_itab_row(it, pobj / R->cs, dobj / R->cs, epr, edu, egp, mu, alpha);   /* (3 November 2026: the default log's table, main.c) */
         /* the stop on the errors of the problem as given (the reported ones), every iteration (O(nnz)): the scaled
          * problem's own measures stay above the tolerance at optimal points (YAO, LISWET1: 1e-11 and below) and fall below
          * it at points that are not (HS268: the gap 3e-6) */
@@ -2072,7 +2265,7 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
           I->e_prev = e; }
         { const double e = fmax(e1, fmax(e2, e3)); if (e < best) { best = e; memcpy(bx, Res->x, sizeof(double) * n0); memcpy(by, Res->y, sizeof(double) * m0); memcpy(bz, Res->z, sizeof(double) * n0); } }
         if (it == maxit) break;
-        if (opt->timelimit > 0 && now() - t0 > opt->timelimit) { status = QP_TIME; break; }
+        if ((opt->timelimit > 0 && now() - t0 > opt->timelimit) || qp_time_up()) { status = QP_TIME; break; }
         /* the scaling matrices */
         for (int j = 0; j < n; j++) I->Dx[j] = (R->hl[j] ? I->zl[j] / I->tl[j] : 0) + (R->hu[j] ? I->zu[j] / I->tu[j] : 0);
         for (int i = 0; i < m; i++) I->Ds[i] = R->eq[i] ? 1 : (R->gl[i] ? I->vl[i] / I->wl[i] : 0) + (R->gu[i] ? I->vu[i] / I->wu[i] : 0);
@@ -2204,12 +2397,16 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
         }
         (void)sigma;
     }
+    brisk_itab_end();
     Res->iter = it;
     extract(P, R, I, fixval, Res);
     Res->status = status;
     Res->obj = qp_objective(P, Res->x);
     qp_errors(P, Res->x, Res->y, Res->z, &Res->pres, &Res->dres, &Res->gap);
-    if (status == QP_OPTIMAL && fmax(Res->pres, fmax(Res->dres, Res->gap)) > 10 * tol) status = Res->status = QP_REDUCED;
+    /* (1 November 2026, the owner's QP benchmark, audit A13) an end above ten times the tolerance on the problem as given is
+     * not OPTIMAL; it is REDUCED only within max(1e-6, 100 tol), the bound of the other ends below, and a failure above it
+     * (it had been REDUCED at any error) */
+    if (status == QP_OPTIMAL && fmax(Res->pres, fmax(Res->dres, Res->gap)) > 10 * tol) status = Res->status = QP_NUMERICAL;
     if (status != QP_OPTIMAL && best < fmax(Res->pres, fmax(Res->dres, Res->gap))) {
         memcpy(Res->x, bx, sizeof(double) * n0); memcpy(Res->y, by, sizeof(double) * m0); memcpy(Res->z, bz, sizeof(double) * n0);
         Res->obj = qp_objective(P, Res->x);
@@ -2217,17 +2414,20 @@ static int qp_solve_ipm_once(const QpProb *P, const QpOpts *opt, QpRes *Res) {
         if (verbose) qp_printf("  the best point seen returned (largest error %.1e)\n", best);
     }
     if (status != QP_OPTIMAL && fmax(Res->pres, fmax(Res->dres, Res->gap)) <= fmax(1e-6, 100 * tol)) status = Res->status = QP_REDUCED;
+    if (verbose && I->M) qp_printf("  the normal equations formed %d times (%.2f s)\n", I->nfact, I->tform);
     if (verbose) qp_printf("  %d factorizations (%.2f s), %d solves (%d refinement steps; %.2f s), %d centrality corrections\n", I->nfact, I->tfact, I->nsolve, I->nref, I->tsolve, I->ncorr);
     if (verbose && I->pcg) qp_printf("  the normal equations' solves: %ld conjugate-gradient iterations in all\n", I->ncg);
     free(bx); free(by); free(bz);
 done:
     Res->time = now() - t0;
     if (I->K) schol_free(I->K);
-    if (I->M) schol_free(I->M);
+    if (I->M && !(g_qp_memo && g_qp_memo->M == I->M)) schol_free(I->M);
     if (I->Kspare) schol_free(I->Kspare);
     free(I->dcol); free(I->isd); free(I->offAd); free(I->offDd);
     free(I->offMd); free(I->offMp); free(I->mpst); free(I->dne); free(I->st0);
-    free(I->grp); free(I->grq); free(I->grj); free(I->gmp); free(I->gmk); free(I->gmo); free(I->gw); free(I->Md); free(I->Wd); free(I->dmo);
+    free(I->grp); free(I->grq); free(I->grj);
+    if (!(g_qp_memo && g_qp_memo->gmp && g_qp_memo->gmp == I->gmp)) { free(I->gmp); free(I->gmk); free(I->gmo); }
+    free(I->gw); free(I->gwt); free(I->Md); free(I->Wd); free(I->dmo);
     free(I->tord); free(I->tpar); free(I->tcol); free(I->ecol); free(I->uf); free(I->tL); free(I->tD); free(I->tE); free(I->tw); free(I->cgw);
     for (size_t k = 0; k < sizeof(vecs) / sizeof(vecs[0]); k++) free(*vecs[k]);
     for (size_t k = 0; k < sizeof(vecr) / sizeof(vecr[0]); k++) free(*vecr[k]);

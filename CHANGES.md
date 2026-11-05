@@ -1,5 +1,59 @@
 # BRISK change log
 
+## Version 1.6.5 (November 2026)
+
+Semidefinite programs:
+- **Facial reduction and its duals.** When the dual of the constraints removed by the facial reduction cannot be rebuilt,
+  `-frdual 1` computes it by a second solve with the optimal value held; `-frdepth <k>` limits the depth of the
+  reduction. The log says when the recovery failed and offers both, with `-nofr`. A semidefinite constraint with a zero
+  right-hand side is removed whenever it is a sum of rank-one terms, and the rebuilt duals are scaled down when that
+  gives smaller errors.
+- **The symmetry search costs less.** Its time budget is set from the problem that is actually solved after the facial
+  reduction, it stops early on searches that cannot finish within their limit, and it no longer analyses the Schur
+  complement's pattern when it does not need it.
+- **Faster factorizations of the Schur complement:** large sparse factors use relaxed supernodes, the Schur matrix of
+  problems made of a few big blocks is ordered from its blocks, dense columns of the linear part are kept out of the
+  sparse factor, and the regularization follows the steps of the method.
+- **More robust endings:** the dual of a problem whose dual optimum is not attained is lifted by a chosen amount, a dual
+  whose feasibility cannot be decided is no longer reported feasible, an infeasibility verdict is given only with a
+  certificate on the problem as read, a looser `-tol` also loosens the thresholds derived from it, and the end phases
+  check their memory.
+- **Low-rank data** is used through its factors in the constraint operator and in the checks, on the threads.
+- **First-order and low-rank methods:** the Burer-Monteiro attempt stops when its rank is too small, the matrix-free
+  attempt hands over its best iterate, and the first-order attempt with entrywise bounds stops when it cannot reach the
+  tolerance in time. One deadline covers the whole solve.
+
+Second-order cone programs and quadratic programs:
+- **Faster SOCP solver:** the normal equations factored in place and as one dense block when they are dense, large dense
+  blocks and the products with the constraint matrix on all threads, a node with many small sources updated in chunks,
+  the constant part of a cone over all rows factored once, dense problems with few more columns than rows solved in the
+  null space of their constraints, and a step that goes closer to the boundary when the iterate needs no centring.
+- **More robust SOCP solves:** the equilibration no longer depends on how the variables are scaled, the normal equations
+  are kept past a dependent row with an exact correction, rotated cones are handled in the dual form, and the time limit
+  holds during the setup. At `-acc low` the solve stops at the limit of double precision.
+- **Quadratic programs:** small problems with equality rows by a triangular basis, dense routes for a dense quadratic
+  term, large sparse MPC problems with the normal equations formed on the threads, and the automatic choice of method
+  from measured costs.
+
+Linear programs:
+- **Simplex methods:** sifting for the primal simplex method on wide problems, a better starting point for the primal
+  method, the dual simplex method from a given basis, a faster ratio test, and fewer passes per iteration.
+- **Presolve:** dependent equations found the same way whatever the order and the scaling of the rows, long rows handled
+  without scans, tiny entries in badly scaled rows dropped, dual infeasibility detected before any method runs.
+- **Interior-point method:** dense columns factored as border rows of the normal equations, nested dissection when the
+  minimum-degree factor does not fit, scaling of badly scaled data, a proof of dual infeasibility from diverging
+  iterates, and a crossover that works on the reduced problem.
+
+Logs and interfaces:
+- **A clean default log for every solver:** the problem, an iteration table for the LP, SOCP, QP and SDP methods, and a
+  Summary with the solves, the time, the status, the DIMACS errors and advice in the syntax of the interface used.
+  `-v` shows the diagnosis.
+- **Solution files are checked:** a file of the solution (`-x`, `-y`, `-z`) that cannot be written completely, for
+  instance on a full disk, is named in the Summary with the reason, and the command line exits with code 16.
+- Linear programs in SeDuMi form and CVXPY's quadratic programs go to their own methods. Input is checked at every
+  entry point (unknown options, cone sizes, NaN and infinity). SeDuMi's options are accepted by `brisk_sedumi`. The
+  version is printed at the start of the log, and the thread count applies per solve.
+
 ## Version 1.6.1 (October 2026)
 
 Quadratic programs from MATLAB and Julia:

@@ -800,7 +800,7 @@ int qcqp_solve(const QpProb *P, const QpOpts *o, QpRes *Res) {
      * sqrt(eps), so F_k'v_k differs from y_k Q_k x by about sqrt(eps): IMPLEMENTATION 28.4, the polishing) */
     tol_pass = fmax(1e-12, 0.5 * e_c * (qtol / e_q) * (qtol / e_q));
     if (!(tol_pass < 0.99 * e_c)) break;
-    if (o->timelimit > 0 && now() - t0 > 0.5 * o->timelimit) break;
+    if ((o->timelimit > 0 && now() - t0 > 0.5 * o->timelimit) || qp_time_up()) break;
     bx = xm(sizeof(double) * (n + 1)); by = xm(sizeof(double) * (m + 1)); bz = xm(sizeof(double) * (n + 1));
     memcpy(bx, Res->x, sizeof(double) * n); memcpy(by, Res->y, sizeof(double) * m); memcpy(bz, Res->z, sizeof(double) * n);
     B0 = *Res; have_b = 1; t_pass1 = now() - t0;

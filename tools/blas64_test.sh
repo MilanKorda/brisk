@@ -1,4 +1,6 @@
 #!/bin/bash
+# (ISSUES 725, 31 October 2026: the lines read below are those of the diagnosis log, the default log until then)
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}
 # blas64_test.sh: the MATLAB build's BLAS layer (blas64.c) without MATLAB. MATLAB on Linux links MKL with 64-bit
 # integers (ILP64); build_brisk_mex('blas', 'matlab') compiles the solver with -DBLAS_PREFIX=bk_ and links blas64.c,
 # which widens the integers. A routine the solver calls that blas64.c does not wrap breaks that build ("undefined
@@ -64,7 +66,7 @@ for run in "examples/theta1.dat-s -prec dd" "examples/theta1.dat-s -fom 1" "exam
   # the status of the normal build and of the ILP64 build the same (and for -bound pd both sides certified by both)
   oa=$(./brisk $run -threads 2 2>&1 || true); ob=$("$D/brisk64" $run -threads 2 2>&1 || true)
   sa=$(echo "$oa" | grep '^status' | sed 's/ *iterations.*//; s/ (max.*//'); sb=$(echo "$ob" | grep '^status' | sed 's/ *iterations.*//; s/ (max.*//')
-  ca=$(echo "$oa" | grep -c '^CERTIFIED' || true); cb=$(echo "$ob" | grep -c '^CERTIFIED' || true)
+  ca=$(echo "$oa" | grep -c 'Bound: guaranteed' || true); cb=$(echo "$ob" | grep -c 'Bound: guaranteed' || true)
   name="$(basename "${run%% *}")${run#"${run%% *}"}"
   if [ -n "$sb" ] && [ "$sa" = "$sb" ] && [ "$ca" = "$cb" ]; then c=""; [ "$cb" -gt 0 ] && c=", $cb side(s) certified"; echo "  ok    $name: ${sb#status: }$c"
   else echo "  FAIL  $name: normal build '$sa' ($ca certified), ILP64 build '$sb' ($cb certified)"; fail=1; fi

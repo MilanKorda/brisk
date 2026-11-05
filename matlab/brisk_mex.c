@@ -37,6 +37,7 @@
  * -DBRISK_LIBRARY): the same numbers as the file path, without the disk.
  */
 #include "mex.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,6 +76,10 @@ static double scalar_arg(const mxArray *a, const char *name) {
 }
 
 /* the problem as an SDPA sparse file in the temporary directory */
+/* (31 October 2026, audit A3) a NaN or an infinity in the data is refused here, not met inside the solve */
+static void finite_or_fail(const double *v, size_t n, const char *msg) {
+    for (size_t i = 0; i < n; i++) if (!isfinite(v[i])) fail("brisk:input", msg);
+}
 static void set_data(int m, const mxArray *abs_, const mxArray *ab, const mxArray *aT) {
     if (!mxIsDouble(abs_) || mxIsComplex(abs_) || mxIsSparse(abs_)) fail("brisk:input", "brisk_mex: blocksizes must be a real full vector");
     if (!mxIsDouble(ab) || mxIsComplex(ab) || mxIsSparse(ab)) fail("brisk:input", "brisk_mex: b must be a real full vector");
@@ -87,7 +92,9 @@ static void set_data(int m, const mxArray *abs_, const mxArray *ab, const mxArra
     if (nt > 0 && mxGetN(aT) != 5) fail("brisk:input", "brisk_mex: T must have 5 columns [mat blk i j value]");
     const double *T = mxGetPr(aT);
     for (size_t k = 0; k < nb; k++)
-        if (bs[k] == 0 || bs[k] != (double)(long)bs[k]) fail("brisk:input", "brisk_mex: block sizes must be nonzero integers");
+        if (!isfinite(bs[k]) || bs[k] == 0 || fabs(bs[k]) > 2147483647.0 || bs[k] != (double)(long)bs[k]) fail("brisk:input", "brisk_mex: block sizes must be nonzero integers");
+    finite_or_fail(b, (size_t)m, "brisk_mex: b must hold finite numbers (no NaN or Inf)");
+    if (nt > 0) finite_or_fail(T + 4 * nt, nt, "brisk_mex: T(:,5) must hold finite numbers (no NaN or Inf)");
     for (size_t q = 0; q < nt; q++) {
         const double mat = T[q], blk = T[q + nt], i = T[q + 2 * nt], j = T[q + 3 * nt];
         if (mat < 0 || mat > m || mat != (double)(long)mat) fail("brisk:input", "brisk_mex: T(:,1) must be integers in 0..m");
@@ -157,7 +164,12 @@ static int *int_list(const mxArray *a, int *n, const char *name) {
     if (!mxIsDouble(a) || mxIsComplex(a) || mxIsSparse(a)) { char msg[128]; snprintf(msg, sizeof msg, "brisk_mex: %s must be a real full vector", name); fail("brisk:input", msg); }
     const size_t k = mxGetNumberOfElements(a);
     int *v = mxCalloc(k + 1, sizeof(int)); int c = 0;
-    for (size_t i = 0; i < k; i++) if (mxGetPr(a)[i] > 0) v[c++] = (int)mxGetPr(a)[i];
+    for (size_t i = 0; i < k; i++) {
+        /* (31 October 2026, the owner's external benchmark, audit A3: a size 5.9 was read as 5, a negative one dropped) */
+        const double x = mxGetPr(a)[i];
+        if (!(x >= 0) || x != floor(x) || x > 2147483647.0) { char msg[160]; snprintf(msg, sizeof msg, "brisk_mex: %s must hold nonnegative integers (a cone size)", name); fail("brisk:input", msg); }
+        if (x > 0) v[c++] = (int)x;
+    }
     *n = c;
     return v;
 }
@@ -176,7 +188,12 @@ static void mex_sedumi(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[
     for (int j = 0; j <= P.n; j++) P.Ap[j] = (int)jc[j];
     for (size_t p = 0; p < nnz; p++) P.Ai[p] = (int)ir[p];
     P.Ax = mxGetPr(A); P.b = mxGetPr(prhs[2]); P.c = mxGetPr(prhs[3]);
-    P.nf = (int)scalar_arg(prhs[4], "K.f"); P.nl = (int)scalar_arg(prhs[5], "K.l");
+    finite_or_fail(P.Ax, nnz, "brisk_mex: A must hold finite numbers (no NaN or Inf)");
+    finite_or_fail(P.b, (size_t)P.m, "brisk_mex: b must hold finite numbers (no NaN or Inf)");
+    finite_or_fail(P.c, (size_t)P.n, "brisk_mex: c must hold finite numbers (no NaN or Inf)");
+    {   const double kf = scalar_arg(prhs[4], "K.f"), kl = scalar_arg(prhs[5], "K.l");
+        if (!(kf >= 0) || kf != floor(kf) || !(kl >= 0) || kl != floor(kl) || kf > 2147483647.0 || kl > 2147483647.0) fail("brisk:input", "brisk_mex: K.f and K.l must be nonnegative integers");
+        P.nf = (int)kf; P.nl = (int)kl; }
     P.q = int_list(prhs[6], &P.nq, "K.q"); P.r = int_list(prhs[7], &P.nr, "K.r"); P.s = int_list(prhs[8], &P.ns, "K.s");
     long tot = (long)P.nf + P.nl;
     for (int k = 0; k < P.nq; k++) tot += P.q[k];

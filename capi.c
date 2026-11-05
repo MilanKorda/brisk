@@ -261,6 +261,49 @@ BRISK_API long brisk_qp_lower(int n, const int *Hp, const int *Hi, const double 
     return Lp[n];
 }
 
+/* (28 October 2026, the SOCP developer) a QP from the arrays of CSC matrices as an interface holds them, solved without the
+ * general route, with the results written to the caller's arrays (brisk_qp_run_lean: x n, y m, z n, info 9: its 8 and
+ * info[8] = 1 when the solve was interrupted; no output but error messages, the interrupt flag cleared first: one call
+ * from an interface, 28 October 2026, in place of five around it). P: n columns
+ * with sorted, distinct rows in each, the whole symmetric matrix or one triangle; A: m x n in the same form; l, u, lb, ub:
+ * NULL for none. Returns -3 when a matrix is not in that form and -2 for an option outside the QP's (nothing done: the
+ * caller takes brisk_solve_qp), else brisk_solve_qp's code. For small QPs (the interfaces' wrappers, whose own work and the
+ * general route cost more than the solve) */
+int brisk_qp_run_lean(const QpProb *P, int nopt, const char *const *opts, double *x, double *y, double *z, double *info);
+static int csc_canonical(int n, const int *p, const int *i, int nr) {
+    if (p[0] != 0) return 0;
+    for (int j = 0; j < n; j++) { if (p[j + 1] < p[j]) return 0; for (int k = p[j]; k < p[j + 1]; k++) if (i[k] < 0 || i[k] >= nr || (k > p[j] && i[k] <= i[k - 1])) return 0; }
+    return 1;
+}
+BRISK_API int brisk_solve_qp_lean(int n, int m, const int *Pp, const int *Pi, const double *Px, const double *c, double c0,
+                                  const int *Ap, const int *Ai, const double *Ax, const double *rl, const double *ru,
+                                  const double *xl, const double *xu, int nopt, const char *const *opts,
+                                  double *x, double *y, double *z, double *info) {
+    if (n < 0 || m < 0 || !Ap || !c || !x || !info || (m > 0 && !y) || !z) return 2;
+    if ((Pp && !csc_canonical(n, Pp, Pi, n)) || !csc_canonical(n, Ap, Ai, m)) return -3;
+    const long hz = Pp ? Pp[n] : 0;
+    char *mem = malloc(sizeof(int) * ((size_t)n + 1 + (size_t)hz + 1) + sizeof(double) * ((size_t)hz + 1 + 2 * (size_t)m + 2 * (size_t)n + 1));
+    if (!mem) return -1;
+    double *Lx = (double *)mem, *b = Lx + hz + 1; int *Lp = (int *)(b + 2 * (size_t)m + 2 * (size_t)n + 1), *Li = Lp + n + 1;
+    QpProb P; memset(&P, 0, sizeof P);
+    if (Pp) { if (brisk_qp_lower(n, Pp, Pi, Px, Lp, Li, Lx) < 0) { free(mem); return -3; } P.Hp = Lp; P.Hi = Li; P.Hx = Lx; }
+    P.n = n; P.m = m; P.Ap = (int *)Ap; P.Ai = (int *)Ai; P.Ax = (double *)Ax; P.c = (double *)c; P.c0 = c0;
+    P.rl = b; P.ru = b + m; P.xl = b + 2 * m; P.xu = b + 2 * m + n;
+    for (int i = 0; i < m; i++) { const double l = rl ? rl[i] : -QP_INF, u = ru ? ru[i] : QP_INF; P.rl[i] = l <= -QP_INF ? -QP_INF : l; P.ru[i] = u >= QP_INF ? QP_INF : u; }
+    for (int j = 0; j < n; j++) { const double l = xl ? xl[j] : -QP_INF, u = xu ? xu[j] : QP_INF; P.xl[j] = l <= -QP_INF ? -QP_INF : l; P.xu[j] = u >= QP_INF ? QP_INF : u; }
+    g_caller = pthread_self();
+    brisk_stop_flag = 0;
+    const int mode0 = g_out_mode; int (*cb0)(const char *, int) = g_out_cb;
+    g_out_mode = 1;
+    brisk_print_hook = capi_print;
+    const int rc = brisk_qp_run_lean(&P, nopt, opts, x, y, z, info);
+    info[8] = brisk_stop_flag != 0;
+    brisk_print_hook = NULL;
+    g_out_mode = mode0; g_out_cb = cb0;
+    free(mem);
+    return rc;
+}
+
 /* (22 October 2026) the QP solver object for warm starts (mixed-integer QPs by branch and bound): created on the data of
  * brisk_solve_qp, then bounds, row bounds and the cost changed and the problem re-solved from the previous active set.
  * Options: -qpas (the active-set method, the default here: it carries the active set from solve to solve), -qpipm (each
@@ -268,12 +311,12 @@ BRISK_API long brisk_qp_lower(int n, const int *Hp, const int *Hi, const double 
  * definite, else the interior-point method, cold; used by JuMP), -tol, -maxit, -timelimit, -q, -v, -vv. NULL on bad data
  * or an unknown option. */
 void brisk_qp_fill_result(BriskResult *res, int n, int m, QpRes *R, double t);
-typedef struct { QpSolver *S; int n, m; } BriskQp;
+typedef struct { QpSolver *S; int n, m, brief, nsolve; } BriskQp;   /* brief: the default log, one line a solve (2 November 2026) */
 static double qp_bnd(const double v, const int lo) { return lo ? (v <= -QP_INF ? -QP_INF : v) : (v >= QP_INF ? QP_INF : v); }
 BRISK_API void *brisk_qp_create(int n, int m, const int *Hp, const int *Hi, const double *Hx, const double *c, double c0,
                                 const int *Ap, const int *Ai, const double *Ax, const double *rl, const double *ru,
                                 const double *xl, const double *xu, int nopt, const char *const *opts) {
-    if (n < 0 || m < 0 || !Ap || !c) return NULL;
+    if (n < 0 || m < 0) return NULL;
     QpOpts o; qp_default_opts(&o); o.method = QP_METHOD_ACTIVESET; o.verbose = 1;
     for (int i = 0; i < nopt; i++) {
         const char *a = opts[i];
@@ -284,11 +327,13 @@ BRISK_API void *brisk_qp_create(int n, int m, const int *Hp, const int *Hi, cons
         else if (!strcmp(a, "-tol") && i + 1 < nopt) o.tol = atof(opts[++i]);
         else if (!strcmp(a, "-maxit") && i + 1 < nopt) o.maxit = atoi(opts[++i]);
         else if (!strcmp(a, "-timelimit") && i + 1 < nopt) o.timelimit = atof(opts[++i]);
+        else if (!strcmp(a, "-threads") && i + 1 < nopt) o.threads = atoi(opts[++i]);   /* (1 November 2026, the owner's QP benchmark, audit A4: as the one-shot call) */
         else if (!strcmp(a, "-q")) o.verbose = 0;
         else if (!strcmp(a, "-v")) o.verbose = 2;
         else if (!strcmp(a, "-vv")) o.verbose = 3;
         else return NULL;
     }
+    if (n > 0 && (!Ap || !c)) return NULL;
     QpProb P; memset(&P, 0, sizeof P);
     P.n = n; P.m = m; P.Hp = (int *)Hp; P.Hi = (int *)Hi; P.Hx = (double *)Hx; P.Ap = (int *)Ap; P.Ai = (int *)Ai; P.Ax = (double *)Ax;
     P.c = (double *)c; P.c0 = c0;
@@ -297,8 +342,14 @@ BRISK_API void *brisk_qp_create(int n, int m, const int *Hp, const int *Hi, cons
     P.rl = b; P.ru = b + m; P.xl = b + 2 * m; P.xu = b + 2 * m + n;
     for (int i = 0; i < m; i++) { P.rl[i] = rl ? qp_bnd(rl[i], 1) : -QP_INF; P.ru[i] = ru ? qp_bnd(ru[i], 0) : QP_INF; }
     for (int j = 0; j < n; j++) { P.xl[j] = xl ? qp_bnd(xl[j], 1) : -QP_INF; P.xu[j] = xu ? qp_bnd(xu[j], 0) : QP_INF; }
+    /* (1 November 2026, the owner's QP benchmark, audit A1 and A15) the data checked before they are copied: no model of
+     * invalid data (the reason on stderr) */
+    { char msg[200]; if (qp_input_check(&P, msg, sizeof msg)) { fprintf(stderr, "brisk: invalid problem data: %s\n", msg); free(b); return NULL; } }
     BriskQp *h = malloc(sizeof *h);
     if (!h) { free(b); return NULL; }
+    /* 2 November 2026: by default (no -v, no -q) the solver's own lines are the diagnosis; each re-solve prints one line
+     * (brisk_qp_resolve), as a model solved many times (MPC) wants */
+    h->brief = o.verbose == 1; if (h->brief) o.verbose = 0; h->nsolve = 0;
     h->S = qp_create(&P, &o); h->n = n; h->m = m;           /* (the data copied) */
     free(b);
     if (!h->S) { free(h); return NULL; }
@@ -320,11 +371,85 @@ BRISK_API int brisk_qp_resolve(void *hv, BriskResult *res) {
 #endif
     const double t0 = wtime();
     QpRes R; memset(&R, 0, sizeof R);
+    /* (3 November 2026, the owner on JuMP's QP: "That wrote almost nothing") the first solve prints the default log of the
+     * other solvers (the problem, the iteration table, the Summary); each re-solve after it one line, as a model solved many
+     * times (model predictive control) wants */
+    const int full = h->brief && h->nsolve == 0;
+    /* (printf is the C library's here: the model's lines go through BRISK's printer, as the table's rows, so that a host's
+     * output callback, Julia's, gets them in order) */
+int brisk_printf(const char *fmt, ...);
+#define QP_LOG(...) do { g_log_user++; brisk_printf(__VA_ARGS__); g_log_user--; } while (0)
+    if (full) QP_LOG("Problem:  %d row%s, %d variables (convex QP, minimized)\n", h->m, h->m == 1 ? "" : "s", h->n);
+    extern int g_stab;
+    const int itab0 = g_itab, stab0 = g_stab; g_itab = full; g_stab = full;
     qp_resolve(h->S, &R);
+    g_itab = itab0; g_stab = stab0;
+    const char *mname = R.method == QP_METHOD_IPM ? "QP interior-point method" : "QP active-set method (the dual method of Goldfarb and Idnani)";
+    if (full) {
+        QP_LOG("------------------------------------------------------------------------------------------\n");
+        QP_LOG("Summary\n  Problem as read:   %d row%s, %d variables (convex QP)\n", h->m, h->m == 1 ? "" : "s", h->n);
+        QP_LOG("  Solve:             %s, %d iterations\n", mname, R.iter);
+        QP_LOG("  Time:              %.2f s\n", wtime() - t0);
+        QP_LOG("  Status:            %s\n", qp_status_name(R.status));
+        QP_LOG("  Objective:         %.10e\n", R.obj);
+    } else if (h->brief)
+        QP_LOG("QP solve %d: %s, objective %.10e, %d iterations of the %s, %.3f s\n", h->nsolve + 1, qp_status_name(R.status), R.obj, R.iter,
+              R.method == QP_METHOD_IPM ? "interior-point method" : "active-set method", wtime() - t0);
+#undef QP_LOG
+    h->nsolve++;
     brisk_qp_fill_result(res, h->n, h->m, &R, wtime() - t0);
     qp_res_free(&R);
     finish();
     return res->status;
+}
+/* (28 October 2026, the SOCP developer) every bound at once (NULL: that kind unchanged): one call where a re-solve of a
+ * receding-horizon controller changed hundreds of bounds, each one a call through the per-bound setters (Python: 2.5 ms
+ * of a 4 ms step of a condensed MPC QP of the owner's independent benchmark, 120 variables) */
+BRISK_API int brisk_qp_set_bounds(void *hv, const double *xl, const double *xu, const double *rl, const double *ru) {
+    if (!hv) return 1;
+    BriskQp *h = hv; int rc = 0;
+    const QpProb *P = qp_problem(h->S);
+    for (int j = 0; j < h->n && (xl || xu); j++) {
+        const double lo = xl ? qp_bnd(xl[j], 1) : P->xl[j], hi = xu ? qp_bnd(xu[j], 0) : P->xu[j];
+        if (lo != P->xl[j] || hi != P->xu[j]) rc |= qp_set_var_bounds(h->S, j, lo, hi);
+    }
+    for (int i = 0; i < h->m && (rl || ru); i++) {
+        const double lo = rl ? qp_bnd(rl[i], 1) : P->rl[i], hi = ru ? qp_bnd(ru[i], 0) : P->ru[i];
+        if (lo != P->rl[i] || hi != P->ru[i]) rc |= qp_set_row_bounds(h->S, i, lo, hi);
+    }
+    return rc;
+}
+/* (28 October 2026, the SOCP developer) the re-solve with its results written to the caller's arrays, without the result
+ * object, in one call: no output but error messages, the interrupt flag cleared first; x n, y m, z n, info 9: as
+ * brisk_solve_qp_lean's 8 (status code, iterations, objective, the primal and dual residuals, the gap, the time, the method:
+ * 1 active-set, 2 interior-point) and info[8] = 1 when the solve was interrupted; returns 0 solved, 1 not, < 0 failure.
+ * (Python's five calls around brisk_qp_resolve cost 10 us of a 21 us re-solve of a QP of 20 variables) */
+BRISK_API int brisk_qp_resolve_lean(void *hv, double *x, double *y, double *z, double *info) {
+    if (!hv || !x || !z || !info) return -1;
+    BriskQp *h = hv;
+    g_caller = pthread_self();
+    brisk_stop_flag = 0;
+    const int mode0 = g_out_mode; int (*cb0)(const char *, int) = g_out_cb;
+    g_out_mode = 1;
+    brisk_print_hook = capi_print;
+#if !defined(BRISK_NO_IO_MACROS)
+    qp_printf = brisk_printf;
+#endif
+    const double t0 = wtime();
+    QpRes R; memset(&R, 0, sizeof R);
+    qp_resolve(h->S, &R);
+    const int st = R.status;
+    info[0] = st == QP_OPTIMAL ? 0 : st == QP_PRIMAL_INFEASIBLE ? 1 : st == QP_DUAL_INFEASIBLE ? 2 : st == QP_MAXIT ? 3 : st == QP_REDUCED ? 5 : st == QP_TIME ? 6 : st == QP_INPUT ? -1 : 4;
+    info[1] = R.iter; info[2] = R.obj; info[3] = R.pres; info[4] = R.dres; info[5] = R.gap; info[6] = wtime() - t0;
+    info[7] = R.method == QP_METHOD_IPM ? 2 : 1;
+    if (R.x) memcpy(x, R.x, sizeof(double) * (size_t)h->n); else memset(x, 0, sizeof(double) * (size_t)h->n);
+    if (y) { if (R.y) memcpy(y, R.y, sizeof(double) * (size_t)h->m); else memset(y, 0, sizeof(double) * (size_t)h->m); }
+    if (R.z) memcpy(z, R.z, sizeof(double) * (size_t)h->n); else memset(z, 0, sizeof(double) * (size_t)h->n);
+    info[8] = brisk_stop_flag != 0;
+    qp_res_free(&R);
+    finish();
+    g_out_mode = mode0; g_out_cb = cb0;
+    return st == QP_OPTIMAL || st == QP_REDUCED ? 0 : 1;
 }
 BRISK_API void brisk_qp_destroy(void *h) { if (h) { qp_destroy(((BriskQp *)h)->S); free(h); } }
 
@@ -386,7 +511,7 @@ BRISK_API int brisk_socp_resolve(void *hv, BriskResult *res) {
 BRISK_API void brisk_socp_destroy(void *h) { if (h) { socpm_destroy(((BriskSocp *)h)->M); free(h); } }
 /* the model's warm-start point saved and put back (for example the parent's before each child; NULL: none kept yet) */
 BRISK_API void *brisk_socp_save_point(void *h) { return h ? (void *)socpm_save_point(((BriskSocp *)h)->M) : NULL; }
-BRISK_API void brisk_socp_restore_point(void *h, void *p) { if (h && p) socpm_restore_point(((BriskSocp *)h)->M, (SocpmPoint *)p); }
+BRISK_API int brisk_socp_restore_point(void *h, void *p) { return h && p ? socpm_restore_point(((BriskSocp *)h)->M, (SocpmPoint *)p) : 1; }   /* (0 restored, 1 refused: another model's point) */
 BRISK_API void brisk_socp_point_free(void *p) { socpm_point_free((SocpmPoint *)p); }
 
 BRISK_API int brisk_solve_file(const char *fname, int nopt, const char *const *opts, BriskResult *res) {

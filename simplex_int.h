@@ -70,6 +70,9 @@ typedef struct {
     double pivcanc;                 /* a pivot below this times its column's largest entry in B is refused (0: none; the
                                        crossover's start basis, 22 October 2026) */
     long nflops;                    /* work counter (entries touched), for the cost model of refactorization */
+    unsigned long long *ubm, *ubs;  /* (31 October 2026) the bitmaps of the sweep of U's positions (ftran_u_bits), kept zero */
+    double hy_canc; int hy_cp;      /* (31 October 2026) the share of the forward solve with U's reach that ends zero (a running mean,
+                                       measured by the depth-first solves) and the solves until the next such measure */
     double hy_e[2]; int hy_p[2];    /* the depth-first searches' edges per hypersparse solve (a running mean), forward and
                                        backward, and the solves until the next trial (sxlu_ftran, sxlu_btran; 24 October 2026) */
     long nedges;                    /* the edges the solves' depth-first searches examined (not in nflops: a separate count for the
@@ -78,7 +81,8 @@ typedef struct {
 
 /* the scratch space of a solve: one per solve that runs at the same time as another (the factorization's own, F->stack
  * and the others above, serves the solves called without one) */
-typedef struct { int m; int *stack, *wmark, *wlist, *dfs_pos; unsigned char *dmark; long nflops, nedges; } SxWs;
+typedef struct { int m; int *stack, *wmark, *wlist, *dfs_pos; unsigned char *dmark; long nflops, nedges;
+                 unsigned long long *ubm, *ubs;   /* (31 October 2026) the bitmaps of the sweep of U's positions, kept zero (2m positions) */ } SxWs;
 void sxws_init(SxWs *W, int m);
 void sxws_free(SxWs *W);
 
@@ -92,6 +96,9 @@ void sxlu_copy(SxLU *dst, const SxLU *src);   /* a copy with its updates (dst fr
 /* B x = rhs in place (rhs indexed by rows; on return x indexed by positions = rows).
  * spike != NULL: the partial result after L and R is saved there (for the update) */
 void sxlu_ftran(SxLU *F, SxVec *x, double expdens, SxVec *spike);
+/* (3 November 2026) sxlu_ftran(x1, d1, spike1) and sxlu_ftran(x2, d2, NULL) in one pass over the factor when neither is
+ * hypersparse; the same results */
+void sxlu_ftran_pair(SxLU *F, SxVec *x1, double d1, SxVec *spike1, SxVec *x2, double d2);
 /* the same with the scratch space W (W->m == m): solves with different W may run at the same time */
 void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike);
 /* B x = rhs wanted at the positions pat[0..npat-1] only: those entries are exact; the others may be zero or computed;
@@ -100,6 +107,7 @@ void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike);
 int  sxlu_ftran_part(SxLU *F, SxWs *W2, SxVec *x, double expdens, const int *pat, int npat);
 /* B' y = rhs in place; upart != NULL: the partial result after U' is saved there (for the update) */
 void sxlu_btran(SxLU *F, SxVec *y, double expdens, SxVec *upart);
+void sxlu_btran_ws(SxLU *F, SxWs *W, SxVec *y, double expdens);   /* (the primal steepest-edge weights' solve) */
 void sxlu_btran_upart(SxLU *F, SxVec *y, double expdens, SxVec *upart);
 /* replace the column in position r by the entering column whose spike (from sxlu_ftran) and the
  * partial btran of e_r (upart) are given; alpha = (B^{-1} a_q)_r. Returns 0, or 1 if the update is

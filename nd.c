@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <math.h>
 #include <time.h>
 #include "amd/amd.h"
 
@@ -69,7 +70,19 @@ int nd_aborted(void) { return g_nd_abort; }      /* (the last nd_order stopped a
 static _Thread_local const volatile int *g_nd_stopf;
 void nd_set_stop(const volatile int *f) { g_nd_stopf = f; }
 const volatile int *nd_get_stop(void) { return g_nd_stopf; }
-static int nd_over(void) { return nd_past() || (g_nd_wlim > 0 && g_nd_qwork > g_nd_wlim) || (g_nd_stopf && *g_nd_stopf); }
+/* (31 October 2026, the LP developer) and the caller's deadline (CLOCK_MONOTONIC seconds, 0: none), read with the flag: the
+ * dissection of multicommodity scale 4's normal equations (LP) ran 2-4 s past a time limit of 2.6 s. As the flag, it cuts
+ * only an analysis whose result is discarded (the caller is past its limit), so the orders that are used do not change */
+static _Thread_local double g_nd_sdl = 0;
+static _Thread_local int g_nd_sstop = 0;      /* (the flag or the deadline seen: read by the matching's searches) */
+void nd_set_stop_deadline(double t) { g_nd_sdl = t; g_nd_sstop = 0; }
+double nd_get_stop_deadline(void) { return g_nd_sdl; }
+static int nd_stopped(void) {
+    if (g_nd_sstop) return 1;
+    if ((g_nd_stopf && *g_nd_stopf) || (g_nd_sdl > 0 && nd_now() > g_nd_sdl)) g_nd_sstop = 1;
+    return g_nd_sstop;
+}
+static int nd_over(void) { return nd_past() || (g_nd_wlim > 0 && g_nd_qwork > g_nd_wlim) || nd_stopped(); }
 #define ND_WORK(units) (g_nd_qwork += (double)(units))
 static _Thread_local unsigned int nd_seed;     /* (per thread: orderings run on several threads at once) */
 static unsigned int nd_rand(void) { nd_seed = nd_seed * 1664525u + 1013904223u; return nd_seed >> 8; }
@@ -403,7 +416,7 @@ static int bisect(const Gr *g0, char *part0, int mode) {
 /* maximum matching in the bipartite graph of the cut edges (Kuhn's augmenting paths) */
 static _Thread_local const volatile int *g_nd_stopf;
 static int aug(int a, const Gr *g, const char *part, const int *bidx, int *mb, int *seen, int stamp, const int *alist) {
-    if (g_nd_stopf && *g_nd_stopf) return 0;     /* (28 October 2026: stopped by the caller; the loop below then gives up) */
+    if (g_nd_sstop || (g_nd_stopf && *g_nd_stopf)) return 0;     /* (28 October 2026: stopped by the caller; the loop below then gives up) */
     const int v = alist[a];
     /* (24 October 2026, the night: the edges each search goes over counted in the work: uncounted, the matching of a set
      * covering's dense cut, most of its dissection's time, ran past the budget: lp_setcover_8k, LP, 4.3e8 units counted in
@@ -452,7 +465,7 @@ static int hk_match(const Gr *g, const char *part, const int *bidx, const int *a
         for (int a = 0; a < na; a++) it[a] = g->xadj[alist[a]];
         for (int a0 = 0; a0 < na && !stopped; a0++) {
             if (ma[a0] >= 0 || dist[a0] != 0) continue;
-            if (g_nd_stopf && *g_nd_stopf) { stopped = 1; break; }
+            if (nd_stopped()) { stopped = 1; break; }
             int sp = 0, done = 0; stk[sp++] = a0;
             while (sp > 0 && !done) {
                 const int a = stk[sp - 1], v = alist[a];
@@ -511,7 +524,7 @@ static void vertex_cover(const Gr *g, const char *part, char *sep) {
         return;
     }
     for (int a = 0; a < na; a++) {
-        if (((a & 31) == 0 || (g_nd_stopf && *g_nd_stopf)) && nd_over()) {      /* (past the time budget, or stopped: the smaller side) */
+        if (((a & 31) == 0 || g_nd_sstop || (g_nd_stopf && *g_nd_stopf)) && nd_over()) {      /* (past the time budget, or stopped: the smaller side) */
             g_nd_abort = 1;
             if (na <= nb) for (int a2 = 0; a2 < na; a2++) sep[alist[a2]] = 1; else for (int b = 0; b < nb; b++) sep[blist[b]] = 1;
             free(bidx); free(alist); free(blist); free(mb); free(seen); free(ma);
@@ -711,6 +724,74 @@ static void leaf_order(const Gr *g, const int *name, int *perm, int *np) {
     free(P);
 }
 
+/* (31 October 2026) a separator by degree, for block-angular structure: independent blocks joined by linking rows (the
+ * capacity rows of a multicommodity flow, the first-stage rows of a scenario model, shared resources over periods). In the
+ * graph of the normal equations the linking vertices have the highest degrees (each joins several blocks), and removing
+ * them leaves the blocks as connected components; a multilevel edge bisection does not find this cut (its edge count is
+ * large: a multicommodity flow of 25 commodities on a random network of 600 nodes, LP, gave a separator of 4,758 vertices
+ * and sides of 1,783 and 9,747, so AMD's order was kept, 2.05e11 flops a factorization; the 2,396 capacity rows
+ * separate the 25 commodities, and METIS's order, which finds them, costs 3.8e10). The vertices in decreasing order of
+ * degree: the smallest k whose removal leaves no component of more than half the vertices (the largest component only
+ * shrinks as k grows: a search over k up to n / 4), the components then put on two sides by weight, and every removed
+ * vertex that touches only one side returned to it. part: 0, 1, or 2 (the separator); returns the separator's size, or
+ * -1 when none was found */
+static int ds_cmp(const void *a, const void *b) { const long long x = *(const long long *)a, y = *(const long long *)b; return x < y ? -1 : x > y; }
+static int degree_sep(const Gr *g, char *part) {
+    const int n = g->n;
+    if (n < 1000) return -1;
+    int maxd = 0; for (int v = 0; v < n; v++) { const int d = g->xadj[v + 1] - g->xadj[v]; if (d > maxd) maxd = d; }
+    int *cnt = calloc((size_t)maxd + 2, sizeof(int)), *ord = malloc(sizeof(int) * (n + 1)), *rk = malloc(sizeof(int) * (n + 1));
+    int *cc = malloc(sizeof(int) * (n + 1)), *qq = malloc(sizeof(int) * (n + 1));
+    if (!cnt || !ord || !rk || !cc || !qq) { free(cnt); free(ord); free(rk); free(cc); free(qq); return -1; }
+    for (int v = 0; v < n; v++) cnt[maxd - (g->xadj[v + 1] - g->xadj[v])]++;      /* (decreasing degree, ties by index) */
+    for (int d = 0, o = 0; d <= maxd; d++) { const int c = cnt[d]; cnt[d] = o; o += c; }
+    for (int v = 0; v < n; v++) { const int k = cnt[maxd - (g->xadj[v + 1] - g->xadj[v])]++; ord[k] = v; rk[v] = k; }
+    free(cnt);
+    /* the largest component after the removal of the first k vertices of ord (cc: the component of each vertex, -1 removed) */
+    #define DS_COMPS(K, BIG, NC) do { \
+        BIG = 0; NC = 0; \
+        for (int v_ = 0; v_ < n; v_++) cc[v_] = rk[v_] < (K) ? -1 : -2; \
+        for (int s_ = 0; s_ < n; s_++) if (cc[s_] == -2) { \
+            int h_ = 0, t_ = 0; qq[t_++] = s_; cc[s_] = NC; \
+            while (h_ < t_) { const int v_ = qq[h_++]; for (int p_ = g->xadj[v_]; p_ < g->xadj[v_ + 1]; p_++) { const int u_ = g->adj[p_]; if (cc[u_] == -2) { cc[u_] = NC; qq[t_++] = u_; } } } \
+            if (t_ > BIG) { BIG = t_; } NC++; } \
+        g_nd_work += (double)g->xadj[n] + n; ND_WORK(g->xadj[n] + n); } while (0)
+    int lo = 0, hi = -1, big = 0, nc = 0;
+    for (int k = n / 128 > 1 ? n / 128 : 1; k <= n / 4; k *= 2) {
+        DS_COMPS(k, big, nc);
+        if (2 * big <= n - k) { hi = k; break; }
+        lo = k;
+        if (nd_over()) break;
+    }
+    if (hi < 0) { free(ord); free(rk); free(cc); free(qq); return -1; }
+    while (hi - lo > 1 && hi - lo > n / 1024) {
+        const int mid = lo + (hi - lo) / 2;
+        DS_COMPS(mid, big, nc);
+        if (2 * big <= n - mid) hi = mid; else lo = mid;
+    }
+    DS_COMPS(hi, big, nc);
+    #undef DS_COMPS
+    /* the components on two sides, the heaviest first to the lighter side */
+    int *csz = calloc((size_t)nc + 1, sizeof(int)); long long *cord = malloc(sizeof(long long) * (nc + 1)); char *cside = malloc((size_t)nc + 1);
+    for (int v = 0; v < n; v++) if (cc[v] >= 0) csz[cc[v]]++;
+    for (int c = 0; c < nc; c++) cord[c] = ((long long)(n - csz[c]) << 32) | (long long)c;     /* (decreasing size, ties by index) */
+    qsort(cord, (size_t)nc, sizeof(long long), ds_cmp);
+    long w0 = 0, w1 = 0;
+    for (int i = 0; i < nc; i++) { const int c = (int)(cord[i] & 0xffffffffLL); if (w0 <= w1) { cside[c] = 0; w0 += csz[c]; } else { cside[c] = 1; w1 += csz[c]; } }
+    for (int v = 0; v < n; v++) part[v] = cc[v] < 0 ? 2 : cside[cc[v]];
+    free(csz); free(cord); free(cside);
+    /* a removed vertex with neighbours on one side only joins it (the lowest degrees first) */
+    int nsep = 0;
+    for (int k = hi - 1; k >= 0; k--) {
+        const int v = ord[k]; int has[2] = { 0, 0 };
+        for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (part[u] < 2) has[(int)part[u]] = 1; }
+        if (!(has[0] && has[1])) { part[v] = has[1] ? 1 : 0; if (part[v]) w1++; else w0++; } else nsep++;
+    }
+    g_nd_work += (double)g->xadj[n]; ND_WORK(g->xadj[n]);
+    free(ord); free(rk); free(cc); free(qq);
+    if (w0 == 0 || w1 == 0) return -1;
+    return nsep;
+}
 /* 18 October 2026 (LP/SOCP): 0 = no hub rule (a second trial of the LP method's analysis, sparsechol.c) */
 static _Thread_local int g_nd_hubs = 1;
 void nd_set_hubs(int on) { g_nd_hubs = on; }
@@ -735,9 +816,39 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
         const double avg = (double)g->xadj[n] / n;
         int nh = 0;
         if (hubf > 0) for (int v = 0; v < n; v++) if (g->xadj[v + 1] - g->xadj[v] > hubf * avg && g->xadj[v + 1] - g->xadj[v] > 16) nh++;
+        /* (3 November 2026) the hubs put last form a dense block of the factor: h of them (and those put last above) cost
+         * (top + h)^3 / 3 flops whatever the rest. Given the flops to beat (AMD's, g_nd_target), only the hubs of highest
+         * degree whose block costs at most a hundredth of them are put last; the others stay in the graph for the separators.
+         * sing17 (LP, Gurobi's presolved problem, 58,526 rows of mean degree 39): 2,164 vertices above five times the mean,
+         * a block of 3.4e9 flops alone, the first try judged hopeless against AMD's 1.1e10 and the order lost (METIS: 2.78e9
+         * in all). BRISK_NDHUBCAP: the fraction (0: every vertex above the degree, as before) */
+        static double hubcap = -1;
+        if (hubcap < 0) { const char *e_ = getenv("BRISK_NDHUBCAP"); hubcap = e_ ? atof(e_) : 0.01; }
+        int degcut = -1;     /* (with the cap: a hub is a vertex of degree > degcut, or = degcut up to the count) */
+        int ncut = 0;
+        if (nh > 0 && hubcap > 0 && g_nd_target > 0) {
+            const double hmax = cbrt(3.0 * hubcap * g_nd_target) - g_nd_top;
+            if (hmax < nh) {
+                const int keep = hmax > 0 ? (int)hmax : 0;
+                int *dg = malloc(sizeof(int) * (nh + 1)), t = 0;
+                for (int v = 0; v < n; v++) if (g->xadj[v + 1] - g->xadj[v] > hubf * avg && g->xadj[v + 1] - g->xadj[v] > 16) dg[t++] = g->xadj[v + 1] - g->xadj[v];
+                /* the keep-th largest degree */
+                for (int a = 0; a < keep; a++) { int b = a; for (int c = a + 1; c < t; c++) if (dg[c] > dg[b]) b = c; const int x = dg[a]; dg[a] = dg[b]; dg[b] = x; }
+                degcut = keep > 0 ? dg[keep - 1] : INT_MAX; ncut = 0;
+                for (int a = 0; a < keep; a++) if (dg[a] == degcut) ncut++;    /* (how many of the cut degree are taken) */
+                free(dg);
+                nh = keep;
+            }
+        }
         if (nh > 0 && nh <= n / 8) {
             int *loc = malloc(sizeof(int) * (n + 1)), *hubs = malloc(sizeof(int) * (nh + 1)), k = 0, h = 0, nz = 0;
-            for (int v = 0; v < n; v++) { if (g->xadj[v + 1] - g->xadj[v] > hubf * avg && g->xadj[v + 1] - g->xadj[v] > 16) { loc[v] = -1; hubs[h++] = name[v]; } else { loc[v] = k++; nz += g->xadj[v + 1] - g->xadj[v]; } }
+            for (int v = 0; v < n; v++) {
+                const int dv = g->xadj[v + 1] - g->xadj[v];
+                int hub = dv > hubf * avg && dv > 16;
+                if (hub && degcut >= 0) { if (dv < degcut) hub = 0; else if (dv == degcut) { if (ncut > 0) ncut--; else hub = 0; } }
+                if (hub && h < nh) { loc[v] = -1; hubs[h++] = name[v]; } else { loc[v] = k++; nz += dv; }
+            }
+            nh = h;
             Gr r; r.n = k; r.tvw = k;
             r.xadj = malloc(sizeof(int) * (k + 1)); r.adj = malloc(sizeof(int) * (nz + 1)); r.ew = malloc(sizeof(int) * (nz + 1)); r.vw = malloc(sizeof(int) * (k + 1));
             int *rname = malloc(sizeof(int) * (k + 1)), w = 0; k = 0;
@@ -799,6 +910,19 @@ nohubs:;
      * against 1.11e10 in 5.6 s with four, one gave 1.35e10) */
     const int ntry = g_nd_try_set > 0 ? g_nd_try_set : getenv("BRISK_NDTRY") ? atoi(getenv("BRISK_NDTRY")) : g_nd_hubs ? 4 : 2;
     long bestscore = -1;
+    /* (31 October 2026) the separator by degree first (block-angular structure, degree_sep), scored as the bisections are */
+    static int dsep = -1; if (dsep < 0) { const char *e = getenv("BRISK_NDDEGSEP"); dsep = !(e && atoi(e) == 0); }
+    if (dsep) {
+        const int ns = degree_sep(g, part);
+        if (ns >= 0) {
+            long c[3] = { 0, 0, 0 };
+            for (int v = 0; v < n; v++) c[(int)part[v]]++;
+            const long big = c[0] > c[1] ? c[0] : c[1];
+            bestscore = c[2] * 100 + (c[2] + 1) * (100 * big / (n > 0 ? n : 1) - 50);
+            for (int v = 0; v < n; v++) { bsep[v] = part[v] == 2; bpart[v] = part[v] == 2 ? 0 : part[v]; }
+            if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: n %d, separator by degree %ld, sides %ld + %ld]\n", depth, n, c[2], c[0], c[1]);
+        }
+    }
     for (int t = 0; t < ntry; t++) {
         if (t > 0 && nd_over()) { g_nd_abort = 1; break; }   /* (past the time budget: no more tries) */
         const double wt0 = g_nd_work;

@@ -676,7 +676,9 @@ static int rr_project(FB *f, const double *W, int small_pos, double *T) {
                 for (int i = 0; i < ml; i++) { d[i] = alpha[i]; e[i] = beta[i]; }
                 (void)z1;
                 BL(dsterf_)(&mm, d, e, &info2);
+                if (brisk_fault("fomrr")) info2 = 1;
                 if (info2 == 0) lmax = d[ml - 1];
+                else return 0;   /* (31 October 2026, audit A12: a failed check rejects, it does not pass) */
             }
             if (lmax > thr) { if (ENV_ON("BRISK_RRDBG")) printf("   [rr n %d: missed direction %.2e > %.2e]\n", n, lmax, thr); return 0; }   /* a positive direction outside the basis */
         }
@@ -1903,6 +1905,7 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
     int nsig = 0, nrestart = 0;
     if (verbose) printf("first-order: %s, sigma %.3g, tol %.1e, %d blocks (max n %d), m = %d\n", halpern ? "Halpern Peaceman-Rachford" : "ADMM (step 1.618)", sigma, tol, nb, maxn, m);
     if (verbose > 1) printf("   it        pobj          dobj        pinf     dinf     gap      sigma   time\n");
+    if (verbose > 0 && g_log_brief) { brisk_log_method("first-order method (ADMM, then an augmented Lagrangian method with semismooth Newton steps)"); brisk_log_head(0); }
     double tau = halpern ? 1.0 : 1.618;
     { const char *e = getenv("BRISK_FOMTAU"); if (e && !halpern) tau = atof(e); }
     /* Anderson acceleration (type II, memory aa_mem) on the fixed-point map (X, Z) -> T(X, Z)
@@ -2176,6 +2179,8 @@ resume_splitting:
             }
         }
         if (ftrace) { fprintf(ftrace, "%d %.3f %.3e %.3e %.3e %.3e %.10e %.10e\n", it, wtime() - t0, pinf, dinf, gap, sigma, po + P->obj_off, dob + P->obj_off); if (it % 50 == 0) fflush(ftrace); }
+        if (verbose > 0 && g_log_brief && (it % 50 == 0 || it == 1 || res <= tol))
+            brisk_log_row(it, po + P->obj_off, dob + P->obj_off, pinf, dinf, gap, -1, 0, wtime() - t0);
         if (verbose > 1 && (it % (verbose > 2 ? 1 : 50) == 0 || it == 1 || res <= tol))
             { printf("%5d %14.7e %14.7e %8.1e %8.1e %8.1e %8.2g %7.1fs\n", it, po + P->obj_off, dob + P->obj_off, pinf, dinf, gap, sigma, wtime() - t0); fflush(stdout); }
         if (res <= tol) { status = ST_OPTIMAL; break; }
@@ -2638,9 +2643,15 @@ static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *you
     int it, status = ST_MAXIT;
     double pinf = 1, dinf = 1, gap = 1, pcone = 0, po = 0, dob = 0, err = 1, acc_p = 0, acc_d = 0;
     int nsig = 0;
+    /* (31 October 2026) the progress test of the automatic attempt: the best error after each block of 10 iterations, so
+     * that the error after it and after it/2 can be compared (see below) */
+    const int prog = par->fom_bound_maxit > 0 && !getenv("BRISK_FOMNOPROG");
+    double *bestk = prog ? malloc(sizeof(double) * ((size_t)maxit / 10 + 2)) : NULL, bestsofar = HUGE_VAL;
+    int stopped_prog = 0;
     double t_eig = 0, t_solve = 0;
     if (verbose) printf("first-order: entrywise bounds, symmetric Gauss-Seidel ADMM (step %.3f), sigma %.3g, tol %.1e, %d blocks (max n %d), m = %d\n", tau, sigma, tol, nb2, maxn, m2);
     if (verbose > 1) printf("   it        pobj          dobj        pinf     pcone    dinf     gap      sigma   time\n");
+    if (verbose > 0 && g_log_brief) { brisk_log_method("first-order method with bounds on the entries of X (ADMM)"); brisk_log_head(0); }
     /* T = A*y - C (y = 0 at the start) */
     for (int k = 0; k < nb2; k++) { const Block *B = &Q.blk[k]; FB *f = &F[k]; fb_ATy(B, y, f->T); fb_addC(B, -1.0, f->T); }
     for (it = 1; it <= maxit; it++) {
@@ -2714,9 +2725,30 @@ static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *you
             gap = fabs(po - dob) / (1 + fabs(po + P->obj_off) + fabs(dob + P->obj_off));
             err = fmax(fmax(pinf, pcone), fmax(dinf, gap));
             if (!(pinf == pinf && pcone == pcone && dinf == dinf && gap == gap)) err = HUGE_VAL;   /* (fmax ignores a NaN) */
+            if (verbose > 0 && g_log_brief && (it % 200 == 0 || err <= tol || last)) brisk_log_row(it, po, dob, fmax(pinf, pcone), dinf, gap, -1, 0, wtime() - t0);
             if (verbose > 1 && (it % 200 == 0 || err <= tol || last)) printf("%6d %+.8e %+.8e %.2e %.2e %.2e %.2e %.2e %7.1f\n", it, po, dob, pinf, pcone, dinf, gap, sigma, wtime() - t0);
             if (err <= tol) { status = ST_OPTIMAL; break; }
             if (last) { status = it == maxit ? ST_MAXIT : ST_TIME; break; }
+            /* 31 October 2026 (the owner's external SDP benchmark, doubly nonnegative clustering: the attempt ran its whole cap,
+             * 2.2-4.4 s, and ended at 1.3e-7 and 4.2e-7, before an interior-point solve of 6-7 s that would have needed no
+             * attempt). The error of this method falls like a power of the iteration count: with b(t) the best error up to
+             * iteration t, the exponent over the last doubling is p = log2(b(it/2) / b(it)), and the iterations to the
+             * tolerance at that exponent are it (b(it) / tol)^(1/p). From 1000 iterations on, when that exceeds twice the
+             * cap, the attempt stops: the interior-point method follows sooner. (The case it wins, a clustering SDP of order
+             * 202: projected 12k-22k iterations against a cap of 40k at every check, done at 18k.) */
+            if (prog) {
+                bestsofar = fmin(bestsofar, err);
+                bestk[it / 10] = bestsofar;
+                if (it >= 1000 && 4 * it >= maxit && it % 200 == 0) {   /* (judged after a quarter of its budget: the early phase can plateau, 1.5e-6 at 1,800 iterations of the order-202 case) */
+                    const double bh = bestk[(it / 2) / 10], bn = bestsofar;
+                    const double pe = bh > bn && bn > 0 ? log2(bh / bn) : 0.0;
+                    const double proj = pe > 0.05 ? (double)it * pow(bn / tol, 1.0 / pe) : HUGE_VAL;
+                    if (proj > 10.0 * (double)maxit) {
+                        if (verbose > 1) printf("   first-order attempt stopped at iteration %d: error %.1e, falling as it^-%.2f, would need about %.0f iterations (cap %d)\n", it, bn, pe, proj, maxit);
+                        status = ST_MAXIT; stopped_prog = 1; break;
+                    }
+                }
+            }
             acc_p += fmax(pinf, pcone); acc_d += dinf;
             if (it % 50 == 0) {   /* residual balancing: a smaller sigma lowers pinf and raises dinf */
                 if (acc_p > 3 * acc_d) { sigma /= 1.6; nsig++; }
@@ -2757,7 +2789,7 @@ static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *you
     R->methods = 4;
     R->t_total = wtime() - t0; R->t_chol = t_solve; R->t_dense = t_eig; R->t_setup = t_gram;
     if (verbose) printf("first-order: entrywise bounds: %d iterations, %d sigma changes, errors %.1e %.1e %.1e %.1e (primal, primal cone and bounds, dual, gap); eig %.1fs, Gram solves %.1fs, total %.1fs\n", it, nsig, pinf, pcone, dinf, gap, t_eig, t_solve, R->t_total);
-    free(yP); free(pdu); free(y); free(rhs); free(rp);
+    free(yP); free(pdu); free(y); free(rhs); free(rp); free(bestk); (void)stopped_prog;
     for (int k = 0; k < nb2; k++) { free(lo[k]); free(hi[k]); free(hb[k]); free(ZB[k]); }
     free(lo); free(hi); free(hb); free(ZB);
     fb_free_all(F, nb2); fom_gram_free(G); problem_free(&Q);

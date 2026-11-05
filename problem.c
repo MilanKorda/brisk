@@ -5,6 +5,9 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 typedef struct { int con, blk, i, j; double v; } Trip;
 
@@ -206,19 +209,31 @@ static void sort_trips(Trip *T, size_t nt) {
     free(cnt); free(U);
 }
 
+int g_dup_inexact = 0;   /* (audit A20) entries given in parts whose exact sum is not a double: no rigorous certificate */
 static void build_blocks(Problem *P, Trip *T, size_t nt, long lower_entries) {
     const int nblk = P->nblk;
     static int bbdbg = -1; if (bbdbg < 0) bbdbg = getenv("BRISK_FEDBG") != NULL;
     const double tbb0 = bbdbg ? wtime() : 0;
     sort_trips(T, nt);
     if (bbdbg && nt > 1000000) printf("   [build_blocks: %zu triplets sorted %.2fs]\n", nt, wtime() - tbb0);
-    /* merge duplicates (summed, as SDPA does), then drop entries that cancelled */
+    /* merge duplicates (summed, as SDPA does), then drop entries that cancelled. 31 October 2026 (the owner's external SDP
+     * benchmark, audit A20): the sum is exact (an expansion of doubles, two_sum), rounded once; when the exact sum of an
+     * entry's parts is not itself a double, the data as given cannot be represented in doubles, and the rigorous bound
+     * certification refuses (g_dup_inexact). Summed in double one after the other, 1e16, 1, -1e16 gave 0, and a bound
+     * of the rounded problem was certified for the problem as given. */
     size_t w = 0, ndup = 0;
+    double ex[64]; int ne = 0;      /* the current entry's exact sum (nonoverlapping, increasing magnitude) */
+    #define EX_ADD(b_) do { double q_ = (b_); int w_ = 0; for (int i_ = 0; i_ < ne; i_++) { const double x_ = q_ + ex[i_], bv_ = x_ - q_, av_ = x_ - bv_, h_ = (q_ - av_) + (ex[i_] - bv_); q_ = x_; if (h_ != 0) ex[w_++] = h_; } ne = w_; if (q_ != 0 && ne < 64) ex[ne++] = q_; } while (0)
+    #define EX_FLUSH() do { if (ne > 1) g_dup_inexact++; double s_ = 0; for (int i_ = 0; i_ < ne; i_++) s_ += ex[i_]; T[w-1].v = s_; } while (0)
+    int inrun = 0;                  /* (the current entry has parts summed in ex; its sum may be 0, ne = 0) */
     for (size_t r = 0; r < nt; r++) {
         if (w > 0 && T[w-1].blk == T[r].blk && T[w-1].con == T[r].con &&
-            T[w-1].i == T[r].i && T[w-1].j == T[r].j) { T[w-1].v += T[r].v; ndup++; }
-        else T[w++] = T[r];
+            T[w-1].i == T[r].i && T[w-1].j == T[r].j) { if (!inrun) { ne = 0; EX_ADD(T[w-1].v); inrun = 1; } EX_ADD(T[r].v); ndup++; }
+        else { if (inrun) { EX_FLUSH(); ne = 0; inrun = 0; } T[w++] = T[r]; }
     }
+    if (inrun) { EX_FLUSH(); ne = 0; inrun = 0; }
+    #undef EX_ADD
+    #undef EX_FLUSH
     nt = w;
     w = 0;
     for (size_t r = 0; r < nt; r++) if (T[r].v != 0.0) T[w++] = T[r];
@@ -764,6 +779,166 @@ fail:
     return -1;
 }
 
+/* 1 November 2026 (the owner): the checks of lowrank_factor from products with a block of vectors shared by all
+ * constraints of a block (Om: n x KM, Zv: n x 2, both row-major, drawn once per block from the block's random state),
+ * each product one pass over the constraint's entries for all columns, and no random state inside: the constraints run
+ * on the threads with the same result at any thread count (make reprotest). PhaseLift (SDP, n = 250, 1,000 dense
+ * rank-one constraints): presolve 10.6 -> 7.9 s. BRISK_LRMM=0: one constraint after another from one random stream, as
+ * in 1.6.1. */
+static int lrmm_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("BRISK_LRMM"); on = e ? atoi(e) : 1; } return on; }
+static void sp_mulblk(const SpSym *S, const double *X, int ldx, int k, double *Y, int n) {   /* Y (n x k, row-major) = S X */
+    memset(Y, 0, sizeof(double) * (size_t)n * k);
+    for (int q = 0; q < S->ef; q++) {
+        const double v = S->fv[q];
+        const double *x = X + (size_t)S->fc[q] * ldx;
+        double *y = Y + (size_t)S->fr[q] * k;
+        for (int j = 0; j < k; j++) y[j] += v * x[j];
+    }
+}
+static int lowrank_factor_mm(const SpSym *S, int n, int kmax, const double *Om, int KM, const double *Zv,
+                             double **Wout, double **sigout, int rhint) {
+    const int one = 1, want = Wout != NULL;
+    double anrm = 0;
+    for (int q = 0; q < S->ef; q++) anrm += S->fv[q] * S->fv[q];
+    anrm = sqrt(anrm);
+    if (anrm == 0) { if (want) { *Wout = NULL; *sigout = NULL; } return 0; }
+    int r = S->nr;
+    double *T = NULL, *ev = NULL, *Q = NULL, *W = NULL, *sig = NULL;
+    int k = 0, rank = -1;
+    {   /* 1 November 2026: an exact test for rank one before any eigendecomposition. A symmetric matrix of rank one is
+         * s w w' with w its column p over sqrt|A_pp| (p its largest diagonal entry): it then has exactly |supp w|^2 entries
+         * and each equals s w_i w_j to rounding. O(entries) against the eigendecomposition's k^3 (the many-blocks problem
+         * of the external benchmark, SDP: 165 rank-one constraints in each of 16 blocks; PhaseLift: 1,000 of order 250) */
+        int p = -1; double dpp = 0;
+        for (int q = 0; q < S->ef; q++) if (S->fr[q] == S->fc[q] && fabs(S->fv[q]) > fabs(dpp)) { dpp = S->fv[q]; p = S->fr[q]; }
+        if (p >= 0) {
+            double *w = xcalloc(n, sizeof(double));
+            const double sg1 = dpp > 0 ? 1.0 : -1.0, rt = sqrt(fabs(dpp));
+            long nsup = 0;
+            for (int q = 0; q < S->ef; q++) if (S->fc[q] == p) { w[S->fr[q]] = S->fv[q] / (sg1 * rt); nsup++; }
+            int ok1 = (long)S->ef == nsup * nsup;
+            for (int q = 0; q < S->ef && ok1; q++)
+                if (!(fabs(sg1 * w[S->fr[q]] * w[S->fc[q]] - S->fv[q]) <= 1e-13 * anrm)) ok1 = 0;
+            if (ok1) {
+                if (want) { *Wout = w; sig = xmalloc(sizeof(double)); sig[0] = sg1; *sigout = sig; } else free(w);
+                return 1;
+            }
+            free(w);
+        }
+    }
+    if (r <= kmax) {
+        k = r;
+        T = xcalloc((size_t)k * k, sizeof(double));
+        int *pos = xmalloc(sizeof(int) * n);
+        for (int i = 0; i < n; i++) pos[i] = -1;
+        for (int i = 0; i < r; i++) pos[S->rows[i]] = i;
+        for (int q = 0; q < S->ef; q++) T[pos[S->fr[q]] + (size_t)pos[S->fc[q]] * k] = S->fv[q];
+        Q = xcalloc((size_t)n * k, sizeof(double));
+        for (int i = 0; i < r; i++) Q[S->rows[i] + (size_t)i * n] = 1.0;
+        free(pos);
+    } else {
+        for (k = 8; k <= kmax && k < n; k *= 2) {
+            double *Y = xmalloc(sizeof(double) * (size_t)n * k);
+            sp_mulblk(S, Om, KM, k, Y, n);                       /* Y = A Omega, one pass */
+            Q = xmalloc(sizeof(double) * (size_t)n * k);
+            for (int i = 0; i < n; i++) for (int j = 0; j < k; j++) Q[i + (size_t)j * n] = Y[(size_t)i * k + j];
+            free(Y);
+            int kk = 0;
+            for (int j = 0; j < k; j++) {
+                double *qj = Q + (size_t)j * n;
+                double n0 = BL(dnrm2_)(&n, qj, &one);
+                for (int pass = 0; pass < 2; pass++)
+                    for (int i = 0; i < kk; i++) {
+                        double c = -BL(ddot_)(&n, Q + (size_t)i * n, &one, qj, &one);
+                        BL(daxpy_)(&n, &c, Q + (size_t)i * n, &one, qj, &one);
+                    }
+                double nj = BL(dnrm2_)(&n, qj, &one);
+                if (nj <= 1e-10 * (n0 + 1e-300)) continue;
+                double inv = 1.0 / nj;
+                double *dst = Q + (size_t)kk * n;
+                for (int i = 0; i < n; i++) dst[i] = qj[i] * inv;
+                kk++;
+            }
+            if (kk < k) break;
+            free(Q); Q = NULL;
+            if (k * 2 > kmax) break;
+        }
+        if (!Q) return -1;
+        int kk = 0;
+        for (int j = 0; j < k; j++) {
+            double nj = BL(dnrm2_)(&n, Q + (size_t)j * n, &one);
+            if (fabs(nj - 1.0) < 1e-8) kk++; else break;
+        }
+        k = kk;
+        if (k == 0) { free(Q); return -1; }
+        double *Qr = xmalloc(sizeof(double) * (size_t)n * k), *AQr = xmalloc(sizeof(double) * (size_t)n * k);
+        for (int i = 0; i < n; i++) for (int j = 0; j < k; j++) Qr[(size_t)i * k + j] = Q[i + (size_t)j * n];
+        sp_mulblk(S, Qr, k, k, AQr, n);                          /* A Q, one pass */
+        T = xcalloc((size_t)k * k, sizeof(double));
+        for (int i = 0; i < n; i++) {                            /* T = Q' (A Q) */
+            const double *qa = Qr + (size_t)i * k, *aq = AQr + (size_t)i * k;
+            for (int b = 0; b < k; b++) { const double v = aq[b]; for (int a = 0; a < k; a++) T[a + (size_t)b * k] += qa[a] * v; }
+        }
+        free(Qr); free(AQr);
+        for (int j = 0; j < k; j++)
+            for (int i = 0; i < j; i++) { double v = 0.5 * (T[i + (size_t)j * k] + T[j + (size_t)i * k]); T[i + (size_t)j * k] = T[j + (size_t)i * k] = v; }
+    }
+    int ne = k, info = 0;
+    if (want && rhint >= 0 && k >= 2 * rhint + 8) {
+        ev = lowrank_range_eig(T, k, rhint, &ne);
+        if (ev) { rank = 0; goto vectors; }
+        ne = k;
+    }
+    ev = xmalloc(sizeof(double) * k);
+    {
+        int lwork = -1;
+        double wq;
+        BL(dsyev_)(want ? "V" : "N", "U", &k, T, &k, ev, &wq, &lwork, &info);
+        lwork = (int)wq + 1;
+        double *work = xmalloc(sizeof(double) * lwork);
+        BL(dsyev_)(want ? "V" : "N", "U", &k, T, &k, ev, work, &lwork, &info);
+        free(work);
+    }
+    if (info != 0) goto fail;
+vectors:;
+    double emax = 0;
+    for (int j = 0; j < ne; j++) emax = fmax(emax, fabs(ev[j]));
+    rank = 0;
+    for (int j = 0; j < ne; j++) if (fabs(ev[j]) > 1e-14 * emax) rank++;
+    if (!want) { free(T); free(ev); free(Q); return rank; }
+    W = xmalloc(sizeof(double) * (size_t)n * (rank ? rank : 1));
+    sig = xmalloc(sizeof(double) * (rank ? rank : 1));
+    {
+        int c = 0;
+        const double d1 = 1.0, d0 = 0.0;
+        for (int j = 0; j < ne; j++) {
+            if (fabs(ev[j]) <= 1e-14 * emax) continue;
+            BL(dgemv_)("N", &n, &k, &d1, Q, &n, T + (size_t)j * k, &one, &d0, W + (size_t)c * n, &one);
+            sig[c++] = ev[j];
+        }
+    }
+    {   /* the randomized residual check with the block's two shared vectors: || A z - W S W' z || <= 1e-10 ||A|| ||z|| */
+        double *AZ = xmalloc(sizeof(double) * (size_t)n * 2), *z = xmalloc(sizeof(double) * n), *az = xmalloc(sizeof(double) * n);
+        double *c = xmalloc(sizeof(double) * (rank ? rank : 1));
+        sp_mulblk(S, Zv, 2, 2, AZ, n);
+        for (int trial = 0; trial < 2 && rank >= 0; trial++) {
+            for (int i = 0; i < n; i++) { z[i] = Zv[(size_t)i * 2 + trial]; az[i] = AZ[(size_t)i * 2 + trial]; }
+            for (int j = 0; j < rank; j++) c[j] = -sig[j] * BL(ddot_)(&n, W + (size_t)j * n, &one, z, &one);
+            for (int j = 0; j < rank; j++) BL(daxpy_)(&n, &c[j], W + (size_t)j * n, &one, az, &one);
+            double res = BL(dnrm2_)(&n, az, &one), zn = BL(dnrm2_)(&n, z, &one);
+            if (res > 1e-10 * anrm * zn) rank = -1;
+        }
+        free(AZ); free(z); free(az); free(c);
+    }
+    if (rank < 0) goto fail;
+    free(T); free(ev); free(Q);
+    *Wout = W; *sigout = sig;
+    return rank;
+fail:
+    free(T); free(ev); free(Q); free(W); free(sig);
+    return -1;
+}
+
 /* Decide whether a block should use the low-rank Schur route and build it. */
 static void lowrank_block(Block *B, const Params *par, double cost_now) {
     const int n = B->n, nc = B->ncon;
@@ -785,6 +960,33 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
      * between the two passes so that a taken route gets the same factors as before (delay_indep_n32, a control LMI:
      * 1,056 eigendecompositions with vectors, 0.56 s, for a route that is not taken) */
     const unsigned long rng0 = lr_rng;
+    const double tw0 = wtime();
+    const int mm = lrmm_on();
+    const int KM = kmax;
+    double *Om = NULL, *Zv = NULL;
+#ifdef _OPENMP
+    const int mm_par = mm && omp_get_max_threads() > 1 && !omp_in_parallel() && (double)nc * n * n >= 2e5;
+#else
+    const int mm_par = 0;
+#endif
+    if (mm) {
+        Om = xmalloc(sizeof(double) * (size_t)n * KM); Zv = xmalloc(sizeof(double) * (size_t)n * 2);
+        for (size_t i = 0; i < (size_t)n * KM; i++) Om[i] = lr_rand();
+        for (size_t i = 0; i < (size_t)n * 2; i++) Zv[i] = lr_rand();
+        for (int t0 = 0; t0 < nc && ok; t0 += 256) {
+            const int t1 = t0 + 256 < nc ? t0 + 256 : nc;
+            #pragma omp parallel for schedule(dynamic, 4) if (mm_par)
+            for (int t = t0; t < t1; t++)
+                rk[t] = lowrank_factor_mm(&B->A[t], n, B->A[t].nr <= small ? small : kmax, Om, KM, Zv, NULL, NULL, -1);
+            for (int t = t0; t < t1 && ok; t++) {
+                if (rk[t] < 0) ok = 0; else R += rk[t];
+                if (ok && par->lowrank < 0) {
+                    double lbt = cb * (nd * nd * (R + (nc - t - 1)) + nd * (double)(R + nc - t - 1) * (R + nc - t - 1));
+                    if (lbt >= cost_now) ok = 0;
+                }
+            }
+        }
+    } else
     for (int t = 0; t < nc && ok; t++) {
         rk[t] = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, NULL, NULL, -1);
         if (rk[t] < 0) ok = 0; else R += rk[t];
@@ -793,6 +995,7 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
             if (lbt >= cost_now) ok = 0;
         }
     }
+    const double tw1 = wtime();
     double cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R;
     /* single-buffer mode; 27 October 2026: when P and Q do not fit the budget as R x R matrices (or pass 32 MB) the
      * route forms them in tiles that stay in a core's cache (solver.c, schur_lowrank_tiles), and its memory is then the
@@ -804,6 +1007,14 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
         lr_rng = rng0;
         long R2 = 0;
         const long used0 = lr_range_used;
+        if (mm) {
+            int *rk2 = xmalloc(sizeof(int) * nc);
+            #pragma omp parallel for schedule(dynamic, 4) if (mm_par)
+            for (int t = 0; t < nc; t++)
+                rk2[t] = lowrank_factor_mm(&B->A[t], n, B->A[t].nr <= small ? small : kmax, Om, KM, Zv, &Ws[t], &Ss[t], rk[t]);
+            for (int t = 0; t < nc && ok; t++) { if (rk2[t] < 0) ok = 0; else { rk[t] = rk2[t]; R2 += rk2[t]; } }
+            free(rk2);
+        } else
         for (int t = 0; t < nc && ok; t++) {
             const int r2 = lowrank_factor(&B->A[t], n, B->A[t].nr <= small ? small : kmax, &Ws[t], &Ss[t], rk[t]);
             if (r2 < 0) ok = 0; else { rk[t] = r2; R2 += r2; }
@@ -831,6 +1042,8 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
         }
         B->lr_off[nc] = (int)c;
     }
+    if (getenv("BRISK_LRDBG")) printf("   [low-rank checks of the block: ranks %.3f s, factors %.3f s%s]\n", tw1 - tw0, wtime() - tw1, mm ? " (shared vectors, threads)" : "");
+    free(Om); free(Zv);
     for (int t = 0; t < nc; t++) { free(Ws[t]); free(Ss[t]); }
     free(Ws); free(Ss); free(rk);
 #undef LR_MEM
@@ -882,6 +1095,30 @@ static double lrdict_build(Block *B, const Params *par) {
     if (!on || par->dict == 0 || par->lowrank == 0 || nc < 2 || n < 16) return 1e300;
     int *rk = xcalloc(nc, sizeof(int)); double **Ws = xcalloc(nc, sizeof(double *)), **Ss = xcalloc(nc, sizeof(double *));
     int nl = 0; long nv = 0;
+    const double tw0 = wtime();
+    if (lrmm_on()) {
+        const int KM = 8 < n ? 8 : n;
+        double *Om = xmalloc(sizeof(double) * (size_t)n * KM), *Zv = xmalloc(sizeof(double) * (size_t)n * 2);
+        for (size_t i = 0; i < (size_t)n * KM; i++) Om[i] = lr_rand();
+        for (size_t i = 0; i < (size_t)n * 2; i++) Zv[i] = lr_rand();
+#ifdef _OPENMP
+        const int mm_par = omp_get_max_threads() > 1 && !omp_in_parallel() && (double)nc * n2 >= 2e5;
+#else
+        const int mm_par = 0;
+#endif
+        #pragma omp parallel for schedule(dynamic, 4) if (mm_par)
+        for (int t = 0; t < nc; t++) {
+            const SpSym *S = &B->A[t];
+            if (S->ef < 0.25 * n2) continue;
+            double *W = NULL, *sg = NULL;
+            int r = lowrank_factor_mm(S, n, 8, Om, KM, Zv, &W, &sg, -1);
+            if (r == 1) rank1_exact(S, n, W, sg);
+            if (r > 0 && r <= 8 && 4.0 * n * r <= S->ef) { rk[t] = r; Ws[t] = W; Ss[t] = sg; }
+            else { free(W); free(sg); }
+        }
+        for (int t = 0; t < nc; t++) if (rk[t]) { nl++; nv += rk[t]; }
+        free(Om); free(Zv);
+    } else
     for (int t = 0; t < nc; t++) {
         const SpSym *S = &B->A[t];
         if (S->ef < 0.25 * n2) continue;
@@ -891,6 +1128,7 @@ static double lrdict_build(Block *B, const Params *par) {
         if (r > 0 && r <= 8 && 4.0 * n * r <= S->ef) { rk[t] = r; Ws[t] = W; Ss[t] = sg; nl++; nv += r; }
         else { free(W); free(sg); }
     }
+    if (getenv("BRISK_LRDBG")) printf("   [low-rank dictionary's factors: %.3f s%s]\n", wtime() - tw0, lrmm_on() ? " (shared vectors, threads)" : "");
     /* 27 October 2026: the virtual block's X and Zi are dense of order nu + nv: within the budget the low-rank route has
      * for its P and Q (a metric-learning LMI, lmnn_n1100_d30: 16,500 constraints of rank two, order 33,000, 17.4 GB;
      * the low-rank route, with the same products, now forms them in panels) */
@@ -1116,6 +1354,33 @@ double analyze_sdp_block(Block *B, const Params *par) {
         for (int t = 0; t < nc; t++) B->dpos[t] = -1;
         for (int a = 0; a < nd; a++) { free(drW[a]); free(drS[a]); }
         nd = 0;
+    }
+    /* 1 November 2026: on a block of the low-rank method, the constraint operator A(X) and its adjoint through the factors
+     * (A(X)_t = sum_k s_k w_k' X w_k from one product X W; A'(y) = W diag(s y) W'), when the factors are not larger than
+     * the entries and give every entry back to 32 u of its constraint's largest, as the dense constraints' factors must
+     * (the operators define the problem the solver sees). The many-blocks problem of the external benchmark (SDP: 165
+     * rank-one constraints of order 33 in each of 16 blocks) spent most of its solve in the entry loops of the operators */
+    B->lrop = 0;
+    if (B->lowrank && B->lrR > 0 && !getenv("BRISK_NOLROP")) {
+        double ent = 0;
+        for (int t = 0; t < nc; t++) ent += B->A[t].ef;
+        const double fsz = (double)n * B->lrR;
+        if (2.0 * fsz <= ent && 8.0 * fsz <= 2.6e8) {
+            const double ftol = 32.0 * 1.1102230246251565e-16;
+            int okf = 1;
+            for (int t = 0; t < nc && okf; t++) {
+                const SpSym *S = &B->A[t];
+                double amax = 0, emax = 0;
+                for (int q = 0; q < S->ef; q++) {
+                    double v = 0;
+                    for (int k = B->lr_off[t]; k < B->lr_off[t + 1]; k++) v += B->lr_sig[k] * B->lr_W[S->fr[q] + (size_t)k * n] * B->lr_W[S->fc[q] + (size_t)k * n];
+                    amax = fmax(amax, fabs(S->fv[q])); emax = fmax(emax, fabs(v - S->fv[q]));
+                }
+                if (emax > ftol * amax) okf = 0;
+            }
+            B->lrop = okf;
+            if (getenv("BRISK_LRDBG")) printf("   [low-rank block: the operators through the factors: %s]\n", okf ? "yes" : "no (a factor misses its entries)");
+        }
     }
     /* (the dense indices are renumbered in con order below: the low-rank data follow their constraint) */
     B->drk = xcalloc(nd ? nd : 1, sizeof(int)); B->drW = xcalloc(nd ? nd : 1, sizeof(double *)); B->drS = xcalloc(nd ? nd : 1, sizeof(double *));
@@ -1683,4 +1948,40 @@ void problem_clone(const Problem *P, Problem *Q) {
     Q->tbR = P->tbR;
     Q->obj_off = P->obj_off;
     free(tc); free(tb); free(ti); free(tj); free(tv); free(bsz);
+}
+
+/* (5 November 2026, ISSUES 820) Output files: every file of the solution (X, y, Z, x, the certificates) is opened and closed
+ * here, and a write that failed (a full disk, a quota, a removed directory) is recorded instead of ignored. Before, the
+ * writers ignored the results of fprintf and fclose: on a full disk the benchmark's X files of ice_2.0 (8,113 x 8,113,
+ * 1.06 GB) and diamond_patch (Mittelmann, SDP) were cut short while the run said OPTIMAL with errors of 1e-14, and the
+ * check of the file read the missing entries as zeros (errors up to 0.3). The run's Summary says which file is
+ * incomplete and why, and the command line exits with code 16. */
+#include <errno.h>
+int g_out_fail = 0, g_out_said = 0;
+char g_out_msg[700] = "";
+static void out_failed(const char *fn, int e, int opened) {
+    const char *what = opened ? "was not written completely" : "could not be written";
+    if (!g_out_fail) snprintf(g_out_msg, sizeof g_out_msg, "%s %s (%s); the solution computed is not affected%s", fn ? fn : "?", what, e ? strerror(e) : "write error", opened ? ", the file is incomplete" : "");
+    g_out_fail++;
+    fprintf(stderr, "brisk: %s %s: %s\n", fn ? fn : "?", what, e ? strerror(e) : "write error");
+}
+FILE *brisk_out_open(const char *fn) {
+    errno = 0;
+    FILE *f = fopen(fn, "w");
+    if (!f) out_failed(fn, errno, 0);
+    return f;
+}
+int brisk_out_close(FILE *f, const char *fn) {
+    if (!f) return 1;
+    int bad = ferror(f) != 0, e = 0;
+    errno = 0;
+    if (fclose(f) != 0) { bad = 1; e = errno; }   /* (the close flushes the rest and gives the reason again: ENOSPC) */
+    if (bad && !e) e = EIO;
+    if (bad) out_failed(fn, e, 1);
+    return bad;
+}
+void brisk_out_summary_line(void) {
+    if (!g_out_fail) return;
+    printf("  Output files:      %s%s\n", g_out_msg, g_out_fail > 1 ? " (and other files: see the messages above)" : "");
+    g_out_said = 1;
 }

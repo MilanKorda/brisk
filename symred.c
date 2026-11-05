@@ -518,7 +518,27 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
             /* the reference leaf: leftmost path */
             int *cur = sx(sizeof(int) * A->N); memcpy(cur, child, sizeof(int) * A->N);
             int *cc = sx(sizeof(int) * A->NI);
-            for (;;) { const int k = as_target(A, cur, cc); if (k == 0) break; if (A->nodes > A->maxnodes || as_out(A)) { A->nodes = A->maxnodes + 1; break; } int *nx = sx(sizeof(int) * A->N); as_individualize(A, cur, cc[0], nx); A->nodes++; memcpy(cur, nx, sizeof(int) * A->N); free(nx); }
+            /* 4 November 2026: the reference descent ends at a leaf, where every index has a colour of its own; a descent
+             * that cannot get there within the node cap finds nothing (a user's unsteady Navier-Stokes relaxation, SDP: 501
+             * nodes in 4.6 s, no leaf). From its 32nd node on, it stops when the indices it still has to separate exceed
+             * twice what its rate so far separates in the nodes left. BRISK_SYMDESC=0: off */
+            static int dstop = -1; if (dstop < 0) { const char *e = getenv("BRISK_SYMDESC"); dstop = !(e && atoi(e) == 0); }
+            int *seenc = dstop ? calloc((size_t)A->N + 1, sizeof(int)) : NULL; int stamp = 0, c0 = -1, t0n = 0;
+            for (;;) { const int k = as_target(A, cur, cc); if (k == 0) break; if (A->nodes > A->maxnodes || as_out(A)) { A->nodes = A->maxnodes + 1; break; }
+                if (seenc) {
+                    int cells = 0; stamp++;
+                    for (int u = 0; u < A->NI; u++) if (seenc[cur[u]] != stamp) { seenc[cur[u]] = stamp; cells++; }
+                    if (c0 < 0) { c0 = cells; t0n = 0; }
+                    else if (++t0n >= 32) {
+                        const double rate = (double)(cells - c0) / t0n, left = (double)A->maxnodes - A->nodes;
+                        if ((double)(A->NI - cells) > 2.0 * rate * left) {
+                            if (A->verbose > 0) printf("   symmetry search: the first descent cannot reach a leaf within the node cap (%d of %d indices separated after %d nodes): stopped\n", cells, A->NI, t0n);
+                            A->nodes = A->maxnodes + 1; break;
+                        }
+                    }
+                }
+                int *nx = sx(sizeof(int) * A->N); as_individualize(A, cur, cc[0], nx); A->nodes++; memcpy(cur, nx, sizeof(int) * A->N); free(nx); }
+            free(seenc);
             if (A->nodes > A->maxnodes) { free(cur); free(cc); break; }   /* capped inside the reference descent: no leaf, no automorphisms */
             A->leaf_ref = cur; A->cert_ref = as_cert(A, cur);
             A->inv_ref = sx(sizeof(int) * A->N); for (int u = 0; u < A->N; u++) A->inv_ref[u] = -1;
@@ -637,6 +657,22 @@ static int sym_pretest_no_gain(const Problem *P, const int *off, int NI, double 
     }
     free(ch); free(ih); free(ch2); free(ih2); free(w);
     return no_gain;
+}
+double g_sym_est_div = 1.0;   /* 4 November 2026 (ISSUES 759): the facial reduction's cost ratio, measured on a copy (main.c) */
+/* 4 November 2026 (ISSUES 759): the search's budget is a share of the expected solve of the problem at hand; when the
+ * facial reduction that follows makes that problem much smaller, it is a share of a solve that will not happen (a user's
+ * moment relaxations, SDP: 4.6 s of a 5.7 s run in a search on |data| that found nothing, its budget from an estimate of
+ * 516 s, while the reduction cut the cost 2,800 times and the solve took 0.5 s). main.c sets g_sym_fr_div, which runs the
+ * reduction on a copy and returns its cost ratio (1: none); it is called once per run, only when a search is about to
+ * start (past the gain bound) with a budget of half a second or more, and the budget is then the one the estimate divided
+ * by that ratio gives (on the large frame relaxations the copy costs 0.8-1.9 s where the search, skipped by the gain
+ * bound, costs 0.02 s). g_sym_est_now: the estimate the running search's budget came from */
+double (*g_sym_fr_div)(void) = NULL;
+static double g_sym_est_now = 0, g_sym_symtime = 0, g_sym_tleft = 0;
+static double sym_budget_of(double est) {
+    double tb = fmin(fmax(g_sym_symtime, fmin(900.0, 0.01 * est)), fmax(0.05, 0.15 * est));
+    if (g_sym_tleft > 0) tb = fmin(tb, fmax(0.05, 0.1 * g_sym_tleft));
+    return tb;
 }
 /* seed (nseed generators, NI each, with their constraint maps seedcp, m + 1 each): automorphisms already known, which
  * prune the search from its start; only the generators found beyond them are returned */
@@ -809,7 +845,40 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
     }
     A.ngen = nseed;
     { const char *e = getenv("BRISK_SYMMCKAY"); if (!e || atoi(e) != 0) A.finv = calloc((size_t)NI + 2, sizeof(uint64_t)); }   /* 0: the search as before */
-    if (ncls < NI) { int *path = sx(sizeof(int) * (NI + 1)); as_dfs(&A, col, 0, P->b, E, ne, cnt, path, 1); free(path); }
+    if (ncls < NI) {
+        int *path = sx(sizeof(int) * (NI + 1));
+        /* (ISSUES 759: above) a search with a budget over half a second first runs within half a second; one that is still
+         * running then measures the facial reduction on a copy (once per run) and goes on within the budget of the reduced
+         * estimate: from the root again, the generators it found kept (they prune the orbits). A search that ends within
+         * the slice never pays for the copy (equalG11, SDP: 0.42 s, four generators; the copy would cost 0.36 s) */
+        const double slice = 0.5;
+        const int sliced = g_sym_fr_div && g_sym_est_now > 0 && A.tmax > slice && g_sym_est_div == 0;
+        const double wmax0 = A.wmax, tclock0 = A.tclock;
+        if (sliced) { A.wmax = fmin(wmax0, A.work + slice * SYM_WORK_RATE); A.tclock = fmin(tclock0, wtime() - A.t0 + 2.0 * slice + 0.5); }
+        as_dfs(&A, col, 0, P->b, E, ne, cnt, path, 1);
+        /* (5 November 2026) a refinement the slice's work cap cut short (budget_hit, set before a round that would pass
+         * the cap) is an exhausted slice as well: as_out alone missed it, and the search ended without its generator
+         * (shmup5, Mittelmann, SDP: order 2 lost, 157.8 -> 365.2 s) */
+        if (sliced && (as_out(&A) || A.budget_hit) && !brisk_stop_flag) {   /* (a budget stop in the first descent also sets the node count to the cap: as_out tells them apart) */
+            g_sym_est_div = g_sym_fr_div();
+            double tb = A.tmax;
+            if (g_sym_est_div > 1) {
+                const double er = g_sym_est_now / g_sym_est_div;
+                tb = er < 0.2 && symmin > 1 ? 0 : fmin(A.tmax, sym_budget_of(er));
+                if (verbose > 0) printf("   symmetry search: %s (the expected solve after the facial reduction %.2f s)\n", tb > slice ? "budget lowered" : "stopped", er);
+            }
+            if (tb > slice) {
+                A.wmax = fmin(wmax0, tb * SYM_WORK_RATE); A.tclock = fmin(tclock0, 2.0 * tb + 0.5); A.nodes = 0;
+                /* (5 November 2026) the first path's invariants of the sliced pass are cleared: a refinement the slice cut
+                 * short left them wrong, and they pruned the true leaf (shmup5, Mittelmann, SDP: the generator of order 2
+                 * lost, 157.8 -> 365.2 s) */
+                if (A.finv) memset(A.finv, 0, sizeof(uint64_t) * ((size_t)NI + 2));
+                A.unwind = 0; A.budget_hit = 0;
+                as_dfs(&A, col, 0, P->b, E, ne, cnt, path, 1);
+            }
+        } else if (sliced) { A.wmax = wmax0; A.tclock = tclock0; }
+        free(path);
+    }
     int norb = 0; for (int u = 0; u < NI; u++) if (uf_find(A.ufp, u) == u) norb++;
     if (verbose > 0) printf("   symmetry search: %ld nodes, %d generator(s), %d index orbits, %.2fs\n", A.nodes, A.ngen, norb, wtime() - A.t0);
     if (verbose > 1 && A.finv) printf("   [symmetry search: %ld nodes pruned by their invariant]\n", A.pruned);
@@ -1450,11 +1519,27 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
         double est = (double)m * m * m / 3.0, sp = m;
         for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) sp += (double)P->blk[k].ncon * P->blk[k].ncon;
         if (pow(sp, 1.5) < est) est = pow(sp, 1.5);     /* a sparse Schur complement (many small blocks) factors for about nnz^1.5 */
-        {   /* 5.18: ... or for what its symbolic analysis says, when that is less (a chain of blocks
-             * fills linearly; BRISK_SYMEST=0: the nnz^1.5 estimate alone) */
-            static int se = -1; if (se < 0) { const char *e = getenv("BRISK_SYMEST"); se = e ? atoi(e) : 1; }
-            extern double schur_sparse_cost(const Problem *P, double cap);
-            if (se && m >= 200) {
+        /* 5.18: ... or for what its symbolic analysis says, when that is less (a chain of blocks fills linearly;
+         * BRISK_SYMEST=0: the nnz^1.5 estimate alone). 4 November 2026 (a user's Navier-Stokes moment relaxations, SDP,
+         * ISSUES 755): the analysis can only lower the budget, and costs about 1.5e-7 s per entry of the Schur pattern
+         * (5 s on 2.8e7 entries, where it did not lower the estimate and the searches ended in 0.02 s and 1.9 s). When it
+         * would cost more than a tenth of the budget the cheap estimate gives, it is deferred: the first search runs within
+         * a budget no larger than the analysis's own cost, and only a search that runs into it pays for the analysis and
+         * runs again with the budget it gives. BRISK_SYMLAZY=0: the analysis always first, as before */
+        static int se = -1; if (se < 0) { const char *e = getenv("BRISK_SYMEST"); se = e ? atoi(e) : 1; }
+        static int slazy = -1; if (slazy < 0) { const char *e = getenv("BRISK_SYMLAZY"); slazy = !(e && atoi(e) == 0); }
+        extern double schur_sparse_cost(const Problem *P, double cap);
+        const double est_cheap0 = est, an_cost = 1.5e-7 * sp;   /* (the analysis's expected seconds) */
+        int an_deferred = 0;
+        if (se && m >= 200) {
+            /* (the budget the cheap estimate gives, computed as below) */
+            double e0 = est_cheap0;
+            for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) e0 += 20.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n + 4e5;
+            e0 /= 1e9;
+            const double tb0 = fmin(fmax(symtime, fmin(900.0, 0.01 * e0)), fmax(0.05, 0.15 * e0));
+            if (slazy && e0 >= 0.2 && an_cost > 0.1 * tb0) an_deferred = 1;
+            else if (slazy && e0 < 0.2 && an_cost > 0.1 * tb0) { }   /* (4 November 2026: the analysis can only lower an estimate that already skips the search) */
+            else {
                 const double c = schur_sparse_cost(P, est);
                 if (c > 0 && c < est) est = c;
             }
@@ -1475,8 +1560,33 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
             if (verbose > 0) printf("   symmetry search skipped (expected solve %.2f s)\n", est);
             free(gen); free(gsg); free(gce); free(off); free(E); return NULL;
         }
-        if (verbose > 0) printf("   symmetry search: time budget %.2f s (expected solve ~%.1f s)\n", tb, est);
+        if (an_deferred && an_cost < tb) {
+            if (verbose > 0) printf("   symmetry search: budget %.2f s until the Schur pattern's analysis is needed (expected solve ~%.1f s by the cheap estimate)\n", an_cost, est);
+            tb = an_cost;
+        } else an_deferred = 0;
+        if (!an_deferred && verbose > 0) printf("   symmetry search: time budget %.2f s (expected solve ~%.1f s)\n", tb, est);
+        g_sym_symtime = symtime; g_sym_tleft = g_sym_time_left; g_sym_est_now = est;
         int *ga = sym_auto(P, off, NI, nsdp, E, ne, &na, &gc, verbose, tb, symnodes, auto_mode ? symmin : 0.0, 0, NULL, NULL, 0);
+        if (an_deferred && g_sym_budget_hit) {
+            /* the search ran into the analysis's cost: the analysis, the budget it gives, and the search again with it */
+            double e2 = est_cheap0;
+            const double c = schur_sparse_cost(P, e2);
+            if (c > 0 && c < e2) e2 = c;
+            for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) e2 += 20.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
+            if (getenv("BRISK_SYMEST") == NULL || atoi(getenv("BRISK_SYMEST")) != 0) { int nbs = 0; for (int k = 0; k < nb; k++) nbs += P->blk[k].type == BLK_SDP; e2 += 4e5 * nbs; }
+            e2 /= 1e9;
+            if (g_sym_est_cap > 0 && e2 > g_sym_est_cap) e2 = g_sym_est_cap;
+            double tb2a = fmin(fmax(symtime, fmin(900.0, 0.01 * e2)), fmax(0.05, 0.15 * e2));
+            if (g_sym_time_left > 0) tb2a = fmin(tb2a, fmax(0.05, 0.1 * g_sym_time_left));
+            est = e2;
+            if (verbose > 0) printf("   symmetry search: budget %.2f s after the Schur pattern's analysis (expected solve ~%.1f s)\n", tb2a, est);
+            if (tb2a > tb) {
+                free(ga); free(gc); ga = NULL; gc = NULL; na = 0;
+                tb = tb2a;
+                g_sym_est_now = e2;
+                ga = sym_auto(P, off, NI, nsdp, E, ne, &na, &gc, verbose, tb, symnodes, auto_mode ? symmin : 0.0, 0, NULL, NULL, 0);
+            }
+        }
         /* a search that ran into the budget of the matrix-free estimate and found nothing: with the
          * standard method's budget it might have (main.c runs the pipeline again if the matrix-free
          * attempt is not made after all) */
@@ -1507,6 +1617,7 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
                 for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) est_r += 20.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n + 4e5;
                 est_r /= 1e9;
                 const double cap2 = fmax(0.05, 0.15 * est_r);
+                if (cap2 < tb2) g_sym_est_now = est_r;
                 if (cap2 < tb2) { if (verbose > 0) printf("   symmetry search on |data|: budget %.2f s (the problem the first search reduced: %d constraint orbits, expected solve ~%.1f s)\n", cap2, mr, est_r); tb2 = cap2; }
             }
             int nab = 0, *gcb = NULL;

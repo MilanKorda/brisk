@@ -1,5 +1,6 @@
 #define _GNU_SOURCE          /* sched_getaffinity, CPU_COUNT (the cores the solve may use) */
 #include "brisk.h"
+void schol_set_nd(int on); int schol_set_amd(int mode); void schol_set_perm(const int *perm);
 #include "socp.h"
 #include <time.h>
 #include <unistd.h>
@@ -166,7 +167,7 @@ void params_default(Params *p) {
     p->no_retry = 0;
     p->hsd_hoc = 4;          /* 5.7: second-order passes at the chosen direction (kept only when the predicted reduction is not smaller) */
     p->hsd_nb = 0.3;         /* 5.7: after kept passes the step may go to 0.9995 of the boundary while lambda_min(XZ) >= 0.3 mu */
-    p->hsd_first = 1; p->hsd_first_c = 12.0; p->hsd_first_asm = 0.5; p->hsd_first_on = 0; p->std_slow = 10; p->crossover = 0; p->fr_gain = 4.0;
+    p->hsd_first = 1; p->hsd_first_c = 12.0; p->hsd_first_asm = 0.5; p->hsd_first_on = 0; p->std_slow = 10; p->crossover = 0; p->fr_gain = 4.0; p->fr_maxdepth = -1; p->fr_dual = 0;
     p->soc = 1; p->soc_minn = 3; p->conesolver = 1;
     p->hsd_sig = 3;          /* candidates in the sigma search (0 = Mehrotra only) */
     p->hsd_beta = 1e-3;
@@ -197,7 +198,7 @@ void params_default(Params *p) {
     p->polish_x = 1;
     p->polish_r = 1;         /* the restoration of the primal feasibility in the square-root metric before the other corrections */
     p->polish_mem = 512.0 * 1024 * 1024;
-    p->reg_ill = 1e-10;
+    p->reg_ill = 0;          /* 0: automatic, from m u (schur_reg_floor); until 1 November 2026 1e-10 */
     p->sigma_rule = -1;   /* auto: cubic for pure LP, adaptive otherwise */
     p->timelimit = 0;
     p->fr_fallback = 0.0;    /* 5.17 (the owner, 16 October 2026): no re-solve when the removed duals are not rebuilt; the user is told
@@ -911,6 +912,19 @@ static void blk_Aop_serial(const Block *B, BS *s, const double *D, double *out, 
         });
         return;
     }
+    if (B->lrop) {
+        /* 1 November 2026: through the low-rank method's factors (problem.c: exact to 32 u, not larger than the entries) */
+        const int R = B->lrR;
+        double *T = malloc(sizeof(double) * (size_t)n * R);
+        BL(dgemm_)("N", "N", &n, (int *)&R, &n, &DONE, D, &n, B->lr_W, &n, &DZERO, T, &n);
+        for (int t = 0; t < B->ncon; t++) {
+            double v = 0;
+            for (int k = B->lr_off[t]; k < B->lr_off[t + 1]; k++) v += B->lr_sig[k] * BL(ddot_)(&n, B->lr_W + (size_t)k * n, &IONE, T + (size_t)k * n, &IONE);
+            AOUT(t, scale * v);
+        }
+        free(T);
+        return;
+    }
     if (B->lfoff && !g_noflat) {
         /* 4.23: the block's flattened entries (contiguous, built by analyze_sdp_block) instead
          * of one SpSym per constraint: its row/col/val arrays are three scattered loads per
@@ -983,6 +997,22 @@ static void blk_ATy(const Block *B, BS *s, const double *y, double *F) {
             double yi = y[B->con[t]];
             for (int q = 0; q < S->nnz; q++) F[S->row[q]] += yi * S->val[q];
         }
+        return;
+    }
+    if (B->lrop) {
+        /* 1 November 2026: sum_t y_t A_t = W diag(s y) W' through the low-rank method's factors */
+        const int R = B->lrR;
+        double *Wy = malloc(sizeof(double) * (size_t)n * R);
+        for (int t = 0; t < B->ncon; t++) {
+            const double yt = y[B->con[t]];
+            for (int k = B->lr_off[t]; k < B->lr_off[t + 1]; k++) {
+                const double c = yt * B->lr_sig[k];
+                const double *w = B->lr_W + (size_t)k * n; double *o = Wy + (size_t)k * n;
+                for (int i = 0; i < n; i++) o[i] = c * w[i];
+            }
+        }
+        BL(dgemm_)("N", "T", &n, &n, (int *)&R, &DONE, Wy, &n, B->lr_W, &n, &DZERO, F, &n);
+        free(Wy);
         return;
     }
     if (B->nd && B->dfac) {
@@ -2976,6 +3006,77 @@ static int lp_col_eq(const Block *B, int p, int q) {
     for (int e = 0; e < np; e++) if (cp[e] != cq[e] || vp[e] != sg * vq[e]) return 0;
     return 1;
 }
+#define LR_MAXCONES 16
+/* 4 November 2026: dense columns of LP blocks kept out of the factorization. A variable p of an LP block adds
+ * d_p a_p a_p' to the Schur complement (a_p its coefficients over the constraints); a column on many constraints makes
+ * them one dense clique of the sparse pattern. The second solve for the dual after a facial reduction (main.c,
+ * fr_dual_phase) holds the optimal value by an LP variable whose column is b: on pop_wood_1000 (SDP) its 3,500 entries
+ * took the factor from 1.2e6 to 3.6e7 nonzeros and 5.5e7 to 8.3e10 flops, and the solve from about 3 to 20 s. Such a
+ * column goes into the long cones' low-rank correction instead (U column sqrt(d_p) a_p, sign +1; Sherman-Morrison-
+ * Woodbury after each factorization). Dense: at least 64 constraints and more than 10 sqrt(m) (the threshold of the
+ * interior-point LP codes for dense columns), at most LR_MAXCONES columns, the longest first, and never a column that is
+ * the only term of one of its constraints (the factor without it would be singular there). The marks are kept per
+ * problem (pointer, blocks, m and the solve's number); the pattern leaves the marked columns out, and the LP term goes to
+ * U only when the Schur object has the correction (the sparse factorization: otherwise the column is assembled into M as
+ * before). BRISK_LPDENSE_LR=0: none */
+typedef struct { const Problem *P; const Block *blk0; int nb, m, n; unsigned long solve; int **col; } LpDense;
+static LpDense g_lpd = { 0 };
+static void lpd_clear(void) {
+    if (g_lpd.col) for (int k = 0; k < g_lpd.nb; k++) free(g_lpd.col[k]);
+    free(g_lpd.col); memset(&g_lpd, 0, sizeof(g_lpd));
+}
+static void lpd_build(const Problem *P) {
+    if (g_lpd.P == P && g_lpd.blk0 == P->blk && g_lpd.nb == P->nblk && g_lpd.m == P->m && g_lpd.solve == g_solve_cur) return;
+    lpd_clear();
+    g_lpd.P = P; g_lpd.blk0 = P->blk; g_lpd.nb = P->nblk; g_lpd.m = P->m; g_lpd.solve = g_solve_cur;
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_LPDENSE_LR"); on = !(e && atoi(e) == 0); }
+    const int m = P->m;
+    if (!on || m < 200) return;
+    const double thr = fmax(64.0, 10.0 * sqrt((double)m));
+    int nc = 0;
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_LP || B->soc_lr || !B->lp_ptr) continue;
+        for (int p = 0; p < B->n; p++) if (B->lp_ptr[p + 1] - B->lp_ptr[p] > thr) nc++;
+    }
+    if (!nc) return;
+    /* the terms on each constraint: the blocks other than LP, and the LP variables (a dense candidate counted too) */
+    int *cnt = calloc((size_t)m + 1, sizeof(int));
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_LP || B->soc_lr || !B->lp_ptr) { for (int t = 0; t < B->ncon; t++) cnt[B->con[t]]++; continue; }
+        for (int a = 0; a < B->lp_ptr[B->n]; a++) cnt[B->lp_con[a]]++;
+    }
+    /* candidates by length, the longest first */
+    typedef struct { int k, p, d; } Cand;
+    Cand *cd = malloc(sizeof(Cand) * (size_t)nc); int w = 0;
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_LP || B->soc_lr || !B->lp_ptr) continue;
+        for (int p = 0; p < B->n; p++) { const int d = B->lp_ptr[p + 1] - B->lp_ptr[p]; if (d > thr) cd[w++] = (Cand){ k, p, d }; }
+    }
+    for (int i = 1; i < w; i++) { Cand t = cd[i]; int j = i; while (j > 0 && cd[j - 1].d < t.d) { cd[j] = cd[j - 1]; j--; } cd[j] = t; }
+    g_lpd.col = calloc((size_t)P->nblk, sizeof(int *));
+    for (int i = 0; i < w && g_lpd.n < LR_MAXCONES; i++) {
+        const Block *B = &P->blk[cd[i].k];
+        int alone = 0;
+        for (int a = B->lp_ptr[cd[i].p]; a < B->lp_ptr[cd[i].p + 1]; a++) if (cnt[B->lp_con[a]] <= 1) { alone = 1; break; }
+        if (alone) continue;
+        for (int a = B->lp_ptr[cd[i].p]; a < B->lp_ptr[cd[i].p + 1]; a++) cnt[B->lp_con[a]]--;   /* (the next column's test without this one) */
+        if (!g_lpd.col[cd[i].k]) { g_lpd.col[cd[i].k] = malloc(sizeof(int) * (size_t)B->n); for (int p = 0; p < B->n; p++) g_lpd.col[cd[i].k][p] = -1; }
+        g_lpd.col[cd[i].k][cd[i].p] = g_lpd.n++;
+    }
+    free(cd); free(cnt);
+}
+/* the mark of variable p of LP block B: its index among the marked columns, or -1 */
+static inline int lpd_mark(const Block *B, int p) {
+    if (!g_lpd.col) return -1;
+    const long k = B - g_lpd.blk0;
+    if (k < 0 || k >= g_lpd.nb || !g_lpd.col[k]) return -1;
+    return g_lpd.col[k][p];
+}
+typedef struct LrCorr { int m, r, ok, nb; int *col; const Block *blk0; double *U, *Y, *K, *sg, *t; int *piv; int lpbase, nlp; int **lpcol; } LrCorr;   /* (lpbase, nlp: the dense LP columns' U columns, 4 November 2026) */
+static LrCorr *g_lrc = NULL;          /* the correction schur_soc fills (set while its Schur object exists) */
 static LPCache *lp_cache(const Block *B, const SChol *S) {
     for (int i = 0; i < g_nlpc; i++) if (g_lpc[i].B == B && g_lpc[i].uid == schol_uid(S)) return &g_lpc[i];
     LPCache *c = NULL;
@@ -2991,7 +3092,7 @@ static LPCache *lp_cache(const Block *B, const SChol *S) {
             int *gof = malloc(sizeof(int) * (n + 1)), *grep = malloc(sizeof(int) * (n + 1)), ng = 0;
             for (int p = 0; p < n; p++) {
                 const int a0 = B->lp_ptr[p], a1 = B->lp_ptr[p + 1];
-                if (a1 == a0) { gof[p] = -1; continue; }
+                if (a1 == a0 || (g_lrc && g_lrc->nlp > 0 && B - g_lrc->blk0 >= 0 && B - g_lrc->blk0 < g_lrc->nb && g_lrc->lpcol[B - g_lrc->blk0] && g_lrc->lpcol[B - g_lrc->blk0][p] >= 0)) { gof[p] = -1; continue; }   /* (a dense column goes to the low-rank correction) */
                 const double sg = B->lp_val[a0] > 0 ? 1.0 : -1.0;
                 uint64_t h = 1469598103934665603ULL;
                 for (int a = a0; a < a1; a++) {
@@ -3085,6 +3186,20 @@ static int schur_lp_dense(const Block *B, const BS *s, int m, double *M) {
     free(Ad); free(Bd); free(L);
     return 1;
 }
+/* the dense LP columns' terms (g_lpd): U column sqrt(d_p) a_p of the low-rank correction; 1 when variable p is one */
+static inline int lp_lr_put(const Block *B, const BS *s, int p) {
+    if (!g_lrc || g_lrc->nlp <= 0) return 0;
+    const long k = B - g_lrc->blk0;
+    if (k < 0 || k >= g_lrc->nb || !g_lrc->lpcol[k]) return 0;
+    const int j = g_lrc->lpcol[k][p];
+    if (j < 0) return 0;
+    const int m = g_lrc->m;
+    double *u = g_lrc->U + (size_t)(g_lrc->lpbase + j) * m;
+    memset(u, 0, sizeof(double) * m);
+    const double f = sqrt(s->X[p] * s->Zi[p]);
+    for (int a = B->lp_ptr[p]; a < B->lp_ptr[p + 1]; a++) u[B->lp_con[a]] += f * B->lp_val[a];
+    return 1;
+}
 static void schur_lp(const Block *B, const BS *s, int m, double *M) {
     if (schur_lp_dense(B, s, m, M)) return;
     LPCache *lc = (g_schol && !g_pos) ? lp_cache(B, g_schol) : NULL;
@@ -3095,10 +3210,11 @@ static void schur_lp(const Block *B, const BS *s, int m, double *M) {
             /* bordered split pairs: their weights go to the border, not into M */
             for (int p = 0; p < B->n; p++) {
                 if (g_bpf[p] >= 0) { g_bD[g_bpf[p]] += s->X[p] * s->Zi[p]; continue; }
+                if (lp_lr_put(B, s, p)) continue;
                 if (lc->gof[p] >= 0) gd[lc->gof[p]] += s->X[p] * s->Zi[p];
             }
         } else
-        for (int p = 0; p < B->n; p++) if (lc->gof[p] >= 0) gd[lc->gof[p]] += s->X[p] * s->Zi[p];
+        for (int p = 0; p < B->n; p++) { if (lp_lr_put(B, s, p)) continue; if (lc->gof[p] >= 0) gd[lc->gof[p]] += s->X[p] * s->Zi[p]; }
         for (int g = 0; g < lc->ng; g++) {
             const int p = lc->grep[g];
             const double d = gd[g];
@@ -3113,6 +3229,7 @@ static void schur_lp(const Block *B, const BS *s, int m, double *M) {
         return;
     }
     for (int p = 0; p < B->n; p++) {
+        if (lp_lr_put(B, s, p)) continue;
         double dp = s->X[p] * s->Zi[p];
         for (int a = B->lp_ptr[p]; a < B->lp_ptr[p + 1]; a++) {
             size_t ca = B->lp_con[a];
@@ -3171,9 +3288,6 @@ static void schur_soc_col(const Block *B, int u, const double *L, double *col, c
  * object points to it): M = M_s + U diag(sg) U', U m x r (two columns per cone, one when its first coordinate has no
  * constraints), col[k] the first column of block k (-1: none); Y = M_s^-1 U and K = diag(sg) + U'Y (LU, piv) after
  * each factorization; t: r values of work space */
-#define LR_MAXCONES 16
-typedef struct LrCorr { int m, r, ok, nb; int *col; const Block *blk0; double *U, *Y, *K, *sg, *t; int *piv; } LrCorr;
-static LrCorr *g_lrc = NULL;          /* the correction schur_soc fills (set while its Schur object exists) */
 /* a long cone in the low-rank form (ISSUES 292): beta^2 sum_{p>=1} a_p a_p' into M as an LP block of weight beta^2 on
  * the coordinates p >= 1 (0 on p = 0), and the columns of U: sqrt(2) beta A_c w (sg +1; w = W e / beta = 2 v_0 v - e)
  * and, when the cone's first coordinate has constraints, beta a_0 (sg -1) */
@@ -3343,10 +3457,11 @@ static int schur_pattern(const Problem *P, long **aptr_out, int **adj_out) {
     const int m = P->m;
     int ncl = 0;
     long tot = 0;
+    lpd_build(P);     /* (4 November 2026: the dense LP columns, left out: above) */
     for (int k = 0; k < P->nblk; k++) {
         const Block *B = &P->blk[k];
         if (B->type != BLK_LP && !B->soc_lr) { ncl++; tot += B->ncon; }      /* (a second-order cone too: W^2 couples all its constraints) */
-        else for (int p = 0; p < B->n; p++) { ncl++; tot += B->lp_ptr[p + 1] - B->lp_ptr[p]; }   /* (a long cone in the low-rank form: by its coordinates, as an LP block, ISSUES 292) */
+        else for (int p = 0; p < B->n; p++) { if (lpd_mark(B, p) >= 0) continue; ncl++; tot += B->lp_ptr[p + 1] - B->lp_ptr[p]; }   /* (a long cone in the low-rank form: by its coordinates, as an LP block, ISSUES 292) */
     }
     int *cptr = malloc(sizeof(int) * (ncl + 1));
     int *cidx = malloc(sizeof(int) * (tot ? tot : 1));
@@ -3357,6 +3472,7 @@ static int schur_pattern(const Problem *P, long **aptr_out, int **adj_out) {
             cptr[c++] = (int)pos;
             for (int t = 0; t < B->ncon; t++) cidx[pos++] = B->con[t];
         } else for (int p = 0; p < B->n; p++) {
+            if (lpd_mark(B, p) >= 0) continue;
             cptr[c++] = (int)pos;
             for (int a = B->lp_ptr[p]; a < B->lp_ptr[p + 1]; a++) cidx[pos++] = B->lp_con[a];
         }
@@ -3450,6 +3566,253 @@ int schur_dense_needed(const Problem *P, const Params *par) {
     if (E) { envelope_free(E); return 0; }
     return 1;
 }
+/* experiment (4 November 2026, Charlie's grids): an order of the Schur rows from the row-to-block incidence. Hyperedges:
+ * each non-LP block and each LP variable. Recursive bisection of the hyperedges by the Fiedler vector of their graph (edge
+ * weight: the constraints touching both), split at the weighted median (weight: constraints per hyperedge); the
+ * constraints inside one part are ordered first (recursively), those touching both parts (the separator) after them. The
+ * Schur pattern (a union of one clique per hyperedge) is never formed. */
+typedef struct { int m, nh; const int *rp, *rh, *hp, *hr; int *order, no; int *mark, *loc, *side; double *x, *y, *w; const char *isblk; } IOState;
+static void io_bisect(IOState *S, int *rows, int nr, int *hes, int nh, int depth) {
+    if (nr <= 200 || nh <= 2 || depth > 60) { for (int i = 0; i < nr; i++) S->order[S->no++] = rows[i]; return; }
+    for (int j = 0; j < nh; j++) S->loc[hes[j]] = j;
+    for (int i = 0; i < nr; i++) S->mark[rows[i]] = 1;
+    /* weights: rows of the current set per hyperedge; graph matvec through the rows: (H'H - diag) x */
+    double *w = S->w;
+    for (int j = 0; j < nh; j++) w[j] = 0;
+    for (int i = 0; i < nr; i++) for (int q = S->rp[rows[i]]; q < S->rp[rows[i] + 1]; q++) if (S->loc[S->rh[q]] >= 0) w[S->loc[S->rh[q]]] += 1;
+    /* degree of each hyperedge in the weighted graph: sum over its rows of (row's hyperedges in the set - 1) */
+    double *deg = malloc(sizeof(double) * (size_t)nh), dmax = 0;
+    int *rc = malloc(sizeof(int) * (size_t)nr);
+    for (int i = 0; i < nr; i++) { int c = 0; for (int q = S->rp[rows[i]]; q < S->rp[rows[i] + 1]; q++) c += S->loc[S->rh[q]] >= 0; rc[i] = c; }
+    for (int j = 0; j < nh; j++) deg[j] = 0;
+    for (int i = 0; i < nr; i++) for (int q = S->rp[rows[i]]; q < S->rp[rows[i] + 1]; q++) if (S->loc[S->rh[q]] >= 0) deg[S->loc[S->rh[q]]] += rc[i] - 1;
+    for (int j = 0; j < nh; j++) dmax = fmax(dmax, deg[j]);
+    double *x = S->x, *y = S->y, *r = malloc(sizeof(double) * (size_t)nr);
+    int blk_done = 0;
+    {   /* 4 November 2026: when the set holds at least two non-LP blocks, the split comes from the blocks alone: their graph
+         * (weight: the constraints touching both, directly or through one LP variable) is small, its Fiedler vector exact
+         * (dense eigensolver); each LP variable then follows the side of most of its constraints' blocks */
+        static int cb = -1; if (cb < 0) { const char *e = getenv("BRISK_IOBLK"); cb = e ? atoi(e) : 1; }
+        int nb = 0; for (int j = 0; j < nh; j++) nb += S->isblk[hes[j]] != 0;
+        if (cb && nb >= 2 && nb <= 400) {
+            int *bi = malloc(sizeof(int) * (size_t)nh);   /* local hyperedge -> block index or -1 */
+            int c = 0; for (int j = 0; j < nh; j++) bi[j] = S->isblk[hes[j]] ? c++ : -1;
+            double *W = calloc((size_t)nb * nb, sizeof(double));
+            /* rows: pairs of their blocks; LP variables: the blocks of their rows */
+            int *lst = malloc(sizeof(int) * 4096);
+            double *lpbl = NULL; (void)lpbl;
+            for (int i = 0; i < nr; i++) {
+                int n_ = 0;
+                for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1] && n_ < 4096; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0 && bi[l] >= 0) lst[n_++] = bi[l]; }
+                for (int u = 0; u < n_; u++) for (int v = 0; v < n_; v++) if (lst[u] != lst[v]) W[lst[u] + (size_t)lst[v] * nb] += 1;
+            }
+            /* through LP variables: for each LP hyperedge, the blocks of the rows touching it (via a per-hyperedge pass over rows) */
+            {
+                int *hcnt = calloc((size_t)nh + 1, sizeof(int));
+                for (int i = 0; i < nr; i++) for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0 && bi[l] < 0) hcnt[l + 1]++; }
+                for (int j = 0; j < nh; j++) hcnt[j + 1] += hcnt[j];
+                int *hrow = malloc(sizeof(int) * ((size_t)hcnt[nh] + 1)), *hf = malloc(sizeof(int) * ((size_t)nh + 1));
+                memcpy(hf, hcnt, sizeof(int) * (size_t)nh);
+                for (int i = 0; i < nr; i++) for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0 && bi[l] < 0) hrow[hf[l]++] = i; }
+                for (int j = 0; j < nh; j++) {
+                    if (bi[j] >= 0) continue;
+                    int n_ = 0;
+                    for (int q = hcnt[j]; q < hcnt[j + 1]; q++) { const int i = rows[hrow[q]];
+                        for (int p = S->rp[i]; p < S->rp[i + 1] && n_ < 4096; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0 && bi[l] >= 0) lst[n_++] = bi[l]; } }
+                    for (int u = 0; u < n_; u++) for (int v = 0; v < n_; v++) if (lst[u] != lst[v]) W[lst[u] + (size_t)lst[v] * nb] += 0.5;
+                }
+                /* Fiedler vector of the block graph */
+                double *Lb = malloc(sizeof(double) * (size_t)nb * nb), *ev = malloc(sizeof(double) * (size_t)nb);
+                for (int u = 0; u < nb; u++) { double d = 0; for (int v = 0; v < nb; v++) { Lb[u + (size_t)v * nb] = -W[u + (size_t)v * nb]; d += W[u + (size_t)v * nb]; } Lb[u + (size_t)u * nb] = d; }
+                int info = 0, lw = -1; double wq;
+                BL(dsyev_)("V", "L", &nb, Lb, &nb, ev, &wq, &lw, &info);
+                lw = (int)wq + 1; double *wk = malloc(sizeof(double) * (size_t)lw);
+                BL(dsyev_)("V", "L", &nb, Lb, &nb, ev, wk, &lw, &info);
+                free(wk);
+                if (info == 0) {
+                    blk_done = 1;
+                    const double *f = Lb + (size_t)1 * nb;   /* the second smallest */
+                    for (int j = 0; j < nh; j++) if (bi[j] >= 0) x[j] = f[bi[j]];
+                    /* LP variables: the mean of their rows' blocks' values (0 when none) */
+                    for (int j = 0; j < nh; j++) {
+                        if (bi[j] >= 0) continue;
+                        double sm = 0; int n_ = 0;
+                        for (int q = hcnt[j]; q < hcnt[j + 1]; q++) { const int i = rows[hrow[q]];
+                            for (int p = S->rp[i]; p < S->rp[i + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0 && bi[l] >= 0) { sm += f[bi[l]]; n_++; } } }
+                        x[j] = n_ ? sm / n_ : 0;
+                    }
+                }
+                free(Lb); free(ev); free(hcnt); free(hrow); free(hf);
+            }
+            free(lst); free(W); free(bi);
+        }
+    }
+    if (!blk_done) {
+    /* the Fiedler vector by Lanczos on L restricted to the complement of the constant vector (full reorthogonalization) */
+    (void)dmax;
+    static int ioit = -1; if (ioit < 0) { const char *e = getenv("BRISK_IOIT"); ioit = e ? atoi(e) : 80; }
+    const int kmax = nh - 1 < ioit ? nh - 1 : ioit;
+    double *Q = malloc(sizeof(double) * (size_t)nh * (kmax + 1)), *al = malloc(sizeof(double) * (kmax + 1)), *be = malloc(sizeof(double) * (kmax + 1));
+    unsigned long long sd = 88172645463325252ULL + (unsigned long long)nr;
+    for (int j = 0; j < nh; j++) { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; x[j] = (double)(sd % 100000) / 50000.0 - 1.0; }
+    int k = 0;
+    {
+        double mu = 0; for (int j = 0; j < nh; j++) mu += x[j]; mu /= nh;
+        double nrm = 0; for (int j = 0; j < nh; j++) { x[j] -= mu; nrm += x[j] * x[j]; }
+        nrm = sqrt(nrm); for (int j = 0; j < nh; j++) Q[j] = x[j] / nrm;
+    }
+    for (k = 0; k < kmax; k++) {
+        const double *q = Q + (size_t)k * nh;
+        /* y = L q = deg q - (H'H - diag) q */
+        for (int i = 0; i < nr; i++) { double t = 0; for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0) t += q[l]; } r[i] = t; }
+        for (int j = 0; j < nh; j++) y[j] = deg[j] * q[j];
+        for (int i = 0; i < nr; i++) for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0) y[l] -= r[i] - q[l]; }
+        double a_ = 0; for (int j = 0; j < nh; j++) a_ += y[j] * q[j];
+        al[k] = a_;
+        double mu = 0; for (int j = 0; j < nh; j++) mu += y[j]; mu /= nh;
+        for (int j = 0; j < nh; j++) y[j] -= mu;
+        for (int pass = 0; pass < 2; pass++) for (int u = 0; u <= k; u++) {
+            const double *qu = Q + (size_t)u * nh; double d = 0;
+            for (int j = 0; j < nh; j++) d += y[j] * qu[j];
+            for (int j = 0; j < nh; j++) y[j] -= d * qu[j];
+        }
+        double nrm = 0; for (int j = 0; j < nh; j++) nrm += y[j] * y[j];
+        nrm = sqrt(nrm); be[k] = nrm;
+        if (!(nrm > 1e-12)) { k++; break; }
+        double *qn = Q + (size_t)(k + 1) * nh;
+        for (int j = 0; j < nh; j++) qn[j] = y[j] / nrm;
+    }
+    {   /* smallest Ritz pair of the k x k tridiagonal */
+        int kk = k, info = 0;
+        double *d = malloc(sizeof(double) * (kk + 1)), *e = malloc(sizeof(double) * (kk + 1)), *Z = malloc(sizeof(double) * ((size_t)kk * kk + 1)), *wk = malloc(sizeof(double) * (2 * kk + 2));
+        for (int u = 0; u < kk; u++) { d[u] = al[u]; e[u] = be[u]; }
+        BL(dstev_)("V", &kk, d, e, Z, &kk, wk, &info);
+        for (int j = 0; j < nh; j++) x[j] = 0;
+        if (info == 0) for (int u = 0; u < kk; u++) { const double c = Z[u]; const double *qu = Q + (size_t)u * nh; for (int j = 0; j < nh; j++) x[j] += c * qu[j]; }
+        free(d); free(e); free(Z); free(wk);
+    }
+    free(Q); free(al); free(be);
+    {   /* refine by inverse iteration with the graph's Laplacian factored (the shift-invert of a sparse eigensolver): the
+         * Lanczos vector above is only a start, its convergence to the Fiedler vector is slow on grid-like graphs */
+        static int inv = -1; if (inv < 0) { const char *e = getenv("BRISK_IOINV"); inv = e ? atoi(e) : 0; }
+        size_t np_ = 0;
+        for (int i = 0; i < nr; i++) if (rc[i] >= 2 && rc[i] <= 64) np_ += (size_t)rc[i] * (rc[i] - 1);
+        if (inv > 0 && np_ > 0) {
+            long long *key = malloc(sizeof(long long) * (np_ + 1));
+            size_t e = 0;
+            int *loc_ = malloc(sizeof(int) * 64);
+            for (int i = 0; i < nr; i++) {
+                if (rc[i] < 2 || rc[i] > 64) continue;
+                int c = 0;
+                for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0) loc_[c++] = l; }
+                for (int u = 0; u < c; u++) for (int v = 0; v < c; v++) if (loc_[u] != loc_[v]) key[e++] = (long long)loc_[u] * nh + loc_[v];
+            }
+            free(loc_);
+            extern int io_cmpll(const void *, const void *);
+            qsort(key, e, sizeof(long long), io_cmpll);
+            int *dg = calloc((size_t)nh + 1, sizeof(int));
+            size_t ue = 0;
+            for (size_t q = 0; q < e; q++) if (q == 0 || key[q] != key[q - 1]) { key[ue++] = key[q]; dg[key[q] / nh]++; }
+            int **nb = malloc(sizeof(int *) * (size_t)nh), *nbm = malloc(sizeof(int) * (ue + 1)), *fil = calloc((size_t)nh + 1, sizeof(int));
+            { size_t o = 0; for (int j = 0; j < nh; j++) { nb[j] = nbm + o; o += (size_t)dg[j]; } }
+            for (size_t q = 0; q < ue; q++) { const int j = (int)(key[q] / nh); nb[j][fil[j]++] = (int)(key[q] % nh); }
+            SChol *F = schol_analyze_adj(nh, dg, nb, (size_t)4e8);
+            if (F) {
+                schol_zero(F);
+                /* the weights again, entry by entry (each row adds 1 to every pair of its hyperedges) */
+                int *loc2 = malloc(sizeof(int) * 64);
+                double *dd = calloc((size_t)nh + 1, sizeof(double));
+                for (int i = 0; i < nr; i++) {
+                    if (rc[i] < 2 || rc[i] > 64) continue;
+                    int c = 0;
+                    for (int p = S->rp[rows[i]]; p < S->rp[rows[i] + 1]; p++) { const int l = S->loc[S->rh[p]]; if (l >= 0) loc2[c++] = l; }
+                    for (int u = 0; u < c; u++) for (int v = 0; v < u; v++) if (loc2[u] != loc2[v]) {
+                        const int hi = loc2[u] > loc2[v] ? loc2[u] : loc2[v], lo = loc2[u] + loc2[v] - hi;
+                        schol_add(F, (size_t)hi, (size_t)lo, -1.0); dd[loc2[u]] += 1; dd[loc2[v]] += 1;
+                    }
+                }
+                free(loc2);
+                for (int j = 0; j < nh; j++) schol_add(F, (size_t)j, (size_t)j, dd[j] + 1e-6 * (1.0 + dmax));
+                free(dd);
+                if (schol_factor(F, 0.0) == 0) {
+                    double *wk = malloc(sizeof(double) * ((size_t)nh + 1));
+                    for (int it = 0; it < inv; it++) {
+                        schol_solve(F, x, wk);
+                        double mu = 0; for (int j = 0; j < nh; j++) mu += x[j]; mu /= nh;
+                        double nrm = 0; for (int j = 0; j < nh; j++) { x[j] -= mu; nrm += x[j] * x[j]; }
+                        nrm = sqrt(nrm); if (!(nrm > 0)) break;
+                        for (int j = 0; j < nh; j++) x[j] /= nrm;
+                    }
+                    free(wk);
+                }
+                schol_free(F);
+            }
+            free(key); free(dg); free(nb); free(nbm); free(fil);
+        }
+    }
+    }
+    /* weighted median split */
+    int *idx = malloc(sizeof(int) * (size_t)nh);
+    for (int j = 0; j < nh; j++) idx[j] = j;
+    { extern double *g_io_x; g_io_x = x; int io_cmpx(const void *, const void *); qsort(idx, (size_t)nh, sizeof(int), io_cmpx); }
+    double tot = 0, acc = 0; for (int j = 0; j < nh; j++) tot += w[j];
+    for (int j = 0; j < nh; j++) S->side[idx[j]] = 0;
+    for (int j = 0; j < nh; j++) { acc += w[idx[j]]; if (acc > tot / 2) S->side[idx[j]] = 1; }
+    int *L = malloc(sizeof(int) * (size_t)nr), *R = malloc(sizeof(int) * (size_t)nr), *Sp = malloc(sizeof(int) * (size_t)nr), nl = 0, nrr = 0, ns = 0;
+    for (int i = 0; i < nr; i++) {
+        int a0 = 0, a1 = 0;
+        for (int q = S->rp[rows[i]]; q < S->rp[rows[i] + 1]; q++) { const int l = S->loc[S->rh[q]]; if (l >= 0) { if (S->side[l]) a1 = 1; else a0 = 1; } }
+        if (a0 && !a1) L[nl++] = rows[i]; else if (a1 && !a0) R[nrr++] = rows[i]; else Sp[ns++] = rows[i];
+    }
+    int *HL = malloc(sizeof(int) * (size_t)nh), *HR = malloc(sizeof(int) * (size_t)nh), nhl = 0, nhr = 0;
+    for (int j = 0; j < nh; j++) { if (S->side[j]) HR[nhr++] = hes[j]; else HL[nhl++] = hes[j]; }
+    for (int j = 0; j < nh; j++) S->loc[hes[j]] = -1;
+    for (int i = 0; i < nr; i++) S->mark[rows[i]] = 0;
+    free(deg); free(rc); free(r); free(idx);
+    if (nl == 0 || nrr == 0) { for (int i = 0; i < nr; i++) S->order[S->no++] = rows[i]; }
+    else { io_bisect(S, L, nl, HL, nhl, depth + 1); io_bisect(S, R, nrr, HR, nhr, depth + 1); for (int i = 0; i < ns; i++) S->order[S->no++] = Sp[i]; }
+    free(L); free(R); free(Sp); free(HL); free(HR);
+}
+double *g_io_x;
+int io_cmpll(const void *a, const void *b) { const long long u = *(const long long *)a, v = *(const long long *)b; return u < v ? -1 : u > v; }
+int io_cmpx(const void *a, const void *b) { const double u = g_io_x[*(const int *)a], v = g_io_x[*(const int *)b]; return u < v ? -1 : u > v ? 1 : *(const int *)a - *(const int *)b; }
+static int incidence_order(const Problem *P, int m, int *perm) {
+    int nh = 0;
+    int *base = malloc(sizeof(int) * ((size_t)P->nblk + 1));
+    for (int k = 0; k < P->nblk; k++) { base[k] = nh; nh += P->blk[k].type == BLK_LP ? P->blk[k].n : 1; }
+    int *rp = calloc((size_t)m + 1, sizeof(int));
+    for (int k = 0; k < P->nblk; k++) { const Block *B = &P->blk[k]; for (int t = 0; t < B->ncon; t++) rp[B->con[t] + 1] += B->type == BLK_LP ? B->A[t].nnz : 1; }
+    for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
+    int *rh = malloc(sizeof(int) * ((size_t)rp[m] + 1)), *fl = malloc(sizeof(int) * ((size_t)m + 1));
+    memcpy(fl, rp, sizeof(int) * (size_t)m);
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        for (int t = 0; t < B->ncon; t++) {
+            const int i = B->con[t];
+            if (B->type == BLK_LP) for (int q = 0; q < B->A[t].nnz; q++) rh[fl[i]++] = base[k] + B->A[t].row[q];
+            else rh[fl[i]++] = base[k];
+        }
+    }
+    char *isblk = calloc((size_t)nh + 1, 1);
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type != BLK_LP) isblk[base[k]] = 1;
+    {   /* only where the blocks' own graph decides the split: 2 to 400 blocks (the AC power flows' thousands of small
+         * blocks: no gain and seconds of ordering, conv_case13659 14 s) */
+        int nb0 = 0; for (int k = 0; k < P->nblk; k++) nb0 += P->blk[k].type != BLK_LP;
+        if (nb0 < 2 || nb0 > 400) { free(isblk); free(base); free(rp); free(rh); free(fl); return 1; }
+    }
+    IOState S = { m, nh, rp, rh, NULL, NULL, perm, 0, calloc((size_t)m + 1, sizeof(int)), malloc(sizeof(int) * ((size_t)nh + 1)),
+                  malloc(sizeof(int) * ((size_t)nh + 1)), malloc(sizeof(double) * ((size_t)nh + 1)), malloc(sizeof(double) * ((size_t)nh + 1)),
+                  malloc(sizeof(double) * ((size_t)nh + 1)), isblk };
+    for (int j = 0; j < nh; j++) S.loc[j] = -1;
+    int *rows = malloc(sizeof(int) * (size_t)m), *hes = malloc(sizeof(int) * ((size_t)nh + 1));
+    for (int i = 0; i < m; i++) rows[i] = i;
+    for (int j = 0; j < nh; j++) hes[j] = j;
+    io_bisect(&S, rows, m, hes, nh, 0);
+    const int ok = S.no == m;
+    free(isblk); free(base); free(rp); free(rh); free(fl); free(S.mark); free(S.loc); free(S.side); free(S.x); free(S.y); free(S.w); free(rows); free(hes);
+    return ok ? 0 : 1;
+}
+
 static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
     const int m = P->m;
     if (g_sb_cache && g_sb_cache_P == P && g_sb_cache_m == m && g_sb_cache_solve == g_solve_cur) {
@@ -3524,7 +3887,62 @@ static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
     const int peo_prev = schol_set_peo(peo_on);
     SChol *SC = ictake ? chordal_take_estimate(m, deg, nbr, cap, par->sparse_schur < 0 ? (double)m * m * m / 3.0 * spfrac / wide : 0) : NULL;
     if (SC && (verbose > 1 || getenv("BRISK_ROUTEDBG"))) printf("Schur pattern: the analysis of the presolve's estimate taken\n");
-    if (!SC) SC = schol_analyze_adj(m, deg, nbr, cap);
+    if (!SC) {   /* experiment (4 November 2026, Charlie's grids): the nested dissection of the LP solver tried on the Schur pattern (BRISK_SDPND=1) */
+        static int sdpnd = -1; if (sdpnd < 0) { const char *e = getenv("BRISK_SDPND"); sdpnd = e ? atoi(e) : 0; }
+        int amd_prev = 0;
+        if (sdpnd) { schol_set_nd(1); amd_prev = schol_set_amd(sdpnd); }
+        int *fperm = NULL;   /* experiment: an order read from a file (BRISK_SCHURPERM: m, then m indices) */
+        {
+            const char *pf = getenv("BRISK_SCHURPERM");
+            FILE *fp = pf ? fopen(pf, "r") : NULL;
+            int mm = -1;
+            if (fp && fscanf(fp, "%d", &mm) == 1 && mm == m) {
+                fperm = malloc(sizeof(int) * (size_t)m);
+                for (int q = 0; q < m; q++) if (fscanf(fp, "%d", &fperm[q]) != 1) { free(fperm); fperm = NULL; break; }
+            }
+            if (pf) printf("Schur pattern: order from %s %s (m %d, file %d)\n", pf, fperm ? "used" : "NOT used", m, mm);
+            if (fp) fclose(fp);
+            static int sinc = -1; if (sinc < 0) { const char *e = getenv("BRISK_SCHURINC"); sinc = !(e && atoi(e) == 0); }   /* default on since 4 November 2026; BRISK_SCHURINC=0: off */
+            if (!fperm && sinc && m >= 20000) {   /* experiment: the order from the row-to-block incidence (below 20,000 rows the own ordering competes already) */
+                fperm = malloc(sizeof(int) * (size_t)m);
+                const double t0i = omp_get_wtime();
+                if (incidence_order(P, m, fperm)) { free(fperm); fperm = NULL; }
+                if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: order from the row-to-block incidence %s (%.2f s)\n", fperm ? "used" : "not used", omp_get_wtime() - t0i);
+            }
+            if (fperm) schol_set_perm(fperm);
+        }
+        /* from 20,000 rows the analysis takes AMD's order unchecked (no own ordering beside it): AMD's order is costed
+         * from AMD's own counts (no symbolic factorization) on a second thread while the incidence order is analysed, and
+         * analysed in full only when it can win */
+        extern int schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatile double *cap, double *flops_out, double *nnz_out);
+        double fa = INFINITY, na = 0, te = 0; int er = 1;
+        const double te0 = omp_get_wtime();
+        if (fperm && m >= 20000) {
+            const int *fp_ = fperm;
+#pragma omp parallel sections num_threads(2)
+            {
+#pragma omp section
+                { schol_set_perm(fp_); SC = schol_analyze_adj(m, deg, nbr, cap); schol_set_perm(NULL); }
+#pragma omp section
+                { er = schol_amd_estimate_cap(m, deg, nbr, NULL, &fa, &na); te = omp_get_wtime() - te0; }
+            }
+        } else
+            SC = schol_analyze_adj(m, deg, nbr, cap);
+        if (fperm) {
+            schol_set_perm(NULL); free(fperm);
+            if (m >= 20000) {
+                const double f1 = SC ? schol_flops(SC) : INFINITY;
+                if (er == 0 && fa < f1) {
+                    SChol *S2 = schol_analyze_adj(m, deg, nbr, cap);
+                    const double f2 = S2 ? schol_flops(S2) : INFINITY;
+                    if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: incidence order %.3g flops, AMD %.3g (estimate %.3g, %.2f s): %s kept\n", f1, f2, fa, te, f1 <= f2 ? "incidence" : "AMD");
+                    if (f2 < f1) { if (SC) schol_free(SC); SC = S2; } else if (S2) schol_free(S2);
+                } else
+                    if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: incidence order %.3g flops, AMD's estimate %.3g (%.2f s, beside the analysis; %.2f s for both): incidence kept\n", f1, fa, te, omp_get_wtime() - te0);
+            }
+        }
+        if (sdpnd) { schol_set_nd(0); schol_set_amd(amd_prev); }
+    }
     schol_set_peo(peo_prev);
     if (SC && schol_peo_used() && (verbose > 1 || getenv("BRISK_ROUTEDBG"))) printf("Schur pattern: chordal, perfect elimination ordering (no fill)\n");
     schol_set_flopcap(0);
@@ -3532,6 +3950,20 @@ static SChol *sparse_build(const Problem *P, const Params *par, int verbose) {
     if (!SC) {
         if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: %.3g entries in the lower triangle (%.0f %%): the analysis of a sparse factorization stopped at its fill or flop cap\n", pat_lower, 200.0 * pat_lower / ((double)m * m));
         return NULL;
+    }
+    /* 31 October 2026: a large factor with narrow exact supernodes runs its updates as thin products (the large-problem
+     * benchmark's mixed cones, SDP with SOCP, m = 19,182: 9.6e11 flops in 2,175 supernodes of nine columns on average,
+     * 80 Gflop/s, 12 s a factorization against the dense path's 6.5 s); the relaxed amalgamation of the LP method (30 %
+     * explicit zeros at most) gives 501 supernodes and half the time. Only above 1e11 flops: below, on the 112 sparse
+     * Schur factors of the benchmark (all under 2.4e10 flops), it was neutral in time and its explicit zeros changed four
+     * statuses of ill-conditioned problems. BRISK_SCHURAMALG=0: exact supernodes always. */
+    {   static double amalg_min = -1; if (amalg_min < 0) { const char *e = getenv("BRISK_SCHURAMALG"); amalg_min = e ? atof(e) : 1e11; }
+        if (amalg_min > 0 && schol_flops(SC) >= amalg_min) {
+            extern SChol *schol_reanalyze_amalg(SChol *S, double f);
+            const int ns0 = schol_nsuper(SC);
+            SC = schol_reanalyze_amalg(SC, 0.3);
+            if (verbose > 1 || getenv("BRISK_ROUTEDBG")) printf("Schur pattern: %.1e flops: relaxed supernodes, %d -> %d\n", schol_flops(SC), ns0, schol_nsuper(SC));
+        }
     }
     double dense = par->c_blas * (double)m * m * m / 3.0;
     /* wide supernodes (the dense cliques of SOS/moment constraints) run at BLAS-3 speed:
@@ -3810,7 +4242,7 @@ typedef struct {
     SChol *SC;            /* fill-reducing sparse Cholesky, or NULL */
     double *Masm;         /* dense assembly buffer for SC on dense-ish patterns, or NULL */
     double pivtol;        /* smallest acceptable squared pivot of the equilibrated factor */
-    double reg_ill;       /* regularization used when the factor is ill-conditioned */
+    double reg_ill;       /* fixed floor of the regularization (0: automatic, from m u) */
     double min_pivot;
     double *e1, *e2, *e3;
     int use_hint, reg_hint;   /* start at the regularization the previous factorization needed */
@@ -4396,6 +4828,24 @@ static int schur_factor(Schur *S) {
     S->t_fact += wtime() - t;
     return r;
 }
+/* The shift of the equilibrated (unit-diagonal) Schur complement (1 November 2026). Its lower end is m u, the backward
+ * error of a Cholesky factorization of order m (a smaller shift is lost in the rounding); above it the shift damps the
+ * near-null directions of M, which is what lets the steps grow where constraints are nearly dependent (the maximum-
+ * variance-unfolding SDPs) and what spoils the primal rows where they are not (qap9): the level follows the steps as a
+ * trust region does, raised by 100 after a short step from a regularized factorization (hsd_run), lowered by 100 at
+ * each later factorization otherwise (the rule of 27 October). Until then: a fixed floor of 1e-10 and a first attempt at
+ * 1e-13; -regill r > 0 sets a fixed floor, BRISK_REGTR=0 restores the old rule (comparisons). On the 123 benchmark files
+ * whose factorization is regularized in four or more iterations: 7 better statuses, none worse, 230.3 -> 209.5 s. */
+static int g_regtr = -1;
+static inline int regtr_on(void) { if (g_regtr < 0) { const char *e = getenv("BRISK_REGTR"); g_regtr = e ? atoi(e) : 1; } return g_regtr; }
+static double schur_reg_floor(const Schur *S) {
+    if (S->reg_ill > 0) return S->reg_ill;
+    return regtr_on() ? fmax(1e-15, (double)S->m * 2.220446049250313e-16) : 1e-10;
+}
+static double schur_reg_first(const Schur *S) {
+    if (S->reg_ill > 0 || !regtr_on()) return 1e-13;
+    return fmax(1e-15, (double)S->m * 2.220446049250313e-16);
+}
 static int schur_factor_env(Schur *S) {
     Envelope *E = S->E;
     const int m = S->m;
@@ -4417,15 +4867,15 @@ static int schur_factor_env(Schur *S) {
         if (info == 0) {
             double pmin = 1.0;
             for (int i = 0; i < m; i++) { double p = E->L[E->rptr[i] + (i - E->fst[i])]; if (p * p < pmin) pmin = p * p; }
-            if (pmin >= S->pivtol || reg >= S->reg_ill) {
+            if (pmin >= S->pivtol || reg >= schur_reg_floor(S)) {
                 S->reg = reg; if (reg > 0) S->nreg++; S->is_float = 0;
                 S->min_pivot = pmin;
                 return 0;
             }
-            reg = fmax(S->reg_ill, reg * 100);
+            reg = fmax(schur_reg_floor(S), reg * 100);
             continue;
         }
-        reg = (reg == 0) ? 1e-13 : reg * 100;
+        reg = (reg == 0) ? schur_reg_first(S) : reg * 100;
     }
     return 1;
 }
@@ -4602,7 +5052,7 @@ static int schur_factor_(Schur *S) {
      * (evening of 27 October: one step below that level, so that the level comes down again when M allows it, at the
      * price of one failed attempt at most; started at the level itself, it could only rise: mvu_n1000, SDP, needed the
      * regularization in 69 iterations instead of 12 and took 98 s instead of 44; hinf_brl_70, SDP, lost OPTIMAL) */
-    double reg = S->reg_hint ? fmax(S->reg_ill, 0.01 * S->reg_ok) : 0;
+    double reg = S->reg_hint ? fmax(schur_reg_floor(S), 0.01 * S->reg_ok) : 0;
     for (int attempt = 0; attempt < 10; attempt++) {
         schur_dense_load(S, reg);
         double tpf = wtime();
@@ -4614,16 +5064,16 @@ static int schur_factor_(Schur *S) {
              * "succeeded": regularize instead (PCG then refines against the true M). */
             double pmin = 1.0;
             for (int i = 0; i < m; i++) { double p = S->Mc[i + (size_t)i * m]; if (p * p < pmin) pmin = p * p; }
-            if (pmin >= S->pivtol || reg >= S->reg_ill) {
+            if (pmin >= S->pivtol || reg >= schur_reg_floor(S)) {
                 S->reg = reg; if (reg > 0) S->nreg++;
                 S->min_pivot = pmin;
                 if (S->use_hint) { S->reg_hint = reg > 0; S->reg_ok = reg; }
                 return 0;
             }
-            reg = fmax(S->reg_ill, reg * 100);
+            reg = fmax(schur_reg_floor(S), reg * 100);
             continue;
         }
-        reg = (reg == 0) ? 1e-13 : reg * 100;
+        reg = (reg == 0) ? schur_reg_first(S) : reg * 100;
     }
     return info;
 }
@@ -5696,12 +6146,15 @@ static int sdp_nb_ok(const Problem *P, BS *S, double al, double thr) {
         const size_t n2 = (size_t)n * n;
         double *L = amalloc(sizeof(double) * n2), *T = amalloc(sizeof(double) * n2);
         for (size_t i = 0; i < n2; i++) { L[i] = s->X[i] + al * s->dX[i]; T[i] = s->Z[i] + al * s->dZ[i]; }
-        BL(dpotrf_)("L", &n, L, &n, &info);
+        /* (2 November 2026: the solver's own Cholesky and triangular products, on the threads with fixed tiles; LAPACK's
+         * ran on one thread, about 7 s a test at n = 5,477 on diamond_patch, three tests an iteration when the longer
+         * step is refused) */
+        info = brisk_dpotrf(n, L, n);
         if (!info) {
-            BL(dtrmm_)("L", "L", "T", "N", &n, &n, &DONE, L, &n, T, &n);
-            BL(dtrmm_)("R", "L", "N", "N", &n, &n, &DONE, L, &n, T, &n);
+            xtrmm("L", "L", "T", "N", &n, &n, &DONE, L, &n, T, &n);
+            xtrmm("R", "L", "N", "N", &n, &n, &DONE, L, &n, T, &n);
             for (int i = 0; i < n; i++) T[i + (size_t)i * n] -= thr;
-            BL(dpotrf_)("L", &n, T, &n, &info);
+            info = brisk_dpotrf(n, T, n);
         }
         if (info) ok = 0;
         free(L); free(T);
@@ -5747,22 +6200,23 @@ static int centrality_corrector(const Problem *P, BS *S, Schur *Sc, const Params
             symmetrize(n, s->Ct);
             const int info = sym_eig(n, s->Ct, n, s->ev);
             if (info != 0) return 0;
-            /* T = V diag(t) V' over eigenpairs that need correction */
-            memset(s->G, 0, sizeof(double) * len);
+            /* T = V diag(t) V' over eigenpairs that need correction: the corrected eigenvectors moved to the front of
+             * V, scaled into Q, and T formed by one product (1 November 2026; as in hsd_corrector since 5.12: until
+             * then nt rank-one updates in a scalar loop, up to n^3 multiply-adds on one thread a corrector) */
             int nt = 0;
             for (int j = 0; j < n; j++) {
                 double v = s->ev[j], t = 0;
                 if (v < bmin * mu_t) t = bmin * mu_t - v;
                 else if (v > bmax * mu_t) t = fmax(bmax * mu_t - v, -bmax * mu_t);
                 if (t == 0) continue;
+                if (nt != j) memcpy(s->Ct + (size_t)nt * n, s->Ct + (size_t)j * n, sizeof(double) * n);
+                const double *vj = s->Ct + (size_t)nt * n;
+                double *uj = s->Q + (size_t)nt * n;
+                for (int r = 0; r < n; r++) uj[r] = t * vj[r];
                 nt++;
-                const double *vj = s->Ct + (size_t)j * n;
-                for (int c = 0; c < n; c++) {
-                    double f = t * vj[c];
-                    double *gc = s->G + (size_t)c * n;
-                    for (int r = 0; r < n; r++) gc[r] += f * vj[r];
-                }
             }
+            if (nt > 0) { pdgemm("N", "T", &n, &n, &nt, &DONE, s->Q, &n, s->Ct, &n, &DZERO, s->G, &n); symmetrize(n, s->G); }
+            else memset(s->G, 0, sizeof(double) * len);
             if (nt == 0) { memset(s->Q, 0, sizeof(double) * len); }
             else {
                 /* Q = K = L^{-T} T L^{-1} */
@@ -5965,6 +6419,12 @@ static double gram_cg_polish(const Problem *P, BS *S, const double *rhs, double 
             if (it >= 500 && (!(h[2] < 0.5 * h[0]) || h[2] > 1e-6 * nb)) break;
         }
         gram_mv(P, S, p, q);
+        if (it < 3 && getenv("BRISK_BITDBG")) {   /* (diagnosis of ISSUES 739: bit patterns of the CG's inputs and products) */
+            unsigned long long hr = 0, hp = 0, hq = 0;
+            for (int i = 0; i < m; i++) { unsigned long long u; memcpy(&u, &rhs[i], 8); hr ^= u * (2 * (unsigned long long)i + 1);
+                memcpy(&u, &p[i], 8); hp ^= u * (2 * (unsigned long long)i + 1); memcpy(&u, &q[i], 8); hq ^= u * (2 * (unsigned long long)i + 1); }
+            printf("   [bitdbg gram_cg it %d: rhs %016llx p %016llx Ap %016llx]\n", it, hr, hp, hq);
+        }
         double pq = ddot_n(m, p, q);
         if (!(pq > 0)) break;
         double a = rr / pq;
@@ -6071,9 +6531,30 @@ static double dd_meas_cb(void *c, double **X, double **Z, const double *y, doubl
     return v;
 }
 static void rej_offer(const Problem *P, double *const *Xk, const double *y, const Result *R, double score);   /* (ISSUES 266) */
+/* 1 November 2026 (ISSUES 741, diamond_patch's peak above 9 GB in the end steps): BRISK_MEMTRACE=1 prints the resident
+ * memory and its peak at the boundaries of the end steps (Linux: /proc/self/status) */
+void brisk_memtrace(const char *where) {
+    static int on = -1; if (on < 0) on = getenv("BRISK_MEMTRACE") != NULL;
+    if (!on) return;
+    FILE *f = fopen("/proc/self/status", "r"); if (!f) return;
+    char line[256]; double rss = 0, hwm = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "VmRSS:", 6)) rss = atof(line + 6) / 1048576.0;
+        else if (!strncmp(line, "VmHWM:", 6)) hwm = atof(line + 6) / 1048576.0;
+    }
+    fclose(f);
+    printf("   [memory %s: resident %.2f GB, peak %.2f GB]\n", where, rss, hwm); fflush(stdout);
+}
 static int polish_solution(const Problem *P, BS *S, double **Xb, double **Zb, const double *yb,
                            Result *R, double score_now, Schur *Sc, double *w, int verbose) {
     const int m = P->m, nb = P->nblk;
+    brisk_memtrace("polish (Euclidean) start");
+    if (getenv("BRISK_BITDBG")) {   /* (diagnosis of ISSUES 739) */
+        unsigned long long hx = 0, hy = 0, u;
+        for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]); for (size_t i = 0; i < len; i++) { memcpy(&u, &Xb[k][i], 8); hx ^= u * (2 * (unsigned long long)i + 1 + 2 * (unsigned long long)k); } }
+        for (int i = 0; i < m; i++) { memcpy(&u, &yb[i], 8); hy ^= u * (2 * (unsigned long long)i + 1); }
+        printf("   [bitdbg polish_solution entry: X %016llx y %016llx, %d blocks]\n", hx, hy, nb);
+    }
     memcpy(Sc->t, P->b, sizeof(double) * m);
     for (int k = 0; k < nb; k++) blk_Aop(&P->blk[k], &S[k], Xb[k], Sc->t, -1.0);
     const double tg0 = wtime();
@@ -6095,9 +6576,11 @@ static int polish_solution(const Problem *P, BS *S, double **Xb, double **Zb, co
     double sp = measure_candidate(P, S, Xs, Zs, yb, &Rp, Sc->t);
     if (!(sp < score_now)) rej_offer(P, Xs, yb, &Rp, sp);
     free(Xs); free(Zs);
+    brisk_memtrace("polish (Euclidean) end");
     if (verbose > 0)
         printf("   polishing: score %.2e -> %.2e (Gram CG residual %.1e) %s\n",
                score_now, sp, rres, sp < score_now ? "accepted" : "rejected");
+    brisk_log_step("polish: projection onto the constraints", score_now, sp, sp < score_now);
     if (sp < score_now) {
         double tt[6] = { R->t_setup, R->t_schur, R->t_chol, R->t_dense, R->t_step, R->t_total };
         int it = R->iters;
@@ -6512,6 +6995,7 @@ static double sqrt_restore(const Problem *P, BS *S, double **Xc, const double *b
 static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, const double *yb,
                           Result *R, double score_now, Schur *Sc, double *w, int verbose, int half) {
     const int m = P->m, nb = P->nblk;
+    brisk_memtrace(half ? "polish (square-root metric) start" : "polish (X metric) start");
     double **Xc = malloc(sizeof(double *) * nb), **Zi = malloc(sizeof(double *) * nb);
     int zok = 1;
     for (int k = 0; k < nb; k++) {
@@ -6587,7 +7071,7 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
                 for (size_t i = 0; i < len; i++) s->F[i] = Xc[k][i] + a * 0.5 * (s->W[i] + s->W[(i % n) * n + i / n]);
                 double *T = malloc(sizeof(double) * (len + 1));
                 memcpy(T, s->F, sizeof(double) * len);
-                BL(dpotrf_)("L", &n, T, &n, &info);
+                info = brisk_dpotrf(n, T, n);       /* (a test of definiteness: on the threads, 2 November 2026) */
                 free(T);
                 if (info == 0) memcpy(Xc[k], s->F, sizeof(double) * len);
             }
@@ -6629,6 +7113,7 @@ static int polish_xmetric(const Problem *P, BS *S, double **Xb, double **Zb, con
         if (verbose > 0)
             printf("   %s polishing: score %.2e -> %.2e (solve residual %.1e, step %.2f) %s\n", half ? "square-root-metric" : "X-metric",
                    score_now, sp, rres, alpha_min, take ? "accepted" : sp < score_now ? "rejected (solve residual)" : "rejected");
+        brisk_log_step(half ? "polish: projection in the metric of X^(1/2)" : "polish: projection in the metric of X", score_now, sp, take);
         if (half && ENV_ON("BRISK_POLDBG")) printf("     [candidate: pinf %.2e dinf %.2e gap %.2e comp %.2e err %.1e %.1e]\n", Rp.pinf, Rp.dinf, Rp.relgap, Rp.relcomp, Rp.err[2], Rp.err[4]);
         if (take) {
             double tt[6] = { R->t_setup, R->t_schur, R->t_chol, R->t_dense, R->t_step, R->t_total };
@@ -7485,7 +7970,18 @@ static int bord_factor(const Problem *P, Schur *Sc, FreeVars *F) {
     }
     int ok = 0;
     double delta = 0;
+    /* (ISSUES 761) a failure without a shift: the caller goes back to M (return 2) instead of
+     * factoring a shifted bordered system, whose refinement stalled at 1e-9..1e-4 on a user's unsteady cavity (M itself
+     * needed a shift there in 6 iterations; giving the pairs' weight up to theta to M did not remove the shift: the
+     * near-singularity is M's, not that of M without the pairs). On the 40 files with split pairs: 12 go back, two
+     * reduced-accuracy runs end OPTIMAL, one OPTIMAL run ends at reduced accuracy (case588_sdet, 5e-8: both routes
+     * lose the primal residual at its end, the default's too (pinf 18 at iteration 39); the best iterate polished is
+     * iteration 36 (mu 7e-9) there and 39 (mu 1.5e-10, nearer the boundary) here, whose polish leaves X >= 0 at 5e-8).
+     * Off for the release of 5 November 2026 (the owner: to be tested properly in the next round): default 1, the shifted
+     * bordered factor as before; BRISK_BORDSHIFT=0 goes back to M. */
+    static int bs_env = -1; if (bs_env < 0) { const char *e = getenv("BRISK_BORDSHIFT"); bs_env = e ? atoi(e) : 1; }
     for (int attempt = 0; attempt < 8 && !ok; attempt++) {
+        if (attempt == 1 && !bs_env) { Sc->t_fact += wtime() - t0; g_bf_all += wtime() - t0; g_bf_n++; return 2; }
         schol_zero(F->KS);
         for (size_t q = 0; q < F->nkm; q++) kv[F->km_k[q]] = mv[F->km_sc[q]] * d[F->km_r[q]] * d[F->km_c[q]];
         for (size_t q = 0; q < F->naf; q++) kv[F->kaf_off[q]] += F->kaf_val[q] * d[F->kaf_r[q]] * d[m + F->kaf_f[q]];
@@ -7498,6 +7994,7 @@ static int bord_factor(const Problem *P, Schur *Sc, FreeVars *F) {
     }
     Sc->reg = delta;
     if (delta > 0) Sc->nreg++;
+    if (getenv("BRISK_BORDDBG")) printf("     [bord factor: ok %d delta %.1e]\n", ok, delta);
     Sc->is_float = 0;
     Sc->t_fact += wtime() - t0;
     g_bf_all += wtime() - t0; g_bf_n++;
@@ -7554,6 +8051,7 @@ static double bord_solve(Schur *S, const double *rhs, double *x, double tol_rel)
         if (g_bdbg) { if (pass == 0) { int b = rel <= 1e-13 ? 0 : rel <= 1e-11 ? 1 : rel <= 1e-9 ? 2 : rel <= 1e-7 ? 3 : 4; g_bh0[b]++; g_bprev0 = rel; }
                       else if (pass == 1 && g_bprev0 > 1e-13 && g_bprev0 <= 1e-11) { if (rel <= 1e-13) g_b1ok++; else { g_b1bad++; if (rel > g_b1worst) g_b1worst = rel; } } }
         /* 4.22: the caller's tolerance (correctors ask for 1e-7) */
+        if (getenv("BRISK_BORDDBG")) printf("     [bord solve pass %d rel %.2e]\n", pass, rel);
         if (rel <= fmax(1e-13, g_btol ? fmin(tol_rel, g_btolcap) : 0.0) || !(nr < 0.5 * prev)) { if (g_bdbg) g_bhp[pass < 5 ? pass : 5]++; break; }
         /* 4.22: from <= 1e-11 one more pass is applied without its residual check (a
          * product with M and the border saved). Refinement stagnates at that level anyway
@@ -8267,6 +8765,35 @@ static __attribute__((noinline)) void hsd_bits(const Problem *P, const BS *S, co
     printf("     [bits it %d X %016llx Z %016llx y %016llx tau %016llx kap %016llx]\n", it, (unsigned long long)h[0], (unsigned long long)h[1],
            (unsigned long long)h[2], (unsigned long long)ut, (unsigned long long)uk);
 }
+static int g_early_a = 0;    /* (ISSUES 737: rule A fired in this iteration) */
+static int g_early_a_ended = 0;   /* (rule A ended this solve: its end steps are skipped, the re-solve follows) */
+static double g_pol_s0 = -1, g_pol_t0 = -1;   /* (BRISK_POLDBG: the end steps measured, brisk_solve_body) */
+/* 2 November 2026: the embedding's corrector count from the deterministic work model (4.25) alone: per-iteration
+ * factorization + assembly against one corrector, least-squares fit on 135 instances; the thresholds as set then. The
+ * model needs only the problem's sizes, so the count is fixed before the first iteration; until today it was fixed after
+ * three iterations, a leftover of the timed rule, and those three ran correctors at the full count: on diamond_patch
+ * (Mittelmann, SDP, one block of order 5,477) each corrector's eigenvalues outside the box cost a tridiagonal reduction
+ * of the block, about 200 s of the embedding's 706 s, for a model verdict of no correctors. BRISK_KFLATE=1: as before. */
+static int hsd_corr_count_model(const Problem *P, const Params *par, const Schur *Sc, int nb, int m, double *rho_out) {
+    double f_chol = 0, f_nnz = 0, f_asm = 0, f_dense = 0, f_small = 0, f_aop = 0;
+    if (Sc->SC) { f_chol = schol_flops(Sc->SC); f_nnz = (double)schol_nnz(Sc->SC); }
+    else if (Sc->E) { for (int i = 0; i < m; i++) { double r = i - Sc->E->fst[i] + 1; f_chol += r * r; f_nnz += r; } }
+    else { f_chol = (double)m * m * m / 3.0; f_nnz = 0.5 * (double)m * m; }
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k];
+        const double nk = B->n;
+        if (B->type == BLK_SDP) { if (nk > 16) f_dense += nk * nk * nk; else f_small += nk * nk * nk + 64.0; }
+        for (int t = 0; t < B->ncon; t++) { f_aop += B->A[t].ef; f_asm += 2.0 * B->A[t].ef * (B->type == BLK_SDP ? nk : 1.0); }
+    }
+    const double w_fact = (Sc->allow_float ? 7.0e-12 : 2.0e-11) * f_chol + 9.2e-11 * f_asm + 3.9e-8 * f_nnz + 1.6e-6 * nb + 6.0e-5;
+    const double w_corr = 9.9e-10 * f_dense + 7.8e-9 * f_small + 3.6e-9 * f_nnz + 2.7e-9 * f_aop + 1.05e-6 * nb + 3.4e-7 * m + 6.9e-5;
+    const double rho = par->hsd_cfrac * w_fact / w_corr;
+    int k = (int)fmin((double)par->hsd_corr, rho >= 0.9 ? 3.0 : rho >= 0.45 ? 2.0 : rho >= 0.2 ? 1.0 : -1.0);
+    if (w_fact < 2e-3) k = par->hsd_corr;          /* tiny problems: correctors are cheap in absolute terms */
+    if (rho_out) *rho_out = rho;
+    return k;
+}
+
 static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, double *y,
                    double *ybest, double *best_score, int *it_out, int *it_best, Result *best,
                    int keep_best, RCand *rc) {
@@ -8423,6 +8950,19 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         npk = nf; pk_b = malloc(sizeof(int) * nf); pk_p = malloc(sizeof(int) * nf); pk_q = malloc(sizeof(int) * nf);
         memcpy(pk_b, FV.kb, sizeof(int) * nf); memcpy(pk_p, FV.ip, sizeof(int) * nf); memcpy(pk_q, FV.im, sizeof(int) * nf);
     }
+    /* 4 November 2026: the split pairs as the measure of the problem as read sees them. A free variable has no cone:
+     * the products x+ z+ and x- z- of its two halves are no complementarity of the problem as read, and its dual
+     * equation c_f - a_f'y = 0 is a dual residual there (estimated by ((Rd+ + Z+) - (Rd- + Z-)) / 2). The score's
+     * complementarity and dual residual are measured that way while the pairs stay LP slots (not when the free
+     * variables are handled natively, nf > 0 below). The user's unsteady cavity on the kept monomials (4,278 pairs):
+     * all errors 4e-9 at iteration 16 while x+ z+ + x- z- held relcomp at 6e-7; the run went on to 20 iterations and
+     * a primal residual of 1e-2 (with the measure: relcomp 1.9e-7 at 16, 1.2e-8 at 17, still above 1e-8). BRISK_PAIRCOMP=1 on. */
+    int nmp = 0, *mp_b = NULL, *mp_p = NULL, *mp_q = NULL;
+    { static int pc_env = -1; if (pc_env < 0) { const char *e = getenv("BRISK_PAIRCOMP"); pc_env = e ? atoi(e) : 0; }   /* (off until judged on the files with split pairs; BRISK_PAIRCOMP=1 on) */
+      if (nf && pc_env) {
+          nmp = nf; mp_b = malloc(sizeof(int) * nf); mp_p = malloc(sizeof(int) * nf); mp_q = malloc(sizeof(int) * nf);
+          memcpy(mp_b, FV.kb, sizeof(int) * nf); memcpy(mp_p, FV.ip, sizeof(int) * nf); memcpy(mp_q, FV.im, sizeof(int) * nf);
+      } }
     if (nf && !par->hsd_free) { free_release(P, S, &FV); nf = 0; }
     if (!par->hsd_free) memset(&FV, 0, sizeof(FV));
     int fmode = par->hsd_free;
@@ -8472,6 +9012,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         }
         if (par->verbose > 1 && !nf) printf("   HSD: split free pairs kept (saddle system too costly)\n");
     }
+    if (nf) nmp = 0;   /* handled natively: their slots are not LP entries of the measure */
     double *uf0 = NULL, *uf1 = NULL, *vf = NULL, *ufa = NULL, *rf = NULL, *dxfd = NULL, *qf = NULL;
     if (nf) {
         ndim -= 2.0 * nf;
@@ -8541,7 +9082,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
     shc.bmh = bmh;
     { const char *e = getenv("BRISK_PFLOOR"); g_pfloor = e ? atoi(e) : 1; }
     { const char *e = getenv("BRISK_BREAKDOWN"); g_brkdn = e ? atoi(e) : 1; }
-    int kfix = 0, kf_n = 0, tiny_steps = 0, small_steps = 0;
+    int kfix = 0, kf_n = 0, tiny_steps = 0, small_steps = 0, kmodel = -2;
     static int epolish_on = -1; if (epolish_on < 0) { const char *e = getenv("BRISK_EPOLISH"); epolish_on = e ? atoi(e) : 1; }
     int n_epol = 0;
     int n_xprobe = 0, n_rprobe = 0; double rprobe_last = INFINITY, pinf_lo = INFINITY;
@@ -8772,6 +9313,16 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             aop_end();
             for (int k = 0; k < nb; k++) { const double *r5 = pr + 5 * (size_t)k; nAty += r5[0]; rd2 += r5[1]; dev2 += r5[2]; cX += r5[3]; xz += r5[4]; }
         }
+        /* the split pairs measured as the problem as read sees them (see nmp above): their products out of the
+         * complementarity, their dual equation into the dual residual (in a fixed order: the pair list) */
+        double xz_m = xz, rd2_m = rd2;
+        for (int f = 0; f < nmp; f++) {
+            const BS *s = &S[mp_b[f]]; const int p = mp_p[f], q = mp_q[f];
+            const double ef = 0.5 * ((s->F[p] + s->Z[p]) - (s->F[q] + s->Z[q]));
+            xz_m -= s->X[p] * s->Z[p] + s->X[q] * s->Z[q];
+            rd2_m += ef * ef - s->F[p] * s->F[p] - s->F[q] * s->F[q];
+        }
+        rd2_m = fmax(rd2_m, 0.0);
         double bty = ddot_n(m, P->b, y), rg = kap + cX - bty;
         if (rp0 && it == 0) { memcpy(rp0, rp, sizeof(double) * m); rg0 = rg; }
         double cfx = 0;                            /* c_f' x_f: cX without it is the cone part */
@@ -8793,17 +9344,17 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         double rpo = 0;
         for (int i = 0; i < m; i++) { double w = rp[i] * P->du[i]; rpo += w * w; }
         rpo = sqrt(rpo);
-        double rdo = P->cs * sqrt(rd2);
+        double rdo = P->cs * sqrt(rd2), rdo_m = P->cs * sqrt(rd2_m);
         double po = sc * cX / tau, dob = sc * bty / tau, den = 1 + fabs(po + P->obj_off) + fabs(dob + P->obj_off);
         R->pobj = po; R->dobj = dob;
         R->pinf = rpo / (tau * (1 + P->normb2));
-        R->dinf = rdo / (tau * (1 + P->normC2));
+        R->dinf = rdo_m / (tau * (1 + P->normC2));
         R->relgap = fabs(po - dob) / den;
-        R->relcomp = fabs(sc * xz / (tau * tau)) / den;
+        R->relcomp = fabs(sc * xz_m / (tau * tau)) / den;
         R->err[1] = rpo / (tau * (1 + P->normb1));
-        R->err[3] = rdo / (tau * (1 + P->normC1));
+        R->err[3] = rdo_m / (tau * (1 + P->normC1));
         R->err[5] = (po - dob) / den;
-        R->err[6] = sc * xz / (tau * tau) / den;
+        R->err[6] = sc * xz_m / (tau * tau) / den;
         R->err[2] = R->err[4] = 0;        /* (an iterate is inside the cone; a candidate's values must not stay behind) */
         /* a shifted step whose primal residual came out above twice its prediction (1 - alpha (1 - sigma)) rp: the shifted
          * form's own miss in the primal rows (A(dX) through C^ = (Z + Rd) / tau) dominates there; the original form from now
@@ -8840,7 +9391,10 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         }
         const int moving = drift_on && it > 0 && drift > fmax(100.0 * par->tol, 10.0 * gap_prev);
         po_prev = po; dob_prev = dob; gap_prev = R->relgap;
-        if (par->verbose)
+        if (par->verbose > 0 && g_log_brief)
+            log_user("%4d  %+.8e  %+.8e   %.1e  %.1e  %.1e  %.1e  %.3f %6.2f\n", it, po, dob,
+                     R->pinf, R->dinf, R->relgap, mu, alpha, wtime() - par->t_start);
+        else if (par->verbose)
             printf("%3d %+.8e %+.8e %.2e %.2e %.2e %.2e %.3f %.3f %.3f %7.2f  kap/mu %.1e%s\n",
                    it, po, dob, R->pinf, R->dinf, R->relgap, mu, alpha, alpha, sigma,
                    wtime() - par->t_start, tau * kap / mu, "");
@@ -9150,7 +9704,18 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
         /* no better iterate for hsd_stall iterations: give up, unless mu keeps falling fast
          * (the score can rise for a while when tau goes to zero, e.g. kernel forms, whose
          * optimum is approached only as the Gram matrices grow) */
-        if (it - it_prog >= par->hsd_stall && !(*best_score > 1e-5 && mu < 1e-1 * mu_at_best && it - it_prog < 5 * par->hsd_stall)) { status = 4; g_hsd_why = "no better iterate for the stall window"; break; }
+        /* 31 October 2026 (ISSUES 724): only while the rise is in the complementarity: residuals above the best score and
+         * 100 times the best iterate's are no approach to the optimum (the owner's region of attraction, SDP, eliminated:
+         * best at iteration 26 with the complementarity at 2e-3, then 23 iterations while mu fell 1e6 times and the
+         * primal residual rose from 5e-6 to 20, stopped by a collapsed step; the best iterate returned either way) */
+        const int mu_falls = *best_score > 1e-5 && mu < 1e-1 * mu_at_best && it - it_prog < 5 * par->hsd_stall
+            && (ENV_ON("BRISK_STALLRES_OLD") || fmax(R->pinf, R->dinf) <= fmax(*best_score, 100.0 * fmax(best->pinf, best->dinf)));
+        if (it - it_prog >= par->hsd_stall && !mu_falls) {
+            if (par->verbose > 1 && *best_score > 1e-5 && mu < 1e-1 * mu_at_best && it - it_prog < 5 * par->hsd_stall)
+                printf("   HSD: no better iterate for %d iterations, the residuals %.1e far above the best iterate's %.1e, stopping\n",
+                       it - it_prog, fmax(R->pinf, R->dinf), fmax(best->pinf, best->dinf));
+            status = 4; g_hsd_why = "no better iterate for the stall window"; break;
+        }
         /* at the accuracy floor: a best iterate within 10 tol that has not improved for three
          * iterations while the current one is much worse (the Newton directions have lost
          * their primal accuracy) will not be improved on */
@@ -9245,6 +9810,7 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
               g_asmsp = asmf_env && Sc->allow_float && !Sc->want_double && !Sc->SC && !Sc->E
                         && fmax(R->pinf, fmax(R->dinf, R->relgap)) > asmf_thr;
               extern int g_ntsp; g_ntsp = g_asmsp; }
+        asm_again: ;
             double *Ma = schur_asm_begin(Sc);
             if (bord && bord_next && !bord_on) {
                 if (Sc->lr || (!BV.KS && free_ks_setup(P, Sc, &BV) != 0)) { bord = 0; bord_next = 0; }   /* (not beside the long cones' low-rank correction) */
@@ -9322,7 +9888,18 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             if (free_ks_factor(P, Sc, &FV)) { status = 4; g_hsd_why = "factorization of the free-variable system failed"; break; }
         } else if (bord_on) {
             Sc->bF = NULL;
-            if (bord_factor(P, Sc, &BV)) { status = 4; g_hsd_why = "factorization of the bordered system failed"; break; }
+            const int bfr = bord_factor(P, Sc, &BV);
+            if (bfr == 1) { status = 4; g_hsd_why = "factorization of the bordered system failed"; break; }
+            /* 4 November 2026 (ISSUES 761; off by default since 5 November 2026, BRISK_BORDSHIFT=0 on): when the bordered system needs a shift,
+             * the bordered route is dropped for the rest of the solve and this iteration is assembled again with the
+             * pairs in M (one more assembly): a user's unsteady cavity, primal residual 9e-9 -> 4e-4 in the one
+             * shifted bordered step, 2.4e-8 on M. */
+            { if (bfr == 2) {
+                  if (par->verbose > 1) printf("   HSD: the bordered system needs a shift: the Schur complement with the split pairs from now on\n");
+                  bord_on = 0; bord = 0; bord_next = 0; Sc->reg = 0;
+                  g_bpf = NULL; g_bpB = NULL; g_bD = NULL;
+                  goto asm_again;
+              } }
             Sc->bF = &BV; Sc->bP = P;
         } else {
             if (schur_factor(Sc)) { status = 4; g_hsd_why = "factorization of the Schur complement failed"; break; }
@@ -9878,12 +10455,23 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             if (par->hsd_corr > 0 && best_am < 1.0) {
                 int nacc = 0;
                 double tcorr = 0;
+                /* until the count is fixed (after three iterations), at most g_prek correctors an
+                 * iteration, and no more than the work model allows: on a large dense block a
+                 * corrector costs several factorizations (diamond_patch, n = 5477: 207 of 317 s in
+                 * six iterations went to the correctors the model would not have run) */
+                if (kmodel == -2) {
+                    double rho0 = 0;
+                    kmodel = ENV_ON("BRISK_KFLATE") ? g_prek : hsd_corr_count_model(P, par, Sc, nb, m, &rho0);
+                    if (par->verbose > 1 && kmodel < g_prek)
+                        printf("   HSD: at most %d correctors an iteration before the count is fixed (factor/corrector cost %.2f)\n", kmodel > 0 ? kmodel : 0, rho0 / par->hsd_cfrac);
+                }
+                const int prek = kmodel < g_prek ? (kmodel > 0 ? kmodel : 0) : g_prek;
                 for (int c = 0; c < par->hsd_corr && best_am < 1.0; c++) {
                     /* cost control: correctors pay off when they are cheap against the
                      * assembly and factorization of M; after the first one, continue only
                      * while their total stays within hsd_cfrac of that cost             */
                     if (kfix != 0) { if (c >= (kfix > 0 ? kfix : 0)) break; }
-                    else if (c >= g_prek) break;     /* until the count is fixed: a fixed limit, not timings */
+                    else if (c >= prek) break;       /* until the count is fixed: a fixed limit, not timings */
                     (void)t_fact_it;
                     /* ... and a corrector must lengthen the step by at least hsd_cgain times
                      * its share of an iteration (progress per iteration ~ alpha)         */
@@ -10174,8 +10762,23 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
                 nb_beta = nb_env >= 0 ? nb_env : par->hsd_nb;
                 if (nb_beta > 0 && best_am >= nb_amin && ((nb_mode == 0 && hoc_on) || (nb_mode == 1 && hoc_kept > 0) || nb_always)) {
                     const double gs[4] = { nb_g, 1.0 - 4.0 * (1.0 - nb_g), 1.0 - 16.0 * (1.0 - nb_g), 0 };
-                    for (int c = 0; c < 3; c++) {
+                    /* 2 November 2026: the shortest candidate first; when it is outside, the longer ones are not tried (a test
+                     * costs two factorizations and two triangular products of every block: 3.6 s at n = 5,477 on diamond_patch,
+                     * where all three were refused at every attempt). Then the longest down as before. */
+                    static int nb_short = -1; if (nb_short < 0) nb_short = !ENV_ON("BRISK_HSDNBLONG");
+                    int short_ok = 1, short_tested = 0;
+                    if (nb_short) {
+                        const double al = fmin(1.0, gs[2] * best_am);
+                        if (al > alpha && (tau + al * dt) > 0 && (kap + al * dk) > 0) {
+                            const double mun = mu * (1.0 - al * (1.0 - sigma));
+                            short_ok = (tau + al * dt) * (kap + al * dk) >= nb_beta * mun && sdp_nb_ok(P, S, al, nb_beta * mun);
+                            short_tested = 1;
+                            if (ENV_ON("BRISK_HSDDBG")) printf("     [neighbourhood: alpha %.5f (default %.5f): %s, tried first]\n", al, alpha, short_ok ? "inside" : "outside");
+                        }
+                    }
+                    for (int c = 0; c < 3 && short_ok; c++) {
                         const double al = fmin(1.0, gs[c] * best_am);
+                        if (short_tested && c == 2) { alpha = al; break; }   /* (tested first: inside) */
                         if (al <= alpha) break;
                         if ((tau + al * dt) <= 0 || (kap + al * dk) <= 0) continue;
                         const double mun = mu * (1.0 - al * (1.0 - sigma));
@@ -10331,6 +10934,12 @@ static int hsd_run(Problem *P, const Params *par, Result *R, BS *S, Schur *Sc, d
             }
             if (ap != ad) okp = 0;
             double a = ap;
+            /* the shift's level as a trust region: a short step from a regularized factorization raises the next start by
+             * 100 (schur_reg_floor; 1 November 2026) */
+            if (regtr_on() && Sc->use_hint && Sc->reg_hint && Sc->reg > 0 && a < 0.3) {
+                Sc->reg_ok = fmin(Sc->reg * 1e4, 1e-6);
+                if (regtr_on() > 1) printf("     [regularization: step %.3f after %.1e: next start %.1e]\n", a, Sc->reg, 0.01 * Sc->reg_ok);
+            }
             if (dbgA0) {
                 double *A1 = calloc(m, sizeof(double)), e = 0, nd = 0;
                 for (int k = 0; k < nb; k++) blk_Aop(&P->blk[k], &S[k], S[k].X, A1, 1.0);
@@ -10483,6 +11092,7 @@ done:
     for (int i = 0; i < m; i++) y[i] /= (tau > 0 ? tau : 1.0);
     if (par->verbose && nsafe) printf("   (HSD neighbourhood safeguard shortened %d steps)\n", nsafe);
     Sc->pivtol = pivtol_saved; Sc->use_hint = 0; Sc->reg_hint = 0; Sc->reg_ok = 0;
+    brisk_memtrace("end of the embedding's iterations");
     if (par->verbose && ncorr) printf("   (HSD: %d centrality correctors accepted)\n", ncorr);
     if (par->verbose > 1 && n_tstep) printf("   (HSD: terminal step taken in %d iteration%s)\n", n_tstep, n_tstep > 1 ? "s" : "");
     if (par->verbose && nrefine) printf("   (HSD: %d refinement passes)\n", nrefine);
@@ -10507,7 +11117,7 @@ done:
     for (int k = 0; k < nb; k++) free(Zv[k]);
     free(Zv);
     if (par->verbose > 1 && nrebase) printf("   (HSD: residual re-based %d times)\n", nrebase);
-    free(pk_b); free(pk_p); free(pk_q); free(shist); free(phist); free(ihist); free(mhist); free(ghist);
+    free(pk_b); free(pk_p); free(pk_q); free(mp_b); free(mp_p); free(mp_q); free(shist); free(phist); free(ihist); free(mhist); free(ghist);
     if (bord) {
         Sc->bF = NULL; Sc->bP = NULL; free(Sc->bE); Sc->bE = NULL;
         free(bpf); free(bD);
@@ -10523,7 +11133,7 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
  * - Tiny problems run on one thread. An iteration of under 5e6 flops gains nothing from
  *   threads, and with libgomp's spinning idle threads a busy machine made it 400 times slower
  *   (truss1 with another process on the second core: 0.85 s instead of 0.002 s).
- *   BRISK_TINYMT=1 keeps the threads.
+ *   BRISK_TINYMT=1 keeps the threads (deprecated, 31 October 2026: -threads k forces k; only a positive value counts).
  * - A busy machine: when other threads are running right now, the solve starts with the cores
  *   that are free (until 5.10 only with the default count, and the count stayed; 5.11: any
  *   count, only when every core is allowed, and the count follows the load, below). With
@@ -10534,6 +11144,13 @@ static int brisk_solve_impl(Problem *P, const Params *par_user, Result *R, doubl
  *   BRISK_NOBUSY=1 turns the rule off.
  * The thread count is restored on return. */
 int g_threads_user = 0;      /* -threads or OMP_NUM_THREADS given (main.c) */
+/* 31 October 2026 (ISSUES 727, the owner's agreed behaviour): a positive -threads k (opts.threads = k) forces k threads
+ * for this solve: no automatic reduction (neither the small-problem rule nor the busy-machine rule). Omitted or 0: the
+ * automatic count of the process, for this solve only (main.c, brisk_run). Set per solve by main.c */
+int g_threads_forced = 0;
+static int g_nt_small = 0;   /* the small-problem rule chose one thread (the log's "(problem too small for multithreading)") */
+/* BRISK_TINYMT (deprecated: -threads k forces the count): on only for a positive number; empty, 0 or absent is off */
+static int tinymt_on(void) { const char *e = getenv("BRISK_TINYMT"); return e && atoi(e) > 0; }
 /* the runnable threads on the machine, this one included: the fourth field of /proc/loadavg
  * (Linux), else -1 */
 static int runnable_now(void) {
@@ -10580,6 +11197,67 @@ static int runnable_own(void) {
 #ifdef __linux__
 static int allowed_cores(cpu_set_t *ms);
 #endif
+/* (31 October 2026, the LP developer; PLAN_lp_1031.md P1.5) the CPUs the container's quota allows, rounded up, or 0 when
+ * there is no quota (or it cannot be read): cgroup v2's cpu.max ("quota period", or "max") of the process's cgroup and of
+ * each cgroup above it, the smallest; else cgroup v1's cpu.cfs_quota_us / cpu.cfs_period_us. The runtime counts the CPUs
+ * the process may run on (the affinity mask), not the time the quota lets it run: in the owner's independent benchmarks
+ * of 29 October (5 CPUs visible, a quota of 4) BRISK ran 5 busy threads on 4 CPUs' worth of time and was throttled in 15 %
+ * of the periods; Docker's --cpus, Kubernetes' CPU limits and cloud notebooks set such quotas. Rounded up as the Java and
+ * .NET runtimes do (a quota of 3.5 CPUs: 4 threads) */
+static double cg_ratio(const char *qf, const char *pf) {
+    FILE *f = fopen(qf, "r"); if (!f) return 0;
+    char b[64] = ""; const int ok = fgets(b, sizeof b, f) != NULL; fclose(f);
+    if (!ok) return 0;
+    double q = 0, per = 0;
+    if (pf) {                                       /* (v1: two files, a quota of -1 is none) */
+        q = atof(b);
+        FILE *g = fopen(pf, "r"); if (!g) return 0;
+        char c[64] = ""; const int ok2 = fgets(c, sizeof c, g) != NULL; fclose(g);
+        if (!ok2) return 0;
+        per = atof(c);
+    } else {                                        /* (v2: "max 100000" or "400000 100000") */
+        if (!strncmp(b, "max", 3)) return 0;
+        if (sscanf(b, "%lf %lf", &q, &per) != 2) return 0;
+    }
+    return q > 0 && per > 0 ? q / per : 0;
+}
+int brisk_cpu_quota(void) {
+#ifdef __linux__
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    double best = 0;
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (f) {
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!strncmp(line, "0::", 3)) {          /* (v2: the unified hierarchy, from the process's cgroup up) */
+                char path[4096]; snprintf(path, sizeof path, "%s", line + 3);
+                for (;;) {
+                    char fn[4200]; snprintf(fn, sizeof fn, "/sys/fs/cgroup%s/cpu.max", strcmp(path, "/") ? path : "");
+                    const double r = cg_ratio(fn, NULL);
+                    if (r > 0 && (best == 0 || r < best)) best = r;
+                    char *sl = strrchr(path, '/');
+                    if (!sl || sl == path) { if (strcmp(path, "/")) { snprintf(path, sizeof path, "/"); continue; } break; }
+                    *sl = 0;
+                }
+            } else if (strstr(line, ":cpu,") || strstr(line, ":cpu:") || strstr(line, ",cpu:") || strstr(line, ",cpu,")) {
+                const double r = cg_ratio("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+                const double r2 = r > 0 ? r : cg_ratio("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us");
+                if (r2 > 0 && (best == 0 || r2 < best)) best = r2;
+            }
+        }
+        fclose(f);
+    }
+    if (best == 0) { const double r = cg_ratio("/sys/fs/cgroup/cpu.max", NULL); if (r > 0) best = r; }   /* (a namespace without the line) */
+    if (getenv("BRISK_CPUQUOTA")) best = atof(getenv("BRISK_CPUQUOTA"));      /* (tests: a quota as if read) */
+    cached = best > 0 ? (int)ceil(best - 1e-9) : 0;
+    if (cached < 0) cached = 0;
+    return cached;
+#else
+    return 0;
+#endif
+}
 /* the cores that are free, from /proc/loadavg, or -1. It counts the runnable threads of the
  * whole machine, so it is used only when every core is allowed (5.11). The threads of this
  * process are not other threads: 23 October 2026, libgomp's idle threads spin for a while after
@@ -10732,10 +11410,9 @@ static int nt_measure_start(void) {
     return 1;
 }
 #endif
-void brisk_threads_adapt(int verbose) {
-#ifdef _OPENMP
-    if (!g_nt_adapt || g_nt_cap <= 1 || omp_in_parallel()) return;
-    const int cur = omp_get_max_threads(), cap = g_nt_cap;
+/* the rule's decision: the count for the next iteration from the current one, cur, and the limit, cap (the state of the
+ * measures in the statics above); -1 when it is too early to decide (the window is shorter than 50 ms) */
+static int nt_decide(int cur, int cap) {
     int want = cur;
     if (g_nt_test) {
         g_nt_test = g_nt_test * 1103515245u + 12345u;
@@ -10743,9 +11420,9 @@ void brisk_threads_adapt(int verbose) {
     } else {
 #ifdef __linux__
         const double now = wtime();
-        if (now - g_dn_t < 0.05) return;
+        if (now - g_dn_t < 0.05) return -1;
         const long long w = proc_wait_ns();
-        if (w < 0) return;
+        if (w < 0) return -1;
         const double c = 1e-9 * (double)(w - g_dn_wait) / (now - g_dn_t);
         g_dn_t = now; g_dn_wait = w;
         double f = -1;
@@ -10771,7 +11448,14 @@ void brisk_threads_adapt(int verbose) {
         if (want != cur) nt_window_up(now);
 #endif
     }
-    if (want == cur) return;
+    return want;
+}
+void brisk_threads_adapt(int verbose) {
+#ifdef _OPENMP
+    if (!g_nt_adapt || g_nt_cap <= 1 || omp_in_parallel()) return;
+    const int cur = omp_get_max_threads(), cap = g_nt_cap;
+    const int want = nt_decide(cur, cap);
+    if (want < 0 || want == cur) return;
     omp_set_num_threads(want);
     nt_used(want);
     g_nt_chg++;
@@ -10797,15 +11481,22 @@ const char *brisk_threads_summary(void) {
  * Printed once per run, and again only if a later solve of the same run uses another count
  * (brisk_log_threads_reset at the start of a run). */
 static int g_nt_logged = -1;
-void brisk_log_threads_reset(void) { g_nt_logged = -1; g_nt_lo = g_nt_hi = g_nt_lim = g_nt_chg = 0; }
+void brisk_log_threads_reset(void) { g_nt_logged = -1; g_nt_lo = g_nt_hi = g_nt_lim = g_nt_chg = 0; g_nt_small = 0; }
+/* the reason in parentheses after "Number of threads: k", the same at the log's start and in the Summary: only for a
+ * count the user forced and for the small-problem rule's single thread (the owner, 30 October 2026) */
+const char *brisk_threads_label(int nt) {
+    if (g_threads_forced) return " (forced by user)";
+    if (g_nt_small && nt == 1) return " (problem too small for multithreading)";
+    return "";
+}
 int brisk_threads_logged(void) { return g_nt_logged; }   /* 5.8: the count last logged, for the summary (-1: none) */
 void brisk_log_threads(int verbose) {
     const int nt = nthreads();
     if (verbose > 0 && nt != g_nt_logged) {
-        printf("Number of threads: %d\n", nt);
+        log_user("Number of threads: %d%s\n", nt, brisk_threads_label(nt));
         /* 27 October 2026 (ISSUES 708): MKL started by the host program without its reproducible mode */
         if (nt > 1 && brisk_blas_unreproducible())
-            printf("   note: MKL runs without its reproducible mode, so results can change from run to run at more than one thread;\n"
+            log_user("   note: MKL runs without its reproducible mode, so results can change from run to run at more than one thread;\n"
                    "   set MKL_CBWR=AUTO in the environment before starting this program for the same results every time\n");
         g_nt_logged = nt;
     }
@@ -10813,7 +11504,7 @@ void brisk_log_threads(int verbose) {
 int brisk_threads_busy(int verbose) {
 #ifdef _OPENMP
     const int nt0 = omp_get_max_threads();
-    if (nt0 > 1 && !getenv("BRISK_NOBUSY")) {
+    if (nt0 > 1 && !getenv("BRISK_NOBUSY") && !g_threads_forced) {
         const int fr = free_cores();
         if (fr >= 1 && fr < nt0) {
             if (verbose > 0) printf("   threads: %d of %d (other threads are running on this machine; BRISK_NOBUSY=1 keeps the count)\n", fr, nt0);
@@ -10824,6 +11515,49 @@ int brisk_threads_busy(int verbose) {
 #endif
     (void)verbose;
     return -1;
+}
+/* (28 October 2026, the SOCP developer) the busy-machine rule for an engine that keeps its own thread count (the SOCP solver:
+ * its parallel loops and the panels of its factorization, with OpenMP's count at one): brisk_team_begin(nt) starts the
+ * measures and returns the count to start with (at most nt, the allowed cores and the free ones), brisk_team_adapt(cur) the
+ * count for the next iteration (the rule of brisk_threads_adapt: down when the threads wait for cores, up when cores are free
+ * again, never above nt), brisk_team_end() gives the state back (an engine called from another's solve). The same switches:
+ * BRISK_NOBUSY=1 off, BRISK_THREADTEST=<seed> a random count each iteration (the reproducibility test), BRISK_NTDBG=1. */
+static int g_team_prev_cap = 0, g_team_prev_adapt = 0, g_team_depth = 0;
+static unsigned g_team_prev_test = 0;
+int brisk_team_begin(int nt) {
+#ifdef _OPENMP
+    if (g_team_depth++ > 0) return nt;              /* (nested: the outer engine's rule stands) */
+    g_team_prev_cap = g_nt_cap; g_team_prev_adapt = g_nt_adapt; g_team_prev_test = g_nt_test;
+    int adapt = 0;
+    if (nt > 1 && !getenv("BRISK_NOBUSY")) {
+#ifdef __linux__
+        adapt = nt_measure_start();
+        if (adapt && nt > g_nt_ncore) nt = g_nt_ncore;
+        const int fr = free_cores();
+        if (fr >= 1 && fr < nt) nt = fr;
+#endif
+    }
+    g_nt_cap = nt; g_nt_adapt = adapt;
+    { const char *e = getenv("BRISK_THREADTEST"); g_nt_test = e && nt > 1 ? (unsigned)atoi(e) * 2654435761u + 1u : 0; if (g_nt_test) g_nt_adapt = 1; }
+    if (getenv("BRISK_NTDBG")) printf("   [team threads: start %d, rule %s]\n", nt, g_nt_adapt ? "on" : "off");
+    return nt;
+#else
+    return nt;
+#endif
+}
+int brisk_team_adapt(int cur) {
+#ifdef _OPENMP
+    if (g_team_depth != 1 || !g_nt_adapt || g_nt_cap <= 1 || omp_in_parallel()) return cur;
+    const int want = nt_decide(cur, g_nt_cap);
+    return want < 1 ? cur : want;
+#else
+    return cur;
+#endif
+}
+void brisk_team_end(void) {
+#ifdef _OPENMP
+    if (g_team_depth > 0 && --g_team_depth == 0) { g_nt_cap = g_team_prev_cap; g_nt_adapt = g_team_prev_adapt; g_nt_test = g_team_prev_test; }
+#endif
 }
 /* ---- 5.16: semidefinite blocks with arrow data solved as second-order cones (REPORT_5.16 §9).
  * A block of order d whose C and A_i are all arrow matrices Arw(a) = [[a_0, ab'], [ab, a_0 I]]
@@ -11058,6 +11792,7 @@ static double aug_maxstep(const Block *B, const BS *s, const double *D, double *
 static int aug_endgame(const Problem *P, BS *S, Schur *Sc, double **Xio, double **Zio, double *yio, const Params *par,
                        double Ntot, int maxit, double wbudget, double work_it, int verbose, Result *Rio) {
     const int m = P->m, nb = P->nblk;
+    brisk_memtrace("end phase on the augmented system start");
     for (int k = 0; k < nb; k++) if (P->blk[k].type != BLK_SDP && P->blk[k].type != BLK_LP) return 0;
     AugOp o = { P, S, Sc, malloc(sizeof(size_t) * (nb + 1)), 0, m, NULL, 0.0, wbudget, 0.0 };
     size_t maxlen = 1;
@@ -11078,6 +11813,22 @@ static int aug_endgame(const Problem *P, BS *S, Schur *Sc, double **Xio, double 
     double wit_blk = 0;
     for (int k = 0; k < nb; k++) { const double nk = P->blk[k].n; if (P->blk[k].type == BLK_SDP) wit_blk += (nk >= 512 ? 50.0 : 30.0) * nk * nk * nk; }
     const size_t N = o.L + m;
+    {   /* 2 November 2026 (ISSUES 741): the phase's arrays, about 23 vectors of the blocks' size (the NT buffers when the
+         * run has none, the two copies of X and Z, eight work vectors of L and three of N, the MINRES vectors), only when
+         * they fit in half of the memory left (the convention of the solver's other memory checks). diamond_patch
+         * (Mittelmann, SDP, one block of order 5,477): the phase raised the peak from 6.4 to 10.7 GB, for nothing (the
+         * polished 1.9e-6 kept), where MOSEK's whole solve takes 5.3 GB. BRISK_AUGMEM=0: no check */
+        static int memchk = -1; if (memchk < 0) { const char *e = getenv("BRISK_AUGMEM"); memchk = !(e && atoi(e) == 0); }
+        extern double brisk_mem_limit(void);
+        const double lim = brisk_mem_limit(), need = 8.0 * (23.0 * (double)o.L + 4.0 * (double)m);
+        double rss = 0;
+        FILE *fs = fopen("/proc/self/statm", "r");
+        if (fs) { long pages_total = 0, pages_res = 0; if (fscanf(fs, "%ld %ld", &pages_total, &pages_res) == 2) rss = (double)pages_res * (double)sysconf(_SC_PAGESIZE); fclose(fs); }
+        if (memchk && lim > 0 && need > 0.5 * (lim - rss)) {
+            if (verbose > 0) printf("   augmented-system end phase skipped: its arrays (%.1f GB) do not fit in half of the memory left (%.1f of %.1f GB)\n", need / 1e9, (lim - rss) / 1e9, lim / 1e9);
+            free(o.off); return 0;
+        }
+    }
     /* the NT buffers of a run with the HKM direction are allocated here and released at the end */
     char *own = calloc((size_t)(nb > 0 ? nb : 1), 1);
     double **saveX = malloc(sizeof(double *) * nb), **saveZ = malloc(sizeof(double *) * nb);
@@ -11500,6 +12251,7 @@ static int socp_route(Problem *P, const Params *par, const int *hub, Result *R, 
     socp_printf = brisk_printf;
 #endif
     SocpRes S; memset(&S, 0, sizeof S);
+    if (par->verbose > 0) brisk_log_method("the SOCP solver (each semidefinite block is equivalent to a second-order cone)");   /* (ISSUES 725) */
     const int st = socp_solve(&Q, &o, &S);
     if (getenv("BRISK_SOCPRDBG") && S.x && S.y) {
         double cx = 0, by = 0, r2 = 0, d2 = 0; double *r = calloc((size_t)m + 1, sizeof(double));
@@ -11602,9 +12354,10 @@ static int brisk_solve_thr(Problem *P, const Params *par_user, Result *R, double
              * tiny_soc_N50000 (SDP with SOCP) ran on one thread: 12.8 s against 6.3 s on four, the same bits */
             w += 40.0 * ((double)bsz(B) + 100.0);
         }
-        if (w < 5e6 && !getenv("BRISK_TINYMT")) {
+        if (g_threads_forced) { }                  /* the count the user set: no automatic reduction */
+        else if (w < 5e6 && !tinymt_on()) {
             nt = cap = 1;
-            if (par_user->verbose > 0) printf("   threads: 1 of %d (a small problem, about %.0e flops an iteration: threads would not pay; BRISK_TINYMT=1 uses them)\n", nt0, w);
+            g_nt_small = 1;
         }
         else if (!getenv("BRISK_NOBUSY")) {
 #ifdef __linux__
@@ -11883,8 +12636,10 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
          * cones' marks are cleared and their whole term goes into M (the dense matrix and the envelope have no use for it) */
         int nlr = 0, rr = 0;
         for (int k = 0; k < nb; k++) if (P->blk[k].soc_lr) nlr++;
-        if (nlr && !Sc.SC) for (int k = 0; k < nb; k++) P->blk[k].soc_lr = 0;
-        else if (nlr) {
+        if (nlr && !Sc.SC) { for (int k = 0; k < nb; k++) P->blk[k].soc_lr = 0; nlr = 0; }
+        lpd_build(P);
+        const int nlp = Sc.SC ? g_lpd.n : 0;      /* (4 November 2026: the dense LP columns, with the sparse factorization only) */
+        if (nlr || nlp) {
             LrCorr *L = calloc(1, sizeof(LrCorr));
             L->m = m; L->nb = nb; L->blk0 = P->blk; L->col = malloc(sizeof(int) * (nb + 1));
             for (int k = 0; k < nb; k++) {
@@ -11893,6 +12648,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                 if (!B->soc_lr) continue;
                 L->col[k] = rr; rr += B->lp_ptr[1] > B->lp_ptr[0] ? 2 : 1;
             }
+            L->lpbase = rr; L->nlp = nlp; rr += nlp;
             L->r = rr;
             L->U = calloc((size_t)m * rr + 1, sizeof(double)); L->Y = malloc(sizeof(double) * ((size_t)m * rr + 1));
             L->K = malloc(sizeof(double) * ((size_t)rr * rr + 1)); L->sg = malloc(sizeof(double) * (rr + 1));
@@ -11902,8 +12658,14 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                 L->sg[L->col[k]] = 1.0;
                 if (P->blk[k].lp_ptr[1] > P->blk[k].lp_ptr[0]) L->sg[L->col[k] + 1] = -1.0;
             }
+            for (int j = 0; j < nlp; j++) L->sg[L->lpbase + j] = 1.0;
+            if (nlp) {   /* (the marks copied: the pattern's table may be rebuilt for another problem during the solve) */
+                L->lpcol = calloc((size_t)nb + 1, sizeof(int *));
+                for (int k = 0; k < nb; k++) if (g_lpd.col && g_lpd.col[k]) { L->lpcol[k] = malloc(sizeof(int) * (size_t)P->blk[k].n); memcpy(L->lpcol[k], g_lpd.col[k], sizeof(int) * (size_t)P->blk[k].n); }
+            }
             Sc.lr = L; g_lrc = L;
-            if (par->verbose > 0) printf("   %d long second-order cone(s): their rank-one and rank-two Schur terms kept out of the factorization (rank %d)\n", nlr, rr);
+            if (par->verbose > 0 && nlr) printf("   %d long second-order cone(s): their rank-one and rank-two Schur terms kept out of the factorization (rank %d)\n", nlr, rr - nlp);
+            if (par->verbose > 0 && nlp) printf("   %d dense column(s) of the LP variables kept out of the factorization (rank %d)\n", nlp, nlp);
         }
     }
     double tps0 = wtime();
@@ -12430,7 +13192,14 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
     if (nzsp) for (int k = 0; k < nb; k++) if (S[k].zon) { const double nk = P->blk[k].n; work_it += 3.0 * nk * nk * nk + 8.0 * nk * (double)schol_nnz(S[k].zf) - 15.0 * nk * nk * nk; }
     R->t_setup = wtime() - t0;
 
-    if (par->verbose) {
+    if (par->verbose > 0) {
+        /* ISSUES 725: the default log's table: the objectives, the relative errors of the equations and the gap, the
+         * step length (the smaller of the two) and the time; the diagnosis (-v) keeps every column */
+        if (g_log_brief) {
+            brisk_log_method("interior-point method, %s, %s direction", par->hsd == 1 ? "self-dual embedding" : "infeasible start",
+                             par->direction == 1 ? "NT" : "HKM");
+            log_user(" ITE  PRIMAL OBJ        DUAL OBJ           PFEAS    DFEAS    GAP      MU       STEP   TIME\n");
+        } else
         printf(" it   pobj            dobj            pinf     dinf     gap      mu       alp   ald   sigma  time\n");
     }
     int status = 3, stall = 0, it;
@@ -12441,6 +13210,17 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
     int it_best = 0;
     Result best = *R;
     double *ybest = calloc(m, sizeof(double));
+    /* 2 November 2026 (the owner: "try passing a well centered iterate"; ISSUES 737): the infeasible-start method's last
+     * well-centred iterate (both steps at least 0.5), kept for the self-dual embedding's start when this attempt fails.
+     * Experiment: BRISK_WARMC = lambda (the blend lambda X_w + (1 - lambda) X_0 of the embedding's start) */
+    static double wc_lam = -1; if (wc_lam < 0) { const char *e = getenv("BRISK_WARMC"); wc_lam = e ? atof(e) : 0.0; }
+    const int wc_on = wc_lam > 0 && par->hsd != 1 && par_user->hsd < 0 && !par->no_retry;
+    double **wcX = NULL, **wcZ = NULL, *wcy = NULL; int wc_it = -1;
+    /* the ladder (the owner: "what about passing an earlier point"): a well-centred snapshot each time mu has fallen a
+     * hundredfold since the last one; two slots, the latest level (A) and the one before (B); BRISK_WARMD = 1 hands
+     * over A, 2 hands over B (default 1); BRISK_WARMC = lambda as above (1: the snapshot itself) */
+    static int wc_depth = -1; if (wc_depth < 0) { const char *e = getenv("BRISK_WARMD"); wc_depth = e ? atoi(e) : 1; }
+    double **wbX = NULL, **wbZ = NULL, *wby = NULL; int wb_it = -1; double wc_mu = -1;
     double *slowh = (par->std_slow > 0 && par_user->hsd < 0 && !par->no_retry && par->hsd != 1)
                     ? calloc(par->maxit + 2, sizeof(double)) : NULL;
     R->methods |= par->hsd == 1 ? 2 : 1;
@@ -12551,11 +13331,46 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
         R->err[2] = R->err[4] = 0;        /* (an iterate is inside the cone; a candidate's values must not stay behind) */
         R->t_dense += wtime() - td;
         R->iters = it;
-        if (par->verbose)
+        if (par->verbose > 0 && g_log_brief)
+            log_user("%4d  %+.8e  %+.8e   %.1e  %.1e  %.1e  %.1e  %.3f %6.2f\n", it, po, dob,   /* (<C,X> and b'y as the embedding's rows and the Summary: 3 November 2026) */
+                     R->pinf, R->dinf, R->relgap, sc * mu, fmin(alp, ald), wtime() - (par->t_start > 0 ? par->t_start : t0));   /* (the run's clock, as the embedding's column: 3 November 2026, ISSUES 750) */
+        else if (par->verbose)
             printf("%3d %+.8e %+.8e %.2e %.2e %.2e %.2e %.3f %.3f %.3f %6.2f\n", it, -po, -dob,
                    R->pinf, R->dinf, R->relgap, sc * mu, alp, ald, sigma, wtime() - t0);
+        {   /* 1 November 2026 (ISSUES 737), a measurement only (BRISK_EARLYDBG=1): where two rules that would end the
+             * infeasible-start method early would fire. A: the primal error risen a thousandfold from its lowest value
+             * (below 1e-8) while the gap is still open; C: from iteration 10, ten iterations in a row with primal steps
+             * below 0.25 and the primal error down less than tenfold over them */
+            static int edbg = -1; if (edbg < 0) edbg = ENV_ON("BRISK_EARLYDBG");
+            /* Rule A is on by default since 1 November 2026 (BRISK_EARLYA=0 turns it off). It fires only when the
+             * primal error, once below the tolerance, has risen above it again (a thousandfold from its lowest value)
+             * while the gap is still ten times the tolerance: the attempt has lost the feasibility it had and cannot
+             * meet the tolerance without regaining it. On the mezo set it fired on exactly the five solves that ended
+             * in the self-dual re-solve (buck5, vibra4, vibra5, trto4, trto5) and on none that succeeded; the first
+             * form (a rise from below 1e-8, any level) also fired on exactly feasible starts (max-cut, a rise from 0 to
+             * 1e-16) and on shmup3 (6.6e-10, harmless) */
+            static int earlya = -1; if (earlya < 0) { const char *e = getenv("BRISK_EARLYA"); earlya = !e || atoi(e) != 0; }
+            static double pmin, ph[11]; static int fa, fc, nsh;
+            if (edbg || earlya) {
+                if (it == 0) { pmin = 1e300; fa = fc = 0; nsh = 0; g_early_a_ended = 0; }
+                if (R->pinf < pmin) pmin = R->pinf;
+                if (!fa && pmin < par->tol && R->pinf > par->tol && R->pinf > 1e3 * pmin && R->relgap > 10 * par->tol) {
+                    fa = 1;
+                    if (edbg) printf("   [early rule A would fire at iteration %d: primal error %.1e, lowest %.1e, gap %.1e, %.2f s]\n", it, R->pinf, pmin, R->relgap, wtime() - t0);
+                    /* (under test, BRISK_EARLYA=1: the attempt ends here; its best iterate is the one kept before the rise,
+                     * so the outcome is that of the stall rules below, ten or so iterations sooner) */
+                    if (earlya) { if (par->verbose > 0) printf("   the primal error has risen a thousandfold from its lowest value with the gap open: the attempt ends\n"); g_early_a = 1; }
+                }
+                nsh = alp < 0.25 && it > 0 ? nsh + 1 : 0;
+                for (int q = 0; q < 10; q++) ph[q] = ph[q + 1];
+                ph[10] = R->pinf;
+                if (!fc && it >= 10 && nsh >= 10 && ph[0] > 0 && R->pinf > 0.1 * ph[0]) {
+                    fc = 1; printf("   [early rule C would fire at iteration %d: ten steps below 0.25, primal error %.1e from %.1e, %.2f s]\n", it, R->pinf, ph[0], wtime() - t0); }
+            }
+        }
         dump_xz(P, S, y, it, 1.0);
         if (!isfinite(po) || !isfinite(dob)) { status = 4; break; }
+        if (g_early_a) { g_early_a = 0; g_early_a_ended = 1; status = 4; break; }   /* (ISSUES 737, rule A) */
         double score = res_score(R);
         if (ENV_ON("BRISK_SCOREDBG")) printf("   SCORE it %d score %.3e comp %.3e best %.3e itbest %d t %.4f\n", it, score, R->relcomp, fmin(score, best_score), score < best_score ? it : it_best, wtime() - par->t_start);
         btrack_offer(par, P, S, y, 1.0, sc * mu, R, it);
@@ -12571,6 +13386,29 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                     if (S[k].zon && S[k].zpat && S[k].zbc) zsp_copy(&S[k], S[k].Zb, S[k].Z);   /* (zero off the pattern) */
                     else { pcopy(len, S[k].Zb, S[k].Z); S[k].zbc = 1; }
                 }
+        }
+        if (wc_on && it > 0 && alp >= 0.5 && ald >= 0.5 && (wc_mu < 0 || sc * mu <= 0.01 * wc_mu)) {
+            if (!wcX) {
+                double need = 2.0 * 8.0 * m;
+                for (int k = 0; k < nb; k++) need += 2.0 * 16.0 * bsz(&P->blk[k]);
+                double avail = 0;
+                if (mem_fits(need, &avail)) {
+                    wcX = calloc(nb, sizeof(double *)); wcZ = calloc(nb, sizeof(double *)); wcy = malloc(sizeof(double) * (m + 1));
+                    wbX = calloc(nb, sizeof(double *)); wbZ = calloc(nb, sizeof(double *)); wby = malloc(sizeof(double) * (m + 1));
+                    for (int k = 0; k < nb; k++) {
+                        wcX[k] = malloc(sizeof(double) * (bsz(&P->blk[k]) + 1)); wcZ[k] = malloc(sizeof(double) * (bsz(&P->blk[k]) + 1));
+                        wbX[k] = malloc(sizeof(double) * (bsz(&P->blk[k]) + 1)); wbZ[k] = malloc(sizeof(double) * (bsz(&P->blk[k]) + 1));
+                    }
+                }
+            }
+            if (wcX) {
+                if (wc_it >= 0) {   /* the latest level moves to the slot before it */
+                    double **t1 = wbX; wbX = wcX; wcX = t1; double **t2 = wbZ; wbZ = wcZ; wcZ = t2; double *t3 = wby; wby = wcy; wcy = t3; wb_it = wc_it;
+                }
+                for (int k = 0; k < nb; k++) { const size_t len = bsz(&P->blk[k]); pcopy(len, wcX[k], S[k].X); pcopy(len, wcZ[k], S[k].Z); }
+                memcpy(wcy, y, sizeof(double) * m);
+                wc_it = it; wc_mu = sc * mu;
+            }
         }
         if (res_score(R) < par->tol) { status = 0; break; }
         /* 5.12: as in the embedding (hsd_run): a best iterate that meets the tolerance in the
@@ -13197,6 +14035,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
     const double work_run = work_it * (it + 1);
     for (int k = 0; k < nb; k++) S[k].zon = 0;     /* polishing and endgame: the dense Zi and factors */
     int xsrc = 0;                 /* returned X: 0 S.X, 1 S.Xb, 2 S.G (polished) */
+    int bpt_kept = 0;             /* the iterate for the a-priori bound of side p stored at the probe's stop */
     const int objcand = g_objcand; g_objcand = 0;
     int ran_dd = 0;
     if (g_epol_stop) {
@@ -13209,6 +14048,15 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
         R->iters = it;
         xsrc = 2;
         memcpy(y, ybest, sizeof(double) * m);
+        /* 28 October 2026: the iterate the probe polished (S.Xb, positive definite) for the a-priori bound of side p,
+         * as before every polish below: the probe's candidate is a Euclidean projection and can be indefinite (a
+         * user's cut SDP, ni10fv order 3: lambda_min -4e-4, an eigenvalue term of 9e-5 against <C,X> 2.8e-5; the
+         * bound 1.18e-4 -> 2.80e-5). Stored before a fallback candidate overwrites S.Xb below, and kept then */
+        if (Xout && (par->bound_side & 1)) {
+            double **Xi = malloc(sizeof(double *) * (nb + 1));
+            if (Xi) { for (int k = 0; k < nb; k++) Xi[k] = S[k].Xb; slot_store(&g_bpt, P, Xi, ybest, &best, "the method's iterate before the polishes"); free(Xi); }
+            bpt_kept = 1;
+        }
         const double acc = fmax(res_score(R), fmax(R->err[2], R->err[4]));
         status = acc < par->tol ? 0 : 4;
         if (par->verbose > 0) printf("   polishing: score %.2e (the probe's candidate)\n", acc);
@@ -13254,9 +14102,32 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
          * 1.3 -> 2.3 s; the values the same or near). BRISK_DRIFTDD=1: the endgame as before */
         static int drift_dd = -1; if (drift_dd < 0) { const char *e = getenv("BRISK_DRIFTDD"); drift_dd = e ? atoi(e) != 0 : 0; }
         const int skip_dd_drift = g_drift_held && !drift_dd;
+        g_pol_s0 = res_score(R); g_pol_t0 = wtime();     /* (BRISK_POLDBG: the score and the clock before the end steps) */
+        /* 1 November 2026 (a user's report on diamond_patch, Mittelmann, SDP: 314 s of polishes and of the end phase on the
+         * infeasible-start method's result at 8e-2, which the re-solve with the self-dual embedding then replaced): the end
+         * steps (the double-double endgame, the end phase on the augmented Newton system, the polishes) are skipped when the
+         * re-solve below is certain whatever they do: every condition of the re-solve holds and the score is more than 1,000
+         * times its gate. Measured on the files whose first solve is thrown away, the end steps gained at most 125 times
+         * (mvu_200: 3.4e-4 -> 2.7e-6). Saved: tiger_texture 31 s, truss_20x10_4 5 s (the re-solve identical, iteration by
+         * iteration). BRISK_POLGATE=0: the end steps always */
+        static int pol_gate = -1; if (pol_gate < 0) { const char *e = getenv("BRISK_POLGATE"); pol_gate = !(e && atoi(e) == 0); }
+        const double gate_r = par_local.hsd_first_on ? 10.0 * par->retry_hsd1 : par->retry_acc;
+        const int skip_end = pol_gate && !has_soc && par_user->hsd < 0 && (!par_local.hsd || par_local.hsd_first_on) && status != 0 && status != 1
+                             && status != 2 && !par_local.no_retry && !brisk_time_up(par) && !(status == 3 && params_maxit_is_budget(par_user))
+                             && !g_dstop && (res_score(R) > 1e3 * gate_r || (g_early_a_ended && res_score(R) > gate_r));
+        /* (2 November 2026: only when the re-solve does follow, i.e. above its gate. buck4, Mittelmann, SDP: rule A ended the
+         * attempt at 9.99e-8, under the gate of 1e-7, so no re-solve came and the end steps skipped were the ones that bring
+         * it to 5.1e-9: OPTIMAL -> reduced accuracy in the macro bench) */
+        /* (1 November 2026, ISSUES 737: an attempt that rule A ended also skips them. The rule fires only with the gap above
+         * ten times the tolerance after the attempt lost its feasibility; vibra5, Mittelmann, SDP, ended at 3.1e-5, 310 times
+         * the gate: the end phase on the augmented system spent 37 s for 8.7e-6 and the re-solve followed, 111 -> 131 s) */
+        if (skip_end && par->verbose > 0) printf("   end steps skipped: the re-solve follows anyway (score %.2e, more than 1,000 times its gate %.1e)\n", res_score(R), gate_r);
+        /* (the skip counts as the run's one double-double endgame: the re-solve does not get a fresh one, so the cost does not
+         * move there; mvu_200, SDP: with a fresh one the re-solve spent 33 s for 3.6e-6 -> 2.5e-6, the same status, 8.0 -> 39.5 s) */
+        if (skip_end) ran_dd = 1;
         if (skip_dd_drift && par->verbose > 1 && res_score(R) >= par->tol) printf("   double-double endgame skipped: the drift guard held the stop back\n");
         int dd_gated = 0;             /* the double-double endgame skipped by its gates (constraints, memory, budget) */
-        if (par->dd_end && !par->dd_done && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc && !skip_dd_drift) {
+        if (par->dd_end && !par->dd_done && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc && !skip_dd_drift && !skip_end) {
             double n2 = 0;
             for (int k = 0; k < nb; k++) n2 += (double)bsz(&P->blk[k]);
             /* one dd iteration: Schur assembly through G_t = X A_t Zi (n ef_t + n^2 r_t per
@@ -13362,9 +14233,11 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                     static int polcmp = -1; if (polcmp < 0) polcmp = !ENV_ON("BRISK_DDNOPOLCMP");
                     if (polcmp && sp < cur2 && par->polish) {
                         Result Re = Rp, Rb = *R;
+                        extern int g_log_step_off; g_log_step_off++;   /* (two polishes that only compare the candidates: not steps of the log) */
                         const int ae = polish_solution(P, S, Xs, Zs, yc, &Re, sp, &Sc, dy, par->verbose > 1 ? par->verbose : 0);
                         const double pe = ae ? res_score(&Re) : sp;
                         const int ab = polish_solution(P, S, Xpre, Zpre, ypre, &Rb, cur2, &Sc, dy, par->verbose > 1 ? par->verbose : 0);
+                        g_log_step_off--;
                         const double pb = ab ? res_score(&Rb) : cur2;
                         if (par->verbose > 0) printf("   endgame candidates after the Euclidean polish: %.2e (endgame) against %.2e (the iterate)\n", pe, pb);
                         if (!(pe < pb)) {
@@ -13389,7 +14262,8 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                     if (par->verbose > 0)
                         printf("   high-precision endgame: score %.2e -> %.2e %s\n",
                                cur2, sp, sp < cur2 ? "accepted" : "rejected");
-                    { extern void brisk_note(const char *, ...); brisk_note("double-double endgame of the embedding: score %.1e -> %.1e, %s", cur2, sp, sp < cur2 ? "accepted" : "rejected"); }
+                    brisk_log_step("end phase in double-double arithmetic", cur2, sp, sp < cur2);
+                    { extern void brisk_note_diag(const char *, ...); brisk_note_diag("double-double endgame of the embedding: score %.1e -> %.1e, %s", cur2, sp, sp < cur2 ? "accepted" : "rejected"); }
                     if (sp < cur2) {
                         double tt[6] = { R->t_setup, R->t_schur, R->t_chol, R->t_dense, R->t_step, R->t_total };
                         int itn = R->iters;
@@ -13422,7 +14296,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
          * in 1.5.5, 4.3e-5 in 446 s after two re-solves) */
         static int augend = -1; if (augend < 0) { const char *e = getenv("BRISK_AUGEND"); augend = e ? atoi(e) : 1; }   /* (BRISK_AUGEND=0: off) */
         double **augX = NULL, **augZ = NULL, *augy = NULL; Result augR0; memset(&augR0, 0, sizeof(augR0));
-        if (augend > 0 && dd_gated && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc && !g_free_hsd) {
+        if (augend > 0 && dd_gated && !mixed && !timeout && status != 3 && res_score(R) >= par->tol && !g_dstop && !has_soc && !g_free_hsd && !skip_end) {
             const int use_best = keep_best && best_score <= res_score(R) * (1 + 1e-12);
             augX = malloc(sizeof(double *) * nb); augZ = malloc(sizeof(double *) * nb); augy = malloc(sizeof(double) * (m + 1));
             for (int k = 0; k < nb; k++) {
@@ -13447,6 +14321,9 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
             for (int k = 0; k < nb; k++) { Xb[k] = use_best ? S[k].Xb : S[k].X; Zb[k] = use_best ? S[k].Zb : S[k].Z; }
             R->iters = it;
             if (use_best || !keep_best || res_score(R) <= best_score) {
+                /* 28 October 2026: the iterate for the a-priori bound of side p, as before the polishes below (the
+                 * projection can leave a cone slightly) */
+                if (Xout && (par->bound_side & 1) && !bpt_kept) { const Result Rm = use_best ? best : *R; slot_store(&g_bpt, P, Xb, use_best ? ybest : y, &Rm, "the method's iterate before the polishes"); }
                 if (polish_solution(P, S, Xb, Zb, use_best ? ybest : y, R, res_score(R), &Sc, dy, par->verbose)) {
                     xsrc = 2;
                     if (use_best) memcpy(y, ybest, sizeof(double) * m);
@@ -13456,7 +14333,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
         }
         /* polishing of the returned point (best iterate if stored, else final) */
         /* 4.25: not past the time limit (thetaG51 -timelimit 1: 5 s of polishing after the stop) */
-        if (par->polish && status != 3 && !mixed && !timeout && !g_dstop && !has_soc) {
+        if (par->polish && status != 3 && !mixed && !timeout && !g_dstop && !has_soc && !skip_end) {
             double **Xb = malloc(sizeof(double *) * nb), **Zb = malloc(sizeof(double *) * nb);
             int use_best = keep_best && best_score <= res_score(R) * (1 + 1e-12);
             for (int k = 0; k < nb; k++) {
@@ -13471,7 +14348,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                 double *ym = malloc(sizeof(double) * (m + 1));
                 memcpy(ym, use_best ? ybest : y, sizeof(double) * m);
                 if (Xout) rej_begin();
-                if (Xout && (par->bound_side & 1)) slot_store(&g_bpt, P, Xb, ym, &Rm, "the method's iterate before the polishes");
+                if (Xout && (par->bound_side & 1) && !bpt_kept) slot_store(&g_bpt, P, Xb, ym, &Rm, "the method's iterate before the polishes");
                 /* the X-metric correction first (it keeps X positive definite); the
                  * Euclidean projection only if that one was not accepted */
                 /* the restoration of the primal feasibility in the square-root metric first: from
@@ -13635,6 +14512,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                     }
                     take = pe < bar; pe_out = pe;
                     if (par->verbose > 0) printf("   augmented-system end phase: polished %.2e against %.2e after the polishes, %s\n", pe, bar, take ? "kept" : "not kept");
+                    brisk_log_step("end phase on the augmented Newton system", bar, pe, take);
                     if (take) {
                         if (Xout) {                          /* the chain's point, for the judgment on the problem as read */
                             double **Xk = malloc(sizeof(double *) * (nb + 1));
@@ -13662,7 +14540,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
                     free(sG); free(sQ);
                 }
                 /* the Summary's line (the scores after the polishes) */
-                { extern void brisk_note(const char *, ...); brisk_note("end phase on the augmented Newton system: score %.1e -> %.1e, %s", bar, take ? pe_out : bar, take ? "kept" : "nothing gained"); }
+                { extern void brisk_note_diag(const char *, ...); brisk_note_diag("end phase on the augmented Newton system: score %.1e -> %.1e, %s", bar, take ? pe_out : bar, take ? "kept" : "nothing gained"); }
             }
             for (int k = 0; k < nb; k++) { free(augX[k]); free(augZ[k]); }
             free(augX); free(augZ); free(augy);
@@ -13695,6 +14573,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
     const int do_retry = !has_soc && par_user->hsd < 0 && (!par_local.hsd || par_local.hsd_first_on) && status != 0 && status != 1 && status != 2 &&
                          !par_local.no_retry && time_left && !(s1 <= rgate) && !(status == 3 && params_maxit_is_budget(par_user)) &&
                          !g_dstop;      /* 5.12: the returned best iterate meets the tolerance in the DIMACS measures */
+    if (getenv("BRISK_POLDBG")) printf("   [end steps: score %.2e -> %.2e in %.2f s; re-solve gate %.1e; re-solve %s; status %d]\n", g_pol_s0, s1, g_pol_t0 > 0 ? wtime() - g_pol_t0 : -1.0, rgate, do_retry ? "follows" : "no", status);
     if (par->verbose && (Sc.nreg || nrefine || Sc.pcg_iters))
         printf("   (Schur regularized in %d its; %d Newton refinements; %d PCG steps)\n",
                Sc.nreg, nrefine, Sc.pcg_iters);
@@ -13723,6 +14602,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
     if (par->verbose && cnt_feas) printf("   (primal step capped by the feasibility guard %d times)\n", cnt_feas);
     if (par->verbose && nt) printf("   (NT direction: Gram split used in %d iterations, unavailable in %d; least-squares refinement accepted %d/%d)\n",
                                    nsplit, nsplit_fail, nls_acc, nls_try);
+    brisk_memtrace("end of the infeasible-start iterations");
     if (par->verbose && ncorr_total) printf("   (%d centrality correctors accepted)\n", ncorr_total);
 
     /* 4.29: the re-solve starts from a blend of this run's returned point and its own
@@ -13772,7 +14652,7 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
     R->nreg = Sc.nreg; R->npcg = Sc.pcg_iters;
     schur_pos_free(&Sc);
     free(Sc.M); free(Sc.Md); free(Sc.Mf); free(Sc.ya); free(Sc.e3m); free(Sc.Masm); envelope_free(Sc.E); schol_free(Sc.SC); free(Sc.e1); free(Sc.e2); free(Sc.e3); free(Sc.D); free(Sc.r); free(Sc.t); free(Sc.p); free(Sc.q); free(Sc.xb); free(Sc.fw);
-    if (Sc.lr) { LrCorr *L = Sc.lr; free(L->col); free(L->U); free(L->Y); free(L->K); free(L->sg); free(L->t); free(L->piv); free(L); Sc.lr = NULL; if (g_lrc == L) g_lrc = NULL; }
+    if (Sc.lr) { LrCorr *L = Sc.lr; if (L->lpcol) { for (int k = 0; k < L->nb; k++) free(L->lpcol[k]); free(L->lpcol); } free(L->col); free(L->U); free(L->Y); free(L->K); free(L->sg); free(L->t); free(L->piv); free(L); Sc.lr = NULL; if (g_lrc == L) g_lrc = NULL; }
     int do_retry2 = do_retry;
     if (do_retry2) {
         /* the retry's memory (ISSUES 98): about twelve dense arrays of n^2 per semidefinite block and one and a
@@ -13809,6 +14689,12 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
         const int rescale = par_local.hsd_first_on && rescale_on && !(par_user->hsd_x0 > 0) && fmis >= 10;
         const double xfac = fmis;
         if (rescale) { p2.hsd = 1; p2.hsd_x0 = xfac; p2.warm_X = NULL; p2.warm_Z = NULL; p2.warm_y = NULL; }
+        if (wcX && wc_it >= 0 && p2.hsd == 1 && !rescale) {
+            const int useb = wc_depth >= 2 && wb_it >= 0;
+            p2.warm_X = useb ? wbX : wcX; p2.warm_Z = useb ? wbZ : wcZ; p2.warm_y = useb ? wby : wcy; p2.warm_lam = wc_lam;
+            if (par_user->verbose) printf("   the embedding starts from the well-centred iterate %d (a level of mu %s), blended with its own start (lambda %.2g)\n",
+                                          useb ? wb_it : wc_it, useb ? "two levels back" : "the latest", wc_lam);
+        }
         if (par_user->verbose && rescale) printf("   retrying with the self-dual embedding, its primal start scaled by %.1e (the first one's X/tau ended at that many times its start's Frobenius norm)\n", xfac);
         else if (par_user->verbose) printf("   retrying with the %s (status %d, accuracy %.1e%s%s)\n", p2.hsd ? "self-dual embedding" : "infeasible-start method", status, s1,
                                       (!p2.hsd && status == 4 && g_hsd_why) ? "; the embedding stopped: " : "", (!p2.hsd && status == 4 && g_hsd_why) ? g_hsd_why : "");
@@ -13848,6 +14734,8 @@ static int brisk_solve_body(Problem *P, const Params *par_user, Result *R, doubl
         free(y2);
     }
     if (wX) { for (int k = 0; k < nb; k++) { free(wX[k]); free(wZ[k]); } free(wX); free(wZ); free(wy); }
+    if (wcX) { for (int k = 0; k < nb; k++) { free(wcX[k]); free(wcZ[k]); } free(wcX); free(wcZ); free(wcy); }
+    if (wbX) { for (int k = 0; k < nb; k++) { free(wbX[k]); free(wbZ[k]); } free(wbX); free(wbZ); free(wby); }
     return status;
 }
 

@@ -5,6 +5,10 @@ here = fileparts(mfilename('fullpath'));
 ex1 = fullfile(here, 'examples', 'example1.dat-s');
 ex2 = fullfile(here, 'examples', 'example2.dat-s');
 nfail = 0;
+% (31 October 2026) the thread count of a fresh session's solve, for the check at the end that these tests (several
+% of which set threads = 1) leave later solves as they found them
+thr_file = fullfile(here, '..', 'examples', 'theta3.dat-s');
+nt_fresh = log_threads(thr_file, struct('verbose', 1));
 
 % ---- 1. SDPA file ------------------------------------------------------------------
 [objVal, x, X, Y, INFO] = brisk_sdpa(ex1);
@@ -128,7 +132,7 @@ nfail = nfail + check('opts -> args: numbers, flags, strings, underscore = dash'
 % written as fields of their options; a SeDuMi problem with one row (find(A) returned rows)
 a = brisk_opts2args(struct('verbose', 1), 'brisk_sdpa');
 nfail = nfail + check('opts -> args: the calling command', isequal(a, {'-caller', 'matlab:brisk_sdpa'}));
-out = evalc('brisk_sdpa(ex1, struct(''verbose'', 1));');
+out = evalc('brisk_sdpa(ex1, struct(''verbose'', 2));');   % (the advice after OPTIMAL: the diagnosis, verbose 2, ISSUES 725)
 has = @(t) ~isempty(strfind(out, t));
 nfail = nfail + check('log: the advice in MATLAB syntax (accuracy, precision, bound)', ...
     has('in the options of brisk_sdpa(..., opts)') && has('opts.acc = ''high''') && has('opts.prec = ''dd''') && ...
@@ -147,7 +151,7 @@ for q = 1:3
     o = struct('verbose', 1, 'chordal', cs(q), 'threads', 1);
     txt = evalc('[ov, ~, ~, ~, inf_] = brisk_sdpa(n, 1, n, ones(n, 1), Tm, o);');
     vals(q) = ov(1);
-    ok = ok && strcmp(inf_.status, 'OPTIMAL') && (~isempty(strfind(txt, 'chordal decomposition')) == (cs(q) ~= 0));
+    ok = ok && strcmp(inf_.status, 'OPTIMAL') && (~isempty(strfind(txt, 'split into cliques')) == (cs(q) ~= 0));   % (the Summary's step: applied; ISSUES 725)
 end
 nfail = nfail + check('opts.chordal = -1 / 0 / 1 reaches the solver (auto, off, forced)', ok && max(abs(vals - vals(1))) < 1e-6 * (1 + abs(vals(1))));
 % returnx = 0 on a chordal problem: Y (BRISK's X) is not formed, its blocks are empty
@@ -172,8 +176,8 @@ nfail = nfail + check('opts.prec: quad-double solve (errors below 1e-40, value -
     strcmp(inq.status, 'OPTIMAL') && max(abs(inq.dimacs)) < 1e-40 && abs(ovq(1) + 41.9) < 1e-12);
 % the *-algebra symmetry reduction (hidden symmetry under a random orthogonal basis)
 hs = fullfile(here, '..', 'examples', 'hidden_symmetry23.dat-s');
-txt1 = evalc('[ov1, ~, ~, ~, i1] = brisk_sdpa(hs, struct(''verbose'', 1, ''threads'', 1));');
-txt0 = evalc('[ov0, ~, ~, ~, i0] = brisk_sdpa(hs, struct(''verbose'', 1, ''threads'', 1, ''symalg'', 0));');
+txt1 = evalc('[ov1, ~, ~, ~, i1] = brisk_sdpa(hs, struct(''verbose'', 2, ''threads'', 1));');   % (the presolve's lines: verbose 2)
+txt0 = evalc('[ov0, ~, ~, ~, i0] = brisk_sdpa(hs, struct(''verbose'', 2, ''threads'', 1, ''symalg'', 0));');
 nfail = nfail + check('opts.symalg: the algebra symmetry on by default, off with 0, same objective', ...
     strcmp(i1.status, 'OPTIMAL') && strcmp(i0.status, 'OPTIMAL') && ~isempty(strfind(txt1, '23 -> 5 3(x2) 4(x3)')) ...
     && isempty(strfind(txt0, 'algebra symmetry')) && abs(ov1(1) - ov0(1)) < 1e-7 * (1 + abs(ov0(1))));
@@ -240,6 +244,29 @@ else
     fprintf('  (SeDuMi not on the path: comparison skipped)\n');
 end
 
+% ---- SeDuMi's own fields in brisk_sedumi (31 October 2026: pars.fid stopped the call before) ----
+ps = struct('fid', 0, 'eps', 1e-9, 'maxiter', 100, 'alg', 2, 'theta', 0.25, 'beta', 0.5, 'stepdif', 2, 'w', [1 1], ...
+            'bigeps', 1e-3, 'vplot', 0, 'numtol', 5e-7, 'chol', struct('skip', 1), 'cg', struct('maxiter', 49));
+[m5, bs5, c5, F5] = read_sdpa_cells(ex2);
+[A5, b5, cs5, K5] = sdpa2sedumi(m5, bs5, c5, F5);
+x5 = brisk_sedumi(A5, b5, cs5, K5);
+[xp, yp, ip] = brisk_sedumi(A5, b5, cs5, K5, ps); %#ok<ASGLU>
+nfail = nfail + check('brisk_sedumi: SeDuMi''s pars (fid, eps, maxiter and its tuning fields) accepted', ip.numerr == 0 && abs(cs5(:)' * xp - cs5(:)' * x5) < 1e-6 * (1 + abs(cs5(:)' * x5)));
+txtq = evalc('brisk_sedumi(A5, b5, cs5, K5, struct(''fid'', 0));'); txtl = evalc('brisk_sedumi(A5, b5, cs5, K5, struct(''fid'', 1));');
+nfail = nfail + check('brisk_sedumi: fid = 0 is quiet, fid = 1 prints the log', isempty(strfind(txtq, 'Summary')) && ~isempty(strfind(txtl, 'Summary')));
+
+% ---- the thread count: per solve (31 October 2026; until 1.6.1 these tests left later solves on one thread) ----
+if ~isempty(nt_fresh)
+    [nt1, txt1] = log_threads(thr_file, struct('verbose', 1, 'threads', 1));
+    nfail = nfail + check('threads = 1 is forced for that solve ("forced by user")', isequal(nt1, 1) && ~isempty(strfind(txt1, '(forced by user)')));
+    [nt2, txt2] = log_threads(thr_file, struct('verbose', 1));
+    % (the automatic count can be lower than the fresh one when other processes keep cores busy, never one held over:
+    % not "forced", and not stuck at one thread when the fresh session had more)
+    nfail = nfail + check('a later solve without threads starts from the automatic count again', ~isempty(nt2) && isempty(strfind(txt2, 'forced')) && (nt2 > 1 || nt_fresh == 1));
+    [nt3, txt3] = log_threads(thr_file, struct('verbose', 1, 'threads', 0));
+    nfail = nfail + check('threads = 0 is the automatic count', ~isempty(nt3) && isempty(strfind(txt3, 'forced')) && (nt3 > 1 || nt_fresh == 1));
+end
+
 if nfail == 0
     fprintf('test_brisk: all checks passed\n');
 else
@@ -248,6 +275,15 @@ end
 end
 
 % ======================================================================================
+function [nt, txt] = log_threads(file, opts)
+% the count of the log's line "Number of threads: k" of a solve of file ([] when the file is not there)
+nt = []; txt = '';
+if exist(file, 'file') ~= 2, return; end
+txt = evalc('brisk_sdpa(file, opts);');
+t = regexp(txt, 'Number of threads: (\d+)', 'tokens', 'once');
+if ~isempty(t), nt = str2double(t{1}); end
+end
+
 function f = check(name, ok)
 if ok, fprintf('  PASS  %s\n', name); f = 0; else, fprintf('  FAIL  %s\n', name); f = 1; end
 end

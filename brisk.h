@@ -10,7 +10,7 @@
 #ifndef BRISK_H
 #define BRISK_H
 
-#define BRISK_VERSION "1.6.1"
+#define BRISK_VERSION "1.6.5"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -136,13 +136,69 @@ int  brisk_run(int argc, char **argv, BriskResult *res);   /* BRISK_LIBRARY: ret
 int  brisk_run_data(const BriskData *d, int argc, char **argv, BriskResult *res);
 void brisk_result_free(BriskResult *res);
 extern int (*brisk_print_hook)(const char *s, int is_err); /* BRISK_LIBRARY: where printed output goes (is_err: stderr) */
-#if defined(BRISK_LIBRARY) && !defined(BRISK_NO_IO_MACROS)
-void brisk_exit(int code) __attribute__((noreturn));
+/* 31 October 2026 (ISSUES 725, the owner: "make sure only the things that can be reasonably understood by somebody not
+ * having an insight into the internal workings of the solver stay at the default option"): the default log of the SDP
+ * solver prints only the user's lines, written with log_user; every other line of the default level is the diagnosis,
+ * printed with -v (-vv and -vvv: the levels that -v and -vv were). While g_log_brief is set, a line written to stdout
+ * prints only inside log_user (g_log_user > 0); stderr always prints. The command line and the library both print
+ * through brisk_printf (main.c). */
+extern int g_log_brief, g_log_user, g_log_wrap;
+/* (5 November 2026, ISSUES 820) the files of the solution: opened and closed through these, a failed write is recorded,
+ * said in the Summary (brisk_out_summary_line) and gives exit code 16 (problem.c) */
+FILE *brisk_out_open(const char *fname);
+int brisk_out_close(FILE *f, const char *fname);
+void brisk_out_summary_line(void);
+extern int g_out_fail, g_out_said;
+extern int g_itab;   /* (main.c) the default log shows the iteration table of the LP, SOCP or QP interior-point method */
+void brisk_itab_row(int it, double pobj, double dobj, double pinf, double dinf, double gap, double mu, double step);
+void brisk_itab_end(void);
+void brisk_log_step(const char *what, double before, double after, int kept);   /* (main.c: a polish or an end phase in the default log) */
+#include <math.h>
+/* (31 October 2026, the owner's external SDP benchmark, audit A11) Acceptance arithmetic. C's fmax returns the other operand
+ * when one is NaN, so a measure that could not be computed vanished from a combined error and the result could be called
+ * OPTIMAL; every acceptance and ranking maximum goes through brisk_nmax, where a NaN gives +infinity (not accepted). */
+/* fault injection for the tests of failed checks (tools/fault_test.sh): BRISK_FAULT=<name> makes the named check fail
+ * (pslam: the postsolve's eigenvalue routines; bmverify: the Burer-Monteiro check of Z; lrlmin: the low-rank augmented
+ * Lagrangian's factorization of Z; fomrr: the first-order method's tridiagonal eigensolve; chordal: the completion's
+ * eigendecompositions) */
+int brisk_fault(const char *name);
+/* (31 October 2026, the owner's external SOCP and SDP audits, A6) one deadline for the whole solve: the absolute end time on
+ * the solver's clock (wtime, CLOCK_MONOTONIC; 0: none), set by the public call (brisk_main; sedumi_solve for the SOCP route)
+ * from the time limit and only ever shortened by an inner call (brisk_deadline_tighten returns the value to restore on
+ * return). Every part that does work before or around a method (presolves, folding, wrappers, re-solves) reads it. */
+double brisk_deadline(void);
+double brisk_time_left(void);                 /* seconds left; INFINITY when there is no deadline */
+double brisk_deadline_tighten(double t_abs);  /* the deadline becomes min(current, t_abs) (t_abs <= 0: unchanged); returns the previous value */
+void brisk_deadline_restore(double prev);
+static inline double brisk_nmax(double a, double b) { return (a != a || b != b) ? INFINITY : (b > a ? b : a); }
+/* the smallest eigenvalue over blocks: a NaN (not measured) gives -infinity, an unbounded violation, never a value that passes */
+static inline double brisk_nmin(double a, double b) { return (a != a || b != b) ? -INFINITY : (a < b ? a : b); }
+/* the error a result is accepted by: primal equations, X's cone, Z's cone, gap and complementarity (err[1], err[2], err[4],
+ * |err[5]|, |err[6]|; the dual equations err[3] hold by construction, Z = C - A'y) */
+static inline double brisk_acc_err(const double *e) {
+    return brisk_nmax(brisk_nmax(e[1], e[2]), brisk_nmax(e[4], brisk_nmax(fabs(e[5]), fabs(e[6]))));
+}
+
+#if !defined(BRISK_NO_IO_MACROS)
 int  brisk_printf(const char *fmt, ...);
 int  brisk_fprintf(FILE *f, const char *fmt, ...);
-#define exit(c) brisk_exit(c)
 #define printf(...) brisk_printf(__VA_ARGS__)
 #define fprintf(...) brisk_fprintf(__VA_ARGS__)
+#endif
+#define log_user(...) do { g_log_user++; printf(__VA_ARGS__); g_log_user--; } while (0)
+/* (main.c) the default log's lines shared by every method of the SDP solver: the method, the table's head and a row
+ * (mu < 0: a method without a barrier parameter, no MU and STEP columns), and the Summary of a method that ends outside
+ * the standard pipeline (Burer-Monteiro, the low-rank augmented Lagrangian, the high-precision solver) */
+void brisk_log_method(const char *fmt, ...);
+void brisk_log_head(int ipm);
+void brisk_log_row(int it, double po, double dob, double pinf, double dinf, double gap, double mu, double step, double t);
+void brisk_log_summary(const char *problem, const char *solve, double t, const char *status, double acc, const char *cause,
+                       double pobj, double dobj, const double *err, const char *extra);
+struct Problem_s;
+void brisk_log_problem(char *b, size_t n, const void *P);   /* (a const Problem *) */
+#if defined(BRISK_LIBRARY) && !defined(BRISK_NO_IO_MACROS)
+void brisk_exit(int code) __attribute__((noreturn));
+#define exit(c) brisk_exit(c)
 #endif
 
 #define BLK_SDP 0
@@ -220,6 +276,8 @@ typedef struct Block {
     /* low-rank Schur route (whole block): A_t = W_t diag(sig_t) W_t' */
     int lowrank;
     int lrR;             /* total rank */
+    int lrop;            /* 1 November 2026: the operators A(X), A'(y) through lr_W (every factor exact to 32 u, not larger
+                          * than the entries) */
     int *lr_off;         /* ncon+1 offsets into the columns of lr_W */
     double *lr_W;        /* n x lrR */
     double *lr_sig;      /* lrR */
@@ -345,6 +403,8 @@ typedef struct {
     int hsd_first_on;    /* internal: this run is the embedding-first attempt */
     int crossover;       /* 0 off, 1 on, -1 auto (when cheap) */
     double fr_gain;      /* facial reduction of depth >= 2 kept only if it cuts the cost per iteration this much (4) */
+    int fr_maxdepth;     /* facial reduction: the chain of reductions cut at this depth (-1: no limit, the default; 0: none, as -nofr) */
+    int fr_dual;            /* -frdual (4 November 2026): when the facial reduction's dual is lost, solve for the dual on the problem as read with the optimal value held (1) */
     double fr_fallback;  /* removed duals not rebuilt: the re-solve without facial reduction may take this multiple of the solve's time (0 = none, the default: the user is told) */
     double sym_fallback; /* a solve after an automorphism reduction that ends worse than reduced accuracy is repeated without it within this multiple of the solve's time (4; 0 = never) */
     int std_slow;        /* standard method: stop on slow progress when a retry follows (iterations, 0 off) */
@@ -361,7 +421,7 @@ typedef struct {
     int polish_r;        /* the restoration of the primal feasibility in the square-root metric (first) */
     double polish_mem;   /* bytes allowed for storing the best iterate */
     double pivtol;       /* squared-pivot threshold of the equilibrated Schur factor (1e-14) */
-    double reg_ill;      /* regularization applied when that threshold is violated (1e-10) */
+    double reg_ill;      /* fixed lowest regularization when that threshold is violated (0: automatic, from m u) */
     double balance;      /* keep relative infeasibility <= balance * relative complementarity (0 = off) */
     int mixed;           /* single-precision Schur factor as PCG preconditioner: -1 auto, 0 off, 1 on */
     double mixed_frac;   /* 4.31: auto, m in [1000, 4000): float when the factorization is at least this fraction of the iteration's work (0.6) */
@@ -540,11 +600,13 @@ void symred_rng_reset(void);
 void problem_free(Problem *P);
 int  facial_reduction(Problem *P, int verbose);
 int  lifted_faces(Problem *P, int verbose);   /* 23 October 2026: faces of lifted relaxations from their linear constraints (presolve.c) */
+int  clique_faces(Problem *P, int verbose);   /* 3 November 2026: faces fixed by small index sets (presolve.c; numerical) */
 int  remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc);   /* 20 October 2026: linearly dependent equality constraints (presolve.c) */
 int  chordal_convert(Problem *P, const Params *par, int verbose);
 void problem_from_trips(Problem *P, int m, int nblk, const int *bsz, const double *b,
                         size_t nt, const int *con, const int *blk, const int *ii, const int *jj, const double *v);
 void brisk_note(const char *fmt, ...);
+void brisk_note_diag(const char *fmt, ...);   /* (ISSUES 725) a note of an internal step: in the Summary of the diagnosis (-v) only */
 int  brisk_threads_logged(void);         /* 5.8: the thread count the log stated last (-1: none) */   /* 5.8: a line for the summary at the end of the run (events of the solve) */
 int  schur_dense_needed(const Problem *P, const Params *par);   /* 5.8: the standard method would need a dense Schur complement (solver.c) */
 int  dsdp_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
@@ -554,6 +616,7 @@ int  fom_bound_rows(const Problem *P);   /* 25 October 2026: rows g X_ij + alpha
 void brisk_log_threads(int verbose);   /* (solver.c) the log line "Number of threads: k", once per run */
 void brisk_log_threads_reset(void);
 void brisk_threads_adapt(int verbose);          /* 5.11 (solver.c): the thread count of the next iteration = the free cores */
+const char *brisk_threads_label(int nt);      /* 31 October 2026: " (forced by user)", " (problem too small for multithreading)" or "" */
 const char *brisk_threads_summary(void);        /* 5.11: the summary's words when the count changed or stayed under its limit, else NULL */
 int  brisk_threads_busy(int verbose);   /* 4.42 (solver.c): the busy-machine thread rule; returns the count to restore or -1 */
 /* sparse Cholesky of the Schur complement (sparsechol.c) */
@@ -581,6 +644,7 @@ void schol_set_dynpiv(SChol *S, double p);       /* signed factorization: wrong-
 int schol_ndyn(const SChol *S);
 int schol_ntiny(const SChol *S);
 void schol_set_perm(const int *perm);              /* an ordering for the next analysis (perm[new] = old; NULL: none) */
+void schol_set_snbreak(int a, int b);              /* positions of the ordering where a supernode must begin (-1: none) */
 int  schol_set_amd(int mode);                       /* the ordering mode of the next analyses (0 own, 1 automatic, 2 AMD alone); returns the previous one */
 void schol_solve_many_t(const SChol *S, double *Bm, int nrhs, double *work);   /* 20 October 2026: schol_solve_many by the transposed right-hand sides */
 void schol_pivots(const SChol *S, double *d);      /* 20 October 2026: pivots of the last factorization by original index (1e128: replaced as tiny) */
@@ -604,6 +668,9 @@ int    schol_peo_used(void);
 void   schol_mv2(const SChol *S, const double *x1, const double *x2, double *y1, double *y2);
 void   schol_mv_abs(const SChol *S, const double *x, double *y, double *ya);
 int    schol_factor(SChol *S, double shift);
+void   schol_set_stop(SChol *S, const volatile int *f, double deadline); /* stop flag and deadline (omp_get_wtime; 0 none), read at every supernode */
+int    schol_stopped(const SChol *S);
+int    brisk_cpu_quota(void);    /* the CPUs the container's quota allows (cgroup cpu.max), rounded up; 0: none */
 void   schol_release_factor(SChol *S);
 size_t schol_pansz(const SChol *S);
 void   schol_set_inplace(SChol *S, int on);
@@ -765,6 +832,12 @@ typedef struct Postsolve {
      * with con = -2 - j removed combination j, sum_q comb_w[q] A_{comb_i[q]} for q in [comb_ptr[j], comb_ptr[j + 1]) */
     int ncomb, *comb_ptr, *comb_i;
     double *comb_w;
+    /* 3 November 2026: comb_num[j] = 1 when combination j is a face proven only numerically (clique_faces, presolve.c),
+     * the one kind the facial reduction's numerical eigen test applies to */
+    unsigned char *comb_num; int ncomb_num;
+    /* and its face, accurate: the block's order, N (n x k, orthonormal, the face) and U (n x (n - k), the span of the face
+     * vectors), from the vectors themselves (E = sum v v' squares their conditioning: swissroll 1.3e-11) */
+    int *comb_fn, *comb_fk; double **comb_fN, **comb_fU;
 } Postsolve;
 /* compact copy of the data as read, for measuring the returned solution */
 typedef struct {
@@ -868,6 +941,9 @@ void  fom_gram_solve(const Gram *G, double *x);
 void  fom_gram_free(Gram *G);
 /* 4.34 matrix-free interior-point method (mfipm.c) */
 int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout);
+int mfipm_stalled(void);
+void brisk_fmt_bound7(char *buf, size_t sz, double v, int dir);
+void brisk_fmt_bound(char *buf, size_t sz, double v, int dir, int nd);   /* (main.c) the same with nd significant digits */   /* (main.c) a bound with 7 significant digits, rounded down (dir -1) or up (+1) */   /* 1: the last mfipm_solve stopped on a stall of its conjugate gradient solves (status ST_NUMERIC) */
 /* 5.4: the hybrid (-mfipm 2): the matrix-free iteration to a merit of mf_hand or until a solve
  * needs more than mf_handcg CG steps, then the standard method from its iterate (warm start).
  * The internal (scaled) iterate is returned in Xint, Zint (per block, allocated by the caller)
@@ -875,6 +951,7 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
  * 2 when CG gave up with the merit above 1e-2 (the point is no use as a start), 0 when the
  * matrix-free method ended by itself, < 0 on an error. */
 int mfipm_solve_snap(Problem *P, const Params *par, Result *R, double *yout, double **Xout, double **Xint, double **Zint, double *yint, double merit, int *taken);
+double  mfipm_snap_merit(void);   /* the merit of the iterate the last mfipm_solve_snap handed over */
 int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, double **Zint, double *yint, double hand_merit, int hand_cg);
 /* 4.40 low-rank augmented Lagrangian (lralm.c): reads, solves, reports; returns the exit code */
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);
@@ -923,6 +1000,7 @@ typedef struct {
     int late;               /* the time limit was reached: the dual recovery, or its later passes, and the projection skipped (ISSUES 284) */
     double t;               /* seconds */
 } PSResult;
+void    postsolve_set_tol(double tol);        /* the accuracy asked for (-tol); main.c, before postsolve */
 void    postsolve_set_time_left(double left);   /* the seconds the run has left (INFINITY: no limit); main.c, before postsolve */
 int  ps_measure(const PSOrig *O, double **Xo, const double *yo, PSResult *res);   /* 4.30: errors of (Xo, yo) on O */
 int  ps_measure_xc(const PSOrig *O, double **Xo, const double *yo, PSResult *res, const int *xc);   /* ... with Xo's cone-vector blocks (xc, NULL: none) */

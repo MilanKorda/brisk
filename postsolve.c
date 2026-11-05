@@ -24,7 +24,6 @@
 #include <float.h>
 #include <time.h>
 
-static const int IONE_ = 1;
 static const double DONE_ = 1.0, DZERO_ = 0.0;
 
 static void *pmalloc(size_t n) {
@@ -53,7 +52,14 @@ static double ps_now(void) {
  * A(X) = b. The mapping back and the errors' measure still run. */
 static double g_ps_deadline = 0;
 void postsolve_set_time_left(double left) { g_ps_deadline = left < INFINITY ? ps_now() + left : 0; }
+/* the accuracy the run asks for (-tol; 0: not known), so that a repair of the duals runs only when the error stands above it
+ * (31 October 2026, ISSUES 734) */
+static double g_ps_tol = 0;
+void postsolve_set_tol(double tol) { g_ps_tol = tol > 0 ? tol : 0; }
 static int ps_late(void) { return g_ps_deadline > 0 && ps_now() > g_ps_deadline; }
+/* the final measure as past the time limit (ISSUES 744; a test switch: BRISK_PSLATE=1 compares the bounded test with the
+ * full measure on the same point) */
+static int ps_measure_late(void) { return ps_late() || ENV_ON("BRISK_PSLATE"); }
 
 /* ------------------------------------------------------------------ basis */
 static void basis_free(PSBasis *T) {
@@ -208,7 +214,9 @@ void ps_free(Postsolve *ps) {
     for (int q = 0; q < ps->nch; q++) { free(ps->ch[q].cptr); free(ps->ch[q].cv); free(ps->ch[q].par); }
     if (ps->mom) ps_moment_free(ps->mom);
     free(ps->ch);
-    free(ps->comb_ptr); free(ps->comb_i); free(ps->comb_w);
+    free(ps->comb_ptr); free(ps->comb_i); free(ps->comb_w); free(ps->comb_num);
+    for (int q = 0; q < ps->ncomb_num; q++) { if (ps->comb_fN) free(ps->comb_fN[q]); if (ps->comb_fU) free(ps->comb_fU[q]); }
+    free(ps->comb_fN); free(ps->comb_fU); free(ps->comb_fn); free(ps->comb_fk);
     free(ps);
 }
 
@@ -375,7 +383,6 @@ static int chol_reg(int n, double *A, double *work) {
 /* smallest eigenvalue of symmetric M; returns 0 if M is numerically positive
  * definite (Cholesky succeeds), the exact value for n <= 4000, a Lanczos estimate
  * otherwise. work: n*n doubles. */
-static double lanczos_min(int n, const double *M);
 /* lambda_min when it matters: 0 if M is PSD (Cholesky), -delta if M + delta I is (a bound
  * that is all the error measures need, at a third of the cost of an eigensolver),
  * otherwise the exact value */
@@ -659,6 +666,40 @@ double ps_lammin_tol(int n, const double *M, double *work, double delta) {
     return v;
 }
 
+/* 2 November 2026 (ISSUES 744): lambda_min past the time limit, at a bounded cost. Until now a block of order above 500
+ * was not measured past the limit (ISSUES 284), so a good point whose solve ended a few seconds late was reported as
+ * NUMERICAL DIFFICULTIES with the error inf (diamond_patch, Mittelmann, SDP: 907.6 s of a 900 s limit, a point good to
+ * 8.6e-7 by the independent measure). The status needs one answer: is the error within the reduced-accuracy level 1e-6
+ * (a shift of 1e6 delta, delta = 1e-12 (1 + norm))? Cholesky of M, of M + delta I, and of M + 1e6 delta I; when the last
+ * succeeds, six bisections in the exponent bound lambda_min within a factor 1.24. At most nine factorizations; on a point
+ * far from the cone three (the case of ISSUES 284, where the ladder failed nine times and the eigenvalues followed).
+ * -INFINITY: worse than the reduced-accuracy level, not measured further. */
+static double ps_lammin_late(int n, const double *M, double *work, double delta) {
+    double v;
+    if (ps_lammin_arrow(n, M, delta, &v)) return v;
+    if (n > 1 && delta > 0 && ps_lammin_sparse(n, M, delta, &v) == 0) return v;
+    if (n <= 1 || !(delta > 0)) return ps_lammin(n, M, work);
+    double lo = 0, hi = 0;
+    const double shifts[3] = {0.0, delta, 1e6 * delta};
+    int k;
+    for (k = 0; k < 3; k++) {
+        memcpy(work, M, sizeof(double) * (size_t)n * n);
+        for (int i = 0; i < n; i++) work[i + (size_t)i * n] += shifts[k];
+        if (brisk_dpotrf(n, work, n) == 0) break;
+    }
+    if (k == 0) return 0;
+    if (k == 1) return -delta;
+    if (k == 3) return -INFINITY;
+    lo = delta; hi = 1e6 * delta;
+    for (int b = 0; b < 6; b++) {
+        const double h = sqrt(lo * hi);
+        memcpy(work, M, sizeof(double) * (size_t)n * n);
+        for (int i = 0; i < n; i++) work[i + (size_t)i * n] += h;
+        if (brisk_dpotrf(n, work, n) == 0) hi = h; else lo = h;
+    }
+    return -hi;
+}
+
 double ps_lammin(int n, const double *M, double *work) {
     if (n <= 0) return 0;
     if (n == 1) return M[0] < 0 ? M[0] : 0;
@@ -712,7 +753,7 @@ double ps_lammin(int n, const double *M, double *work) {
     return lammin_eig(n, M, work);
 }
 
-/* the smallest eigenvalue itself (dsyevr, values only); Lanczos only if LAPACK fails */
+/* the smallest eigenvalue itself (dsyevr, values only; dsyev if it fails; NaN if both fail) */
 static double lammin_eig(int n, const double *M, double *work) {
     memcpy(work, M, sizeof(double) * (size_t)n * n);
     int il = 1, iu = 1, mf, lwork = -1, liwork = -1, iwq, isup[2], info;
@@ -729,42 +770,23 @@ static double lammin_eig(int n, const double *M, double *work) {
     free(wk); free(iwk);
     double lam = w[0];
     free(w);
-    if (info != 0 || mf < 1) return lanczos_min(n, M);
-    return lam;
-}
-
-static double lanczos_min(int n, const double *M) {
-    const int K = 120;
-    double *Q = pmalloc(sizeof(double) * (size_t)n * (K + 1));
-    double *wv = pmalloc(sizeof(double) * n);
-    double al[121], be[121];
-    double nrm = 0;
-    for (int i = 0; i < n; i++) { Q[i] = 1.0 + 0.37 * sin(0.9 * i + 0.1); nrm += Q[i] * Q[i]; }
-    nrm = 1 / sqrt(nrm);
-    for (int i = 0; i < n; i++) Q[i] *= nrm;
-    int kk = 0;
-    for (int j = 0; j < K; j++) {
-        double *qj = Q + (size_t)j * n;
-        BL(dsymv_)("L", &n, &DONE_, M, &n, qj, &IONE_, &DZERO_, wv, &IONE_);
-        al[j] = BL(ddot_)(&n, qj, &IONE_, wv, &IONE_);
-        for (int pass = 0; pass < 2; pass++)
-            for (int i = 0; i <= j; i++) {
-                double c = -BL(ddot_)(&n, Q + (size_t)i * n, &IONE_, wv, &IONE_);
-                BL(daxpy_)(&n, &c, Q + (size_t)i * n, &IONE_, wv, &IONE_);
-            }
-        be[j] = BL(dnrm2_)(&n, wv, &IONE_);
-        kk = j + 1;
-        if (be[j] <= 1e-14 * (fabs(al[j]) + 1e-300)) break;
-        double inv = 1 / be[j];
-        for (int i = 0; i < n; i++) Q[(size_t)(j + 1) * n + i] = wv[i] * inv;
+    if (brisk_fault("pslam")) info = 1;
+    if (info != 0 || mf < 1) {
+        /* (31 October 2026, the owner's external SDP benchmark, audit A16) the 120-step Lanczos estimate from one fixed start
+         * that stood here is no bound on the smallest eigenvalue; LAPACK's QR iteration instead (dsyev), and when that fails
+         * too the value is not available: NaN, which no acceptance passes (brisk_nmax) */
+        memcpy(work, M, sizeof(double) * (size_t)n * n);
+        double *ev = pmalloc(sizeof(double) * (n + 1)), wq2 = 0;
+        int lw = -1, info2 = 0;
+        BL(dsyev_)("N", "L", &n, work, &n, ev, &wq2, &lw, &info2);
+        lw = (int)wq2 + 1;
+        double *wk2 = pmalloc(sizeof(double) * (size_t)lw);
+        BL(dsyev_)("N", "L", &n, work, &n, ev, wk2, &lw, &info2);
+        if (brisk_fault("pslam")) info2 = 1;
+        lam = info2 == 0 ? ev[0] : NAN;
+        free(ev); free(wk2);
+        if (getenv("BRISK_PSDEBUG")) printf("   [lambda_min: dsyevr failed (info %d), dsyev %s]\n", info, info2 == 0 ? "used" : "failed too: not available");
     }
-    double d[121], e[121], zv[121 * 121], wk[242];
-    int info;
-    memcpy(d, al, sizeof(double) * kk);
-    for (int i = 0; i + 1 < kk; i++) e[i] = be[i];
-    BL(dstev_)("V", &kk, d, e, zv, &kk, wk, &info);
-    double lam = d[0] - fabs(be[kk - 1] * zv[kk - 1]);
-    free(Q); free(wv);
     return lam;
 }
 
@@ -914,8 +936,16 @@ static int spx_find(const PSSpX *s, uint64_t k) {
 static int cmp_u64(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 /* lambda_min bound of the sparse symmetric matrix given by its upper triangle at the
  * positions of s (values v): as ps_lammin_sparse (0, or -d of the ladder). Returns 1 if
- * the pattern could not be factored or no shift up to 1e-6 max|diag| works. */
-static int spx_lammin(const PSSpX *s, const double *v, double delta, double *out) {
+ * the pattern could not be factored or no shift up to 1e-6 max|diag| works.
+ * late (2 November 2026, ISSUES 744; past the time limit): the shifts 0, delta and the largest of the ladder, then six
+ * bisections in the exponent when the largest succeeds: at most nine factorizations, three on a point far from the cone
+ * (the ladder's fourteen cost 57 s on the block of order 27,317 of ISSUES 284). */
+static void spx_fill(SChol *S, const PSSpX *s, const double *v, const size_t *off, const size_t *doff, const double *dg, double d) {
+    double *pm = schol_values(S);
+    for (int e = 0; e < s->ne; e++) if (off[e] != (size_t)-1) pm[off[e]] += v[e];
+    for (int j = 0; j < s->n0; j++) pm[doff[j]] += dg[j] + d;
+}
+static int spx_lammin(const PSSpX *s, const double *v, double delta, double *out, int late) {
     const int n = s->n0;
     int *deg = pcalloc(n + 1, sizeof(int));
     for (int e = 0; e < s->ne; e++) { const int i = (int)(s->key[e] / (uint64_t)n), j = (int)(s->key[e] % (uint64_t)n); if (i != j && v[e] != 0) { deg[i]++; deg[j]++; } }
@@ -935,16 +965,26 @@ static int spx_lammin(const PSSpX *s, const double *v, double delta, double *out
     }
     for (int j = 0; j < n; j++) { doff[j] = schol_offset(S, j, j); dmax = fmax(dmax, fabs(dg[j])); }
     int rc = 1;
+#define SPX_TRY(d_) (schol_zero(S), spx_fill(S, s, v, off, doff, dg, (d_)), schol_factor(S, 0.0) == 0)
+    if (late && delta > 0) {
+        /* the largest shift of the ladder below */
+        int kt = -1;
+        for (int k = 0; k <= 12; k++) { if (delta * pow(10.0, k) > 1e-6 * (dmax > 0 ? dmax : 1.0)) break; kt = k; }
+        if (SPX_TRY(0.0)) { *out = 0; rc = 0; }
+        else if (kt >= 0 && SPX_TRY(delta)) { *out = -delta; rc = 0; }
+        else if (kt >= 1 && SPX_TRY(delta * pow(10.0, kt))) {
+            double lo = delta, hi = delta * pow(10.0, kt);
+            for (int b = 0; b < 6; b++) { const double h = sqrt(lo * hi); if (SPX_TRY(h)) hi = h; else lo = h; }
+            *out = -hi; rc = 0;
+        }
+    } else
     for (int k = -1; k <= 12; k++) {
         const double d = k < 0 ? 0.0 : delta * pow(10.0, k);
         if (k >= 0 && d > 1e-6 * (dmax > 0 ? dmax : 1.0)) break;
-        schol_zero(S);
-        double *pm = schol_values(S);
-        for (int e = 0; e < s->ne; e++) if (off[e] != (size_t)-1) pm[off[e]] += v[e];
-        for (int j = 0; j < n; j++) pm[doff[j]] += dg[j] + d;
-        if (schol_factor(S, 0.0) == 0) { *out = -d; rc = 0; break; }
+        if (SPX_TRY(d)) { *out = -d; rc = 0; break; }
         if (k < 0 && !(delta > 0)) break;
     }
+#undef SPX_TRY
     free(off); free(doff); free(dg);
     schol_free(S);
     return rc;
@@ -1179,6 +1219,10 @@ static double part_t_sdp(const PSOrig *O, const ConIndex *CI, const PSRecord *r,
 
                 free(Zc); free(ev); free(w2);
             }
+        }
+        {   /* experiment: recovery as if the reduced slack were Zn + delta I (BRISK_PSSHIFT=delta, relative to max diag) */
+            static double shf = -1; if (shf < 0) { const char *e = getenv("BRISK_PSSHIFT"); shf = e ? atof(e) : 0; }
+            if (shf > 0) { double dm = 0; for (int i = 0; i < nn; i++) dm = fmax(dm, fabs(Zn[i + (size_t)i * nn])); for (int i = 0; i < nn; i++) Zn[i + (size_t)i * nn] += shf * fmax(dm, 1.0); }
         }
         const int sp = sparse_gtag(nn, Zn, G, kw, S);
         if (sp == 2) { *fail = 1; free(wk); goto out; }
@@ -1905,6 +1949,54 @@ static inline void ps_zadd(const PSOrig *O, const int *zc, double **Z, size_t q,
     else if (zc && zc[o] >= 0) { const int h = zc[o]; if (i == j) { if (i == h) Z[o][0] += coef; } else { const int u = i == h ? j : i; Z[o][u < h ? u + 1 : u] += coef; } }
     else { Z[o][i + (size_t)j * no] += coef; if (i != j) Z[o][j + (size_t)i * no] += coef; }
 }
+/* Z = C - A'y on the problem as read, each entry summed in double-double arithmetic and rounded once (4 November 2026,
+ * ISSUES 757): with multipliers far larger than Z, the cancelling terms leave errors of about |A||y| eps in Z's entries
+ * when summed in double, and the verdicts on Z (the recovery's tests, the measure) read them. Each product is split
+ * exactly by fma, each sum by Knuth's two-sum; the errors are kept in a second array and added at the end. Z is the block
+ * storage of ps_zadd (zc: cone-vector blocks); the block skipo (-1: none) goes to zs[qe[q]] instead (the postsolve's
+ * split block). Z, and zs, are overwritten. */
+static void ps_zbuild(const PSOrig *O, const int *zc, double **Z, const double *y, int skipo, double *zs, const int *qe, int ne) {
+    const int nbo = O->nblk;
+    double **L = pmalloc(sizeof(double *) * (nbo + 1));
+    for (int o = 0; o < nbo; o++) {
+        const size_t len = o == skipo ? 0 : ps_zlen(O, zc, o);
+        if (o != skipo) memset(Z[o], 0, sizeof(double) * len);
+        L[o] = pcalloc(len + 1, sizeof(double));
+    }
+    double *Ls = NULL;
+    if (skipo >= 0 && zs) { memset(zs, 0, sizeof(double) * ne); Ls = pcalloc(ne + 1, sizeof(double)); }
+    for (size_t q = 0; q < O->nnz; q++) {
+        double p, e;
+        if (O->con[q] < 0) { p = O->v[q]; e = 0; }
+        else { const double yv = y[O->con[q]]; if (yv == 0) continue; p = -yv * O->v[q]; e = fma(-yv, O->v[q], -p); }
+        if (p == 0) continue;
+        const int o = O->blk[q];
+        double *zz[2]; double *ll[2]; int nk = 0;
+        if (o == skipo) { if (!zs) continue; zz[0] = &zs[qe[q]]; ll[0] = &Ls[qe[q]]; nk = 1; }
+        else {
+            const int i = O->ii[q], j = O->jj[q], no = abs(O->bs[o]);
+            if (O->bs[o] < 0) { zz[0] = &Z[o][i]; ll[0] = &L[o][i]; nk = 1; }
+            else if (zc && zc[o] >= 0) {
+                const int h = zc[o]; size_t k;
+                if (i == j) { if (i != h) continue; k = 0; } else { const int u = i == h ? j : i; k = u < h ? u + 1 : u; }
+                zz[0] = &Z[o][k]; ll[0] = &L[o][k]; nk = 1;
+            } else {
+                zz[0] = &Z[o][i + (size_t)j * no]; ll[0] = &L[o][i + (size_t)j * no]; nk = 1;
+                if (i != j) { zz[1] = &Z[o][j + (size_t)i * no]; ll[1] = &L[o][j + (size_t)i * no]; nk = 2; }
+            }
+        }
+        for (int t = 0; t < nk; t++) {
+            const double a = *zz[t], sm = a + p, bb = sm - a, er = (a - (sm - bb)) + (p - bb);
+            *zz[t] = sm; *ll[t] += er + e;
+        }
+    }
+    for (int o = 0; o < nbo; o++) {
+        if (o != skipo) { const size_t len = ps_zlen(O, zc, o); for (size_t k = 0; k < len; k++) Z[o][k] += L[o][k]; }
+        free(L[o]);
+    }
+    free(L);
+    if (Ls) { for (int k = 0; k < ne; k++) zs[k] += Ls[k]; free(Ls); }
+}
 static inline double ps_zlam(const PSOrig *O, const int *zc, double *const *Z, int o, double *work, double delta) {
     const int no = abs(O->bs[o]);
     if (O->bs[o] < 0) { double v = 0; for (int i = 0; i < no; i++) v = fmin(v, Z[o][i]); return v; }
@@ -2222,12 +2314,17 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
     }
     double **Zo = pmalloc(sizeof(double *) * (nbo + 1));
     for (int o = 0; o < nbo; o++) Zo[o] = pcalloc(o == spx.o ? 2 : ps_zlen(O, zc, o) + 1, sizeof(double));
-    for (size_t q = 0; q < O->nnz; q++) {
-        const int o = O->blk[q];
-        const double coef = O->con[q] < 0 ? O->v[q] : -yo[O->con[q]] * O->v[q];
-        if (coef == 0) continue;
-        if (o == spx.o) { spx.zs[spx.qe[q]] += coef; continue; }
-        ps_zadd(O, zc, Zo, q, coef);
+    ps_zbuild(O, zc, Zo, yo, spx.o, spx.zs, spx.qe, spx.ne);
+    {   /* experiment (4 November 2026): the recovery run on Z + delta I (BRISK_PSDSHIFT=delta, absolute): the dual of the
+         * problem with C + delta I, whose value exceeds the true one by delta tr(X); taken off again after the passes */
+        const char *e = getenv("BRISK_PSDSHIFT");
+        const double dsh = e ? atof(e) : 0;
+        if (dsh > 0 && ps && ps->nrec > 0) for (int o = 0; o < nbo; o++) {
+            const int no = abs(O->bs[o]);
+            if (o == spx.o) { for (int q = 0; q < spx.ne; q++) if (spx.key[q] / (uint64_t)spx.n0 == spx.key[q] % (uint64_t)spx.n0) spx.zs[q] += dsh; }
+            else if (O->bs[o] < 0) { for (int i = 0; i < no; i++) Zo[o][i] += dsh; }
+            else for (int i = 0; i < no; i++) Zo[o][i + (size_t)i * no] += dsh;
+        }
     }
     if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: Z formed]\n", ps_now() - t0);
     /* ---- dual recovery for constraints removed by facial reduction. The back-off margin
@@ -2246,9 +2343,9 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         const double dtol = 1e-12 * (1.0 + O->nC1);
 #define SP_LAM(out) do { double b_ = 0, v_ = 0; \
             for (int o = 0; o < nbo; o++) { const int no = abs(O->bs[o]); \
-                if (o == spx.o) { if (spx_lammin(&spx, spx.zs, dtol, &v_)) v_ = -INFINITY; b_ = fmin(b_, v_); } \
-                else if (O->bs[o] < 0) { for (int i = 0; i < no; i++) b_ = fmin(b_, Zo[o][i]); } \
-                else b_ = fmin(b_, ps_lammin_tol(no, Zo[o], wk, dtol)); } \
+                if (o == spx.o) { if (spx_lammin(&spx, spx.zs, dtol, &v_, 0)) v_ = -INFINITY; b_ = brisk_nmin(b_, v_); } \
+                else if (O->bs[o] < 0) { for (int i = 0; i < no; i++) b_ = brisk_nmin(b_, Zo[o][i]); } \
+                else b_ = brisk_nmin(b_, ps_lammin_tol(no, Zo[o], wk, dtol)); } \
             (out) = b_; } while (0)
         double lz0;
         SP_LAM(lz0);
@@ -2337,7 +2434,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             /* candidate 0: the removed constraints' duals left at zero, which is often
              * already dual feasible (then nothing is to be recovered) */
             double best = 0;
-            for (int o = 0; o < nbo; o++) best = fmin(best, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
+            for (int o = 0; o < nbo; o++) best = brisk_nmin(best, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
             best = best == best ? -best : INFINITY;
             if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: lambda_min with the removed duals at zero]\n", ps_now() - t0);
             double best0 = best;
@@ -2358,6 +2455,8 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             double bestr = best;
             memcpy(ybr, y0, sizeof(double) * mo);
             const int maxround = getenv("BRISK_PSROUNDS") ? atoi(getenv("BRISK_PSROUNDS")) : 2;
+            double *ylift0 = pmalloc(sizeof(double) * (mo + 1));   /* the base before any correction round (the lift below) */
+            memcpy(ylift0, y0, sizeof(double) * mo);
             for (int round = 0; round < maxround; round++) {
             if (round >= 1 && ps_late()) { res->late = 1; break; }   /* (ISSUES 284) */
             if (round >= 1) {
@@ -2371,14 +2470,9 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 double dn = 0;
                 ps_fix_apply(&fix, ybr, y0, verbose, &dn);
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: dual correction round %d]\n", ps_now() - t0, round);
-                for (int o = 0; o < nbo; o++) memset(Z0[o], 0, sizeof(double) * ps_zlen(O, zc, o));
-                for (size_t q = 0; q < O->nnz; q++) {
-                    const double coef = O->con[q] < 0 ? O->v[q] : -y0[O->con[q]] * O->v[q];
-                    if (coef == 0) continue;
-                    ps_zadd(O, zc, Z0, q, coef);
-                }
+                ps_zbuild(O, zc, Z0, y0, -1, NULL, NULL, 0);
                 double lb = 0;
-                for (int o = 0; o < nbo; o++) lb = fmin(lb, ps_zlam(O, zc, Z0, o, wk, 1e-12 * (1.0 + O->nC1)));
+                for (int o = 0; o < nbo; o++) lb = brisk_nmin(lb, ps_zlam(O, zc, Z0, o, wk, 1e-12 * (1.0 + O->nC1)));
                 best0 = lb == lb ? -lb : INFINITY;
                 if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: corrected base (round %d): lambda_min(Z) %.2e, |dy| %.2e\n", round, -best0, dn);
                 if (best0 < best) { best = best0; brec = 0; bunrec = 0; bround = round; memcpy(ybest, y0, sizeof(double) * mo); }
@@ -2396,7 +2490,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 if (recover_pass(ps, O, &CI, yo, Zo, me ? atof(me) : margins[k], &rc, &un, NULL)) { lz = -INFINITY; if (round >= 1 && bestr == INFINITY) memcpy(ybr, yo, sizeof(double) * mo); }
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: recovery pass]\n", ps_now() - t0);
                 if (lz == 0) for (int o = 0; o < nbo; o++)   /* (4.22: was skipped under BRISK_PSTIME) */
-                    lz = fmin(lz, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
+                    lz = brisk_nmin(lz, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
                 if (!(lz == lz)) lz = -INFINITY;
                 if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yo));
                 if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: recovery margin %g: lambda_min(Z) %.2e\n", me ? atof(me) : margins[k], lz);
@@ -2419,18 +2513,141 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 if (best <= 1e-10 * (1.0 + O->nC1)) break;
             }
             }   /* rounds */
+            /* 31 October 2026 (the owner's external SDP benchmark, kernel SDPs; ISSUES 731): the dual optimum of the problem as
+             * read is not attained when the facial reduction removed a face that X cannot leave (X 1 = 0 in a balanced
+             * elliptope): the removed constraint's dual t must make Z PSD against a reduced slack that is singular on the
+             * range of X, so t ~ |g|^2 / lambda_min, 1e10 for a solve to 1e-9, and Z = C - A'y then carries rounding of
+             * eps t n (the benchmark's own check read lambda_min(Z) = -2.6e-4 on data_kernel_L4_S1). The trade the problem
+             * allows is explicit: lift the dual by delta I where I = A'w (rows that cover a block's diagonal exactly once,
+             * each with one value), at a gap cost of exactly delta tr(X), which bounds t by |g|^2 / delta; delta is chosen
+             * by the errors of the result (dual violation with its rounding bound, gap, complementarity). */
+            if (Xo && !(best <= 1e-12 * (1.0 + O->nC1)) && !ps_late() && !getenv("BRISK_NOLIFT")) {
+                int xcany = 0;
+                if (xc_o) for (int o = 0; o < nbo; o++) if (xc_o[o] >= 0) xcany = 1;
+                int *rblk = pmalloc(sizeof(int) * (mo + 1)); double *rval = pmalloc(sizeof(double) * (mo + 1));
+                for (int i = 0; i < mo; i++) { rblk[i] = -1; rval[i] = 0; }
+                for (size_t q = 0; q < O->nnz && !xcany; q++) {
+                    const int r = O->con[q], o = O->blk[q];
+                    if (r < 0 || rblk[r] == -2) continue;
+                    if (O->bs[o] <= 0 || O->ii[q] != O->jj[q] || (rblk[r] >= 0 && (rblk[r] != o || O->v[q] != rval[r])) || O->v[q] == 0) { rblk[r] = -2; continue; }
+                    rblk[r] = o; rval[r] = O->v[q];
+                }
+                double *lw = pcalloc(mo + 1, sizeof(double)); int nlift = 0; double trx = 0;
+                for (int o = 0; o < nbo && !xcany; o++) {
+                    if (O->bs[o] <= 0) continue;
+                    const int no = O->bs[o];
+                    int *cov = pcalloc(no + 1, sizeof(int));
+                    for (size_t q = 0; q < O->nnz; q++) { const int r = O->con[q]; if (r >= 0 && rblk[r] == o) cov[O->ii[q]]++; }
+                    int ok = 1; for (int i = 0; i < no; i++) if (cov[i] != 1) { ok = 0; break; }
+                    free(cov);
+                    if (!ok) continue;
+                    for (int r = 0; r < mo; r++) if (rblk[r] == o) lw[r] = 1.0 / rval[r];
+                    for (int i = 0; i < no; i++) trx += Xo[o][i + (size_t)i * no];
+                    nlift++;
+                }
+                if (nlift > 0 && trx > 0) {
+                    /* <C, X> and A(X), once */
+                    double pob = 0; double *ax = pcalloc(mo + 1, sizeof(double));
+                    for (size_t q = 0; q < O->nnz; q++) {
+                        const int o = O->blk[q], no = abs(O->bs[o]);
+                        const double xv = O->bs[o] < 0 ? Xo[o][O->ii[q]] : Xo[o][O->ii[q] + (size_t)O->jj[q] * no] * (O->ii[q] != O->jj[q] ? 2.0 : 1.0);
+                        if (O->con[q] < 0) pob += O->v[q] * xv; else ax[O->con[q]] += O->v[q] * xv;
+                    }
+#define LIFT_SCORE(yv, viol, out) do { double d_ = 0, xy_ = 0; \
+                        for (int i_ = 0; i_ < mo; i_++) { d_ += O->b[i_] * (yv)[i_]; xy_ += (yv)[i_] * ax[i_]; } \
+                        const double den_ = 1.0 + fabs(pob) + fabs(d_); \
+                        (out) = fmax((viol) / (1.0 + O->nC1), fmax(fabs(pob - d_), fabs(pob - xy_)) / den_); } while (0)
+                    double sbest; LIFT_SCORE(ybest, best, sbest);
+                    if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: lift along the identity (%d block(s), tr X %.3g): without it, error %.2e\n", nlift, trx, sbest);
+                    double prev = INFINITY;
+                    /* (31 October 2026, ISSUES 734: only when the error without the lift is above the accuracy asked for;
+                     * each shift costs a full recovery pass, 0.85 s on cancer_100 (SDP, 198 faces removed), whose error
+                     * 4.3e-9 the lift could not improve where it matters: 5 s of its 10.7 s) */
+                    const int lift_needed = !(g_ps_tol > 0 && sbest <= g_ps_tol);
+                    if (!lift_needed && (verbose >= 2 || getenv("BRISK_PSTIME"))) printf("postsolve: lift not needed (error %.2e within the tolerance %.0e)\n", sbest, g_ps_tol);
+                    for (int k = 0; k < 7 && lift_needed; k++) {
+                        if (ps_late()) { res->late = 1; break; }
+                        const double sg = pow(10.0, -12.0 + k), dl = sg * (1.0 + 2.0 * fabs(pob)) / trx;
+                        for (int i = 0; i < mo; i++) yo[i] = ylift0[i] - dl * lw[i];
+                        ps_zbuild(O, zc, Zo, yo, -1, NULL, NULL, 0);
+                        int rc = 0, un = 0; double lz = 0;
+                        if (recover_pass(ps, O, &CI, yo, Zo, 1.0, &rc, &un, NULL)) lz = -INFINITY;
+                        if (lz == 0) for (int o = 0; o < nbo; o++) lz = brisk_nmin(lz, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
+                        if (!(lz == lz)) lz = -INFINITY;
+                        if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yo));
+                        double sc = INFINITY;
+                        if (lz > -INFINITY) LIFT_SCORE(yo, -lz, sc);
+                        if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: lift %.0e (delta %.2e): lambda_min(Z) %.2e, error %.2e\n", sg, dl, lz, sc);
+                        if (sc < sbest) { sbest = sc; best = -lz; brec = rc; bunrec = un; memcpy(ybest, yo, sizeof(double) * mo); }
+                        if (sc > 10.0 * prev && prev < INFINITY) break;      /* past the balance of the two errors */
+                        prev = fmin(prev, sc);
+                    }
+#undef LIFT_SCORE
+                    free(ax);
+                }
+                free(lw); free(rblk); free(rval);
+            }
+            /* 2 November 2026 (ISSUES 745, the owner: "better dual rebuild for duals that are not attained is important"):
+             * the removed constraints' duals scaled down along the found direction, judged by the errors. The passes above
+             * size each removed dual t* so that Z is semidefinite exactly; when the reduced slack is singular on the range
+             * of X (the dual optimum of the problem as read is not attained), t* is huge (5e10 on tiger_texture, Mittelmann,
+             * SDP) and Z = C - A'y then carries rounding of eps t* |A_r| (lambda_min(Z) about -1e-3: the independent maximum
+             * error 3.4e-6). A t a thousand to a hundred thousand times smaller leaves Z violated by far less than that
+             * rounding (measured on that file: t = -1e5 .. -3e7 gives the maximum error 1.6e-8, the gap's). The candidates
+             * y0 + 10^-k (y - y0), k = 1..8 (y0 the base before the recovery), each judged by the score of the lift above
+             * (Z's violation with its rounding bound, the gap, complementarity), until the score rises tenfold past its
+             * minimum. Each costs one rebuild of Z and its smallest eigenvalue. BRISK_NOTRADE: off. */
+            if (Xo && !(best <= 1e-12 * (1.0 + O->nC1)) && !ps_late() && !getenv("BRISK_NOTRADE")) {
+                double pob = 0; double *ax = pcalloc(mo + 1, sizeof(double));
+                for (size_t q = 0; q < O->nnz; q++) {
+                    const int o = O->blk[q], no = abs(O->bs[o]);
+                    if (xc_o && xc_o[o] >= 0) { pob = NAN; break; }    /* (cone-vector blocks: not handled here) */
+                    const double xv = O->bs[o] < 0 ? Xo[o][O->ii[q]] : Xo[o][O->ii[q] + (size_t)O->jj[q] * no] * (O->ii[q] != O->jj[q] ? 2.0 : 1.0);
+                    if (O->con[q] < 0) pob += O->v[q] * xv; else ax[O->con[q]] += O->v[q] * xv;
+                }
+#define TRADE_SCORE(yv, viol, out) do { double d_ = 0, xy_ = 0; \
+                    for (int i_ = 0; i_ < mo; i_++) { d_ += O->b[i_] * (yv)[i_]; xy_ += (yv)[i_] * ax[i_]; } \
+                    const double den_ = 1.0 + fabs(pob) + fabs(d_); \
+                    (out) = fmax((viol) / (1.0 + O->nC1), fmax(fabs(pob - d_), fabs(pob - xy_)) / den_); } while (0)
+                double dmax = 0;
+                for (int i = 0; i < mo; i++) dmax = fmax(dmax, fabs(ybest[i] - ylift0[i]));
+                if (pob == pob && dmax > 0) {
+                    double sb; TRADE_SCORE(ybest, best, sb);
+                    if (!(g_ps_tol > 0 && sb <= g_ps_tol)) {
+                        if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: removed duals scaled down: as found, error %.2e\n", sb);
+                        double *yt = pmalloc(sizeof(double) * (mo + 1)), prev = INFINITY;
+                        int kept = 0;
+                        for (int k = 1; k <= 8; k++) {
+                            if (ps_late()) { res->late = 1; break; }
+                            const double s = pow(10.0, -k);
+                            for (int i = 0; i < mo; i++) yt[i] = ylift0[i] + s * (ybest[i] - ylift0[i]);
+                            ps_zbuild(O, zc, Zo, yt, -1, NULL, NULL, 0);
+                            double lz = 0;
+                            for (int o = 0; o < nbo; o++) lz = brisk_nmin(lz, ps_zlam(O, zc, Zo, o, wk, 1e-12 * (1.0 + O->nC1)));
+                            if (!(lz == lz)) lz = -INFINITY;
+                            if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yt));
+                            double sc = INFINITY;
+                            if (lz > -INFINITY) TRADE_SCORE(yt, -lz, sc);
+                            if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: removed duals scaled by %.0e: lambda_min(Z) %.2e, error %.2e\n", s, lz, sc);
+                            if (sc < sb) { sb = sc; best = -lz; kept = 1; memcpy(ybest, yt, sizeof(double) * mo); }
+                            if (sc > 10.0 * prev && prev < INFINITY) break;      /* past the balance of the two errors */
+                            prev = fmin(prev, sc);
+                        }
+                        if (kept && verbose >= 1) printf("postsolve: the removed constraints' duals scaled down: error %.2e\n", sb);
+                        free(yt);
+                    }
+                }
+#undef TRADE_SCORE
+                free(ax);
+            }
+            free(ylift0);
             if (have_fix) ps_fix_free(&fix);
             free(ybr);
             res->fr_corrected = bround >= 1;
             if (bround >= 1 && (verbose >= 2 || getenv("BRISK_PSTIME"))) printf("postsolve: the corrected lift is kept (round %d): lambda_min(Z) %.2e\n", bround, -best);
             memcpy(yo, ybest, sizeof(double) * mo);
             /* rebuild Z from the kept y */
-            for (int o = 0; o < nbo; o++) memset(Zo[o], 0, sizeof(double) * ps_zlen(O, zc, o));
-            for (size_t q = 0; q < O->nnz; q++) {
-                const double coef = O->con[q] < 0 ? O->v[q] : -yo[O->con[q]] * O->v[q];
-                if (coef == 0) continue;
-                ps_zadd(O, zc, Zo, q, coef);
-            }
+            ps_zbuild(O, zc, Zo, yo, -1, NULL, NULL, 0);
             res->recovered = brec; res->unrecovered = bunrec;
             for (int o = 0; o < nbo; o++) free(Z0[o]);
             free(Z0); free(y0); free(ybest); free(wk);
@@ -2479,27 +2696,31 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         const int no = abs(O->bs[o]);
         if (o == spx.o) {
             double v = 0;
-            /* (ISSUES 284: past the time limit not measured: on a point far from Z >= 0 every one of the up to 14 shifted
-             * factorizations fails, 57 s on the block of order 27,317 of pglib_opf_case13659_pegase at its starting point) */
-            if (ps_late()) {
-                if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (the time limit is reached)\n", o + 1);
-                v = -INFINITY; res->late = 1;
-            } else if (spx_lammin(&spx, spx.zs, 1e-12 * (1.0 + O->nC1), &v)) {
-                if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (sparse factorization failed)\n", o + 1);
-                v = -INFINITY;
+            /* (ISSUES 284: on a point far from Z >= 0 every one of the up to 14 shifted factorizations fails, 57 s on the
+             * block of order 27,317 of pglib_opf_case13659_pegase at its starting point; ISSUES 744: past the time limit
+             * the bounded test, at most nine factorizations and three on such a point, instead of no measure) */
+            const int late = ps_measure_late();
+            if (spx_lammin(&spx, spx.zs, 1e-12 * (1.0 + O->nC1), &v, late)) {
+                if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (%s)\n", o + 1,
+                                         late ? "the time limit is reached and the error exceeds 1e-6" : "sparse factorization failed");
+                v = -INFINITY; if (late) res->late = 1;
             }
-            lamz = fmin(lamz, v);
+            lamz = brisk_nmin(lamz, v);
             continue;
         }
         if (O->bs[o] < 0) {
-            for (int i = 0; i < no; i++) lamz = fmin(lamz, Zo[o][i]);
-        } else if (zc && zc[o] >= 0) lamz = fmin(lamz, ps_zlam(O, zc, Zo, o, work, 0.0));
-        else if (no > 500 && ps_late()) {   /* (ISSUES 284: past the time limit a large block is not measured; on a point far
-                                              * from Z >= 0 the Cholesky ladder fails nine times and the eigenvalues follow) */
-            if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (the time limit is reached)\n", o + 1);
-            lamz = -INFINITY; res->late = 1;
+            for (int i = 0; i < no; i++) lamz = brisk_nmin(lamz, Zo[o][i]);
+        } else if (zc && zc[o] >= 0) lamz = brisk_nmin(lamz, ps_zlam(O, zc, Zo, o, work, 0.0));
+        else if (no > 500 && ps_measure_late()) {   /* (ISSUES 284: on a point far from Z >= 0 the Cholesky ladder fails nine times
+                                              * and the eigenvalues follow; ISSUES 744: past the time limit the bounded test) */
+            const double lz_ = ps_lammin_late(no, Zo[o], work, 1e-12 * (1.0 + O->nC1));
+            if (lz_ == -INFINITY) {
+                if (verbose >= 0) printf("postsolve: lambda_min(Z) of block %d not measured (the time limit is reached and the error exceeds 1e-6)\n", o + 1);
+                res->late = 1;
+            }
+            lamz = brisk_nmin(lamz, lz_);
         }
-        else { double lz_ = ps_lammin_tol(no, Zo[o], work, 1e-12 * (1.0 + O->nC1)); if (ENV_ON("BRISK_LZDBG")) { printf("   [block %d n %d lammin(Z) %.3e]\n", o, no, lz_); if (no <= 6) for (int i = 0; i < no; i++) { for (int j = 0; j < no; j++) printf(" %.6e", Zo[o][i + (size_t)j * no]); printf("\n"); } } lamz = fmin(lamz, lz_); }
+        else { double lz_ = ps_lammin_tol(no, Zo[o], work, 1e-12 * (1.0 + O->nC1)); if (ENV_ON("BRISK_LZDBG")) { printf("   [block %d n %d lammin(Z) %.3e]\n", o, no, lz_); if (no <= 6) for (int i = 0; i < no; i++) { for (int j = 0; j < no; j++) printf(" %.6e", Zo[o][i + (size_t)j * no]); printf("\n"); } } lamz = brisk_nmin(lamz, lz_); }
     }
     if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: lambda_min(Z) measured]\n", ps_now() - t0);
     if (Xo) {
@@ -2523,7 +2744,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             for (int e = 0; e < spx.ne; e++) xz += (spx.key[e] / n0 == spx.key[e] % n0 ? 1.0 : 2.0) * spx.xs[e] * spx.zs[e];
             for (int t = 0; t < spncl; t++) {
                 const int c = spch->cptr[t + 1] - spch->cptr[t];
-                lamx = fmin(lamx, ps_lammin_tol(c, spXc[t], work, 1e-12 * (1.0 + O->nb1)));
+                lamx = brisk_nmin(lamx, ps_lammin_tol(c, spXc[t], work, 1e-12 * (1.0 + O->nb1)));
             }
         }
         for (int o = 0; o < nbo; o++) {
@@ -2532,7 +2753,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
             if (xc_o && xc_o[o] >= 0) {
                 /* both cone vectors (above): <X, Z> = x'z */
                 for (int t = 0; t < no; t++) xz += Xo[o][t] * Zo[o][t];
-                lamx = fmin(lamx, xc_lammin_x(no, Xo[o]));
+                lamx = brisk_nmin(lamx, xc_lammin_x(no, Xo[o]));
                 continue;
             }
             if (zc && zc[o] >= 0) {
@@ -2542,12 +2763,12 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 for (int i = 0; i < no; i++) tr += Xo[o][i + (size_t)i * no];
                 xz += Zo[o][0] * tr;
                 for (int t = 1; t < no; t++) xz += 2.0 * Zo[o][t] * Xo[o][(size_t)xc_index(h, t) + (size_t)h * no];
-                lamx = fmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
+                lamx = brisk_nmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
                 continue;
             }
             const size_t len = bsize(O->bs[o]);
             for (size_t q = 0; q < len; q++) xz += Xo[o][q] * Zo[o][q];
-            if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamx = fmin(lamx, Xo[o][i]); }
+            if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamx = brisk_nmin(lamx, Xo[o][i]); }
             else if (spx.o >= 0 && clam_o && clam_o[o] == clam_o[o]) {
                 /* 4.42: X is not returned (the sparse measure is on): a decomposed block is
                  * measured on its cliques, like the largest one, not on its completion. The
@@ -2565,11 +2786,18 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                     free(G); free(wkc);
                     clam_o[o] = lm;
                 }
-                lamx = fmin(lamx, clam_o[o]);
+                lamx = brisk_nmin(lamx, clam_o[o]);
                 if (getenv("BRISK_PSTIME")) printf("   [postsolve: block %d (n %d) measured on its cliques: lambda_min %.3e]\n", o, no, clam_o[o]);
             }
-            else if (no > 500 && ps_late()) { lamx = -INFINITY; res->late = 1; }   /* (ISSUES 284, as for Z above) */
-            else lamx = fmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
+            else if (no > 500 && ps_measure_late()) {   /* (ISSUES 284 and 744, as for Z above) */
+                const double lx_ = ps_lammin_late(no, Xo[o], work, 1e-12 * (1.0 + O->nb1));
+                if (lx_ == -INFINITY) {
+                    if (verbose >= 0) printf("postsolve: lambda_min(X) of block %d not measured (the time limit is reached and the error exceeds 1e-6)\n", o + 1);
+                    res->late = 1;
+                }
+                lamx = brisk_nmin(lamx, lx_);
+            }
+            else lamx = brisk_nmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
         }
         if (getenv("BRISK_PSTIME")) printf("   [postsolve %.3fs: <C,X>, A(X), <X,Z> and lambda_min(X) measured]\n", ps_now() - t0);
         double r2 = 0;
@@ -2595,14 +2823,14 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
         }
         double den = 1 + fabs(pobj + O->obj_off) + fabs(dobj + O->obj_off);
         res->err[1] = sqrt(r2) / (1 + O->nb1);
-        res->err[2] = fmax(0.0, -lamx) / (1 + O->nb1);
+        res->err[2] = brisk_nmax(0.0, -lamx) / (1 + O->nb1);   /* (a NaN lambda_min, not measured, stays NaN: audit A11/A16) */
         res->err[5] = (pobj - dobj) / den;
         res->err[6] = xz / den;
     }
     res->err[3] = 0;
     /* rounding uncertainty of Z (matters only after a recovery with large duals) */
-    if (ps && ps->nrec > 0 && res->recovered > 0) lamz = fmin(lamz, -z_round_est(O, yo));
-    res->err[4] = fmax(0.0, -lamz) / (1 + O->nC1);
+    if (ps && ps->nrec > 0 && res->recovered > 0) lamz = brisk_nmin(lamz, -z_round_est(O, yo));
+    res->err[4] = brisk_nmax(0.0, -lamz) / (1 + O->nC1);
     res->pobj = pobj;
     res->dobj = dobj;
     free(work); free(rp); free(clam_k); free(clam_o); free(cch_k); free(cch_o);
@@ -2748,17 +2976,26 @@ int ps_measure_xc(const PSOrig *O, double **Xo, const double *yo, PSResult *res,
     memset(res, 0, sizeof(*res));
     double **Zo = pmalloc(sizeof(double *) * (nbo + 1));
     for (int o = 0; o < nbo; o++) Zo[o] = pcalloc(ps_zlen(O, xc, o) + 1, sizeof(double));
-    for (size_t q = 0; q < O->nnz; q++) {
-        const double coef = O->con[q] < 0 ? O->v[q] : -yo[O->con[q]] * O->v[q];
-        if (coef == 0) continue;
-        ps_zadd(O, xc, Zo, q, coef);
-    }
+    ps_zbuild(O, xc, Zo, yo, -1, NULL, NULL, 0);
     size_t maxn2 = 1;
     for (int o = 0; o < nbo; o++) if (O->bs[o] > 0 && !(xc && xc[o] >= 0) && bsize(O->bs[o]) > maxn2) maxn2 = bsize(O->bs[o]);
     double *work = pmalloc(sizeof(double) * maxn2);
     double pobj = 0, dobj = 0, xz = 0, lamx = 0, lamz = 0;
     for (int i = 0; i < mo; i++) dobj += O->b[i] * yo[i];
-    for (int o = 0; o < nbo; o++) lamz = fmin(lamz, ps_zlam(O, xc, Zo, o, work, 1e-12 * (1.0 + O->nC1)));
+    /* (4 November 2026, ISSUES 757) lambda_min of a block is resolved only to about eps |Z_o| in double: a dual with
+     * multipliers of 1e14 (a facial reduction's recovery, a user's moment relaxation at -frdepth 1) has |Z_o| = 1.2e14 and
+     * an eigenvalue of -1.4e-3 that no double computation can see (the block passed the Cholesky test; "Z>=0 7.4e-14",
+     * OPTIMAL). The error of Z's cone is reported as at least that resolution, so that a dual whose feasibility cannot
+     * be resolved is not declared feasible; it counts only where |Z_o| exceeds about 1e4 (1 + |C|_1). */
+    double zres = 0;
+    for (int o = 0; o < nbo; o++) {
+        lamz = brisk_nmin(lamz, ps_zlam(O, xc, Zo, o, work, 1e-12 * (1.0 + O->nC1)));
+        if (O->bs[o] > 0 && !(xc && xc[o] >= 0)) {
+            double f2 = 0; const size_t len = bsize(O->bs[o]);
+            for (size_t k = 0; k < len; k++) f2 += Zo[o][k] * Zo[o][k];
+            zres = fmax(zres, DBL_EPSILON * sqrt(f2));
+        }
+    }
     if (Xo) {
         double *rp = pcalloc(mo + 1, sizeof(double));
         for (size_t q = 0; q < O->nnz; q++) {
@@ -2778,13 +3015,13 @@ int ps_measure_xc(const PSOrig *O, double **Xo, const double *yo, PSResult *res,
             const int no = abs(O->bs[o]);
             if (xc && xc[o] >= 0) {
                 for (int t = 0; t < no; t++) xz += Xo[o][t] * Zo[o][t];
-                lamx = fmin(lamx, xc_lammin_x(no, Xo[o]));
+                lamx = brisk_nmin(lamx, xc_lammin_x(no, Xo[o]));
                 continue;
             }
             const size_t len = bsize(O->bs[o]);
             for (size_t q = 0; q < len; q++) xz += Xo[o][q] * Zo[o][q];
-            if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamx = fmin(lamx, Xo[o][i]); }
-            else lamx = fmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
+            if (O->bs[o] < 0) { for (int i = 0; i < no; i++) lamx = brisk_nmin(lamx, Xo[o][i]); }
+            else lamx = brisk_nmin(lamx, ps_lammin_tol(no, Xo[o], work, 1e-12 * (1.0 + O->nb1)));
         }
         double r2 = 0;
         for (int i = 0; i < mo; i++) {
@@ -2794,14 +3031,14 @@ int ps_measure_xc(const PSOrig *O, double **Xo, const double *yo, PSResult *res,
         }
         const double den = 1 + fabs(pobj + O->obj_off) + fabs(dobj + O->obj_off);
         res->err[1] = sqrt(r2) / (1 + O->nb1);
-        res->err[2] = fmax(0.0, -lamx) / (1 + O->nb1);
+        res->err[2] = brisk_nmax(0.0, -lamx) / (1 + O->nb1);   /* (a NaN lambda_min, not measured, stays NaN: audit A11/A16) */
         res->err[5] = (pobj - dobj) / den;
         res->err[6] = xz / den;
         res->have_x = 1;
         free(rp);
     }
     res->err[3] = 0;
-    res->err[4] = fmax(0.0, -lamz) / (1 + O->nC1);
+    res->err[4] = brisk_nmax(brisk_nmax(0.0, -lamz), zres > 1e4 * DBL_EPSILON * (1 + O->nC1) ? zres : 0) / (1 + O->nC1);
     res->pobj = pobj; res->dobj = dobj;
     free(work);
     for (int o = 0; o < nbo; o++) free(Zo[o]);

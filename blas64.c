@@ -76,6 +76,8 @@ void   B64(dgeqrf_)(const bi *, const bi *, double *, const bi *, double *, doub
 void   B64(dsytrd_)(const char *, const bi *, double *, const bi *, double *, double *, double *, double *, const bi *, bi *);
 void   B64(dormtr_)(const char *, const char *, const char *, const bi *, const bi *, const double *, const bi *, const double *, double *, const bi *, double *, const bi *, bi *);
 void   B64(dsytrf_)(const char *, const bi *, double *, const bi *, bi *, double *, const bi *, bi *);
+void   B64(dgetrf_)(const bi *, const bi *, double *, const bi *, bi *, bi *);
+void   B64(dtrtri_)(const char *, const char *, const bi *, double *, const bi *, bi *);
 void   B64(dsytf2_)(const char *, const bi *, double *, const bi *, bi *, bi *);
 void   B64(dsytrs_)(const char *, const bi *, const bi *, const double *, const bi *, const bi *, double *, const bi *, bi *);
 void   B64(dsysv_)(const char *, const bi *, const bi *, double *, const bi *, bi *, double *, const bi *, double *, const bi *, bi *);
@@ -338,6 +340,20 @@ void BW(dsytrf_)(const char *u, const int *n, double *a, const int *lda, int *ip
     bi *ip = iget(ib, nn);
     B64(dsytrf_)(u, &N, a, &LA, ip, work, &LW, &inf);
     if (LW != -1) b2i(ipiv, ip, (size_t)N);
+    iput(ib, ip); OUT(info, inf);
+}
+/* the triangular inverse of the QP active-set method (the merge for 1.6.5) */
+void BW(dtrtri_)(const char *u, const char *d, const int *n, double *a, const int *lda, int *info) {
+    const bi N = I(n), LA = I(lda); bi inf = 0;
+    B64(dtrtri_)(u, d, &N, a, &LA, &inf); OUT(info, inf);
+}
+/* ipiv (min(m, n)) out; the LU factorization of the QP active-set method and the SOCP solver (the merge for 1.6.5) */
+void BW(dgetrf_)(const int *m, const int *n, double *a, const int *lda, int *ipiv, int *info) {
+    const bi M = I(m), N = I(n), LA = I(lda); bi inf = 0, ib[IBUF];
+    const size_t k = (size_t)(M < N ? (M > 0 ? M : 1) : (N > 0 ? N : 1));
+    bi *ip = iget(ib, k);
+    B64(dgetrf_)(&M, &N, a, &LA, ip, &inf);
+    b2i(ipiv, ip, (size_t)(M < N ? M : N) > 0 ? (size_t)(M < N ? M : N) : 0);
     iput(ib, ip); OUT(info, inf);
 }
 /* ipiv (n) out; brisk_dsytrf's diagonal blocks (1.5.3) */

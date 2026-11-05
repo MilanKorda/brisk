@@ -84,6 +84,33 @@ static double fe_clique_density(const Problem *P) {
     free(s);
     return P->m > 0 ? cl2 / ((double)P->m * P->m) : 0;
 }
+/* 4 November 2026 (a user's Navier-Stokes moment relaxations, SDP): the Schur complement's entries counted from every
+ * source, the semidefinite blocks (each couples all the rows on it) and each LP index (it couples the rows that contain
+ * it; a split free pair is two such indices), over the live rows: the sum of the squared counts. Split free pairs that
+ * appear in many rows fill the Schur complement as much as the blocks do (2x2 grid: the sparse Schur factor 1.1e11
+ * flops with the pairs, 1.4e10 after the elimination, while the data's nonzeros grow 1.5 times) */
+static double schur_entries_rows(const Row *R, int m, const char *dead, const Problem *P) {
+    const int nb = P->nblk;
+    long *soff = fx(sizeof(long) * (nb + 1));
+    for (int k = 0; k < nb; k++) soff[k + 1] = soff[k] + (P->blk[k].type == BLK_LP ? P->blk[k].n : 0);
+    long *lpc = fx(sizeof(long) * (soff[nb] + 1)), *bc = fx(sizeof(long) * (nb + 1));
+    int *last = fx(sizeof(int) * (nb + 1)); for (int k = 0; k < nb; k++) last[k] = -1;
+    for (int r = 0; r < m; r++) {
+        if (dead && dead[r]) continue;
+        for (int q = 0; q < R[r].n; q++) {
+            if (R[r].e[q].v == 0) continue;
+            const uint64_t k = R[r].e[q].k; const int b = KB(k);
+            if (b < 0 || b >= nb) continue;
+            if (P->blk[b].type == BLK_LP) lpc[soff[b] + KI(k)]++;
+            else if (last[b] != r) { last[b] = r; bc[b]++; }
+        }
+    }
+    double s = 0;
+    for (int k = 0; k < nb; k++) s += (double)bc[k] * bc[k];
+    for (long i = 0; i < soff[nb]; i++) s += (double)lpc[i] * lpc[i];
+    free(soff); free(lpc); free(bc); free(last);
+    return s;
+}
 static void row_push(Row *R, uint64_t k, double v) {
     if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 8; R->e = realloc(R->e, sizeof(RE) * R->cap); }
     R->e[R->n].k = k; R->e[R->n].v = v; R->n++;
@@ -275,12 +302,35 @@ int free_pairs_detect(const Problem *P, FreePair **out) {
 }
 
 static int g_fe_cheaponly = 0;   /* (the fill-free retry of a rejected elimination by cost, below) */
+double g_fe_refused_cost = 0;   /* (4 November 2026, ISSUES 760: the estimate of an elimination refused on its cost alone; 0 otherwise) */
+long g_fe_refused_cand = 0;      /* (the eliminated rows that are candidates of the single-constraint facial reduction) */
+/* a row of the eliminated problem as a candidate of the single-constraint facial reduction: rhs zero (tested by the
+ * caller), every diagonal entry (LP entries are diagonal) of one sign, every off-diagonal entry within the geometric mean
+ * of its two diagonal entries (presolve.c's quick test, over the whole row); rows are sorted by key after row_compact */
+static double fe_diag(const Row *R, uint64_t k) {
+    int lo = 0, hi = R->n - 1;
+    while (lo <= hi) { const int mid = (lo + hi) / 2; if (R->e[mid].k == k) return R->e[mid].v; if (R->e[mid].k < k) lo = mid + 1; else hi = mid - 1; }
+    return 0.0;
+}
+static int fe_row_candidate(const Row *R) {
+    int pos = 0, neg = 0;
+    for (int q = 0; q < R->n; q++) if (KI(R->e[q].k) == KJ(R->e[q].k)) { if (R->e[q].v > 0) pos = 1; else neg = 1; }
+    if ((pos && neg) || (!pos && !neg)) return 0;
+    for (int q = 0; q < R->n; q++) {
+        const uint64_t k = R->e[q].k; const int b = KB(k), i = KI(k), j = KJ(k);
+        if (i == j) continue;
+        const double di = fe_diag(R, KEY(b, i, i)), dj = fe_diag(R, KEY(b, j, j)), v = R->e[q].v;
+        if (di == 0 || dj == 0 || v * v > di * dj * (1 + 1e-12)) return 0;
+    }
+    return 1;
+}
 PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automatic) {
     const int m = P->m, nb = P->nblk;
     typedef FreePair Pair;
     Pair *pr = NULL;
     int cheap = 0, bycost = 0;
     const double tfe0 = wtime(); const int fedbg = getenv("BRISK_FEDBG") != NULL;
+    if (!g_fe_cheaponly) g_fe_refused_cost = 0;
     int npr = free_pairs_detect(P, &pr);
     if (fedbg) printf("   [free-elim: %d pairs detected %.2fs]\n", npr, wtime() - tfe0);
     if (npr == 0) { free(pr); return NULL; }
@@ -406,6 +456,7 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
     char *seen = fx(m + 1);
     long fill0 = 0, fill1 = 0;
     for (int r = 0; r < m; r++) fill0 += R[r].n;
+    const double se0 = automatic ? schur_entries_rows(R, m, NULL, P) : 0;   /* (the sparse estimate below) */
     /* 4.30: live column counts kept incrementally (a heap of (count, f) with lazy
      * invalidation; only the free variables of a pivot row change) - the full rescan per
      * step was quadratic (9 s for the 3485 pairs of the dual form of nn_n10_m50_K) */
@@ -521,10 +572,28 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         static int fq_env = -1; if (fq_env < 0) { const char *e = getenv("BRISK_FECLIQ"); fq_env = !(e && atoi(e) == 0); }
         const double dens0 = cl2 / ((double)m * m), dens = fq_env ? fe_clique_density(P) : dens0;
         const double rm = (double)mn_est / m, rn = (double)fill1 / fmax(1.0, (double)fill0);
-        cost_ratio = dens >= 0.3 ? rm * rm * rm * rn : rm * rn;
-        if (fedbg) printf("   [free-elim: cost ratio %.3f (rows %d -> %ld, nonzeros %ld -> %ld, clique density %.3f; each block its own clique %.3f)]\n", cost_ratio, m, mn_est, fill0, fill1, dens, dens0);
+        /* 4 November 2026 (a user's Navier-Stokes moment relaxations, SDP; ISSUES 755): with a sparse Schur complement its work
+         * scales with the complement's own entries, not with the data's nonzeros (rows x nonzeros until then). Counted from
+         * every source, the blocks and each LP index (schur_entries_rows): split free pairs couple the rows they are in as
+         * the blocks do, and the elimination removes that coupling. 2x2 grid: data nonzeros x1.50, rows x0.79, estimate 1.19
+         * (refused), Schur entries x0.87, the sparse factor 1.1e11 flops with the pairs and 1.4e10 eliminated (8 times
+         * fewer), the run 37.4 -> 9.9 s; the power-flow relaxations' entries grow x3-14 and stay refused, as measured
+         * before. BRISK_FESCHUR=0: rows x nonzeros, as before */
+        static int fs_env = -1; if (fs_env < 0) { const char *e = getenv("BRISK_FESCHUR"); fs_env = !(e && atoi(e) == 0); }
+        const double se1 = schur_entries_rows(R, m, dead, P), rs = se1 / fmax(1.0, se0);
+        /* (the elimination is taken when either measure of the work says it is cheaper: the split pairs also cost what
+         * neither counts, the regularized Schur solves and the accuracy lost to them; copo14 (DIMACS, SDP): Schur entries
+         * x1.10 but rows x nonzeros 0.14, 0.24 s eliminated against 0.37 s kept as pairs, median of 5) */
+        cost_ratio = dens >= 0.3 ? rm * rm * rm * rn : fs_env ? fmin(rs, rm * rn) : rm * rn;
+        if (fedbg) printf("   [free-elim: cost ratio %.3f (rows %d -> %ld, nonzeros %ld -> %ld, clique density %.3f; each block its own clique %.3f); Schur entries from every source %.3g -> %.3g (ratio %.3f)]\n", cost_ratio, m, mn_est, fill0, fill1, dens, dens0, se0, se1, rs);
     }
     if (automatic && !cheap && (fill1 > 8 * fill0 || 4 * nelim < 3 * npr || cost_ratio > 1.0)) {
+        g_fe_refused_cost = (!bycost && !(fill1 > 8 * fill0) && !(4 * nelim < 3 * npr)) ? cost_ratio : 0.0;
+        g_fe_refused_cand = 0;
+        if (g_fe_refused_cost > 0)
+            for (int r = 0; r < m; r++)
+                if (!dead[r] && R[r].n > 0 && fabs(b[r]) <= 1e-12 * (1.0 + fabs(P->b[r])) && fe_row_candidate(&R[r])) g_fe_refused_cand++;
+        if (fedbg) printf("   [free-elim: %ld rows of the eliminated problem are candidates of the facial reduction]\n", g_fe_refused_cand);
         if (verbose && !bycost)
             printf("presolve: free elimination not used (%d of %d pairs eliminated, nonzeros %ld -> %ld, estimated cost ratio %.2f)\n", nelim, npr, fill0, fill1, cost_ratio);
         if (fedbg && bycost) printf("   [free-elim: by cost rejected (%d of %d, nonzeros %ld -> %ld, cost ratio %.2f): the fill-free mode]\n", nelim, npr, fill0, fill1, cost_ratio);

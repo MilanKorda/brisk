@@ -45,6 +45,10 @@ static Int clear_flag (Int wflg, Int wbig, Int W [ ], Int n)
  * to be used. The value may be lowered by another thread while the ordering runs (lpsolve.c, the dense-column choice:
  * an estimate stops once another one has shown that it cannot be chosen). */
 __thread const volatile double *brisk_amd_cap = NULL;
+/* (BRISK, 3 November 2026) the starting degrees, when the caller hands them (socp.c, kkt_analyse): the graph given without
+ * the entries of the unknowns AMD sets aside as dense, their counts kept in the others' starting degrees, as AMD would have
+ * found them in the whole graph; the order is the same (a dense unknown has weight zero in every later degree update) */
+__thread const int *brisk_amd_deg0 = NULL;
 __thread int brisk_amd_capped = 0;
 /* (BRISK, 26 October 2026) and a deadline (CLOCK_MONOTONIC seconds, 0: none) and a stop flag (may be NULL), looked at every
  * 256 eliminations (the flag after every one since 28 October): the estimate of a form of a large LP's normal equations took 23 s past a time limit of 10 s
@@ -539,6 +543,7 @@ GLOBAL void AMD_2
  */
 
     double f, r, ndiv, s, nms_lu, nms_ldl, dmax, alpha, lnz, lnzme ;
+    double lnz_lb = 0, nms_lb = 0 ;
 
 /*
  * f:		nvpiv
@@ -643,7 +648,7 @@ GLOBAL void AMD_2
 	Nv [i] = 1 ;
 	W [i] = 1 ;
 	Elen [i] = 0 ;
-	Degree [i] = Len [i] ;
+	Degree [i] = brisk_amd_deg0 ? brisk_amd_deg0 [i] : Len [i] ;
     }
 
 #ifndef NDEBUG
@@ -1565,14 +1570,23 @@ GLOBAL void AMD_2
 	    /* number of multiply-subtract pairs for LDL' */
 	    nms_ldl += (s + lnzme)/2 ;
 	}
-	if (Info != (double *) NULL && ((brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lu + 2.0 * lnz > *brisk_amd_cap)
+	/* (BRISK, 31 October 2026) the cap is tested on the counts without the "dense" rows (r = degme), a lower bound on the
+	 * factor's work in this order; the counts above join every dense row to every pivot, an upper bound that can be far off
+	 * (an LAD regression's dual form, LP: 10,000 pivots of 100 entries each counted as 2,000 long, 4.3e10 flops for 3e9) */
+	if (Info != (double *) NULL)
+	{
+	    f = nvpiv ; r = degme ;
+	    lnz_lb += f*r + (f-1)*f/2 ;
+	    nms_lb += f*r*r + r*(f-1)*f + (f-1)*f*(2*f-1)/6 ;
+	}
+	if (Info != (double *) NULL && ((brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lb + 2.0 * lnz_lb > *brisk_amd_cap)
 	    || (brisk_amd_stop && *brisk_amd_stop)
 	    || (brisk_amd_deadline > 0 && (++brisk_amd_tick & 255) == 0 && amd_now () > brisk_amd_deadline)))
 	{
 	    /* (2: stopped by the deadline or the flag, the counts then no bound worth using; 1: by the cap) */
-	    brisk_amd_capped = (brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lu + 2.0 * lnz > *brisk_amd_cap) ? 1 : 2 ;
-	    Info [AMD_LNZ] = lnz ;
-	    Info [AMD_NMULTSUBS_LU] = nms_lu ;
+	    brisk_amd_capped = (brisk_amd_cap != NULL && *brisk_amd_cap > 0 && nms_lb + 2.0 * lnz_lb > *brisk_amd_cap) ? 1 : 2 ;
+	    Info [AMD_LNZ] = lnz_lb ;
+	    Info [AMD_NMULTSUBS_LU] = nms_lb ;
 	    return ;
 	}
 

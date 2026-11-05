@@ -1,4 +1,6 @@
 #!/bin/bash
+# (ISSUES 725, 31 October 2026: the lines read below are those of the diagnosis log, the default log until then)
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}
 # Every method keeps the time limit (24 October 2026, after ISSUES 274: the matrix-free interior-point method gave the
 # whole of the time left to each of its two conjugate gradient solves, and ran 1,290 s of a 900 s limit).
 # A generated problem that none of the methods solves in 3 s (the theta function of a random graph: n = 250, edge

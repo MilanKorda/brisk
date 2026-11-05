@@ -2432,7 +2432,7 @@ int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData 
         res->bound_rigorous = NAN;
         snprintf(res->cause, sizeof(res->cause), "%s", stc == ST_OPTIMAL ? "" : "Burer-Monteiro (-bm 2): the target accuracy was not reached");
     }
-    if (yfile) { FILE *fy = fopen(yfile, "w"); if (fy) { for (int i = 0; i < m0; i++) fprintf(fy, "%.17g\n", yo[i]); fclose(fy); } }
+    if (yfile) { FILE *fy = brisk_out_open(yfile); if (fy) { for (int i = 0; i < m0; i++) fprintf(fy, "%.17g\n", yo[i]); brisk_out_close(fy, yfile); } }
     free(u); free(g); free(yr); free(yo); free(vE); free(lmin); free(xl); free(lam); free(z); free(bs0);
     ip_free(&Q); problem_free(P); sign_free(SG);
     return stc == ST_OPTIMAL ? 0 : stc == ST_REDUCED ? 10 : stc == ST_TIME ? 15 : 13;

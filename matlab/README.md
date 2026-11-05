@@ -110,13 +110,13 @@ start).
 ### Options
 
 ```matlab
-opts.verbose   = 0;          % 0 quiet (default), 1 summary, 2 iteration log; the log ends with how to get
+opts.verbose   = 0;          % 0 quiet (default), 1 the log (iterations and summary), 2 the diagnosis, 3 internals; the log ends with how to get
                              % more accuracy and a guaranteed bound, as fields of opts (opts.prec = 'dd', ...)
 opts.acc       = 'high';     % 'low' | 'default' | 'high'  (1e-6 / 1e-8 / 1e-10)
 opts.tol       = 1e-9;       % overrides acc
 opts.maxit     = 200;
 opts.timelimit = 3600;       % seconds
-opts.threads   = 8;          % threads (default: every core)
+opts.threads   = 8;          % threads for this solve (0 or not set: automatic, every core; a later solve starts from automatic again)
 opts.prec      = 'qd';       % high precision: 'dd', 'qd' or a number of digits (results returned as doubles;
                              % all the digits: command line with -x / -y / -z)
 opts.mfipm     = 1;          % matrix-free interior-point method, for problems with a low-rank optimal side

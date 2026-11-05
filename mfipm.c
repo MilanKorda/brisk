@@ -643,7 +643,11 @@ static int pcg(MF *S, const double *h, double *x, double tol, int maxit, double 
     }
     if (k > maxit) k = maxit;
     S->ncg += k;
-    if (r2_out) *r2_out = sqrt(dotn(m, r, r));
+    if (r2_out) {   /* (31 October 2026, audit A6) the true residual h - M x, not the recursively updated r, which drifts from it */
+        matvec(S, x, q);
+        double t2 = 0; for (int i = 0; i < m; i++) { const double d = h[i] - q[i]; t2 += d * d; }
+        *r2_out = sqrt(t2);
+    }
     free(r); free(z); free(p); free(q);
     *res_out = res;
     return k;
@@ -660,11 +664,15 @@ static double **blk_arrays(MF *S, int which) {
 }
 
 static double **hand_X = NULL, **hand_Z = NULL, *hand_y = NULL; static double hand_merit = 0; static int hand_cg = 0, hand_done = 0; static int hand_snap = 0;
+/* 31 October 2026: the snapshot handed to the factored method is refreshed while the merit falls, down to the first iterate
+ * a hundred times below the hand-over merit (hand_snap_m: the merit of the iterate held); see mfipm_solve_snap */
+static double hand_snap_m = 0;
+double mfipm_snap_merit(void) { return hand_snap_m; }
 /* 5.7: the automatic first attempt keeps the first iterate with a merit below `merit` (a copy,
  * the iteration goes on); *taken tells whether there is one.  If the attempt does not end
  * OPTIMAL the standard method starts from it (main.c). */
 int mfipm_solve_snap(Problem *P, const Params *par, Result *R, double *yout, double **Xout, double **Xint, double **Zint, double *yint, double merit, int *taken) {
-    hand_X = Xint; hand_Z = Zint; hand_y = yint; hand_merit = merit; hand_cg = 0; hand_done = 0; hand_snap = 1;
+    hand_X = Xint; hand_Z = Zint; hand_y = yint; hand_merit = merit; hand_cg = 0; hand_done = 0; hand_snap = 1; hand_snap_m = 0;
     const int rc = mfipm_solve(P, par, R, yout, Xout);
     hand_X = hand_Z = NULL; hand_y = NULL; hand_snap = 0;
     *taken = hand_done == 1; hand_done = 0;
@@ -676,8 +684,12 @@ int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, do
     hand_X = hand_Z = NULL; hand_y = NULL;
     return rc < 0 ? rc : hand_done;
 }
+/* 1 when the last mfipm_solve stopped on a stall of its conjugate gradient solves (read by the Summary of that solve) */
+static int g_mf_stalled = 0;
+int mfipm_stalled(void) { return g_mf_stalled; }
 int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double **Xout) {
     const double t0 = wtime();
+    g_mf_stalled = 0;
     memset(R, 0, sizeof(*R));
     const int m = P->m, nb = P->nblk, verbose = par->verbose;
     const double sc = P->bs * P->cs;
@@ -711,6 +723,10 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
         printf("matrix-free IPM: m = %d, %d block(s), sum n^3 %.2e (M v %.2e flops), %zu nonzeros; A A' %s (%.2fs); rho %g, rmax %d, kmax %d\n",
                m, nb, s3, 4 * s3, nnz, !S.G ? "not formed" : S.G->dense ? "dense" : "sparse", tg, par->mf_rho, par->mf_rmax, par->mf_kmax);
         printf(" it   pobj            dobj            pinf     dinf     gap      mu       alp   ald   sigma   cg(pred,corr) k     kbulk    time\n");
+    }
+    if (verbose > 0 && g_log_brief) {   /* (ISSUES 725: the default log) */
+        brisk_log_method("matrix-free interior-point method (the Newton systems solved by preconditioned conjugate gradients)");
+        brisk_log_head(1);
     }
     if (par->mf_trial && getenv("BRISK_MFDBG2")) printf("   [mf attempt: cap %d CG steps a solve, %ld products in all]\n", par->mf_trial, (long)par->mf_trial_total);
     double mu0 = -1, pobj = 0, dobj = 0, pinf = 1, dinf = 1, gap = 1;
@@ -752,9 +768,13 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             }
             if (merit < tol) { status = ST_OPTIMAL; break; }
             if (hand_X && hand_snap) {
-                if (!hand_done && merit <= hand_merit) {
+                /* (31 October 2026) the first iterate below the hand-over merit, then each better one until the first a
+                 * hundred times below it: the factored method needs fewer iterations from a closer point (tru11, SDP:
+                 * 9.4 -> 5.5 s; tru13 58.7 -> 44.8 s), while a fixed lower threshold that the attempt never reaches left it
+                 * no point at all (07-04 sparse PCA at 1e-6: a start from nothing) */
+                if (merit <= hand_merit && (!hand_done || (hand_snap_m > 1e-2 * hand_merit && merit < hand_snap_m))) {
                     for (int k = 0; k < nb; k++) { memcpy(hand_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k])); memcpy(hand_Z[k], S.b[k].Z, sizeof(double) * blen(&S.b[k])); }
-                    memcpy(hand_y, y, sizeof(double) * m); hand_done = 1;
+                    memcpy(hand_y, y, sizeof(double) * m); hand_done = 1; hand_snap_m = merit;
                 }
             } else if (hand_X && (merit <= hand_merit || hand_done)) {
                 /* the hybrid: hand this iterate to the standard method (hand_done: the last
@@ -771,7 +791,10 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             if (par->timelimit > 0 && t_setup_last > 0 && wtime() + t_setup_last > par->t_start + par->timelimit) { status = ST_TIME; break; }
             if (nstall >= par->mf_stall) {
                 if (verbose > 0) printf("matrix-free IPM: no progress in %d iterations with the CG budget exhausted (best %.1e at iteration %d): stopping\n", nstall, best_merit, best_it);
-                status = ST_MAXIT; break;
+                /* (3 November 2026, the owner's question "How come 16 iterations are limit for matrix free?") a stall, not the
+                 * iteration limit: the conjugate gradient solves reached their step limit before their tolerance and the
+                 * directions were inexact (theta6, SDP: stopped after 16 iterations at 7.4e-5, reported as ITERATION LIMIT) */
+                status = ST_NUMERIC; g_mf_stalled = 1; break;
             }
         }
         /* NT scaling, W Rd W, preconditioner */
@@ -950,7 +973,8 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
             if (b->type == BLK_SDP) { symmetrize(b->n, b->X); symmetrize(b->n, b->Z); }
         }
         for (int c = 0; c < m; c++) y[c] += ald * dy[c];
-        if (verbose > 0)
+        if (verbose > 0 && g_log_brief) brisk_log_row(it, sc * pobj, sc * dobj, pinf, dinf, gap, mu, fmin(alp, ald), wtime() - t0);
+        else if (verbose > 0)
             printf("%3d %+.8e %+.8e %.2e %.2e %.2e %.2e %.3f %.3f %.3f %5d %5d %5d %.1e %8.1f\n",
                    it, sc * pobj, sc * dobj, pinf, dinf, gap, mu, alp, ald, sigma, cgk[0], cgk[1], S.k, kbulk, wtime() - t0);
         if (verbose > 0) fflush(stdout);

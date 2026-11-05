@@ -429,7 +429,7 @@ static void measure(LR *L, const double *z, const double *y, const double *t, in
             pat_slack(s, y);
             double dmax = 0; for (int i = 0; i < s->n; i++) if (s->dg[i] >= 0) dmax = fmax(dmax, fabs(s->ws[s->dg[i]]));
             const double d = ladder(s, dmax > 0 ? dmax : 1.0);
-            if (d < 0) M->lmin_ok = 0; else if (-d < lmin) lmin = -d;
+            if (d < 0 || brisk_fault("lrlmin")) M->lmin_ok = 0; else if (-d < lmin) lmin = -d;
         }
         M->lmin = lmin;
     }
@@ -853,7 +853,12 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
     g_amax = getenv("BRISK_LRAMAX") ? atoi(getenv("BRISK_LRAMAX")) : 1;
     g_local = 0;   /* (per solve: a library caller runs several in one process) */
     g_shs = getenv("BRISK_LRSHS") ? atoi(getenv("BRISK_LRSHS")) : 2;   /* 5.19: the shift on the scale of 2 S(w) in the local regime (0: always on the diagonal, 1: always on S(w)) */
-    if (verbose >= 0) {
+    if (verbose > 0 && g_log_brief) {   /* (ISSUES 725: the default log) */
+        char pz[200]; brisk_log_problem(pz, sizeof pz, P); log_user("Problem:  %s\n", pz);
+        brisk_log_threads(1);
+        brisk_log_method("low-rank augmented Lagrangian method (X = R R' with R of %d columns)", r0);
+        brisk_log_head(0);
+    } else if (verbose >= 0) {
         long np = 0; for (int q = 0; q < L->ns; q++) np += L->S[q].np;
         int maxn = 0; for (int q = 0; q < L->ns; q++) if (L->S[q].n > maxn) maxn = L->S[q].n;
         printf("BRISK %s low-rank augmented Lagrangian (-lralm)\n", BRISK_VERSION);
@@ -1163,7 +1168,8 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
             if (fmax(M.pinf, fmax(fabs(M.gap), fabs(M.compl))) <= tol && M.dinf <= 10 * tol) { measure(L, z, y, t, 1, &M); full = 1; }
             cobj = eval_t(L, z, t);
         }
-        if (verbose > 0) printf("LR%4d %16.9e %16.9e  pinf %8.1e gap %9.1e compl %9.1e dinf %8.1e%s  sigma %7.1e  inner %5d (cg %ld, neg %d, shift %.0e) |g| %7.1e  rank %d  %7.1fs  LB %s%.9e\n",
+        if (verbose > 0 && g_log_brief) brisk_log_row(outer, M.pobj, M.dobj, M.pinf, M.dinf, fabs(M.gap), -1, 0, wtime() - t0);
+        else if (verbose > 0) printf("LR%4d %16.9e %16.9e  pinf %8.1e gap %9.1e compl %9.1e dinf %8.1e%s  sigma %7.1e  inner %5d (cg %ld, neg %d, shift %.0e) |g| %7.1e  rank %d  %7.1fs  LB %s%.9e\n",
                                 outer, M.pobj, M.dobj, M.pinf, M.gap, M.compl, M.dinf, full ? "*" : (lz_min < 0 || outer % 10 == 0 || fmax(M.pinf, fabs(M.gap)) <= 10 * tol ? "~" : " "),
                                 L->sigma, inner, ncg - ncg0, nneg - nneg0, L->ns ? L->S[0].fshift : 0.0, gnorm, L->ns ? L->S[0].r : 0, wtime() - t0, bound_ok_now ? "+" : " ", have_best ? best_lb : 0.0), fflush(stdout);
         if (!meas_finite(&M) || !isfinite(un)) { status = ST_NUMERIC; break; }
@@ -1208,8 +1214,16 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
      * and a NaN run was reported OPTIMAL with error 0) */
     const int fin = meas_finite(&M);
     const double acc = fin ? fmax(fmax(M.pinf, M.dinf), fmax(fabs(M.gap), fabs(M.compl))) : NAN;
-    int st = !fin || status == ST_NUMERIC ? ST_NUMERIC : acc <= tol ? ST_OPTIMAL : (acc <= par->red_acc ? ST_REDUCED : (status == ST_TIME ? ST_TIME : ST_MAXIT));
-    if (verbose >= 0) {
+    /* (31 October 2026, the owner's external SDP benchmark, audit A9) when Z's factorization failed, lambda_min(Z) was not
+     * measured (lmin_ok 0) and its error is not known: not OPTIMAL */
+    int st = !fin || status == ST_NUMERIC ? ST_NUMERIC : acc <= tol && M.lmin_ok ? ST_OPTIMAL : (acc <= par->red_acc ? ST_REDUCED : (status == ST_TIME ? ST_TIME : ST_MAXIT));
+    if (verbose > 0 && g_log_brief) {
+        const char *sn = st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : st == ST_NUMERIC ? "NUMERICAL DIFFICULTIES" : "ITERATION LIMIT";
+        char pz[200], sv[200], ex[300] = ""; brisk_log_problem(pz, sizeof pz, P);
+        snprintf(sv, sizeof sv, "low-rank augmented Lagrangian method, %d iterations, final rank %d", outer, L->ns ? L->S[0].r : 0);
+        if (have_best) snprintf(ex, sizeof ex, "lower bound on the optimal value (from a y with C - A'y positive definite): %.10e", best_lb);
+        brisk_log_summary(pz, sv, wtime() - t0, sn, acc, M.lmin_ok ? "" : "the smallest eigenvalue of Z could not be checked (its factorization failed)", M.pobj, M.dobj, M.err, ex);
+    } else if (verbose >= 0) {
         const char *sn = st == ST_OPTIMAL ? "OPTIMAL" : st == ST_REDUCED ? "SOLVED TO REDUCED ACCURACY" : st == ST_TIME ? "TIME LIMIT" : st == ST_NUMERIC ? "NUMERICAL DIFFICULTIES" : "ITERATION LIMIT";
         printf("lralm: %d outer, %ld %s steps (%ld CG, %d negative curvature), %d line-search evaluations, %d rank increases, final rank", outer, ninner, newton ? "Newton" : "L-BFGS", ncg, nneg, nev, nrank);
         for (int q = 0; q < L->ns; q++) printf(" %d", L->S[q].r);
@@ -1238,7 +1252,7 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
         for (int i = 0; i < m; i++) res->y[i] = P->cs * P->d[i] * y[i];
         res->have_x = 0; res->X = NULL; res->Z = NULL;
         res->bound_side = 0; res->bound_rigorous = NAN;
-        snprintf(res->cause, sizeof(res->cause), "%s", st == ST_OPTIMAL ? "" : "low-rank ALM (-lralm, experimental): the outer iteration did not reach the target");
+        snprintf(res->cause, sizeof(res->cause), "%s", st == ST_OPTIMAL ? "" : !M.lmin_ok ? "low-rank ALM (-lralm, experimental): the smallest eigenvalue of Z could not be checked (its factorization failed)" : "low-rank ALM (-lralm, experimental): the outer iteration did not reach the target");
     }
     free(bs0);
     if (getenv("BRISK_LRDUMP")) {
@@ -1247,8 +1261,8 @@ int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData
         if (f) { for (int i = 0; i < m; i++) { const double u = clip_u(t[i], y[i], L->sigma, L->sa[i]); fprintf(f, "%d %.6e %.6e %.6e %g\n", i + 1, t[i] * P->du[i], u * P->du[i], P->cs * P->d[i] * y[i], L->sa[i]); } fclose(f); }
     }
     if (yfile) {
-        FILE *f = fopen(yfile, "w");
-        if (f) { for (int i = 0; i < m; i++) fprintf(f, "%.17g\n", P->cs * P->d[i] * y[i]); fclose(f); }
+        FILE *f = brisk_out_open(yfile);
+        if (f) { for (int i = 0; i < m; i++) fprintf(f, "%.17g\n", P->cs * P->d[i] * y[i]); brisk_out_close(f, yfile); }
     }
     for (int q = 0; q < L->ns; q++) ls_free(&L->S[q]);
     for (int q = 0; q < L->nv; q++) { free(L->V[q].ci); free(L->V[q].cv); }

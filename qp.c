@@ -1,10 +1,24 @@
 /* qp.c - the QP solver's common parts (the SOCP developer, 22 October 2026): options, results, the objective and the
  * errors on the problem as given, the choice of the method, and the solver object for warm starts (qp.h). */
 #include "qp.h"
+#include "brisk.h"
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "qp_fminmax.h"
+#include "blas_one.h"
+#ifndef BLAS_PREFIX
+#define BLAS_PREFIX
+#endif
+#define QP_CAT2(a, b) a##b
+#define QP_CAT(a, b) QP_CAT2(a, b)
+void QP_CAT(BLAS_PREFIX, dpotrf_)(const char *, const int *, double *, const int *, int *);
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+static double qp_clock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 void qp_default_opts(QpOpts *o) { o->tol = 1e-8; o->maxit = 0; o->verbose = 1; o->timelimit = 0; o->method = QP_METHOD_AUTO; o->threads = 0; }
 
@@ -63,6 +77,80 @@ static int fin(double v) { return fabs(v) < QP_INF; }
  *   gap:    |f - d| / (1 + |f|), f the primal objective, d the dual objective
  *           d = -1/2 x'Hx + sum_rows (y+ rl - y- ru) + sum_cols (z+ xl - z- xu) + c0 (an infinite bound's term: 0, and its
  *           multiplier is counted as a dual violation) */
+int qp_errors_pabs(void) { static int pabs = -1; if (pabs < 0) { const char *e = getenv("BRISK_QPPABS"); pabs = e ? atoi(e) : 0; } return pabs; }
+static int qp_errdbg(void) { static int d = -1; if (d < 0) d = getenv("BRISK_QPERRDBG") ? 1 + (getenv("BRISK_QPERRDBG")[0] == '2') : 0; return d; }
+/* (28 October 2026, the SOCP developer) the errors from the products: ax = A x (with the quadratic rows' parts), at the sums
+ * |a_ij x_j| of a row (needed only at a violated row; NULL with BRISK_QPPABS=1), nt the rows' numbers of terms (NULL unless
+ * BRISK_QPPABS=0), r = H x (overwritten), aty = A'y (with y_k Q_k x), dq; fobj (if not NULL) the objective f of the internal
+ * minimization. The active-set method passes its own products (dense ones by dgemv): one definition of the measure */
+void qp_errors_core(const QpProb *P, const double *x, const double *y, const double *z, const double *ax, const double *at,
+                    const int *nt, double *r, const double *aty, double dq, double *epri, double *edual, double *egap, double *fobj) {
+    const int n = P->n, m = P->m;
+    double ep = 0;
+    const double uu = 1.1102230246251565e-16;      /* (the unit roundoff of double precision, 2^-53) */
+    for (int i = 0; i < m; i++) {
+        if (nt) {          /* (the violation beyond the rounding floor of the row's sum, against 1 + |b|) */
+            const double ku = (nt[i] + 1) * uu, fl = (ku < 1 ? ku / (1 - ku) : 1.0) * at[i];
+            if (fin(P->rl[i]) && ax[i] < P->rl[i]) ep = fmax(ep, fmax(0.0, P->rl[i] - ax[i] - fl) / (1 + fabs(P->rl[i])));
+            if (fin(P->ru[i]) && ax[i] > P->ru[i]) ep = fmax(ep, fmax(0.0, ax[i] - P->ru[i] - fl) / (1 + fabs(P->ru[i])));
+            continue;
+        }
+        const double ts = at ? at[i] : 0;
+        if (fin(P->rl[i]) && ax[i] < P->rl[i]) ep = fmax(ep, (P->rl[i] - ax[i]) / (1 + fmax(fabs(P->rl[i]), ts)));
+        if (fin(P->ru[i]) && ax[i] > P->ru[i]) ep = fmax(ep, (ax[i] - P->ru[i]) / (1 + fmax(fabs(P->ru[i]), ts)));
+    }
+    if (qp_errdbg()) { double er = 0, eb = 0; int ir = -1, jb = -1;
+        for (int i = 0; i < m; i++) { const double ts = at ? at[i] : 0; double v = 0;
+            if (fin(P->rl[i]) && ax[i] < P->rl[i]) v = (P->rl[i] - ax[i]) / (1 + fmax(fabs(P->rl[i]), ts));
+            if (fin(P->ru[i]) && ax[i] > P->ru[i]) v = (ax[i] - P->ru[i]) / (1 + fmax(fabs(P->ru[i]), ts));
+            if (v > er) { er = v; ir = i; } }
+        for (int j = 0; j < n; j++) { double v = 0;
+            if (fin(P->xl[j]) && x[j] < P->xl[j]) v = (P->xl[j] - x[j]) / (1 + fabs(P->xl[j]));
+            if (fin(P->xu[j]) && x[j] > P->xu[j]) v = (x[j] - P->xu[j]) / (1 + fabs(P->xu[j]));
+            if (v > eb) { eb = v; jb = j; } }
+        if (ir >= 0 && qp_errdbg() == 2) for (int j = 0; j < n; j++) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) if (P->Ai[p] == ir) fprintf(stderr, "        [column %d: a %g, x %.6e, bounds %.3e %.3e]\n", j, P->Ax[p], x[j], P->xl[j], P->xu[j]);
+        fprintf(stderr, "     [primal: row %d %.1e (activity %.6e, bounds %.6e %.6e, terms %.3e); column %d %.1e (x %.9e, bounds %.9e %.9e)]\n", ir, er, ir >= 0 ? ax[ir] : 0, ir >= 0 ? P->rl[ir] : 0, ir >= 0 ? P->ru[ir] : 0, ir >= 0 && at ? at[ir] : 0, jb, eb, jb >= 0 ? x[jb] : 0, jb >= 0 ? P->xl[jb] : 0, jb >= 0 ? P->xu[jb] : 0); }
+    for (int j = 0; j < n; j++) {
+        if (fin(P->xl[j]) && x[j] < P->xl[j]) ep = fmax(ep, (P->xl[j] - x[j]) / (1 + fabs(P->xl[j])));
+        if (fin(P->xu[j]) && x[j] > P->xu[j]) ep = fmax(ep, (x[j] - P->xu[j]) / (1 + fabs(P->xu[j])));
+    }
+    double xhx = 0, cn = 0; for (int j = 0; j < n; j++) { xhx += x[j] * r[j]; cn = fmax(cn, fabs(P->c[j])); }
+    /* the dual residual relative to the size of its terms, |Hx + c - A'y - z| / (1 + max(|Hx|, |c|, |A'y|, |z|)), the
+     * definition of MOSEK, Gurobi, OSQP and PIQP: where the optimal multipliers are unbounded (a variable forced to its
+     * bound by the constraints) the iterates' multipliers grow, 1e9 on QSCFXM2, and their rounding alone is 1e-7 */
+    double tn = cn;
+    for (int j = 0; j < n; j++) { tn = fmax(tn, fabs(r[j])); tn = fmax(tn, fabs(z[j])); r[j] += P->c[j]; }
+    for (int j = 0; j < n; j++) { const double a = aty[j]; r[j] -= a; tn = fmax(tn, fabs(a)); }
+    double dsum = P->c0 - 0.5 * xhx + dq, dviol = 0;
+    for (int j = 0; j < n; j++) {
+        r[j] -= z[j];
+        if (z[j] > 0) { if (fin(P->xl[j])) dsum += z[j] * P->xl[j]; else dviol = fmax(dviol, z[j]); }
+        if (z[j] < 0) { if (fin(P->xu[j])) dsum += z[j] * P->xu[j]; else dviol = fmax(dviol, -z[j]); }
+    }
+    for (int i = 0; i < m; i++) {
+        if (y[i] > 0) { if (fin(P->rl[i])) dsum += y[i] * P->rl[i]; else dviol = fmax(dviol, y[i]); }
+        if (y[i] < 0) { if (fin(P->ru[i])) dsum += y[i] * P->ru[i]; else dviol = fmax(dviol, -y[i]); }
+    }
+    double ed = 0; int jed = -1; for (int j = 0; j < n; j++) if (fabs(r[j]) > ed) { ed = fabs(r[j]); jed = j; }
+    if (qp_errdbg() && jed >= 0) qp_printf("     [errors] the largest dual residual %.3e at column %d (z %.3e)\n", ed, jed, z[jed]);
+    ed = fmax(ed, dviol) / (1 + tn);
+    double f = P->c0 + 0.5 * xhx; for (int j = 0; j < n; j++) f += P->c[j] * x[j];
+    *epri = ep; *edual = ed; *egap = fabs(f - dsum) / (1 + fabs(f));
+    if (fobj) *fobj = f;
+    /* (1 November 2026, the SOCP developer; the owner's QP benchmark, audit A1) a point or a product that is not finite has
+     * infinite errors here, in the one definition every method uses: the maxima above take fmax, which drops a NaN, and
+     * the active-set method, which calls this core with its own products, returned OPTIMAL with a NaN x for a NaN cost */
+    {   int bad = !isfinite(f) || !isfinite(dsum) || isnan(ep) || isnan(ed);
+        for (int j = 0; j < n && !bad; j++) bad = !isfinite(x[j]) || !isfinite(z[j]) || !isfinite(r[j]);
+        for (int i = 0; i < m && !bad; i++) bad = !isfinite(y[i]) || !isfinite(ax[i]);
+        if (bad) { *epri = *edual = *egap = INFINITY; } }
+    if (qp_errdbg()) {
+        double zb = 0, yb = 0, zfree = 0;
+        for (int j = 0; j < n; j++) { if (z[j] > 0 && fin(P->xl[j])) zb += z[j] * P->xl[j]; if (z[j] < 0 && fin(P->xu[j])) zb += z[j] * P->xu[j]; if (fin(P->xl[j]) && fin(P->xu[j]) && P->xl[j] == P->xu[j]) zfree += z[j] * P->xl[j]; }
+        for (int i = 0; i < m; i++) { if (y[i] > 0 && fin(P->rl[i])) yb += y[i] * P->rl[i]; if (y[i] < 0 && fin(P->ru[i])) yb += y[i] * P->ru[i]; }
+        qp_printf("     [errors] f %.10e d %.10e: c0 %.4e, -1/2 x'Hx %.10e, bounds %.10e (fixed %.4e), rows %.10e\n", f, dsum, P->c0, -0.5 * xhx, zb, zfree, yb);
+    }
+}
 void qp_errors(const QpProb *P, const double *x, const double *y, const double *z, double *epri, double *edual, double *egap) {
     const int n = P->n, m = P->m;
     /* (22 October 2026) a point with a non-finite entry has infinite errors: the maxima below take fmax, which drops a
@@ -79,7 +167,7 @@ void qp_errors(const QpProb *P, const double *x, const double *y, const double *
      * cannot get below 1e-6 against 1 + |b| alone (137 iterations, numerical difficulties); the measure of 23 October,
      * |a'x - b| / (1 + max(|b|, sum |a_j x_j|)), let QSCFXM3 (QP) stop with violations of 4.5e-6 against 1 + |b| (two
      * iterations early). BRISK_QPPABS=1: against 1 + |b| alone; 2: the measure of 23 October */
-    static int pabs = -1; if (pabs < 0) { const char *e = getenv("BRISK_QPPABS"); pabs = e ? atoi(e) : 0; }
+    const int pabs = qp_errors_pabs();
     double *at = pabs == 1 ? NULL : calloc((size_t)m + 1, sizeof(double));
     int *nt = pabs == 0 ? calloc((size_t)m + 1, sizeof(int)) : NULL;      /* (the rows' numbers of terms) */
     for (int j = 0; j < n; j++) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) { ax[P->Ai[p]] += P->Ax[p] * x[j]; if (at) at[P->Ai[p]] += fabs(P->Ax[p] * x[j]); if (nt) nt[P->Ai[p]]++; }
@@ -96,64 +184,11 @@ void qp_errors(const QpProb *P, const double *x, const double *y, const double *
         }
         ax[i] += xq; dq += y[i] * xq;
     }
-    double ep = 0;
-    const double uu = 1.1102230246251565e-16;      /* (the unit roundoff of double precision, 2^-53) */
-    for (int i = 0; i < m; i++) {
-        if (nt) {          /* (the violation beyond the rounding floor of the row's sum, against 1 + |b|) */
-            const double ku = (nt[i] + 1) * uu, fl = (ku < 1 ? ku / (1 - ku) : 1.0) * at[i];
-            if (fin(P->rl[i]) && ax[i] < P->rl[i]) ep = fmax(ep, fmax(0.0, P->rl[i] - ax[i] - fl) / (1 + fabs(P->rl[i])));
-            if (fin(P->ru[i]) && ax[i] > P->ru[i]) ep = fmax(ep, fmax(0.0, ax[i] - P->ru[i] - fl) / (1 + fabs(P->ru[i])));
-            continue;
-        }
-        const double ts = at ? at[i] : 0;
-        if (fin(P->rl[i]) && ax[i] < P->rl[i]) ep = fmax(ep, (P->rl[i] - ax[i]) / (1 + fmax(fabs(P->rl[i]), ts)));
-        if (fin(P->ru[i]) && ax[i] > P->ru[i]) ep = fmax(ep, (ax[i] - P->ru[i]) / (1 + fmax(fabs(P->ru[i]), ts)));
-    }
-    if (getenv("BRISK_QPERRDBG")) { double er = 0, eb = 0; int ir = -1, jb = -1;
-        for (int i = 0; i < m; i++) { const double ts = at ? at[i] : 0; double v = 0;
-            if (fin(P->rl[i]) && ax[i] < P->rl[i]) v = (P->rl[i] - ax[i]) / (1 + fmax(fabs(P->rl[i]), ts));
-            if (fin(P->ru[i]) && ax[i] > P->ru[i]) v = (ax[i] - P->ru[i]) / (1 + fmax(fabs(P->ru[i]), ts));
-            if (v > er) { er = v; ir = i; } }
-        for (int j = 0; j < n; j++) { double v = 0;
-            if (fin(P->xl[j]) && x[j] < P->xl[j]) v = (P->xl[j] - x[j]) / (1 + fabs(P->xl[j]));
-            if (fin(P->xu[j]) && x[j] > P->xu[j]) v = (x[j] - P->xu[j]) / (1 + fabs(P->xu[j]));
-            if (v > eb) { eb = v; jb = j; } }
-        if (ir >= 0 && getenv("BRISK_QPERRDBG")[0] == '2') for (int j = 0; j < n; j++) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) if (P->Ai[p] == ir) fprintf(stderr, "        [column %d: a %g, x %.6e, bounds %.3e %.3e]\n", j, P->Ax[p], x[j], P->xl[j], P->xu[j]);
-        fprintf(stderr, "     [primal: row %d %.1e (activity %.6e, bounds %.6e %.6e, terms %.3e); column %d %.1e (x %.9e, bounds %.9e %.9e)]\n", ir, er, ir >= 0 ? ax[ir] : 0, ir >= 0 ? P->rl[ir] : 0, ir >= 0 ? P->ru[ir] : 0, ir >= 0 && at ? at[ir] : 0, jb, eb, jb >= 0 ? x[jb] : 0, jb >= 0 ? P->xl[jb] : 0, jb >= 0 ? P->xu[jb] : 0); }
-    for (int j = 0; j < n; j++) {
-        if (fin(P->xl[j]) && x[j] < P->xl[j]) ep = fmax(ep, (P->xl[j] - x[j]) / (1 + fabs(P->xl[j])));
-        if (fin(P->xu[j]) && x[j] > P->xu[j]) ep = fmax(ep, (x[j] - P->xu[j]) / (1 + fabs(P->xu[j])));
-    }
     qp_hmul(P, x, r);
-    double xhx = 0, cn = 0; for (int j = 0; j < n; j++) { xhx += x[j] * r[j]; cn = fmax(cn, fabs(P->c[j])); }
-    /* the dual residual relative to the size of its terms, |Hx + c - A'y - z| / (1 + max(|Hx|, |c|, |A'y|, |z|)), the
-     * definition of MOSEK, Gurobi, OSQP and PIQP: where the optimal multipliers are unbounded (a variable forced to its
-     * bound by the constraints) the iterates' multipliers grow, 1e9 on QSCFXM2, and their rounding alone is 1e-7 */
-    double tn = cn;
-    for (int j = 0; j < n; j++) { tn = fmax(tn, fabs(r[j])); tn = fmax(tn, fabs(z[j])); r[j] += P->c[j]; }
-    for (int j = 0; j < n; j++) { double a = qx ? qx[j] : 0; for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) a += P->Ax[p] * y[P->Ai[p]]; r[j] -= a; tn = fmax(tn, fabs(a)); }
-    double dsum = P->c0 - 0.5 * xhx + dq, dviol = 0;
-    for (int j = 0; j < n; j++) {
-        r[j] -= z[j];
-        if (z[j] > 0) { if (fin(P->xl[j])) dsum += z[j] * P->xl[j]; else dviol = fmax(dviol, z[j]); }
-        if (z[j] < 0) { if (fin(P->xu[j])) dsum += z[j] * P->xu[j]; else dviol = fmax(dviol, -z[j]); }
-    }
-    for (int i = 0; i < m; i++) {
-        if (y[i] > 0) { if (fin(P->rl[i])) dsum += y[i] * P->rl[i]; else dviol = fmax(dviol, y[i]); }
-        if (y[i] < 0) { if (fin(P->ru[i])) dsum += y[i] * P->ru[i]; else dviol = fmax(dviol, -y[i]); }
-    }
-    double ed = 0; int jed = -1; for (int j = 0; j < n; j++) if (fabs(r[j]) > ed) { ed = fabs(r[j]); jed = j; }
-    if (getenv("BRISK_QPERRDBG") && jed >= 0) qp_printf("     [errors] the largest dual residual %.3e at column %d (z %.3e)\n", ed, jed, z[jed]);
-    ed = fmax(ed, dviol) / (1 + tn);
-    double f = P->c0 + 0.5 * xhx; for (int j = 0; j < n; j++) f += P->c[j] * x[j];
-    *epri = ep; *edual = ed; *egap = fabs(f - dsum) / (1 + fabs(f));
-    if (getenv("BRISK_QPERRDBG")) {
-        double zb = 0, yb = 0, zfree = 0;
-        for (int j = 0; j < n; j++) { if (z[j] > 0 && fin(P->xl[j])) zb += z[j] * P->xl[j]; if (z[j] < 0 && fin(P->xu[j])) zb += z[j] * P->xu[j]; if (fin(P->xl[j]) && fin(P->xu[j]) && P->xl[j] == P->xu[j]) zfree += z[j] * P->xl[j]; }
-        for (int i = 0; i < m; i++) { if (y[i] > 0 && fin(P->rl[i])) yb += y[i] * P->rl[i]; if (y[i] < 0 && fin(P->ru[i])) yb += y[i] * P->ru[i]; }
-        qp_printf("     [errors] f %.10e d %.10e: c0 %.4e, -1/2 x'Hx %.10e, bounds %.10e (fixed %.4e), rows %.10e\n", f, dsum, P->c0, -0.5 * xhx, zb, zfree, yb);
-    }
-    free(ax); free(at); free(nt); free(r); free(qx);
+    double *aty = malloc(sizeof(double) * ((size_t)n + 1));
+    for (int j = 0; j < n; j++) { double a = qx ? qx[j] : 0; for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) a += P->Ax[p] * y[P->Ai[p]]; aty[j] = a; }
+    qp_errors_core(P, x, y, z, ax, at, nt, r, aty, dq, epri, edual, egap, NULL);
+    free(ax); free(at); free(nt); free(r); free(qx); free(aty);
 }
 
 /* (23 October 2026) the doubleton equations substituted out first (qpdbl.c), the reduced QP solved by the interior-point
@@ -164,9 +199,15 @@ typedef struct QpDbl QpDbl;
 QpDbl *qpdbl_presolve(const QpProb *P, QpProb *P2, int *nelim);
 void qpdbl_postsolve(const QpDbl *D, const QpProb *P, const double *x2, const double *y2, const double *z2, double *x, double *y, double *z);
 void qpdbl_free(QpDbl *D);
-static int qp_solve_ipm_dbl(const QpProb *P, const QpOpts *o, QpRes *R) {
+/* (1 November 2026, the owner's QP benchmark, audit A14) also the persistent model's interior-point route (qpas.c), which
+ * had called qp_solve_ipm directly and so solved a problem with doubleton rows differently from the one-shot call; the
+ * time is the whole call's (it was the reduced problem's solve alone) */
+int qp_solve_ipm_dbl(const QpProb *P, const QpOpts *o, QpRes *R) {
+    const double t0d = qp_clock();
     static int off = -1; if (off < 0) { const char *e = getenv("BRISK_QPNODBL"); off = e && atoi(e) == 1; }
+    const double tdb_ = qp_clock();
     QpProb P2; int ne = 0; QpDbl *D = off ? NULL : qpdbl_presolve(P, &P2, &ne);
+    if (getenv("BRISK_QPSTAMP")) fprintf(stderr, "[qp stamp: the doubleton presolve %.3f s]\n", qp_clock() - tdb_);
     if (!D) return qp_solve_ipm(P, o, R);
     if (o->verbose) qp_printf("presolve: %d doubleton equality rows substituted out (columns %d -> %d, rows %d -> %d)\n", ne, P->n, P2.n, P->m, P2.m);
     QpRes R2; memset(&R2, 0, sizeof R2);
@@ -181,7 +222,7 @@ static int qp_solve_ipm_dbl(const QpProb *P, const QpOpts *o, QpRes *R) {
             const double tol = o->tol > 0 ? o->tol : 1e-8;
             if (e1 <= tol && e2 <= tol && e3 <= tol) {
                 ok = 1; R->status = QP_OPTIMAL; R->pres = e1; R->dres = e2; R->gap = e3; R->obj = qp_objective(P, R->x);
-                R->iter = R2.iter; R->time = R2.time; R->resolves = R2.resolves; R->t_first = R2.t_first;
+                R->iter = R2.iter; R->time = qp_clock() - t0d; R->resolves = R2.resolves; R->t_first = R2.t_first;
             } else if (o->verbose) qp_printf("presolve: the mapped point misses the tolerance on the problem as given (primal %.1e, dual %.1e, gap %.1e): solved as given\n", e1, e2, e3);
         }
     }
@@ -200,15 +241,72 @@ static int qp_solve_ipm_dbl(const QpProb *P, const QpOpts *o, QpRes *R) {
  * stays with the interior-point method (the active-set method needs its proximal-point loop for it, with no bound on
  * its solves). When the active-set method does not end optimal, the interior-point method solves the problem (the
  * Summary says so). -qpipm or -qpas: that method */
-int qp_as_small(const QpProb *P) {
+static int as_small(const QpProb *P, double *wipm_out);
+/* the default's size bound alone (the QP model's automatic choice, qpas.c, which has no work budget): within the bound, not
+ * by the cost model's budgeted attempt */
+int qp_as_small(const QpProb *P) { double w = 0; return as_small(P, &w) && w == 0; }
+static int as_small(const QpProb *P, double *wipm_out) {
     const double n = P->n, w = 2 * n * n * n + 2 * n * ((double)P->Ap[P->n] + n + P->m);
+    *wipm_out = 0;
     /* (24 October 2026) 4e6 instead of 2e6: measured again after the active-set method's J = L^-T was made three times
      * cheaper (bench/qp/small/small_ab2.txt, 129 QPs of n <= 300, both methods in C): the rule's choice is the faster
      * method on 123 of them at 4e6 against 117 at 2e6, the sum of the chosen times 293 against 301 ms; between the two
      * bounds the active-set method takes EQQP_100 (0.79 against 2.4 ms) and DUAL3 (0.65 against 3.8 ms; QPs), the
      * others there have H only semidefinite. No status changed on the 288 QPs */
     static double cap = -1; if (cap < 0) { const char *e = getenv("BRISK_QPASAUTO"); cap = e ? atof(e) : 4e6; }   /* (0: off) */
-    return P->n > 0 && w <= cap;
+    if (P->n <= 0) return 0;
+    if (w <= cap) return 1;
+    /* (28 October 2026, the SOCP developer, after the owner's independent QP benchmark: B005_A_mpc_long_condensed, a dense
+     * condensed MPC QP of n = 1,920 and 7,704 rows, 48.6 s by the interior-point method (14 iterations, each factoring a
+     * system of 9,600 unknowns) against 3.2 s by the active-set method) beyond the bound, a cost model in operations: the
+     * interior-point method about 15 iterations, each factoring at least the denser of the rows' cliques and H's pattern,
+     * W_ipm = 100 max(sum_i r_i^2, sum_j h_j^2) + 1000 size (r_i the entries of row i of A, h_j those of column j of H; the
+     * factors measured, below; 5 max(...) until the night of 28 October); the active-set
+     * method's setup (the factor of H and J = L^-T, the rows' products) W_as = 2 n^3 / 3 + 2 n nnz(A). When W_as <= W_ipm the
+     * active-set method is tried with W_ipm as its budget, counted in its iterations as they run (qp_solve_activeset_budget:
+     * the iterations a budget of W_ipm - W_as allows, each charged its own work); when they run out, the interior-point
+     * method solves the problem. (A first form predicted the iterations from the constraints the unconstrained minimum
+     * violates: hundreds on condensed MPC QPs that the method solves in one or two, B010_R_mpc_integrator 22.6 ms by the
+     * interior-point method against 1.8 ms.)
+     * BRISK_QPASAUTOIPM=0: the bound alone */
+    static int ipmr = -1; if (ipmr < 0) { const char *e = getenv("BRISK_QPASAUTOIPM"); ipmr = !(e && atoi(e) == 0); }
+    if (!ipmr || cap <= 0 || n * n > 4e8) return 0;
+    double sr = 0, sh = 0;
+    { int *rc = calloc((size_t)P->m + 1, sizeof(int));
+      if (!rc) return 0;
+      for (int p = 0; p < P->Ap[P->n]; p++) rc[P->Ai[p]]++;
+      for (int i = 0; i < P->m; i++) sr += (double)rc[i] * rc[i];
+      free(rc); }
+    if (P->Hp) {      /* (the columns of the whole H, both triangles, from its lower triangle) */
+        int *hc = calloc((size_t)P->n + 1, sizeof(int));
+        if (!hc) return 0;
+        for (int j = 0; j < P->n; j++) for (int p = P->Hp[j]; p < P->Hp[j + 1]; p++) { hc[j]++; if (P->Hi[p] != j) hc[P->Hi[p]]++; }
+        for (int j = 0; j < P->n; j++) sh += (double)hc[j] * hc[j];
+        free(hc);
+    }
+    /* (28 October 2026, the night) the estimate calibrated on the owner's benchmark: both methods measured on its 534 QPs of
+     * n <= 2,000 (one thread, the medians of 3-9 solves; bench/qp_ext/ab2.py): the interior-point method's iteration costs
+     * 0.24-1.1 ns per unit of max(sum r_i^2, sum h_j^2) and a fixed part per unit of size, against about 0.4 ns per counted
+     * operation of the active-set method; 100 max(...) + 1000 (n + m + nnz(A) + nnz(H)) for its 6-15 iterations. Simulated
+     * on the 534 QPs with the budget below: the chosen method's time over the faster one's, geometric mean, 1.219 with
+     * 5 max(...) (B010_R_mpc_integrator: 10.0 ms by the interior-point method against 1.1 ms) -> 1.048, six attempts of the
+     * active-set method abandoned to the interior-point method */
+    const double size = n + (double)P->m + (double)P->Ap[P->n] + (P->Hp ? (double)P->Hp[P->n] : 0.0);
+    double wipm = 100.0 * fmax(sr, sh) + 1000.0 * size; const double wel = qp_elim_setup_work(P);
+    /* (2 November 2026, the SOCP developer) a dense H (its pattern a quarter of the pairs or more): the interior-point method
+     * factors a dense system at the dense kernels' rate, which the fit above (on sparse factorizations) overstates by 1.2-4
+     * times, more with n; measured on the owner's benchmark's dense-H QPs (bench/run_1101n/choice_1102.jsonl) and the SVM
+     * dual of 3,000 variables (QP: the active-set method 4,541 iterations, 27.6 s, against the interior-point method's 7.1 s),
+     * its time in the active-set method's units is about 25 (n+m)^3 + 8500 (n+m)^2 (n = 128: 2.1e8, 3,000: 7.5e11), the
+     * estimate's upper end taken; so the active-set method's budget, a failed attempt included, stays near the interior-point
+     * method's own time. BRISK_QPDENSEEST=0: off */
+    { static int dest = -1; if (dest < 0) { const char *e = getenv("BRISK_QPDENSEEST"); dest = !(e && atoi(e) == 0); }
+      if (dest && sh >= 0.25 * n * n * n) { const double N = n + (double)P->m, wd = 25.0 * N * N * N + 8500.0 * N * N; if (wd < wipm) wipm = wd; } }
+    double was = 2.0 * n * n * n / 3.0 + 2.0 * n * (double)P->Ap[P->n];
+    if (wel >= 0 && wel < was) was = wel;      /* (the equality rows eliminated: the sparse form of an MPC QP) */
+    if (was > wipm) return 0;
+    *wipm_out = wipm;
+    return 1;
 }
 /* (24 October 2026, the SOCP developer) the exact part of the test for a positive semidefinite matrix sg M, M symmetric
  * given by ne entries (qi[e], qj[e], qv[e]) of its lower triangle (duplicates summed): such a matrix has no negative
@@ -249,6 +347,80 @@ int qp_psd_exact(int n, int ne, const int *qi, const int *qj, const double *qv, 
     free(d); free(part); free(tl);
     return rc;
 }
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, audit A3) the sufficient part of the test: the Cholesky
+ * factorization of H + 1e-9 diag(|H|) (each diagonal entry raised by 1e-9 of itself: the test of the unit-diagonal scaling
+ * D^-1/2 H D^-1/2 for its smallest eigenvalue >= -1e-9, whatever the units of the variables; the rounding of the
+ * factorization is about n u of the scaled matrix, far below the margin). Only for an H with products (the necessary
+ * part decides a diagonal H exactly) and within 1e11 flops of the factor (a few seconds; one factorization of the
+ * interior-point method's system costs at least as much); beyond that the test is not made and said so under -v. H =
+ * [1 2; 2 1] (eigenvalues -1 and 3) had passed the necessary part and been solved to a saddle point reported OPTIMAL.
+ * 0 positive semidefinite within the margin, 1 not, -1 not tested */
+static int qp_psd_chol(int n, const int *Hp, const int *Hi, const double *Hx) {
+    int *deg = calloc((size_t)n + 1, sizeof(int)), *mk = malloc(sizeof(int) * ((size_t)n + 1));
+    if (!deg || !mk) { free(deg); free(mk); return -1; }
+    long off = 0;
+    for (int j = 0; j < n; j++) for (int p = Hp[j]; p < Hp[j + 1]; p++) if (Hi[p] != j && Hx[p] != 0) { deg[j]++; deg[Hi[p]]++; off++; }
+    if (off == 0) { free(deg); free(mk); return 0; }
+    /* (1 November 2026, the SOCP developer; the owner's QP benchmark, the small MPC QPs) up to 128 columns the same test on a
+     * dense array (the same shift, a pivot that is not positive fails): through the sparse factorization's pattern, analysis
+     * and scatter it took a fifth of the solve of a quadrotor MPC QP of 92 variables (its reduced Hessian: 20 x 20). Positive
+     * semidefiniteness does not depend on the order; only the rounding at the margin can differ */
+    /* (1 November 2026, 00:10) and a dense H of up to 2,048 columns (its products a quarter of the pairs or more) by LAPACK's
+     * blocked Cholesky factorization (OpenBLAS on one thread, blas_one.h: the verdict at the margin independent of the host's
+     * thread count; info > 0, a leading minor not positive definite, is the failure of a pivot): the sparse route's minimum-
+     * degree ordering and analysis of the complete graph cost 4.5 times its factorization (the benchmark's portfolio QP of
+     * 512 variables, a dense H: 107 million instructions, a fifth of the interior-point solve) */
+    const int dense_ = n <= 128 || (n <= 2048 && 2.0 * (double)off >= 0.25 * (double)n * (n - 1));
+    if (dense_ && !getenv("BRISK_QPPSDSPARSE")) {
+        free(deg); free(mk);
+        double *L = calloc((size_t)n * n + 1, sizeof(double)); if (!L) return -1;
+        for (int j = 0; j < n; j++) for (int p = Hp[j]; p < Hp[j + 1]; p++) { const int i = Hi[p]; if (i >= j) L[i + (size_t)j * n] += Hx[p]; else L[j + (size_t)i * n] += Hx[p]; }
+        for (int j = 0; j < n; j++) { double *d = &L[j + (size_t)j * n]; *d += 1e-9 * (fabs(*d) > 0 ? fabs(*d) : 1.0); }
+        int rc = 0;
+        if (n > 128) {
+            int info = 0;
+            blas_one_begin(); QP_CAT(BLAS_PREFIX, dpotrf_)("L", &n, L, &n, &info); blas_one_end();
+            free(L);
+            return info > 0 ? 1 : info < 0 ? -1 : 0;
+        }
+        for (int j = 0; j < n && !rc; j++) {
+            double *cj = L + (size_t)j * n;
+            for (int k = 0; k < j; k++) { const double f = L[j + (size_t)k * n]; if (f == 0) continue; const double *ck = L + (size_t)k * n; for (int i = j; i < n; i++) cj[i] -= f * ck[i]; }
+            const double d = cj[j];
+            if (!(d > 0)) { rc = 1; break; }
+            const double s = sqrt(d), is = 1.0 / s; cj[j] = s;
+            for (int i = j + 1; i < n; i++) cj[i] *= is;
+        }
+        free(L);
+        return rc;
+    }
+    int **nbr = malloc(sizeof(int *) * ((size_t)n + 1)), *pool = malloc(sizeof(int) * (2 * (size_t)off + 1));
+    if (!nbr || !pool) { free(deg); free(mk); free(nbr); free(pool); return -1; }
+    { long o = 0; for (int j = 0; j < n; j++) { nbr[j] = pool + o; o += deg[j]; deg[j] = 0; } }
+    for (int j = 0; j < n; j++) for (int p = Hp[j]; p < Hp[j + 1]; p++) if (Hi[p] != j && Hx[p] != 0) { const int i = Hi[p]; nbr[j][deg[j]++] = i; nbr[i][deg[i]++] = j; }
+    /* (duplicate entries of a column give a repeated neighbour: removed, the analysis expects a set) */
+    for (int j = 0; j < n; j++) mk[j] = -1;
+    for (int j = 0; j < n; j++) { int d = 0; for (int c = 0; c < deg[j]; c++) { const int i = nbr[j][c]; if (mk[i] != j) { mk[i] = j; nbr[j][d++] = i; } } deg[j] = d; }
+    /* first the minimum-degree ordering alone, stopped once its running count of the work passes the budget (its count is
+     * that of an LU factorization, about twice the Cholesky factorization's): beyond it no analysis is made (QPUNB_20000,
+     * QP: 20,000 columns, 1.3 million entries in H, the analysis 6 s to learn that the factor exceeds the budget) */
+    {   int schol_amd_estimate_cap(int m, const int *deg, int *const *nbr, const volatile double *cap, double *flops_out, double *nnz_out);
+        const volatile double acap = 2e11; double afl = 0, anz = 0;
+        const int e_ = schol_amd_estimate_cap(n, deg, nbr, &acap, &afl, &anz);
+        if (e_ == 2 || (e_ == 0 && afl > 2e11)) { free(deg); free(mk); free(nbr); free(pool); return -1; } }
+    const int oamd = schol_set_amd(2);
+    SChol *S = schol_analyze_adj(n, deg, nbr, (size_t)(sqrt(1e11 * (double)n) + n));
+    schol_set_amd(oamd);
+    int rc = -1;
+    if (S && schol_flops(S) <= 1e11) {
+        schol_zero(S);
+        for (int j = 0; j < n; j++) for (int p = Hp[j]; p < Hp[j + 1]; p++) if (Hx[p] != 0 || Hi[p] == j) schol_add(S, (size_t)Hi[p], (size_t)j, Hx[p]);
+        rc = schol_factor(S, 1e-9) ? 1 : 0;
+    }
+    if (S) schol_free(S);
+    free(deg); free(mk); free(nbr); free(pool);
+    return rc;
+}
 /* the objective's H and the constraints' Q_k (on the side each row bounds) by that test: 0, or QP_INPUT with the message */
 int qp_convex_exact(const QpProb *P) {
     const int n = P->n;
@@ -259,6 +431,11 @@ int qp_convex_exact(const QpProb *P) {
         const int ne = P->Hp[n];
         int *hj = malloc(sizeof(int) * ((size_t)ne + 1));
         if (hj) { for (int j = 0; j < n; j++) for (int p = P->Hp[j]; p < P->Hp[j + 1]; p++) hj[p] = j; rc = qp_psd_exact(n, ne, P->Hi, hj, P->Hx, 1.0, &j1, &j2); free(hj); }
+        if (!rc) {
+            const int c_ = qp_psd_chol(n, P->Hp, P->Hi, P->Hx);
+            if (c_ == 1) { fprintf(stderr, "brisk: the problem is not convex: the objective's quadratic part is not positive semidefinite (its Cholesky factorization fails)\n"); return QP_INPUT; }
+            if (c_ < 0 && getenv("BRISK_QPDEPDBG")) fprintf(stderr, "[convexity: the Cholesky test of H not made (beyond 1e11 flops)]\n");
+        }
     }
     double *dw = NULL; int *pw = NULL, *tw = NULL;
     if (P->nqc > 0 && !rc) {
@@ -285,25 +462,185 @@ int qp_convex_exact(const QpProb *P) {
     return QP_INPUT;
 }
 
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, audits A2 and A6) one deadline for a whole QP solve: the
+ * outermost entry (qp_solve, qp_resolve, a method called directly) sets it from its time limit, the inner solves (the
+ * active-set method tried first, the doubleton presolve's reduced problem and its fallback, the interior-point method's
+ * re-solve with other dependent rows dropped, the QCQP's rounds) only read it, so that their own clocks no longer each
+ * start the full limit again; the methods test it inside their iterations (the active-set method's inner loop too,
+ * which had tested its limit only between proximal-point solves: a 500-variable box QP ran 0.41 s at a limit of 1 ms) */
+static _Thread_local double g_qp_deadline = 0; static _Thread_local int g_qp_dl_depth = 0;
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, the mass-spring MPC plants) the processor flushes subnormal
+ * results to zero and reads subnormal operands as zero (x86: MXCSR's FTZ and DAZ bits) for the whole solve, on the calling
+ * thread and on the OpenMP threads, the mode before restored at the end. A product of two tiny normal numbers (the exact
+ * zero-order hold of a stiff spring chain has entries down to 1e-300) is a subnormal number, and arithmetic on those takes a
+ * microcode assist of about a hundred cycles: the 128-mass plant (QP, 51,456 variables) factored at 3.5 GFlop/s against 9.4
+ * on the 96-mass plant. Values below 2.2e-308 are zero for every quantity of the solve (the tolerances are relative and
+ * above 1e-16). The mode is the same at every thread count, so the same bits at any thread count still hold. BRISK_QPFTZ=0:
+ * off */
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#define QP_FTZ_BITS 0x8040u
+static _Thread_local unsigned g_qp_csr0 = 0;
+static int qp_ftz_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("BRISK_QPFTZ"); v = e ? atoi(e) : 1; } return v; }
+static void qp_ftz_enter(void) {
+    if (!qp_ftz_on()) return;
+    g_qp_csr0 = _mm_getcsr();
+    if ((g_qp_csr0 & QP_FTZ_BITS) == QP_FTZ_BITS) return;
+    _mm_setcsr(g_qp_csr0 | QP_FTZ_BITS);
+#ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        #pragma omp parallel
+        { _mm_setcsr(_mm_getcsr() | QP_FTZ_BITS); }
+    }
+#endif
+}
+static void qp_ftz_leave(void) {
+    if (!qp_ftz_on() || (g_qp_csr0 & QP_FTZ_BITS) == QP_FTZ_BITS) return;
+    const unsigned clr = QP_FTZ_BITS & ~g_qp_csr0;
+#ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        #pragma omp parallel
+        { _mm_setcsr(_mm_getcsr() & ~clr); }
+    }
+#endif
+    _mm_setcsr(_mm_getcsr() & ~clr);
+}
+#else
+static void qp_ftz_enter(void) {}
+static void qp_ftz_leave(void) {}
+#endif
+/* (1 November 2026) the subnormal results flushed only for a problem of 1e5 entries or more (A's, H's, the rows and the
+ * columns): the mode is set on every OpenMP thread, two parallel regions a call, which woke the thread pool at every solve of
+ * a QP of tens of variables solved in tens of microseconds (the owner's QP benchmark's small MPC, regression and portfolio
+ * QPs); a rule by size alone, so that the mode is the same at any thread count */
+static _Thread_local int g_qp_ftz_set = 0;
+void qp_deadline_enter(const QpOpts *o, const QpProb *P) {
+    if (g_qp_dl_depth++ == 0) {
+        g_qp_deadline = o && o->timelimit > 0 ? qp_clock() + o->timelimit : 0;
+        const double sz = P ? (double)P->n + P->m + (P->Ap ? P->Ap[P->n] : 0) + (P->Hp ? P->Hp[P->n] : 0) : 0;
+        g_qp_ftz_set = sz >= 1e5;
+        if (g_qp_ftz_set) qp_ftz_enter();
+    }
+}
+void qp_deadline_leave(void) { if (g_qp_dl_depth > 0 && --g_qp_dl_depth == 0) { g_qp_deadline = 0; if (g_qp_ftz_set) qp_ftz_leave(); g_qp_ftz_set = 0; } }
+int qp_time_up(void) { return g_qp_deadline > 0 && qp_clock() > g_qp_deadline; }
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, audit A1 and A15) the data of a QP or QCQP checked once
+ * at each entry (the one-shot call, the persistent model, the lean route; the file reader's numbers by qpio.c): the
+ * sizes, the column structures (pointers from 0, nondecreasing, row indices in range; a triangle's entries on or below
+ * the diagonal), every coefficient finite (H, A, c, c0, the quadratic rows' entries), and no bound NaN (an infinite bound
+ * is a missing side). 0, or QP_INPUT with the reason in msg. A NaN cost had given OPTIMAL with a NaN x */
+static int qp_csc_ok(int n, int m, const int *p, const int *ix, const double *v, int lower, const char *what, char *msg, size_t nmsg) {
+    if (p[0] != 0) { snprintf(msg, nmsg, "%s: the column pointers do not start at 0", what); return 0; }
+    for (int j = 0; j < n; j++) {
+        if (p[j + 1] < p[j]) { snprintf(msg, nmsg, "%s: the column pointers decrease at column %d", what, j + 1); return 0; }
+        for (int q = p[j]; q < p[j + 1]; q++) {
+            if (ix[q] < 0 || ix[q] >= m || (lower && ix[q] < j)) { snprintf(msg, nmsg, "%s: the entry %d of column %d has row index %d %s", what, q, j + 1, ix[q], lower && ix[q] >= 0 && ix[q] < j ? "(above the diagonal: the lower triangle is expected)" : "(out of range)"); return 0; }
+            if (!isfinite(v[q])) { snprintf(msg, nmsg, "%s: the entry in row %d, column %d is %s", what, ix[q] + 1, j + 1, isnan(v[q]) ? "NaN" : "infinite"); return 0; }
+        }
+    }
+    return 1;
+}
+int qp_input_check(const QpProb *P, char *msg, size_t nmsg) {
+    const int n = P->n, m = P->m;
+    if (n < 0 || m < 0) { snprintf(msg, nmsg, "negative sizes (n = %d, m = %d)", n, m); return QP_INPUT; }
+    if (P->Hp && !qp_csc_ok(n, n, P->Hp, P->Hi, P->Hx, 1, "the objective's quadratic part H", msg, nmsg)) return QP_INPUT;
+    if (m > 0 && !P->Ap) { snprintf(msg, nmsg, "%d rows but no constraint matrix", m); return QP_INPUT; }
+    if (P->Ap && !qp_csc_ok(n, m, P->Ap, P->Ai, P->Ax, 0, "the constraint matrix A", msg, nmsg)) return QP_INPUT;
+    if (!isfinite(P->c0)) { snprintf(msg, nmsg, "the objective's constant is %s", isnan(P->c0) ? "NaN" : "infinite"); return QP_INPUT; }
+    for (int j = 0; j < n; j++) {
+        if (P->c && !isfinite(P->c[j])) { snprintf(msg, nmsg, "the cost of variable %d is %s", j + 1, isnan(P->c[j]) ? "NaN" : "infinite"); return QP_INPUT; }
+        if ((P->xl && isnan(P->xl[j])) || (P->xu && isnan(P->xu[j]))) { snprintf(msg, nmsg, "a bound of variable %d is NaN", j + 1); return QP_INPUT; }
+    }
+    for (int i = 0; i < m; i++)
+        if ((P->rl && isnan(P->rl[i])) || (P->ru && isnan(P->ru[i]))) { snprintf(msg, nmsg, "a bound of row %d is NaN", i + 1); return QP_INPUT; }
+    for (int k = 0; k < P->nqc; k++) {
+        if (P->qrow[k] < 0 || P->qrow[k] >= m) { snprintf(msg, nmsg, "quadratic constraint %d names row %d (out of range)", k + 1, P->qrow[k] + 1); return QP_INPUT; }
+        for (int q = P->qs[k]; q < P->qs[k + 1]; q++) {
+            if (P->qi[q] < 0 || P->qi[q] >= n || P->qj[q] < 0 || P->qj[q] >= n) { snprintf(msg, nmsg, "quadratic constraint %d: an entry's index is out of range", k + 1); return QP_INPUT; }
+            if (!isfinite(P->qv[q])) { snprintf(msg, nmsg, "quadratic constraint %d: the entry (%d, %d) is %s", k + 1, P->qi[q] + 1, P->qj[q] + 1, isnan(P->qv[q]) ? "NaN" : "infinite"); return QP_INPUT; }
+        }
+    }
+    return 0;
+}
+static int qp_input_refuse(const QpProb *P, QpRes *R, const char *msg) {
+    memset(R, 0, sizeof(*R));
+    R->x = calloc((size_t)(P->n > 0 ? P->n : 0) + 1, sizeof(double)); R->y = calloc((size_t)(P->m > 0 ? P->m : 0) + 1, sizeof(double)); R->z = calloc((size_t)(P->n > 0 ? P->n : 0) + 1, sizeof(double));
+    fprintf(stderr, "brisk: invalid problem data: %s\n", msg);
+    R->status = QP_INPUT; return R->status;
+}
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, the large mass-spring MPC plants) entries of H and A below
+ * the smallest normal double (2.2e-308, subnormal numbers) are zero for every purpose: their product with any variable
+ * within the bounds' range (1e20) is below 1e-287, far below the rounding of any row or column with a normal entry; but
+ * arithmetic on them is slow (each operation a microcode assist on x86) and the factorizations' fill spreads them. The
+ * exact zero-order hold of a stiff spring chain gives them (the 128-mass plant: 276,960 in its dynamics matrix; BRISK's
+ * solve 80 s, 31 s with the processor flushing them to zero). Dropped in place from a column structure; returns the count */
+long qp_csc_drop_subnormal(int n, int *p, int *ix, double *v) {
+    long nd = 0, w = 0;
+    for (int j = 0; j < n; j++) {
+        const int a = p[j], b = p[j + 1]; p[j] = (int)w;
+        for (int q = a; q < b; q++) { if (v[q] != 0 && fabs(v[q]) < 2.2250738585072014e-308) { nd++; continue; } ix[w] = ix[q]; v[w] = v[q]; w++; }
+    }
+    p[n] = (int)w;
+    return nd;
+}
+static long qp_count_subnormal(const int *p, const double *v, int n) { long c = 0; for (long q = 0; q < p[n]; q++) if (v[q] != 0 && fabs(v[q]) < 2.2250738585072014e-308) c++; return c; }
+static int qp_solve_body(const QpProb *P, const QpOpts *o, QpRes *R);
+static int qp_solve_body0(const QpProb *P, const QpOpts *o, QpRes *R) {
+    const long sa = P->Ap ? qp_count_subnormal(P->Ap, P->Ax, P->n) : 0, sh = P->Hp ? qp_count_subnormal(P->Hp, P->Hx, P->n) : 0;
+    if (sa == 0 && sh == 0) return qp_solve_body(P, o, R);
+    QpProb C = *P; int *ap = NULL, *ai = NULL, *hp = NULL, *hi = NULL; double *ax = NULL, *hx = NULL;
+    if (sa) {
+        const long nz = P->Ap[P->n];
+        ap = malloc(sizeof(int) * ((size_t)P->n + 1)); ai = malloc(sizeof(int) * ((size_t)nz + 1)); ax = malloc(sizeof(double) * ((size_t)nz + 1));
+        if (ap && ai && ax) { memcpy(ap, P->Ap, sizeof(int) * ((size_t)P->n + 1)); memcpy(ai, P->Ai, sizeof(int) * (size_t)nz); memcpy(ax, P->Ax, sizeof(double) * (size_t)nz); qp_csc_drop_subnormal(P->n, ap, ai, ax); C.Ap = ap; C.Ai = ai; C.Ax = ax; }
+    }
+    if (sh) {
+        const long nz = P->Hp[P->n];
+        hp = malloc(sizeof(int) * ((size_t)P->n + 1)); hi = malloc(sizeof(int) * ((size_t)nz + 1)); hx = malloc(sizeof(double) * ((size_t)nz + 1));
+        if (hp && hi && hx) { memcpy(hp, P->Hp, sizeof(int) * ((size_t)P->n + 1)); memcpy(hi, P->Hi, sizeof(int) * (size_t)nz); memcpy(hx, P->Hx, sizeof(double) * (size_t)nz); qp_csc_drop_subnormal(P->n, hp, hi, hx); C.Hp = hp; C.Hi = hi; C.Hx = hx; }
+    }
+    if (o->verbose > 1) qp_printf("%ld entries of A and %ld of H below the smallest normal number (2.2e-308) dropped\n", sa, sh);
+    const int st = qp_solve_body(&C, o, R);
+    free(ap); free(ai); free(ax); free(hp); free(hi); free(hx);
+    return st;
+}
 int qp_solve(const QpProb *P, const QpOpts *o, QpRes *R) {
+    { char msg[200]; if (qp_input_check(P, msg, sizeof msg)) return qp_input_refuse(P, R, msg); }
     QpOpts od; if (!o) { qp_default_opts(&od); o = &od; }
-    if (qp_convex_exact(P)) {
+    qp_deadline_enter(o, P);
+    const int st = qp_solve_body0(P, o, R);
+    qp_deadline_leave();
+    return st;
+}
+static int qp_solve_body(const QpProb *P, const QpOpts *o, QpRes *R) {
+    /* (28 October 2026, the SOCP developer) the default choice's active-set method first, before the exact test of
+     * convexity: when H's Cholesky factor exists (positive definite, eps = 0) it proves the convexity the test checks (a
+     * positive definite H has a positive diagonal); the test, which allocates and sorts H's entries, was a part of the solve
+     * of a small QP (the owner's independent QP benchmark: QPs of 10 to 64 variables solved in tens of microseconds). For a
+     * semidefinite H the active-set method runs the test itself before its proximal-point loop (as_solve_body), and a model
+     * that eliminates equality rows runs it when it is made; so a result (st >= 0) has passed it. Every other route takes the
+     * test first, as before */
+    int proven = 0; double t_as = 0;
+    if (P->nqc == 0 && o->method == QP_METHOD_AUTO) {
+        double wipm = 0;
+        if (as_small(P, &wipm)) {
+            const int st = qp_solve_activeset_budget(P, o, R, wipm);
+            if (st == QP_OPTIMAL) { R->method = QP_METHOD_ACTIVESET; return st; }
+            if (st >= 0) {
+                proven = 1;
+                t_as = R->time > 0 ? R->time : 1e-9;
+                if (o->verbose) qp_printf("the active-set method ended %s: the interior-point method solves the problem\n", qp_status_name(st));
+                qp_res_free(R);
+            }
+        }
+    }
+    if (!proven && qp_convex_exact(P)) {
         memset(R, 0, sizeof(*R));
         R->x = calloc((size_t)P->n + 1, sizeof(double)); R->y = calloc((size_t)P->m + 1, sizeof(double)); R->z = calloc((size_t)P->n + 1, sizeof(double));
         R->status = QP_INPUT; return R->status;
     }
     if (P->nqc > 0) return qcqp_solve(P, o, R);
     if (o->method == QP_METHOD_ACTIVESET) { const int st = qp_solve_activeset(P, o, R); R->method = QP_METHOD_ACTIVESET; return st; }
-    double t_as = 0;
-    if (o->method == QP_METHOD_AUTO && qp_as_small(P)) {
-        const int st = qp_solve_activeset_pd(P, o, R);
-        if (st == QP_OPTIMAL) { R->method = QP_METHOD_ACTIVESET; return st; }
-        if (st >= 0) {
-            t_as = R->time > 0 ? R->time : 1e-9;
-            if (o->verbose) qp_printf("the active-set method ended %s: the interior-point method solves the problem\n", qp_status_name(st));
-            qp_res_free(R);
-        }
-    }
     const int st = qp_solve_ipm_dbl(P, o, R);
     R->method = QP_METHOD_IPM; R->t_as = t_as;
     return st;

@@ -1,4 +1,6 @@
 #!/bin/bash
+# (ISSUES 725, 31 October 2026: the lines read below are those of the diagnosis log, the default log until then)
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}
 # Results independent of the thread count: each file is solved with 1, 2, ..., T threads
 # (BRISK_NOBUSY=1, so the count is exactly the one asked for) and the runs are compared bit for
 # bit: y as written by -y (%.17g), the status line, and the objective and DIMACS error lines.

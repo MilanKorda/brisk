@@ -20,13 +20,21 @@ typedef struct {
                                    equations with an iteration's cost in flops (lpipm_iter_flops' measure); a nonzero
                                    return stops the method at once (status 6, why "declined") */
     void *analyzed_ctx;
+    void (*iter_cb)(void *ctx, int it, double pobj, double err);   /* (4 November 2026) if set: called at each iteration with
+                                   its number, the primal objective c'x + objoff and the largest relative error (the race's log) */
+    void *iter_ctx;
 } LpIpmOpts;
 typedef struct {
-    int status;                 /* 0 optimal, 3 iteration limit, 4 stalled or diverging (see why), 6 stopped */
+    int status;                 /* 0 optimal, 2 dual infeasible (x: a ray), 3 iteration limit, 4 stalled or diverging (see why), 6 stopped */
     int iters, ncorr, ndense, ntiny;
     long lnz, nfact, nsolve, ncg;
     double pobj, dobj, pinf, dinf, gap, time, t_fact, t_solve;
-    char why[96];
+    char why[192];
+    int dense_lost;             /* (31 October 2026) stopped because the dense columns' correction lost its accuracy and
+                                   joining them was refused: the SOCP solver, whose augmented system keeps them apart, follows */
+    int free_stalled;           /* (2 November 2026) stopped for no progress with the free columns' weight at its largest (1);
+                                   2: and the split of the free columns stalled as well */
+    int geo_used;               /* (4 November 2026) the attempt's scaling took the geometric-mean passes (lp_scale_choose) */
 } LpIpmInfo;
 /* (23 October 2026) the cost in flops of one iteration of the method on this form (its own analysis: the dense columns'
  * choice and the nested dissection ordering, not an estimate; 1e300 when the factor does not fit), for a choice between

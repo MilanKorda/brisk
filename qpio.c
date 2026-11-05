@@ -14,6 +14,16 @@
 #include <ctype.h>
 #include <stdint.h>
 
+/* (1 November 2026, the SOCP developer; the owner's QP benchmark, audit A11) a number field read in full: the whole token
+ * a number (strtod's syntax, "inf" and "nan" included), else the file is refused with the line; "1.5x" and "abc" had been
+ * read as 1.5 and 0. A NaN or an infinite coefficient is refused after reading by the data check (qp_input_check); an
+ * infinite bound or right-hand side is a missing side */
+static int qps_num(const char *t, double *v) {
+    char *e = NULL; *v = fast_strtod(t, &e);
+    if (!e || e == t) return 0;
+    while (*e == ' ' || *e == '\t' || *e == '\r' || *e == '\n') e++;
+    return *e == 0;
+}
 static void *xm(size_t s) { void *p = malloc(s ? s : 1); if (!p) { fprintf(stderr, "brisk_qp: out of memory\n"); exit(2); } return p; }
 static void *xz(size_t s) { void *p = calloc(1, s ? s : 1); if (!p) { fprintf(stderr, "brisk_qp: out of memory\n"); exit(2); } return p; }
 static void *xr(void *p, size_t s) { p = realloc(p, s ? s : 1); if (!p) { fprintf(stderr, "brisk_qp: out of memory\n"); exit(2); } return p; }
@@ -179,7 +189,7 @@ static int read_(const char *fname, QpProb *P, char *msg, size_t nmsg, int fixed
             for (int k = 1; k + 1 < nt; k += 2) {
                 const int r = h_get(&HR, tok[k]);
                 if (r < 0) { snprintf(msg, nmsg, "%s:%ld: unknown row %s", fname, lineno, tok[k]); rc = 1; break; }
-                const double v = fast_strtod(tok[k + 1], NULL);
+                double v; if (!qps_num(tok[k + 1], &v)) { snprintf(msg, nmsg, "%s:%ld: '%s' is not a number", fname, lineno, tok[k + 1]); rc = 1; break; }
                 if (rtype[r] == 'N' && r != objrow) continue;
                 if (nz == zcap) { zcap *= 2; Z = xr(Z, sizeof(Trip) * zcap); }
                 Z[nz].i = r == objrow ? -1 : r; Z[nz].j = j; Z[nz].v = v; nz++;
@@ -191,7 +201,7 @@ static int read_(const char *fname, QpProb *P, char *msg, size_t nmsg, int fixed
             for (int k = k0; k + 1 < nt; k += 2) {
                 const int r = h_get(&HR, tok[k]);
                 if (r < 0) { snprintf(msg, nmsg, "%s:%ld: unknown row %s", fname, lineno, tok[k]); rc = 1; break; }
-                const double v = fast_strtod(tok[k + 1], NULL);
+                double v; if (!qps_num(tok[k + 1], &v)) { snprintf(msg, nmsg, "%s:%ld: '%s' is not a number", fname, lineno, tok[k + 1]); rc = 1; break; }
                 if (sec == S_RHS) { if (r == objrow) c0 = -v; else rhs[r] = v; }
                 else { rng[r] = v; hasrng[r] = 1; }
             }
@@ -204,7 +214,8 @@ static int read_(const char *fname, QpProb *P, char *msg, size_t nmsg, int fixed
                 if (nt == 2) col = tok[1];
             } else {
                 if (nt < 3) { snprintf(msg, nmsg, "%s:%ld: a bound needs a value", fname, lineno); rc = 1; break; }
-                col = nt >= 4 ? tok[2] : tok[1]; v = fast_strtod(nt >= 4 ? tok[3] : tok[2], NULL);
+                col = nt >= 4 ? tok[2] : tok[1];
+                if (!qps_num(nt >= 4 ? tok[3] : tok[2], &v)) { snprintf(msg, nmsg, "%s:%ld: '%s' is not a number", fname, lineno, nt >= 4 ? tok[3] : tok[2]); rc = 1; break; }
             }
             const int j = h_get(&HC, col);
             if (j < 0) { snprintf(msg, nmsg, "%s:%ld: unknown column %s", fname, lineno, col); rc = 1; break; }
@@ -220,7 +231,7 @@ static int read_(const char *fname, QpProb *P, char *msg, size_t nmsg, int fixed
             if (nt < 3) continue;
             const int a = h_get(&HC, tok[0]), b = h_get(&HC, tok[1]);
             if (a < 0 || b < 0) { snprintf(msg, nmsg, "%s:%ld: unknown column in the quadratic section", fname, lineno); rc = 1; break; }
-            const double v = fast_strtod(tok[2], NULL);
+            double v; if (!qps_num(tok[2], &v)) { snprintf(msg, nmsg, "%s:%ld: '%s' is not a number", fname, lineno, tok[2]); rc = 1; break; }
             int i = a, j = b; if (i < j) { const int t = i; i = j; j = t; }       /* lower triangle: row i >= column j */
             if (qfull && a < b) continue;                  /* both triangles given: the upper one dropped */
             if (nq == qcap) { qcap *= 2; Q = xr(Q, sizeof(Trip) * qcap); }
@@ -230,9 +241,10 @@ static int read_(const char *fname, QpProb *P, char *msg, size_t nmsg, int fixed
             if (nt < 3) continue;
             const int a = h_get(&HC, tok[0]), b = h_get(&HC, tok[1]);
             if (a < 0 || b < 0) { snprintf(msg, nmsg, "%s:%ld: unknown column in QCMATRIX", fname, lineno); rc = 1; break; }
+            double v; if (!qps_num(tok[2], &v)) { snprintf(msg, nmsg, "%s:%ld: '%s' is not a number", fname, lineno, tok[2]); rc = 1; break; }
             if (a < b) continue;
             if (nc == ccap) { ccap *= 2; C = xr(C, sizeof(QTrip) * ccap); }
-            C[nc].r = qcr; C[nc].i = a; C[nc].j = b; C[nc].v = 2 * fast_strtod(tok[2], NULL); nc++;
+            C[nc].r = qcr; C[nc].i = a; C[nc].j = b; C[nc].v = 2 * v; nc++;
         }
     }
     free(line); fclose(f);

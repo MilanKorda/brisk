@@ -77,6 +77,10 @@ static int adj_add(Adj *A, int x) {        /* (1 when x was not there) */
     A->a[A->n++] = x;
     return 1;
 }
+static void adj_push(Adj *A, int x) {      /* x known to be absent */
+    if (A->n == A->cap) { A->cap = A->cap ? 2 * A->cap : 8; A->a = realloc(A->a, sizeof(int) * A->cap); }
+    A->a[A->n++] = x;
+}
 
 /* 24 October 2026: a tree of minima over the node indices (leaf i at L + i, each inner node the minimum of its two
  * children, INT_MAX for an eliminated node), for the minimum-degree elimination below: the smallest degree is the root,
@@ -110,14 +114,37 @@ static int chordal_cliques(const Block *B, const Params *par, Clique **cliq_out,
                            int *nmerge_out, int **pos_out) {
     const int n = B->n;
     Adj *adj = cm(sizeof(Adj) * n);
-    for (int t = -1; t < B->ncon; t++) {
+    /* 1 November 2026: the union of the patterns marked in a bit matrix (blocks up to order 16384, at most 32 MB, zero
+     * pages untouched), so that an entry seen before costs one test instead of a scan of its row's list, and the build
+     * stops as soon as the union is denser than the conversion takes. Before, every entry of every constraint scanned the
+     * list: quantum tomography of order 300 (SDP; 601 constraints, each a dense rank-one matrix) spent 2.49 s here on a
+     * block that has no decomposition. The lists are filled in the same order, so the cliques are the same. */
+    const size_t lim2 = (size_t)(par->chordal_density * 0.5 * n * (double)(n + 1)) + 1;
+    unsigned char *bit = n <= 16384 ? calloc(((size_t)n * n + 7) / 8, 1) : NULL;
+    size_t nup = 0;
+    for (int t = -1; t < B->ncon && nup <= lim2; t++) {
         const SpSym *S = t < 0 ? &B->C : &B->A[t];
         for (int q = 0; q < S->nnz; q++) {
             int i = S->row[q], j = S->col[q];
             if (i == j) continue;
+            if (bit) {
+                const size_t e = (size_t)(i < j ? i : j) * n + (i < j ? j : i);
+                if (bit[e >> 3] & (1u << (e & 7))) continue;
+                bit[e >> 3] |= (unsigned char)(1u << (e & 7));
+                nup++;
+                adj_push(&adj[i], j);
+                adj_push(&adj[j], i);
+                continue;
+            }
             adj_add(&adj[i], j);
             adj_add(&adj[j], i);
         }
+    }
+    free(bit);
+    if (nup > lim2) {                                          /* denser than the conversion takes */
+        for (int i = 0; i < n; i++) free(adj[i].a);
+        free(adj);
+        return 0;
     }
     /* 5.16: the density of the union of the patterns (each entry once; until 5.15 counted
      * once per constraint, so that a block whose entries several constraints share, as the
@@ -744,6 +771,7 @@ double *chordal_complete(const PSChordal *r, double *const *Xc) {
         Xw[t] = malloc(sizeof(double) * ((size_t)c * c + 1));
         memcpy(Xw[t], Xc[t], sizeof(double) * (size_t)c * c);
     }
+    int nfail = 0;   /* (31 October 2026, the owner's external SDP benchmark, audit A17) eigendecompositions that failed */
     /* The returned blocks can be slightly indefinite (the polishing step trades a little
      * positive semidefiniteness for feasibility; -5e-9 relative on AC-OPF), and the
      * completion amplifies any indefiniteness down the clique tree. Every block gets its
@@ -760,7 +788,8 @@ double *chordal_complete(const PSChordal *r, double *const *Xc) {
             memcpy(A, Xw[t], sizeof(double) * (size_t)c * c);
             int info = 0;
             BL(dsyev_)("V", "L", &c, A, &c, ev, wk, &lw4, &info);
-            if (info != 0) continue;
+            if (brisk_fault("chordal")) info = 1;
+            if (info != 0) { nfail++; continue; }   /* (audit A17: counted and reported below; X is measured afterwards) */
             const double fl0 = floor_rel * fmax(ev[c - 1], 0.0);
             if (ev[0] >= fl0) continue;
             for (int a = 0; a < c; a++) for (int b = 0; b < c; b++) {
@@ -795,7 +824,7 @@ double *chordal_complete(const PSChordal *r, double *const *Xc) {
                         D[a + (size_t)b * ns] = XP[ip[a] + (size_t)ip[b] * cpn] - XC[ic[a] + (size_t)ic[b] * c];
                     int info = 0;
                     BL(dsyev_)("V", "L", &ns, D, &ns, ev, wk2, &lw2, &info);
-                    if (info != 0) continue;
+                    if (info != 0) { nfail++; continue; }
                     for (int k = 0; k < ns; k++) {
                         if (ev[k] >= 0) continue;
                         const double w = -ev[k];
@@ -808,6 +837,7 @@ double *chordal_complete(const PSChordal *r, double *const *Xc) {
                 }
             }
         free(lp); free(ic); free(ip); free(D); free(ev); free(wk2);
+        if (nfail) brisk_note_diag("chordal completion: %d eigendecomposition(s) failed, their clique or separator not repaired (the completed X is measured as returned)", nfail);
     }
     if (getenv("BRISK_CHK_COMPL")) {
         double wmin0 = 1e300, wmin1 = 1e300, rel0 = 1e300;

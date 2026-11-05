@@ -733,12 +733,13 @@ static int dsp_factor(DSp *S, const dd *M) {
          * at m* = c3 / (c1 - c2 / T); with the measured m* = 1024 at one thread (SDPLIB's endgames +11 % with the blocked
          * one everywhere) and 512 at four (the 107 benchmark files with an endgame, SDP: the factorizations 8.40 -> 5.00 s,
          * identical results on 106, qap10 2.58 -> 1.11 s), m* = 768 / (1.75 - 1 / T). BRISK_DDBLK=<n> sets it */
+        /* 1 November 2026 (ISSUES 739): the order no longer follows the thread count. The two factorizations add in
+         * different orders, so a factor between the two orders came out with other bits at one thread than at four
+         * (trto3, Mittelmann, SDP: m between 512 and 1,024; y differed after the endgame). Fixed at 512, the order
+         * measured at four threads (the default runs use every core); a run on one thread takes the blocked factor
+         * from 512 instead of 1,024, at most about 11 % of the factorization in that range (the measurement above) */
         static int blk_env = -2; if (blk_env == -2) { const char *e = getenv("BRISK_DDBLK"); blk_env = e ? atoi(e) : -1; }
-        int nthr_f = 1;
-#ifdef _OPENMP
-        nthr_f = omp_get_max_threads(); if (nthr_f < 1) nthr_f = 1;
-#endif
-        const int blk_from = blk_env >= 0 ? blk_env : (int)(768.0 / (1.75 - 1.0 / nthr_f) + 0.5);
+        const int blk_from = blk_env >= 0 ? blk_env : 512;
         if (blk_from > 0 && n >= blk_from) {
             for (int j = 0; j < n; j++) memcpy(L + (size_t)j * n + j, M + (size_t)j * n + j, sizeof(dd) * (size_t)(n - j));
             return ddp_potrf(n, L, M, &S->ndep);
@@ -1124,8 +1125,17 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         }
     }
     double best_inf = 1e300, prev_score = 1e300;
-    int started = 0, extra = 0;
+    int started = 0, extra = 0, nsmall_first = 0;
     const int maxit0 = maxit;
+    /* 1 November 2026 (ISSUES 269): the margin of the projection rule below, and the rule on the first three steps.
+     * BRISK_DDPROJM=<m> sets the margin (10 until this date), BRISK_DDFIRST=0 turns the first-steps rule off */
+    static double proj_margin = -1; static int first_rule = -1;
+    if (proj_margin < 0) { const char *e = getenv("BRISK_DDPROJM"); proj_margin = e ? atof(e) : 3.0; if (!(proj_margin > 0)) proj_margin = 3.0; }
+    /* (2 November 2026: the first-steps rule off by default, BRISK_DDFIRST=1 turns it on. The macro bench found two
+     * endgames that start with three short steps and then succeed: dlyap_30 5.6e-6 -> 5.3e-9 and an option-pricing SDP
+     * 1.4e-5 -> OPTIMAL, both OPTIMAL without the rule and at numerical difficulties with it. Its premise, read from seven
+     * traces, does not hold) */
+    if (first_rule < 0) { const char *e = getenv("BRISK_DDFIRST"); first_rule = e && atoi(e) != 0; }
     static int ddtime = -1; if (ddtime < 0) ddtime = getenv("BRISK_DDTIME") != NULL;
     double tph[8] = {0,0,0,0,0,0,0,0}, tp0 = dd_now();
     #define DDPH(i) do { if (ddtime) { const double _t = dd_now(); tph[i] += _t - tp0; tp0 = _t; } } while (0)
@@ -1168,6 +1178,8 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         if (verbose > 0)
             printf("   dd %2d  pinf %.2e  dinf %.2e  gap %.2e  compl %.2e  mu %.2e  steps %.3f %.3f\n",
                    it, pinf, dinf, gap, comp, mu, last_ap, last_ad);
+        {   extern void brisk_ddtab_row(int, double, double, double, double, double, double, double);   /* (the default log's table) */
+            brisk_ddtab_row(it, po + P->obj_off, dob + P->obj_off, pinf, dinf, gap, mu, fmin(last_ap, last_ad)); }
         if (verbose > 0 && dddiag && it > 0) {
             printf("      (sigma %.3g, mu_aff/mu %.3g; the step bounded by block %d on X, block %d on Z)\n", last_sig, last_frac, last_lp + 1, last_ld + 1);
             for (int side = 0; side < 2; side++) {
@@ -1240,7 +1252,14 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
             const double proj = brest[it] * pow(r, (double)(maxit - it));
             /* (a tenth of the way short is not evidence: the runs that end accepted speed up after their first steps;
              * hinf11, SDPLIB: 2.50e-6 projected against 2.49e-6 at the tenth step, accepted at 1.5e-7 after 40) */
-            if (proj > 10.0 * bar) { if (verbose > 0) printf("   dd endgame: at its rate (%.2f a step) the measure would end at %.1e, more than ten times the polished iterate's %.1e: stopping\n", r, proj, bar); break; }
+            /* 1 November 2026: the margin is the polish's own gain on the endgame's iterate, three rather than ten. brest
+             * leaves the primal residual out (the polish removes it) but is measured before the polish, and bar after
+             * it; the polish lowered the endgame's final measure 2.3 to 3.1 times on the four runs recorded with -vv
+             * (sat_roa_n32 4.3e-8 -> 1.39e-8, qap8 7.9e-9 -> 2.5e-9, qap7 9.2e-9 -> 3.5e-9, hinf_sf_n32 6.2e-9 -> 2.7e-9).
+             * With ten, sat_roa_n32 (control LMIs, SDP) projected 6.4e-8 against a bar of 1.02e-8 at its tenth step,
+             * ran its nine remaining steps (2 of its 4.1 s), reached 4.3e-8 as projected, and was rejected; hinf11
+             * (projected at 1.0 times its bar, accepted after 40 steps) stays inside the margin of three */
+            if (proj > proj_margin * bar) { if (verbose > 0) printf("   dd endgame: at its rate (%.2f a step) the measure would end at %.1e, more than %g times the polished iterate's %.1e: stopping\n", r, proj, proj_margin, bar); break; }
         }
         if (!meas && score < tol) { used = 1; break; }
         /* 5.9: at the end of the budget, up to half as many iterations more while each one halves
@@ -1364,6 +1383,14 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
         if (dd_d(sp) > 1) sp = dd_of(1.0);
         if (dd_d(sdd) > 1) sdd = dd_of(1.0);
         if (dd_d(sp) < 1e-10 && dd_d(sdd) < 1e-10) { if (verbose > 0) printf("   dd endgame: the step collapsed: stopping\n"); break; }
+        /* 1 November 2026 (ISSUES 269, the first kind): an endgame whose first three steps are all shorter than a tenth
+         * (primal and dual) is stuck from its start: sat_roa_n32 (0.013, 0.029, 0.052) and mvu_100 crawled for their
+         * whole budget and were rejected; the accepted endgames that run long start with a step of at least 0.1 (qap10
+         * 0.16, attr_henon_d10_K 0.27, hinf11 0.41, qap8 0.15; most near 1). The third such step is not taken */
+        if (first_rule && it < 3) {
+            if (fmax(dd_d(sp), dd_d(sdd)) < 0.1) nsmall_first++;
+            if (it == 2 && nsmall_first == 3) { if (verbose > 0) printf("   dd endgame: its first three steps were all shorter than 0.1: stopping\n"); break; }
+        }
         for (int k = 0; k < nb; k++) {
             for (size_t i = 0; i < b[k].len; i++) {
                 b[k].X[i] = dd_add(b[k].X[i], dd_mul(sp, b[k].dX[i]));

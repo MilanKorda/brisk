@@ -5,6 +5,11 @@
 #define BRISK_SIMPLEX_H
 #include "lpio.h"
 
+/* (4 November 2026) the race's log: the simplex method stores its iteration count (all of a solve's rounds counted) at each
+ * iteration, one plain store, and its objective and largest violation on the problem as read at the end of an optimal solve,
+ * which it computes anyway; nothing is computed for the log. The default route's log reads them (main.c) for display only */
+typedef struct { volatile long it; volatile double obj, pinf; volatile int started, ended; } SimplexProgress;
+
 typedef struct {
     int method;                 /* 0 automatic (the dual simplex method; with two free threads or more the interior-point
                                    method and the crossover beside it once a first budget of work is spent, the first to end
@@ -48,6 +53,7 @@ typedef struct {
                                    result (a job beside other methods: they decide then) */
     int no_dual_route;          /* (28 October 2026) 1: not through the dual problem of a tall problem (the direct job beside
                                    another simplex job that takes that route) */
+    SimplexProgress *prog;      /* (4 November 2026) if not NULL: the progress the race's log shows (above) */
 } SimplexOpts;
 
 /* basis status of a column or row */
@@ -92,6 +98,15 @@ int simplex_aggb_possible(const LpProb *L);
 int simplex_dual_route_possible(const LpProb *L);
 int simplex_solve(const LpProb *L, const SimplexOpts *o, double *x, double *ax, double *y, double *z, int *cstat, int *rstat,
                   SimplexInfo *info);
+/* (4 November 2026) the crossover of a tall problem through its dual: the point x0 (n) and the row duals y0 (m, as
+ * simplex_solve returns them) of L mapped to its dual problem (sxpre_dualize), the crossover there (a basis of as many
+ * rows as L has columns), its basis mapped back by complementarity (sxpre_dual_basis), and the simplex method on L from
+ * that basis (o's limits and switches; its xstart, ystart and starting basis ignored). x (n) as simplex_solve; returns its
+ * status, or -1 when it did not apply (info then untouched) */
+/* (4 November 2026) a postsolved basic solution (sxpre_postsolve's x, y and statuses) taken when it is optimal on L within
+ * 1e-9: returns 1 with x in xout and info set, 0 otherwise */
+int simplex_postsolved_check(const LpProb *L, const double *x, const double *ymin, const int *cs, const int *rs, double *xout, SimplexInfo *info);
+int simplex_crossover_dual(const LpProb *L, const SimplexOpts *o, const double *x0, const double *y0, double *x, SimplexInfo *info);
 /* a linear program in the cone form min c'x, A x = b, x = (free part K.f, nonnegative part K.l), as the interfaces give it
  * (P->nq = P->nr = P->ns = 0), by simplex_solve (method 0 when o is NULL: the automatic choice and its race): x (n), y (m)
  * and z = c - A'y (n), *pobj = c'x, *dobj = b'y, with the cone solver's conventions for a primal infeasible problem (y

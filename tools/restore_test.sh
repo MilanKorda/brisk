@@ -1,4 +1,6 @@
 #!/bin/bash
+# (ISSUES 725, 31 October 2026: the lines read below are those of the diagnosis log, the default log until then)
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}
 # The restoration of the primal feasibility at the end of a solve (sqrt_restore in solver.c).
 # A tolerance that double precision cannot reach (1e-14) sends well-posed examples through the
 # end-of-solve corrections. Checks, on three shipped examples, that

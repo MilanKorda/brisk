@@ -94,12 +94,12 @@ brisk: $(OBJ) $(AMDOBJ)
 
 # the QP solver's command line (the SOCP developer, 22 October 2026): qp.h, qp.c, qpio.c, qpipm.c, qpas.c, qpmain.c
 QPOBJ    = qp.o qpio.o qpipm.o qpas.o qcqp.o qpdbl.o
-brisk_qp: qpmain.o $(QPOBJ) sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ)
-	$(CC) $(CFLAGS) $(DEFS) $(LINKFIX) -o $@ qpmain.o $(QPOBJ) sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
+brisk_qp: qpmain.o $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ)
+	$(CC) $(CFLAGS) $(DEFS) $(LINKFIX) -o $@ qpmain.o $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
 qp.o qpio.o qpipm.o qpas.o qpmain.o: qp.h
 lpio.o qpio.o: fastnum.h
-tests/qp_test: tests/qp_test.c $(QPOBJ) sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) qp.h
-	$(CC) $(CFLAGS) $(DEFS) -o $@ tests/qp_test.c $(QPOBJ) sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
+tests/qp_test: tests/qp_test.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) qp.h
+	$(CC) $(CFLAGS) $(DEFS) -o $@ tests/qp_test.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
 qptest: tests/qp_test
 	./tests/qp_test
 
@@ -170,6 +170,10 @@ asantest:
 
 # reproducibility (CLAUDE.md, ISSUES 708): the same bits at 1, 2 and all threads, with thread changes, and from the C
 # library with problems of the same dimensions alternated; reprotest-mkl: the same under MKL (tools/setup_env.sh --mkl)
+# (31 October 2026, ISSUES 727, RELEASE_CHECKS R17) the thread count of a library call is the call's own
+threadtest: $(LIBBRISK) tools/thread_test.c
+	$(CC) -O1 -std=gnu11 -Wall -o tools/thread_test tools/thread_test.c -L. -lbrisk -Wl,-rpath,$(CURDIR) -lm
+	env -u OMP_NUM_THREADS -u BRISK_TINYMT BRISK_NOBUSY=1 ./tools/thread_test examples
 reprotest: brisk $(LIBBRISK)
 	tools/repro_suite.sh
 reprotest-mkl: brisk $(LIBBRISK)
@@ -194,6 +198,10 @@ restoretest: brisk
 # the advice at the end of the log (more accuracy, a guaranteed bound) on the command line
 advicetest: brisk
 	tools/advice_test.sh ./brisk
+
+# failed checks are not passed (BRISK_FAULT; audits A8, A9, A11, A16 of the owner's external SDP benchmark, 31 October 2026)
+faulttest: brisk
+	tools/fault_test.sh ./brisk
 
 # every method keeps the time limit (a generated problem, -timelimit 3 on each method; ISSUES 274)
 timetest: brisk
@@ -226,6 +234,7 @@ LPMODEL_FILES = $(addprefix benchmarks/mip_small/,flugpl.mps gr4x6.mps gt2.mps k
 lpmodeltest: $(LIBOBJ) $(LIBAMDOBJ) lpmodel.c lpmodel.h sxmodel.h tools/lpmodel_test.c tools/lpmodel_bb.c
 	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_test tools/lpmodel_test.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
 	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_bb tools/lpmodel_bb.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
+	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_replay tools/lpmodel_replay.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
 	./tools/lpmodel_test $(LPMODEL_FILES)
 	./tools/lpmodel_bb $(addprefix benchmarks/mip_small/,flugpl.mps gr4x6.mps khb05250.mps)
 	./tools/lpmodel_bb -weights 1 $(addprefix benchmarks/mip_small/,gr4x6.mps khb05250.mps)

@@ -36,6 +36,7 @@ typedef struct {
     double pobj, dobj, err[4], maxerr, time;
     long lnz;
     double *cx, *cy, *cz;           /* the centred iterate kept with SocpOpts.wsave (NULL when none) */
+    int stalled;                    /* (3 November 2026) the solve stopped by the stall rule: no second attempt */
 } SocpRes;
 void socp_default_opts(SocpOpts *o);
 int socp_solve(const SocpProb *P, const SocpOpts *opt, SocpRes *R);

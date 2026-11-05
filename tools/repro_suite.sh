@@ -1,4 +1,5 @@
 #!/bin/bash
+export BRISK_LOGDIAG=${BRISK_LOGDIAG-1}   # (ISSUES 639: the lines read are those of the diagnosis log)
 # The reproducibility test (CLAUDE.md, "Reproducible results"; ISSUES 708; RELEASE_CHECKS R16): the same input gives
 # the same bits (status, iterations, y, X) at any thread count, with thread changes during a solve, and whatever was
 # solved before in the same process. Part of the pre-release testing (tools/release_check.sh).
@@ -61,10 +62,19 @@ bench/adversarial_5.19/problems/socp_tv_150/socp_tv_150.cbf ${BRISK_BENCH:-bench
 ${BRISK_BENCH:-benchmarks}/socp/cblib/chainsing-10000-1.cbf.gz
 ${BRISK_BENCH:-benchmarks}/kennington/ken-07.mps
 ${BRISK_BENCH:-benchmarks}/socp/cblib/db-shear-wall.cbf.gz ${BRISK_BENCH:-benchmarks}/dimacs/mat/sched_100_100_orig.mat
-${BRISK_BENCH:-benchmarks}/dimacs/mat/sched_200_100_orig.mat"
+${BRISK_BENCH:-benchmarks}/dimacs/mat/sched_200_100_orig.mat
+${BRISK_BENCH:-benchmarks}/mittelmann/trto3.dat-s"
+# (trto3, Mittelmann, SDP: its double-double endgame factors a Schur complement of order between 512 and 1,024, where
+# the endgame chose its Cholesky algorithm by the thread count until 1 November 2026: other bits at one thread than at
+# four, ISSUES 739)
 for f in $GEN; do
   if [ -f "$f" ]; then FILES="$FILES $f"; else echo "repro_suite: (not generated here: $f)"; fi
 done
+# two blocks of order 80: the low-rank check of the first runs on the threads and rejects it, the second's factors come
+# from random vectors, which must not depend on which thread checked which constraint of the first (ISSUES 736: five
+# different results in twelve runs at four threads before the fix); generated, 8 MB
+if python3 -I tests/repro/gen_lowrank_blocks.py "$W/lowrank_blocks.dat-s" 2> /dev/null; then FILES="$FILES $W/lowrank_blocks.dat-s"
+else echo "repro_suite: FAIL: tests/repro/gen_lowrank_blocks.py did not run (python3)"; fail=1; fi
 for f in $FILES; do
   [ -f "$f" ] || { echo "repro_suite: missing $f"; fail=1; continue; }
   case $f in */ken-07.mps) OPTS="'-lpmethod 1' '-lpmethod 5'";; */db-shear-wall.cbf.gz|*/sched_*_orig.mat) OPTS="''";; *.mps) OPTS="'-lpmethod 1' '-lpmethod 5'";; *.qps|*.QPS|*.cbf|*.cbf.gz) OPTS="''";; */user_marek_cutsdp/*) OPTS="'-hsd -bound p -certify -boundprior 2' '-hsd'";;

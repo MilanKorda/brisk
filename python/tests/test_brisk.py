@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.6.1"
+    assert brisk.version() == "1.6.5"
     assert os.path.exists(brisk.library_path())
 
 
@@ -68,20 +68,21 @@ def test_output(capsys):
 def test_advice_in_the_callers_syntax(capsys):
     """1.3.2: the last lines of the log say how to get more accuracy and a guaranteed bound, in
     the syntax of the command that was called."""
-    brisk.solve_sdpa(**EX1, verbose=True)
+    # (31 October 2026, ISSUES 725: no advice after an OPTIMAL result in the default log; the diagnosis, "v", keeps it)
+    brisk.solve_sdpa(**EX1, options={"v": True}, verbose=True)
     out = capsys.readouterr().out
     assert "For higher accuracy, in brisk.solve_sdpa(..., options={...}):" in out
     assert '"acc": "high"' in out and '"prec": "dd"' in out
     assert "For a guaranteed bound on the optimal value" in out and '"bound": "d"' in out
     assert '"certify": True' not in out                                            # (a bound is always checked rigorously)
-    brisk.solve_sdpa(**EX1, options={"acc": "high", "bound": "d"}, verbose=True)   # what was asked for is not advised
+    brisk.solve_sdpa(**EX1, options={"acc": "high", "bound": "d", "v": True}, verbose=True)   # what was asked for is not advised
     out = capsys.readouterr().out
     assert '"acc": "high"' not in out and "For a guaranteed bound" not in out and "For a rigorous check of the bound" not in out
-    brisk.solve_sdpa(**EX1, options={"prec": "dd"}, verbose=True)                  # high precision: the bound only
+    brisk.solve_sdpa(**EX1, options={"prec": "dd", "v": True}, verbose=True)                  # high precision: the bound only
     out = capsys.readouterr().out
     assert "For higher accuracy" not in out and '"bound": "d"' in out and "in brisk.solve_sdpa(" in out
     import scipy.sparse as sp                                                      # the cone solver ends the same way
-    brisk.solve_sedumi(sp.csc_matrix(np.array([[1.0, 1.0, 1.0]])), [1.0], [1.0, 2.0, 3.0], dict(l=3), verbose=True)
+    brisk.solve_sedumi(sp.csc_matrix(np.array([[1.0, 1.0, 1.0]])), [1.0], [1.0, 2.0, 3.0], dict(l=3), options={"v": True}, verbose=True)
     out = capsys.readouterr().out
     assert out.count("Summary") == 1 and "in brisk.solve_sedumi(..., options={...}):" in out
 
@@ -90,12 +91,12 @@ def test_advice_cvxpy(capsys):
     cp = pytest.importorskip("cvxpy")
     X = cp.Variable((3, 3), PSD=True)
     prob = cp.Problem(cp.Minimize(cp.trace(X)), [X[0, 1] == 1])
-    prob.solve(solver=brisk.BRISK(), verbose=True)
+    prob.solve(solver=brisk.BRISK(), verbose=True, v=True)   # (ISSUES 725: the advice after OPTIMAL in the diagnosis)
     out = capsys.readouterr().out
     assert "For higher accuracy, in prob.solve(solver=brisk.BRISK(), ...):" in out
     assert 'acc="high"' in out and 'prec="dd"' in out and 'bound="dual"' in out and "certify=True" not in out
     x = cp.Variable(3)                                                             # a second-order cone program
-    cp.Problem(cp.Minimize(cp.norm(x, 2)), [cp.sum(x) == 1]).solve(solver=brisk.BRISK(), verbose=True)
+    cp.Problem(cp.Minimize(cp.norm(x, 2)), [cp.sum(x) == 1]).solve(solver=brisk.BRISK(), verbose=True, v=True)
     out = capsys.readouterr().out
     assert "in prob.solve(solver=brisk.BRISK(), ...):" in out and 'acc="high"' in out
 
@@ -131,7 +132,8 @@ def test_option_chordal(capsys, chordal, converted):
     """the options reach the solver: chordal decomposition automatic / off / forced."""
     r = brisk.solve_sdpa(**band_sdpa(), options={"chordal": chordal}, verbose=True)
     out = capsys.readouterr().out
-    assert r.status == 0 and ("chordal decomposition" in out) == converted
+    # (31 October 2026, ISSUES 725: the presolve line names the search either way; the Summary's step says it applied)
+    assert r.status == 0 and ("chordal decomposition:" in out and "split into cliques" in out) == converted
     r0 = brisk.solve_sdpa(**band_sdpa(), verbose=False)
     assert np.isclose(r.pobj, r0.pobj, rtol=1e-6)
 
@@ -140,10 +142,10 @@ def test_option_symalg(capsys):
     """the *-algebra symmetry reduction (a hidden symmetry under a random orthogonal
     basis): on by default, off with symalg=0, the same objective either way."""
     f = os.path.join(os.path.dirname(__file__), "..", "..", "examples", "hidden_symmetry23.dat-s")
-    r = brisk.solve_file(f, verbose=True)
+    r = brisk.solve_file(f, options={"v": True}, verbose=True)   # (the presolve's lines: the diagnosis, ISSUES 725)
     out = capsys.readouterr().out
     assert r.status == 0 and "algebra symmetry: block 1: 23 -> 5 3(x2) 4(x3)" in out
-    r0 = brisk.solve_file(f, options={"symalg": 0}, verbose=True)
+    r0 = brisk.solve_file(f, options={"symalg": 0, "v": True}, verbose=True)
     out = capsys.readouterr().out
     assert r0.status == 0 and "algebra symmetry" not in out
     assert np.isclose(r.pobj, r0.pobj, rtol=1e-7)
@@ -346,6 +348,22 @@ def test_cvxpy_lambda_max():
     prob.solve(solver=brisk.BRISK(), acc="high")
     M = prob.constraints[0].args[0].value + prob.variables()[0].value * 0   # t I - M
     assert np.isclose(np.linalg.eigvalsh(M)[0], 0, atol=1e-7)
+
+
+def test_cvxpy_log_keyword(capfd):
+    """log=True: BRISK's log without CVXPY's own messages (4 November 2026, the owner on the CVXPY example's output)."""
+    prob = p_lmi_offset()
+    prob.solve(solver=brisk.BRISK(), log=True)
+    out = capfd.readouterr().out
+    assert "Summary" in out and "(CVXPY)" not in out
+    prob.solve(solver=brisk.BRISK())
+    assert capfd.readouterr().out == ""
+
+
+def test_printed_result():
+    r = brisk.solve_sdpa(**EX1, verbose=False)
+    t = repr(r)
+    assert t.startswith("brisk.Result: OPTIMAL") and "primal objective" in t and "dual objective" in t
 
 
 def test_cvxpy_options_and_write(tmp_path):
@@ -821,7 +839,12 @@ def test_solve_sedumi_cone_and_sdp_solver_agree():
     assert r1.status == 0 and r2.status in (0, 5) and r3.status == 0
     assert abs(r1.pobj - r2.pobj) < 1e-6 * (1 + abs(r1.pobj))
     assert abs(r1.pobj - r3.pobj) < 1e-7 * (1 + abs(r1.pobj)) and np.max(np.abs(r3.dimacs)) < 1e-18
-    assert np.allclose(r1.x, r3.x, atol=1e-5 * (1 + np.abs(r3.x).max()))
+    # (5 November 2026, the SOCP developer) x compared at high accuracy: the default tolerance bounds the residuals and the
+    # gap (the DIMACS errors, 1e-8), not the distance of x to the optimum, which is that bound times the problem's
+    # conditioning. Here the optimum is unique and strictly complementary, yet at the default tolerance the free variables
+    # are 1.1e-4 from it (DIMACS errors 9.8e-9); at -acc high 1e-6, at tolerance 1e-12 3e-7.
+    r4 = brisk.solve_sedumi(A, b, c, K, {"acc": "high"}, verbose=False)
+    assert r4.status == 0 and np.allclose(r4.x, r3.x, atol=1e-5 * (1 + np.abs(r3.x).max()))
 
 
 def test_solve_sedumi_infeasible_and_unbounded():
@@ -854,7 +877,7 @@ def test_sedumi_mat_file(tmp_path, compress):
     exe = os.path.join(os.path.dirname(lib), "brisk")
     if os.path.exists(exe):                     # the command line on the same file
         xf = str(tmp_path / "x.txt")
-        out = subprocess.run([exe, f, "-x", xf], capture_output=True, text=True)
+        out = subprocess.run([exe, f, "-x", xf, "-v"], capture_output=True, text=True)   # (the file's header line: the diagnosis)
         assert out.returncode == 0 and "SeDuMi problem" in out.stdout
         assert np.allclose(np.loadtxt(xf), r0.x, atol=1e-6 * (1 + np.abs(r0.x).max()))
 
@@ -1100,6 +1123,40 @@ def test_qp_model_warm_branch_and_bound():
     assert r1.status == 0 and r2.status == 0 and abs(r2.obj - brisk.solve_qp(P, q + 1.0, np.ones((1, n)), [10.0], [10.0], lb0, ub0, verbose=False).obj) <= 1e-7 * (1 + abs(r2.obj))
 
 
+def test_qp_model_receding_horizon_update():
+    # a linear MPC QP in the sparse form (the dynamics as equality rows, the equality rows eliminated inside the model):
+    # re-solves over moving initial states, by update (whole vectors) and by the per-row setters, against cold solves
+    import scipy.sparse as sp
+    rng = np.random.default_rng(5)
+    nx, nu, N = 3, 1, 12
+    Ad = np.eye(nx) + 0.1 * rng.standard_normal((nx, nx)); Bd = rng.standard_normal((nx, nu))
+    nX, n = (N + 1) * nx, (N + 1) * nx + N * nu
+    E = sp.lil_matrix((nX, n))
+    for i in range(nx): E[i, i] = 1.0
+    for s in range(N):
+        for i in range(nx):
+            E[(s + 1) * nx + i, (s + 1) * nx + i] = 1.0
+            for j in range(nx): E[(s + 1) * nx + i, s * nx + j] = -Ad[i, j]
+            for j in range(nu): E[(s + 1) * nx + i, nX + s * nu + j] = -Bd[i, j]
+    A = sp.csc_matrix(E); P = sp.diags(np.r_[np.ones(nX), 0.1 * np.ones(N * nu)]).tocsc()
+    lb = np.r_[-5 * np.ones(nX), -1 * np.ones(N * nu)]; ub = -lb; q = np.zeros(n)
+    x0 = rng.standard_normal(nx); l = np.zeros(nX); l[:nx] = x0
+    m1 = brisk.QpModel(P, q, A, l, l.copy(), lb, ub); m2 = brisk.QpModel(P, q, A, l, l.copy(), lb, ub)
+    for step in range(6):
+        x0 = 0.8 * x0 + 0.3 * rng.standard_normal(nx); l = np.zeros(nX); l[:nx] = x0; qq = 0.01 * rng.standard_normal(n)
+        m1.update(q=qq, l=l, u=l)
+        m2.set_cost(qq)
+        for i in range(nx): m2.set_row_bounds(i, x0[i], x0[i])
+        r1, r2 = m1.solve(), m2.solve()
+        c = brisk.solve_qp(P, qq, A, l, l, lb, ub, verbose=False)
+        assert r1.status == 0 and r2.status == 0 and c.status == 0
+        assert abs(r1.obj - c.obj) <= 1e-7 * (1 + abs(c.obj)) and abs(r2.obj - c.obj) <= 1e-7 * (1 + abs(c.obj))
+        assert np.max(np.abs(A @ r1.x - l)) <= 1e-7
+    with pytest.raises(ValueError):
+        m1.update(l=np.zeros(nX + 1))
+    m1.close(); m2.close()
+
+
 def test_socp_model_warm_branch_and_bound():
     # the nearest integer point to p in the plane, min t, (t, x - p) in a second-order cone, x integer: branch and bound
     # on the SOCP model, each node warm from the last optimal point, against enumeration; then the cutoff
@@ -1136,3 +1193,33 @@ def test_socp_model_warm_branch_and_bound():
     with pytest.raises(ValueError):
         brisk.SocpModel(A, b, c, {"f": 2, "l": 1, "q": [3]})
     mdl.close()
+
+
+def test_socp_model_audit_checks():
+    """(31 October 2026) the owner's SOCP benchmark audit: a point of another model refused; a rejected bound update leaves
+    the bounds as they were; cone sizes must be integers; NaN data refused at the solver's entry"""
+    import scipy.sparse as sp
+    # min t  s.t.  t >= |x|, x1 + x2 = 1   (x free; t, x as a cone of 3)
+    A = sp.csc_matrix(np.array([[0.0, 1.0, 1.0]])); b = np.array([1.0]); c = np.array([1.0, 0.0, 0.0])
+    m1 = brisk.SocpModel(A, b, c, {"q": [3]})
+    assert m1.solve().status == 0
+    pt = m1.save_point()
+    A2 = sp.csc_matrix(np.array([[0.0, 1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 1.0]])); b2 = np.array([1.0, 1.0]); c2 = np.array([1.0, 0, 0, 1.0, 0])
+    m2 = brisk.SocpModel(A2, b2, c2, {"q": [3, 2]})
+    with pytest.raises(ValueError):
+        m2.restore_point(pt)                         # another model's point: refused
+    m1.restore_point(pt)                             # its own: taken
+    with pytest.raises(ValueError):
+        m1.set_var_bounds(1, lo=2.0, hi=1.0)         # lo > hi
+    with pytest.raises(IndexError):
+        m1.set_var_bounds(-1, lo=0.0)
+    m1.set_var_bounds(1, hi=0.3)                     # the lower side kept as it was (-inf), not the rejected 2.0
+    r = m1.solve()
+    assert r.status == 0 and r.x[1] <= 0.3 + 1e-7
+    m1.close(); m2.close()
+    with pytest.raises(ValueError):
+        brisk.solve_sedumi(A, b, c, {"q": [3.9]})    # a fractional cone size
+    with pytest.raises(ValueError):
+        brisk.solve_sedumi(A, b, c, {"q": [-3]})
+    with pytest.raises(RuntimeError, match="invalid problem data"):
+        brisk.solve_sedumi(A, b, np.array([np.nan, 0.0, 0.0]), {"q": [3]})   # a NaN cost: an input error

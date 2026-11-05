@@ -215,6 +215,60 @@ int main(void) {
               "flow %d (%d nodes, %d arcs): factor %s %.10g, conjugate gradients %s %.10g", t, nn, na, qp_status_name(A.status), A.obj, qp_status_name(B.status), B.obj);
         qp_res_free(&A); qp_res_free(&B); qp_prob_free(&P); free(tl); free(hd);
     }
+    printf("6. receding-horizon MPC QPs in the sparse form (the dynamics as equality rows): the QP model with its equality rows\n"
+           "   eliminated against the model without and the interior-point method, over moving initial states\n");
+    for (int t = 0; t < 6; t++) {
+        const int nx = 2 + t % 3, nu = 1 + t % 2, N = 6 + 3 * t, n = (N + 1) * nx + N * nu, m = (N + 1) * nx;
+        double *Ad = malloc(sizeof(double) * nx * nx), *Bd = malloc(sizeof(double) * nx * nu);
+        for (int i = 0; i < nx * nx; i++) Ad[i] = (i % (nx + 1) == 0 ? 1.0 : 0.0) + 0.2 * nrand();
+        for (int i = 0; i < nx * nu; i++) Bd[i] = nrand();
+        QpProb P; memset(&P, 0, sizeof P); P.n = n; P.m = m;
+        /* variables: x_0..x_N (nx each), then u_0..u_{N-1}; rows: x_0 = x_init, x_{s+1} - A x_s - B u_s = 0 */
+        P.Ap = malloc(sizeof(int) * (n + 1)); P.Ai = malloc(sizeof(int) * (n * (nx + 1) + 1)); P.Ax = malloc(sizeof(double) * (n * (nx + 1) + 1));
+        int w = 0;
+        for (int j = 0; j < n; j++) {
+            P.Ap[j] = w;
+            if (j < (N + 1) * nx) {
+                const int s0 = j / nx, a = j % nx;
+                P.Ai[w] = j; P.Ax[w] = 1.0; w++;                                  /* its own row */
+                if (s0 < N) for (int i = 0; i < nx; i++) { P.Ai[w] = (s0 + 1) * nx + i; P.Ax[w] = -Ad[i + a * nx]; w++; }
+            } else {
+                const int s0 = (j - (N + 1) * nx) / nu, b = (j - (N + 1) * nx) % nu;
+                for (int i = 0; i < nx; i++) { P.Ai[w] = (s0 + 1) * nx + i; P.Ax[w] = -Bd[i + b * nx]; w++; }
+            }
+        }
+        P.Ap[n] = w;
+        P.Hp = malloc(sizeof(int) * (n + 1)); P.Hi = malloc(sizeof(int) * n); P.Hx = malloc(sizeof(double) * n);
+        P.c = calloc(n, sizeof(double)); P.xl = malloc(sizeof(double) * n); P.xu = malloc(sizeof(double) * n);
+        for (int j = 0; j < n; j++) { P.Hp[j] = j; P.Hi[j] = j; P.Hx[j] = j < (N + 1) * nx ? 1.0 : 0.1; P.xl[j] = j < (N + 1) * nx ? -5 : -1; P.xu[j] = -P.xl[j]; }
+        P.Hp[n] = n;
+        P.rl = calloc(m, sizeof(double)); P.ru = calloc(m, sizeof(double));
+        double *x0 = malloc(sizeof(double) * nx); for (int i = 0; i < nx; i++) x0[i] = 2 * nrand();
+        for (int i = 0; i < nx; i++) P.rl[i] = P.ru[i] = x0[i];
+        o.method = QP_METHOD_ACTIVESET;
+        QpSolver *Qe = qp_create(&P, &o);
+        setenv("BRISK_QPASELIM", "0", 1); QpSolver *Qf = qp_create(&P, &o); unsetenv("BRISK_QPASELIM");
+        for (int step = 0; step < 8; step++) {
+            for (int i = 0; i < nx; i++) { x0[i] = 0.7 * x0[i] + 0.5 * nrand(); qp_set_row_bounds(Qe, i, x0[i], x0[i]); qp_set_row_bounds(Qf, i, x0[i], x0[i]); P.rl[i] = P.ru[i] = x0[i]; }
+            QpRes A, B, C; memset(&A, 0, sizeof A); memset(&B, 0, sizeof B);
+            qp_resolve(Qe, &A); qp_resolve(Qf, &B);
+            QpOpts oi = o; oi.method = QP_METHOD_IPM; qp_solve(&P, &oi, &C);
+            {   /* the single solve by the active-set method (qp_solve: through a model that eliminates the equalities) */
+                QpRes D; QpOpts oa = o; oa.method = QP_METHOD_ACTIVESET; qp_solve(&P, &oa, &D);
+                CHECK(D.status == C.status && (C.status != QP_OPTIMAL || fabs(D.obj - C.obj) <= 1e-6 * (1 + fabs(C.obj))),
+                      "MPC %d, step %d: the single active-set solve %s %.10g, interior point %s %.10g", t, step, qp_status_name(D.status), D.obj, qp_status_name(C.status), C.obj);
+                qp_res_free(&D); }
+            CHECK(A.status == C.status && B.status == C.status && (C.status != QP_OPTIMAL || (fabs(A.obj - C.obj) <= 1e-6 * (1 + fabs(C.obj)) && fabs(B.obj - C.obj) <= 1e-6 * (1 + fabs(C.obj)))),
+                  "MPC %d (n %d, %d equalities), step %d: eliminated %s %.10g, full %s %.10g, interior point %s %.10g", t, n, m, step,
+                  qp_status_name(A.status), A.obj, qp_status_name(B.status), B.obj, qp_status_name(C.status), C.obj);
+            qp_res_free(&A); qp_res_free(&B); qp_res_free(&C);
+        }
+        qp_destroy(Qe); qp_destroy(Qf); qp_prob_free(&P); free(Ad); free(Bd); free(x0);
+    }
     printf(fails ? "qp_test: %d failures\n" : "qp_test: all checks passed\n", fails);
     return fails != 0;
 }
+
+/* The solver's objects print through brisk_printf and brisk_fprintf (brisk.h), which main.c defines; this test links them
+ * without main.o, with qpstub.c's plain forwarding versions (the merge for 1.6.5: they were also defined here). */
+#include <stdarg.h>

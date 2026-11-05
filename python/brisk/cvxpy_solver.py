@@ -412,8 +412,24 @@ class BRISK(ConicSolver):
     def import_solver(self):
         _core.load_library()
 
+    # (3 November 2026, the owner) a QP (a quadratic objective, linear constraints) goes to BRISK's QP solver: CVXPY asks
+    # can_solve(problem) before it builds the chain and supports_quad_obj() while it builds it, so the quadratic objective is
+    # kept as P only when every constraint is linear; with second-order or semidefinite cones CVXPY writes the objective as
+    # cones itself, as before
+    _quad = False
+
+    def can_solve(self, problem_form):
+        ok = super().can_solve(problem_form)
+        try:
+            self._quad = bool(ok and problem_form.has_quadratic_objective()
+                              and all(c.__name__ in ("Zero", "NonNeg", "NonPos", "Equality", "Inequality")
+                                      for c in problem_form.cones(quad_obj=True)))
+        except Exception:
+            self._quad = False
+        return ok
+
     def supports_quad_obj(self):
-        return False
+        return self._quad
 
     def cite(self, data):
         return ("@misc{brisk, title = {{BRISK}: an {SDP} solver}, note = {version "
@@ -421,6 +437,7 @@ class BRISK(ConicSolver):
 
     def solve_via_data(self, data, warm_start, verbose, solver_opts, solver_cache=None):
         opts = dict(solver_opts or {})
+        verbose = bool(opts.pop("log", verbose))    # log=True: BRISK's log without CVXPY's own messages (verbose=True: both)
         raw = opts.pop("options", None)
         wfile = opts.pop("write_sdpa", None)
         itol = opts.pop("inaccurate_tol", 1e-4)
@@ -431,6 +448,25 @@ class BRISK(ConicSolver):
         opts.pop("certify", None)          # accepted; a bound is always checked rigorously
         opts.pop("use_quad_obj", None)
         dims = data[ConicSolver.DIMS]
+        P = data.get(s.P)
+        if P is not None and sp.csc_matrix(P).nnz > 0:
+            # a QP: BRISK's QP solver on  min 1/2 x'Px + c'x,  A x + s = b,  s in {0}^zero x R+^nonneg  (CVXPY's conic form)
+            for k in ("conesolver", "form", "soc", "soc_arrow_max"):
+                opts.pop(k, None)
+            if bound or wfile:
+                raise SolverError("BRISK: bound and write_sdpa are for problems with cones, not for a QP")
+            aset = opts.pop("active_set", None)
+            A = sp.csc_matrix(data[s.A]); b = np.asarray(data[s.B], float).ravel()
+            nz = int(dims.zero)
+            lo = np.concatenate([b[:nz], np.full(b.size - nz, -np.inf)])
+            argv = (_core.options_to_argv(opts) + _core.options_to_argv(raw)
+                    + ([] if aset is None else ["-qpas"] if aset else ["-qpipm"]))
+            try:
+                res = _core.solve_qp(sp.csc_matrix(P), np.asarray(data[s.C], float).ravel(), A if A.shape[0] else None,
+                                     lo, b, None, None, options=argv, verbose=verbose, _caller="cvxpy")
+            except RuntimeError as e:
+                raise SolverError(str(e)) from e
+            return {"qp": res, "itol": itol}
         cone = opts.pop("conesolver", 1)
         if (int(cone) != 0 and not list(dims.psd) and not bound and form == "auto" and soc == "auto"
                 and not wfile and not any(k in opts for k in ("prec", "fom", "mfipm", "lralm"))):
@@ -477,6 +513,8 @@ class BRISK(ConicSolver):
     def invert(self, solution, inverse_data):
         if "cone" in solution:
             return self._invert_cone(solution, inverse_data)
+        if "qp" in solution:
+            return self._invert_qp(solution, inverse_data)
         res, info = solution["res"], solution["info"]
         attr = {s.SOLVE_TIME: res.time, s.NUM_ITERS: res.iterations,
                 s.EXTRA_STATS: {"status": res.status_str, "dimacs": res.dimacs,
@@ -528,6 +566,21 @@ class BRISK(ConicSolver):
         if status in (s.INFEASIBLE, s.INFEASIBLE_INACCURATE):
             z = self._certificate(res, info, solution["b"])
             return failure_solution(status, attr, dual_dict(z))
+        return failure_solution(status, attr)
+
+    def _invert_qp(self, solution, inverse_data):
+        """The result of BRISK's QP solver (CVXPY's conic form with P: the duals y with P x + c + A'y = 0, y in K*)."""
+        res = solution["qp"]
+        attr = {s.SOLVE_TIME: getattr(res, "time", None), s.NUM_ITERS: res.iterations,
+                s.EXTRA_STATS: {"status": getattr(res, "status_str", None), "form": "qp", "result": res}}
+        status = BRISK_QP.STATUS.get(res.status, s.SOLVER_ERROR)
+        if status in s.SOLUTION_PRESENT:
+            y = -np.asarray(res.y, float)
+            nz = inverse_data[ConicSolver.DIMS].zero
+            d = utilities.get_dual_values(y[:nz], utilities.extract_dual_value, inverse_data[self.EQ_CONSTR])
+            d.update(utilities.get_dual_values(y[nz:], utilities.extract_dual_value, inverse_data[self.NEQ_CONSTR]))
+            return Solution(status, float(res.obj) + inverse_data[s.OFFSET], {inverse_data[self.VAR_ID]: np.asarray(res.x, float)},
+                            d, attr)
         return failure_solution(status, attr)
 
     def _invert_cone(self, solution, inverse_data):
@@ -601,6 +654,7 @@ class BRISK_QP(QpSolver):
 
     def solve_via_data(self, data, warm_start, verbose, solver_opts, solver_cache=None):
         opts = dict(solver_opts or {})
+        verbose = bool(opts.pop("log", verbose))    # log=True: BRISK's log without CVXPY's own messages (verbose=True: both)
         raw = opts.pop("options", None)
         aset = opts.pop("active_set", None)            # (None: the solver's choice; True / False: that method)
         opts.pop("use_quad_obj", None)
