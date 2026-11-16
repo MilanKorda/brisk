@@ -111,6 +111,46 @@ static double schur_entries_rows(const Row *R, int m, const char *dead, const Pr
     free(soff); free(lpc); free(bc); free(last);
     return s;
 }
+/* 12 November 2026 (ISSUES 877): the assembly of the Schur complement estimated from the rows, in the units of a BLAS-3
+ * flop (a sparse operation counted as 20, the c_sparse / c_blas of the route model, problem.c). For each semidefinite
+ * block of order n whose rows hold E entries in all, a row with e entries on it costs the cheaper of its two routes:
+ * the entry-by-entry products with every row of the block (20 e E) and the dense product of its rows with the scaling
+ * matrices followed by the gather (2 min(2e, n) n^2 + 20 E). Each LP index adds 20 c^2 for the c rows it is in. */
+static double asm_rows(const Row *R, int m, const char *dead, const Problem *P) {
+    const int nb = P->nblk;
+    const double cs = 20.0;
+    long *soff = fx(sizeof(long) * (nb + 1));
+    for (int k = 0; k < nb; k++) soff[k + 1] = soff[k] + (P->blk[k].type == BLK_LP ? P->blk[k].n : 0);
+    long *lpc = fx(sizeof(long) * (soff[nb] + 1));
+    double *E = fx(sizeof(double) * (nb + 1));
+    for (int r = 0; r < m; r++) {
+        if (dead && dead[r]) continue;
+        for (int q = 0; q < R[r].n; q++) {
+            if (R[r].e[q].v == 0) continue;
+            const uint64_t k = R[r].e[q].k; const int b = KB(k);
+            if (b < 0 || b >= nb) continue;
+            if (P->blk[b].type == BLK_LP) lpc[soff[b] + KI(k)]++; else E[b] += 1;
+        }
+    }
+    double s = 0;
+    int *e = fx(sizeof(int) * (nb + 1));
+    for (int r = 0; r < m; r++) {
+        if (dead && dead[r]) continue;
+        for (int q = 0; q < R[r].n; q++) {
+            if (R[r].e[q].v == 0) continue;
+            const int b = KB(R[r].e[q].k);
+            if (b >= 0 && b < nb && P->blk[b].type == BLK_SDP) e[b]++;
+        }
+        for (int b = 0; b < nb; b++) if (e[b]) {
+            const double n = P->blk[b].n, eb = e[b];
+            s += fmin(cs * eb * E[b], 2.0 * fmin(2.0 * eb, n) * n * n + cs * E[b]);
+            e[b] = 0;
+        }
+    }
+    for (long i = 0; i < soff[nb]; i++) s += cs * (double)lpc[i] * lpc[i];
+    free(soff); free(lpc); free(E); free(e);
+    return s;
+}
 static void row_push(Row *R, uint64_t k, double v) {
     if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 8; R->e = realloc(R->e, sizeof(RE) * R->cap); }
     R->e[R->n].k = k; R->e[R->n].v = v; R->n++;
@@ -302,6 +342,23 @@ int free_pairs_detect(const Problem *P, FreePair **out) {
 }
 
 static int g_fe_cheaponly = 0;   /* (the fill-free retry of a rejected elimination by cost, below) */
+/* 8 November 2026: the pivot tolerance chosen by the cost model. The stable pivot (the column's largest entry) keeps the
+ * multipliers small but ignores the fill; within 0.1 of the largest the sparsest row is taken, and the multipliers can grow
+ * along the chain of substitutions. Neither is right for every problem: a user's unsteady Navier-Stokes relaxations (SDP)
+ * need the first (the eliminated problem 31 iterations against 19 with 0.1, and reduced accuracy on three grids), the
+ * occupation-measure relaxations the second (the first fills: roa_acrobot_d4_K 4,810 -> 19,520 nonzeros and refused,
+ * against 5,391 eliminated; attr_vdp_d14_I numerical difficulties against OPTIMAL). The cost model that decides whether to
+ * eliminate at all ranks them the same way on every one of these files (the Navier-Stokes models 0.80 / 0.86 / 0.87 with
+ * the largest entries against 1.35 / 1.09 / 1.11 within 0.1; the occupation measures 0.029, 0.244, 1.90, 0.026 against
+ * 0.014, 0.204, 0.43, 0.012): the elimination within 0.1 is costed first without rebuilding the problem (a probe), then the
+ * stable one runs and gives way to the other when the probe's estimate is lower by a tenth or more (the estimate counts
+ * entries, not flops: a near tie keeps the stable pivots, whose multipliers are bounded; at 0.96 a rescaled copy of a
+ * user's 10x1x1 grid took 17 iterations with the sparse pivots against 13, while every file the rule is for lies at 0.84
+ * or below). BRISK_FEPIV fixes the tolerance (no probe); BRISK_FEPIVAUTO=0: the stable pivot alone, as before */
+static int g_fe_probe = 0; static double g_fe_probe_ratio = INFINITY, g_fe_probe_prod = INFINITY, g_fe_tol = 0;
+static long g_fe_probe_cand = 0;   /* (8 November 2026: the probe's rows that are candidates of the facial reduction) */
+double g_fe_refused_tol = 0;       /* (the pivot tolerance of the refused elimination g_fe_refused_cost describes; 0: the stable one) */
+void free_elim_force_tol(double t) { g_fe_tol = t; }   /* (the forced eliminations of the test in main.c take the refused one's tolerance) */
 double g_fe_refused_cost = 0;   /* (4 November 2026, ISSUES 760: the estimate of an elimination refused on its cost alone; 0 otherwise) */
 long g_fe_refused_cand = 0;      /* (the eliminated rows that are candidates of the single-constraint facial reduction) */
 /* a row of the eliminated problem as a candidate of the single-constraint facial reduction: rhs zero (tested by the
@@ -331,7 +388,12 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
     int cheap = 0, bycost = 0;
     const double tfe0 = wtime(); const int fedbg = getenv("BRISK_FEDBG") != NULL;
     if (!g_fe_cheaponly) g_fe_refused_cost = 0;
-    int npr = free_pairs_detect(P, &pr);
+    /* (9 November 2026) the probe below gets the pairs of the call that runs it (the same problem, unchanged): a D-optimal
+     * design's 12,000 LP columns of about 800 entries were read twice, 0.33 s each. BRISK_FEPAIRS=0: detected again */
+    static const FreePair *g_given = NULL; static int g_ngiven = 0;
+    int npr;
+    if (g_given && g_fe_probe) { npr = g_ngiven; pr = malloc(sizeof(Pair) * (npr + 1)); memcpy(pr, g_given, sizeof(Pair) * npr); }
+    else npr = free_pairs_detect(P, &pr);
     if (fedbg) printf("   [free-elim: %d pairs detected %.2fs]\n", npr, wtime() - tfe0);
     if (npr == 0) { free(pr); return NULL; }
     if (automatic) {
@@ -359,6 +421,19 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
             if (bc_env && !g_fe_cheaponly && npr <= m) bycost = 1;
             else { cheap = 1; maxfill = 4.0; }
         }
+    }
+    double r_probe = INFINITY, r_probe_p = INFINITY;     /* (8 November 2026: the estimate of the elimination within 0.1, see g_fe_probe; _p: by entries, below) */
+    if (automatic && !cheap && !g_fe_probe && !g_fe_cheaponly && g_fe_tol == 0 && !getenv("BRISK_FEPIV")
+        && !(getenv("BRISK_FEPIVAUTO") && atoi(getenv("BRISK_FEPIVAUTO")) == 0)) {
+        g_fe_probe = 1; g_fe_tol = 0.1; g_fe_probe_ratio = INFINITY; g_fe_probe_prod = INFINITY;
+        { static int gp = -1; if (gp < 0) { const char *e = getenv("BRISK_FEPAIRS"); gp = !(e && atoi(e) == 0); } if (gp) { g_given = pr; g_ngiven = npr; } }
+        PSFreeElim *Fp = free_eliminate(P, 0, maxfill, automatic);
+        g_given = NULL; g_ngiven = 0;
+        if (Fp) free_elim_free(Fp);
+        r_probe = g_fe_probe_ratio; r_probe_p = g_fe_probe_prod;
+        g_fe_probe = 0; g_fe_tol = 0;
+        if (!g_fe_cheaponly) g_fe_refused_cost = 0;
+        if (fedbg) printf("   [free-elim: the elimination within 0.1 of the largest entries is estimated at %.3f]\n", r_probe);
     }
     /* 22 October 2026: the fill-free mode eliminates a pair only through a row whose Markowitz product (live entries - 1)
      * (column count - 1) is at most maxfill, among the rows within the pivot tolerance of its column; when no pair has
@@ -457,13 +532,22 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
     long fill0 = 0, fill1 = 0;
     for (int r = 0; r < m; r++) fill0 += R[r].n;
     const double se0 = automatic ? schur_entries_rows(R, m, NULL, P) : 0;   /* (the sparse estimate below) */
+    const double as0 = automatic ? asm_rows(R, m, NULL, P) : 0;          /* (the dense estimate below) */
     /* 4.30: live column counts kept incrementally (a heap of (count, f) with lazy
      * invalidation; only the free variables of a pivot row change) - the full rescan per
      * step was quadratic (9 s for the 3485 pairs of the dual form of nn_n10_m50_K) */
     /* keys (count, f): the smallest count first, ties by the pair's index (the order of the
      * full rescan, so the pivots are the same as before) */
     const int g_ferev = getenv("BRISK_FEREV") ? atoi(getenv("BRISK_FEREV")) : 0;
-    const double g_fepiv = getenv("BRISK_FEPIV") ? atof(getenv("BRISK_FEPIV")) : 0.1;   /* pivot threshold (relative to the column's largest entry) */   /* debugging: 1 reversed tie-break, 2 none */
+    /* 7 November 2026: the pivot of a free column: the column's largest entry (the stable choice, BRISK_FEPIV, 1; it was 0.1),
+     * the sparsest such row; the pair is kept when that fills too much (BRISK_FEPIVR=0.1: then the sparsest row within 0.1
+     * of the largest first, an experiment: on Charlie's files and roa_vdp_inner_d12_K its eliminations filled more and the
+     * cost rule refused them, file 2 4.8 -> 7.9 s, the 5x2x2 grid 22.0 -> 34.3 s). The substitution's multipliers stay in every row of the problem solved, so their growth (up to 1/0.1 a
+     * step, compounding along the chain of substitutions) conditions every iteration: a user's unsteady Navier-Stokes
+     * relaxation (SDP), eliminated with pivots within 0.1: 31 iterations; with the largest entries: 19. With the largest
+     * entries alone the fill test kept 296 pairs of roa_vdp_inner_d14_I (SDP) as pairs (38 iterations instead of 33). */
+    const double g_fepiv = g_fe_tol > 0 ? g_fe_tol : getenv("BRISK_FEPIV") ? atof(getenv("BRISK_FEPIV")) : 1.0;   /* the stable pivot (relative to the column's largest entry) */
+    const double g_fepivr = getenv("BRISK_FEPIVR") ? atof(getenv("BRISK_FEPIVR")) : 0.0;   /* the relaxed pivot when the stable one fills too much (0: none) */   /* debugging: 1 reversed tie-break, 2 none */
     int64_t *hk = fx(sizeof(int64_t) * (npr + 1)); int *hf = fx(sizeof(int) * (npr + 1)); int nh = 0, hc = npr + 1;
 #define HPUSH(k_, f_) do { if (nh == hc) { hc *= 2; hk = realloc(hk, sizeof(int64_t) * hc); hf = realloc(hf, sizeof(int) * hc); } \
         int i_ = nh++; hk[i_] = (int64_t)(k_) * npr + (g_ferev == 2 ? 0 : g_ferev ? npr - 1 - (f_) : (f_)); hf[i_] = (f_); \
@@ -494,13 +578,17 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         double amax = 0;
         for (int q = 0; q < cn[f]; q++) amax = fmax(amax, fabs(row_get(&R[cl[f][q]], fk[f])));
         int piv = -1; double pmk = 1e300, pa = 0;
+        int pivr = -1; double pmkr = 1e300, par = 0;
         for (int q = 0; q < cn[f]; q++) {
             int r = cl[f][q];
             double a = row_get(&R[r], fk[f]);
-            if (fabs(a) < g_fepiv * amax) continue;
+            if (fabs(a) < (g_fepivr > 0 ? g_fepivr : g_fepiv) * amax) continue;
             double mkz = (double)(R[r].live - 1) * (cn[f] - 1);
+            if (mkz < pmkr || (mkz == pmkr && fabs(a) > fabs(par))) { pmkr = mkz; pivr = r; par = a; }
+            if (fabs(a) < g_fepiv * amax) continue;
             if (mkz < pmk || (mkz == pmk && fabs(a) > fabs(pa))) { pmk = mkz; piv = r; pa = a; }
         }
+        if (g_fepivr > 0 && (piv < 0 || pmk > maxfill) && pivr >= 0 && pmkr <= maxfill) { piv = pivr; pmk = pmkr; pa = par; }
         if (piv < 0 || pmk > maxfill) { skip[f] = 1; continue; }
         /* record the step (row and column as they are now) */
         row_compact(&R[piv]);
@@ -556,7 +644,7 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
      * case1354 5.8 -> 18.3 s. On the kernel-form SOS problems (dense Schur complement) the
      * nonzeros grow x2-6 while m falls by 14-66%. Estimate: dense Schur complement (clique
      * density of the block pattern above 0.3): (m1/m0)^3 (nnz1/nnz0); sparse: (m1/m0)(nnz1/nnz0). */
-    double cost_ratio = 0;
+    double cost_ratio = 0, cost_prod = 0;
     if (automatic && !cheap) {
         const long mn_est = m - nelim - nempty;
         double cl2 = 0;
@@ -584,15 +672,70 @@ PSFreeElim *free_eliminate(Problem *P, int verbose, double maxfill, int automati
         /* (the elimination is taken when either measure of the work says it is cheaper: the split pairs also cost what
          * neither counts, the regularized Schur solves and the accuracy lost to them; copo14 (DIMACS, SDP): Schur entries
          * x1.10 but rows x nonzeros 0.14, 0.24 s eliminated against 0.37 s kept as pairs, median of 5) */
-        cost_ratio = dens >= 0.3 ? rm * rm * rm * rn : fs_env ? fmin(rs, rm * rn) : rm * rn;
+        /* 12 November 2026 (ISSUES 877): a dense Schur complement's iteration as the sum of its parts, each in BLAS-3 flops:
+         * the factorization m^3/3, the assembly (asm_rows) and the free variables kept (their columns solved with the
+         * factor, 2 m^2 each, and A_f' Y, m nf^2). Until then (m1/m0)^3 (nnz1/nnz0): the nonzeros' growth multiplied into
+         * the factorization, which does not depend on them. The k-means relaxation in SDPA's primal form (SDP, 120
+         * points, 7,260 rows, 121 free variables; constraints of 1-3 entries on one block of order 120): 0.95 x 1.58 =
+         * 1.50, refused, where the factorization is 1.3e11 flops an iteration and the assembly about 1e9-1e10; eliminated,
+         * 9.9 s OPTIMAL against 42.6 s. BRISK_FEASM=0: the product, as before */
+        static int fa_env = -1; if (fa_env < 0) { const char *e = getenv("BRISK_FEASM"); fa_env = !(e && atoi(e) == 0); }
+        double as1 = 0, wd0 = 0, wd1 = 0;
+        if (dens >= 0.3 && fa_env) {
+            as1 = asm_rows(R, m, dead, P);
+            const double m0 = m, m1 = (double)mn_est, f0 = npr, f1 = npr - nelim;
+            wd0 = m0 * m0 * m0 / 3.0 + as0 + 2.0 * f0 * m0 * m0 + m0 * f0 * f0;
+            wd1 = m1 * m1 * m1 / 3.0 + as1 + 2.0 * f1 * m1 * m1 + m1 * f1 * f1;
+        }
+        cost_ratio = dens >= 0.3 ? (fa_env ? wd1 / fmax(wd0, 1.0) : rm * rm * rm * rn) : fs_env ? fmin(rs, rm * rn) : rm * rn;
+        /* (the choice between the stable pivots and those within 0.1 below compares the fill of two eliminations of about
+         * the same rows: it keeps the measure by entries its margin was set on, (m1/m0)^3 (nnz1/nnz0) on a dense Schur
+         * complement; the sum above dilutes the difference by the factorization both share: attr_vdp_d14_K (an occupation
+         * measure, SDP) 0.798 against 0.884 by the sum, 0.204 against 0.244 by entries; with the stable pivots, chosen on
+         * the sum, reduced accuracy 1.0e-7 in 2.3 s against OPTIMAL in 1.5 s) */
+        cost_prod = dens >= 0.3 ? rm * rm * rm * rn : cost_ratio;
+        if (fedbg && dens >= 0.3 && fa_env) printf("   [free-elim: dense estimate: factor %.3g -> %.3g, assembly %.3g -> %.3g, free %.0f -> %d; the old product %.3f]\n", (double)m * m * m / 3.0, (double)mn_est * mn_est * mn_est / 3.0, as0, as1, (double)npr, npr - nelim, rm * rm * rm * rn);
         if (fedbg) printf("   [free-elim: cost ratio %.3f (rows %d -> %ld, nonzeros %ld -> %ld, clique density %.3f; each block its own clique %.3f); Schur entries from every source %.3g -> %.3g (ratio %.3f)]\n", cost_ratio, m, mn_est, fill0, fill1, dens, dens0, se0, se1, rs);
     }
-    if (automatic && !cheap && (fill1 > 8 * fill0 || 4 * nelim < 3 * npr || cost_ratio > 1.0)) {
+    const int fe_refuse = automatic && !cheap && (fill1 > 8 * fill0 || 4 * nelim < 3 * npr || cost_ratio > 1.0);
+    const double fe_eff = (fill1 > 8 * fill0 || 4 * nelim < 3 * npr) ? INFINITY : cost_ratio;   /* (the estimate, INFINITY when refused on fill or count) */
+    const double fe_eff_p = fe_eff < INFINITY ? cost_prod : INFINITY;                                 /* (the same by entries) */
+    const int fe_isprobe = automatic && !cheap && g_fe_probe, fe_switch = automatic && !cheap && !g_fe_probe && r_probe_p < 0.9 * fe_eff_p && r_probe <= 1.0;
+    if (fe_isprobe || fe_switch) {
+        /* (the probe records its estimate; a stable elimination whose estimate the probe's beats gives way to it; the
+         * problem is untouched so far) */
+        if (fe_isprobe) {
+            g_fe_probe_ratio = fe_eff; g_fe_probe_prod = fe_eff_p; g_fe_probe_cand = 0;
+            if (!bycost && fe_eff < INFINITY)
+                for (int r = 0; r < m; r++)
+                    if (!dead[r] && R[r].n > 0 && fabs(b[r]) <= 1e-12 * (1.0 + fabs(P->b[r])) && fe_row_candidate(&R[r])) g_fe_probe_cand++;
+        }
+        for (int r = 0; r <= m; r++) free(R[r].e);
+        free(R); free(b); free(mk); free(fk); free(kf);
+        for (int f = 0; f < npr; f++) free(cl[f]);
+        free(cl); free(cn); free(cc); free(dead); free(elim); free(skip); free(tmp); free(seen); free(buf); free(pr);
+        free_elim_free(F);
+        if (fe_isprobe) return NULL;
+        if (fedbg) printf("   [free-elim: the stable pivots' estimate %.3f, within 0.1 %.3f: the latter]\n", fe_eff, r_probe);
+        g_fe_tol = 0.1;
+        PSFreeElim *F2 = free_eliminate(P, verbose, maxfill, automatic);
+        g_fe_tol = 0;
+        return F2;
+    }
+    if (fe_refuse) {
         g_fe_refused_cost = (!bycost && !(fill1 > 8 * fill0) && !(4 * nelim < 3 * npr)) ? cost_ratio : 0.0;
-        g_fe_refused_cand = 0;
+        g_fe_refused_cand = 0; g_fe_refused_tol = 0;
         if (g_fe_refused_cost > 0)
             for (int r = 0; r < m; r++)
                 if (!dead[r] && R[r].n > 0 && fabs(b[r]) <= 1e-12 * (1.0 + fabs(P->b[r])) && fe_row_candidate(&R[r])) g_fe_refused_cand++;
+        /* 8 November 2026: the elimination within 0.1 of the largest entries, when its estimate is the lower one by the
+         * pivot rule's margin, is the refused elimination the facial-reduction test (main.c) weighs: the stable pivots
+         * fill more and combine other rows, and the face the test looks for is exposed by the sparse one (roa_acrobot_d6_K,
+         * an occupation measure, SDP: 4.09 and no candidate with the stable pivots, 1.03 and the face of 1,221 rows within
+         * 0.1). BRISK_FEFRPIV=0: the stable one's, as before */
+        { static int fp = -1; if (fp < 0) { const char *e = getenv("BRISK_FEFRPIV"); fp = !(e && atoi(e) == 0); }
+          if (fp && !bycost && r_probe < INFINITY && r_probe_p < 0.9 * fe_eff_p && g_fe_probe_cand > 0) {
+              g_fe_refused_cost = r_probe; g_fe_refused_cand = g_fe_probe_cand; g_fe_refused_tol = 0.1; } }
         if (fedbg) printf("   [free-elim: %ld rows of the eliminated problem are candidates of the facial reduction]\n", g_fe_refused_cand);
         if (verbose && !bycost)
             printf("presolve: free elimination not used (%d of %d pairs eliminated, nonzeros %ld -> %ld, estimated cost ratio %.2f)\n", nelim, npr, fill0, fill1, cost_ratio);

@@ -49,9 +49,13 @@ int  lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M)
 int  lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, double **ub);
 /* x of the general form from the standard form's solution; returns the objective (file convention) */
 double lp_recover(const LpProb *L, const LpMap *M, const double *xstd, double *x);
+int lp_presolve_nops(void);   /* (11 November 2026, a diagnostic) the operations of the last presolve */
+void lp_dual_postsolve(const LpProb *L, const double *x, double *y);   /* (11 November 2026) the removed rows' duals */
 double lp_rowviol_act(const LpProb *L, const double *x);
 /* errors of x on the problem as read: max bound and row violations, relative */
 void lp_errors(const LpProb *L, const double *x, double *ebound, double *erow);
+/* the largest absolute bound and row violations of x on L (as Gurobi's BoundVio and ConstrVio) */
+void lp_errors_abs(const LpProb *L, const double *x, double *ebound, double *erow);
 void lp_map_free(LpMap *M);
 int  lp_is_mps(const char *fname);
 /* CBF files (CBLIB): continuous problems with linear and second-order cones, in SeDuMi form;
@@ -65,5 +69,9 @@ int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double
 /* (28 October 2026) 1: lp_to_std of the calling thread skips its search for dependent rows (its input is the simplex method's
  * presolved problem, which has had them removed); the caller sets it back to 0 */
 void lp_set_nodeprows(int v);
-int  cbf_read_vmap(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, int **vmap, signed char **vmsgn, int *nvar, char *msg, size_t nmsg);
+/* (12 November 2026) what -y and -z on a CBF file need: rmap[i] the solver's row of constraint i (-1: a free constraint), and for the
+ * n0 variables fixed at zero (L=), dropped from the solver's form, their costs and columns (CSC over the solver's rows) */
+typedef struct { int ncon, n0; int *rmap; double *c0col; long *zp; int *zi; double *zx; } CbfDualMap;
+int  cbf_read_vmap(const char *fname, SedumiProb *S, double *c0, int *maxim, int *nint, int **vmap, signed char **vmsgn, int *nvar, CbfDualMap *dm, char *msg, size_t nmsg);
+void cbf_dualmap_free(CbfDualMap *dm);
 #endif

@@ -100,8 +100,13 @@ static void usage(void) {
         "                   2 also substitutions: free column singletons, opposite column pairs, implied free\n"
         "                   columns by their equality rows; 3 (default) with -lpmethod 1, first parallel rows\n"
         "                   and columns, doubleton equations and slack columns, then as 2\n"
-        "  -lpmethod <k>    not given (default): the LP interior-point method and, with two threads or more, the\n"
-        "                   dual simplex method beside it on one thread; the first to end with a result gives it, which\n"
+        "  -lpmethod <k>    not given (default): below 1,000 nonzeros, or when the matrix is a network matrix (every\n"
+        "                   column at most two entries, each +-1), the dual simplex method alone; otherwise\n"
+        "                   the LP interior-point method and, with two threads or more, the\n"
+        "                   dual simplex method beside it on one thread (on a problem with many more rows than columns\n"
+        "                   and four threads or more, a second one at a low priority, on the problem's dual and on the problem\n"
+        "                   itself; five threads elsewhere than on Linux);\n"
+        "                   the first to end with a result gives it, which\n"
         "                   can then differ from run to run (-threads 1: the interior-point method alone, the same result\n"
         "                   every run); a result at reduced accuracy waits for the dual simplex method at most twice the\n"
         "                   time taken; 1 the LP interior-point method alone, 0 the SOCP solver directly (also for an\n"
@@ -113,13 +118,13 @@ static void usage(void) {
         "  -lpcorr <k>      the interior-point method's centrality correctors per iteration (-lpmethod 1, 4\n"
         "                   and 5; default: 0-3 from the cost of a factorization against a solve)\n"
         "A problem in SeDuMi format without semidefinite blocks (a linear or second-order cone program)\n"
-        "is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -timelimit, -q,\n"
+        "is solved by the SOCP solver: its options are -tol, -acc, -maxit, -timelimit, -q,\n"
         "-v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With\n"
-        "semidefinite blocks, or with -conesolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem\n"
+        "semidefinite blocks, or with -socpsolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem\n"
         "goes to the semidefinite solver (second-order cones as arrow blocks, which its self-dual embedding\n"
         "solves as second-order cones again: -soc) with all the options below. A problem whose semidefinite\n"
         "blocks are all of order 1 or 2 or have arrow data (an SOCP written in semidefinite form) is again\n"
-        "solved by the SOCP solver, a block of order 2 as a second-order cone of dimension 3 (-conesolver 0: not).\n"
+        "solved by the SOCP solver, a block of order 2 as a second-order cone of dimension 3 (-socpsolver 0: not).\n"
         "output\n"
         "  -q | -v          quiet | the diagnosis: every step of the solver (the default log shows the problem, the\n"
         "                   presolve's changes, the method, one line per iteration and the Summary)\n"
@@ -127,6 +132,8 @@ static void usage(void) {
         "  -y <file>        write y (SDPA primal x = -y), one value per line, original numbering\n"
         "  -x <file>        write X of the original problem (SDPA sparse-like: block i j value, upper triangle)\n"
         "  -z <file>        write Z = C - A'y of the original problem, same format\n"
+        "                   (a CBF file of an LP or SOCP: -x one value per variable, -y one multiplier per constraint,\n"
+        "                   -z = c - A'y one value per variable, CBF's dual; a maximized file: y and z negated)\n"
         "termination\n"
         "  -acc <level>     accuracy: low (tol 1e-6), default (1e-8) or high (1e-10). low also scales the\n"
         "                   re-solve thresholds (10 tol, 100 tol after the embedding) and the reduced-\n"
@@ -209,9 +216,15 @@ static void usage(void) {
         "                   (1e-24 for dd, 1e-48 for qd, 1e-77 for 100 digits) and a result within\n"
         "                   2^(-0.6 bits) (1e-19, 1e-38, 1e-62) counts as OPTIMAL; -fom / -lralm aim at the latter\n"
         "method\n"
-        "  -conesolver 0    a problem in SeDuMi format without semidefinite blocks, or one whose semidefinite\n"
+        "  -socpsolver 0    a problem in SeDuMi format without semidefinite blocks, or one whose semidefinite\n"
         "                   blocks are all of order 1 or 2 or have arrow data: by the semidefinite solver\n"
         "                   (second-order cones as arrow blocks) instead of the SOCP solver (default 1)\n"
+        "  -socpfr <k>      facial reduction in the SOCP solver (LPs and SOCPs it solves): 0 none (default: a solve that\n"
+        "                   fails because the problem has no strictly feasible point says so in the Summary); 1 the\n"
+        "                   face of the feasible set that such a solve shows (variables zero and cones on one ray in\n"
+        "                   every feasible point) is solved again and its result returned; 2 also the faces single\n"
+        "                   constraints prove (a row whose terms are all of one sign with right-hand side 0),\n"
+        "                   removed before the solve\n"
         "  -dual            dual-scaling method (DSDP-style: potential reduction, correctors, verified\n"
         "                   certificates); falls back to the primal-dual method unless certified\n"
         "  -hsd | -nohsd    force | forbid the self-dual embedding (default: automatic - the embedding first\n                   on most problems, the infeasible start first on large dense blocks with a cheap\n                   Schur complement; each method is the other's fallback)\n  -hsdfirst <0|1>  automatic method: the embedding first when its extra dense work is small or the\n                   problem tiny (1; 0: the infeasible start first); many split free pairs and the chordal moment\n                   form use the embedding either way\n  -hsdfirstc <c>   ... i.e. when c * sum n^3 <= m^3/3 (12),\n  -hsdfirstasm <f> ... or <= f * (m^3/3 + the estimated work of the Schur assembly) (0.5; 0: off)\n  -stdslow <k>     infeasible-start method: stop for the retry when the best score has not halved in k iterations (10; 0 off)\n"
@@ -236,14 +249,14 @@ static void usage(void) {
         "                   the corrections at the end and the polish probes of the embedding (-nopolishx:\n"
         "                   also the X-metric probe; -nodd: also the double-double endgame)\n  -crossover <k>   SDP crossover after the solve (Newton on the rank-revealed KKT system; kept only if\n                   the errors on the original data fall): 0 off (default), 1 on, -1 when cheap\n"
         "presolve\n"
-        "  -nofr            no facial-reduction presolve\n  -frdepth <k>     facial reduction cut at depth k: the reductions resting on k earlier ones are not made\n                   (default: no limit; 0: none, as -nofr); a shallower reduction keeps more of the dual (the\n                   multipliers, e.g. the moments of a moment relaxation) recoverable\n  -fr              facial reduction whatever its depth (default: skipped when of depth >= 2 and saving < frgain)\n  -frgain <g>      per-iteration saving that justifies a facial reduction of depth >= 2 (4)\n"
+        "  -nofr            no facial-reduction presolve\n  -frdepth <k>     facial reduction cut at depth k: the reductions resting on k earlier ones are not made\n                   (default: no limit; 0: none, as -nofr); a shallower reduction keeps more of the dual (the\n                   multipliers, e.g. the moments of a moment relaxation) recoverable\n  -fr              facial reduction whatever its depth (default: skipped when of depth >= 2, saving < frgain\n                   and resting on a certificate that holds only to a tolerance)\n  -frgain <g>      per-iteration saving that justifies a facial reduction of depth >= 2 resting on a\n                   certificate that holds only to a tolerance (4)\n  -lpface <k>      search, by linear programs, for faces of the feasible set hidden behind free variables, at\n                   most k levels (each level removes what the one before found and searches again; -1: until a\n                   level finds nothing), and report them in the Summary; the problem is not changed (default 0:\n                   no search). It runs where the free variables' elimination was refused near its break-even\n  -lpfaceall 1     the search of -lpface wherever free variables are left as split pairs\n"
         "  -soc <0|1>       semidefinite blocks whose data are arrow matrices (second-order cones written\n"
         "                   as matrix inequalities; the SeDuMi reader writes cones so next to semidefinite\n"
         "                   blocks) solved as second-order cones in the self-dual embedding (1)\n"
         "  -socmin <n>      ... blocks of at least this order (3)\n"
         "  -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance\n"
-        "  -frdual <k>      1: when the facial reduction's duals cannot be rebuilt, a second solve finds them on the problem as\n                   read: the dual of least violation whose objective equals the optimal value of the first solve (X and the\n                   value are kept; about one solve of the problem as read; 0, the default: the log says that the dual is lost)\n"
-        "  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: with f > 0 the problem is solved again\n                   without facial reduction, within f times the solve's time (0, the default: no re-solve; the reduced\n                   solve is returned as SOLVED TO REDUCED ACCURACY, the log says that the recovery failed, what is\n                   correct, and how to solve again without the reduction for the dual)\n"
+        "  -frdual <k>      the duals of the constraints the facial reduction removed, when zero is not a dual of the\n                   problem as read: they are rebuilt level by level from the reduction's certificates; when that fails:\n                   0 (default) they are returned as NaN (the reduced problem does not determine them), the dual's\n                   errors measured on its face; 1 a second solve finds a dual on the problem as read: the dual of\n                   least violation whose objective equals the optimal value of the first solve (X and the value are\n                   kept; about one solve of the problem as read); 2 the rebuilt duals are returned as they are,\n                   SOLVED TO REDUCED ACCURACY. After the dual form the same holds for the entries of X\n"
+        "  -frfallback <f>  removed duals not rebuilt though the reduced solve is good: with f > 0 the problem is solved again\n                   without facial reduction, within f times the solve's time (0, the default: no re-solve; the reduced\n                   solve is returned with the undetermined duals as NaN, -frdual)\n"
         "  -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated\n                   without the reduction, within this multiple of the solve's time (4; 0 = never)\n"
         "  -deprows <k>     remove the equality constraints that are linear combinations of others (their dual values\n"
         "                   are 0): 1 on (default), 0 off\n"
@@ -291,7 +304,8 @@ static void usage(void) {
         "                   does not fit in memory; a very sparse large block waits for the\n"
         "                   chordal conversion first), 0 off, 1 force (-1)\n"
         "  -bm <k>          the Burer-Monteiro solver (X = R R', nothing of size n^2 formed) for large sparse\n"
-        "                   SDPs with low-rank solutions, one semidefinite block (and LP blocks):\n"
+        "                   SDPs with low-rank solutions (with 1 also several semidefinite blocks and LP\n"
+        "                   variables):\n"
         "                   1 always, 0 never, -1 (default) automatically when the problem has one block of\n"
         "                   order n >= 500 and every constraint fixes a diagonal entry, once the linearly\n"
         "                   dependent constraints are removed (max-cut and its\n"
@@ -310,6 +324,12 @@ static void usage(void) {
         "                   -lrescape (1), -lrtrace R (with tr X <= R: report b'y - R lambda as a lower bound,\n"
         "                   Z >= -lambda I by a sparse Cholesky ladder); SDP blocks above n = 46 340 are\n"
         "                   accepted on this path\n"
+        "  -fomfirst <0|1>  on problems with few large dense blocks and a sparse A A' whose interior-point solve\n"
+        "                   is expected to be long (by its work, counted from the sizes), the first-order\n"
+        "                   engine first; it hands over to the interior-point method when its projected work\n"
+        "                   exceeds the interior-point method's, unless its errors are at most 1e-6; taken where at\n"
+        "                   least 99 % of the constraints fix a single entry of X (theta problems, matrix\n"
+        "                   completion) and at the default tolerance or looser (default 1; 0: off)\n"
         "  -fomrace <f>     at a tolerance of 1e-6 or looser (-acc low), on problems with few large dense\n"
         "                   and a sparse Gram matrix A A' (theta-type problems)\n"
         "                   that the presolve leaves as they are (no chordal conversion, no dual form)\n"
@@ -349,6 +369,9 @@ static void usage(void) {
         "                   representation (1 on, 0 off)\n"
         "  -symsign <k>     ... -sym auto: sign symmetries (D A D = ±A, D diagonal ±1) first: blocks split by\n"
         "                   sign pattern, odd constraints dropped (1 on, 0 off)\n"
+        "  -symrref <k>     ... -sym auto: when no sign symmetry is found, the equality constraints in\n"
+        "                   reduced row echelon form and the search again (finds the symmetries that\n"
+        "                   sums of constraints hide; 1 on, 0 off, the default)\n"
         "  -symsigned <k>   ... -sym auto: signed permutations (x_i -> ±x_g(i)): a second search on the\n"
         "                   absolute values of the data, signs lifted over GF(2), exact (1 on, 0 off)\n"
         "  -symmin <f>      ... -sym auto applies the reduction only when the constraints, the block\n"
@@ -384,13 +407,15 @@ static void usage(void) {
         "                   values grouped: localizing matrices): -1 auto, 0 off, 1 force\n"
         "  -mixed <k>       single-precision Schur factor + PCG: -1 auto (m>=1000), 0 off, 1 on\n"
         "  -route <r>       force Schur route of sparse constraints: 0 sparse-sparse, 1 row-product, 3 row-product on the union pattern\n"
-        "  -threads <k>     OpenMP threads for this solve: k >= 1 forces k (no automatic reduction);\n"
-        "                   0 or absent: automatic (OMP_NUM_THREADS, else all cores within the container's\n"
-        "                   CPU quota (cgroup cpu.max, Linux); problems too small\n"
-        "                   for threads run on one; on Linux fewer while other processes occupy the\n"
-        "                   cores, BRISK_NOBUSY=1 keeps the count). For this solve only: a later solve of\n"
-        "                   the same process starts again from the automatic count. The log states it\n"
-        "                   (\"Number of threads: k\", \"(forced by user)\", \"(problem too small for multithreading)\")\n"
+        "  -threads <k>     OpenMP threads for this solve: k >= 1 is a limit, at most the CPUs the process\n"
+        "                   can run on or its container's CPU quota; under it the automatic rules apply (problems\n"
+        "                   too small for threads run on one; on Linux fewer while other processes occupy the\n"
+        "                   cores, BRISK_NOBUSY=1 keeps the count). 0 or absent: automatic (OMP_NUM_THREADS, a\n"
+        "                   limit too, else all cores within the CPU quota). For this solve only: a later solve\n"
+        "                   of the same process starts again from the automatic count. The log states it\n"
+        "                   (\"Number of threads: k\", \"(at most k as set by the user)\", \"(problem too small for\n"
+        "                   multithreading)\"). An LP's interior-point method and the dual simplex method beside it\n"
+        "                   share the threads\n"
         "  -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on\n"
         "  -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)\n"
         "  -densemem <MB>   memory for dense constraint copies and the low-rank routes' products (768)\n"
@@ -551,9 +576,14 @@ typedef struct {
     PSOrig *Odual;          /* 4.30: the problem as read, when the dual form was solved (Ofile/Otb/O are then of the dual form) */
     PSDual *dual;
     PSOrig *Osym;           /* 4.32: the problem as read, when the symmetry reduction was applied (everything else is of the reduced one) */
+    PSOrig *Odep0;          /* 8 November 2026: the problem before the dependent rows were removed ahead of a second symmetry search */
+    int *dep0_keep, dep0_m, dep0_removed;   /* ... the rows kept (their indices in Odep0) and the count removed */
+    int dep_clean_m; size_t dep_clean_nnz;   /* 9 November 2026: the constraints the first test found independent (m, entries) */
     PSSym *sym;
     PSOrig *Osign;          /* 4.33: the problem as read, when the sign-symmetry reduction was applied (before the permutation one) */
     PSSign *sign;
+    PSOrig *Orref;          /* 16 November 2026: the problem before its constraints were put in reduced row echelon form (kept only when the sign-symmetry search then reduced it) */
+    PSRref *rref;
     PSOrig *Oalg;           /* 4.41: the problem before the *-algebra block diagonalisation (after the exact symmetry reductions) */
     BlkScale *aff;          /* 5.14: the semidefinite blocks in scaled coordinates (blkscale.c; an option) */
     MomAff *maff;           /* 5.12: a moment relaxation over an ellipsoid, solved in the coordinates of the unit ball */
@@ -570,6 +600,10 @@ typedef struct {
                              * held as cone vectors: the hub, or -1 (brisk.h, xc_index); NULL: none */
     int status, measured, fr_removed;
     int fr_faces;           /* 23 October 2026: of fr_removed, the faces of a lifted relaxation (lifted_faces), not constraints of the file */
+    unsigned char *undet;   /* 7 November 2026: the rows of O whose duals the problem solved does not determine (removed by the facial
+                             * reduction, or dependent on its face), NULL: none; their duals are returned as NaN when zero is not a dual
+                             * of the problem as read (ISSUES 755) */
+    int nundet;             /* ... and their number */
     /* 23 October 2026: run_pipeline's own re-solve with the second-order cones as semidefinite blocks (both runs, which
      * one this Run holds): the caller's entry in the Summary lists the two runs under its name, once each */
     int soc2_done, soc2_kept;
@@ -583,6 +617,27 @@ typedef struct {
     int fom_chordal;        /* 4.40: ... until after the chordal conversion (a very sparse large block) */
     double fr_cost;      /* per-iteration cost of the problem as read over that of the reduced problem (the model of the fr_gain rule) */
 } Run;
+/* 9 November 2026: the copy of the problem made before a reduction that then does not apply is kept and taken again by the next
+ * reduction when the problem has not changed since (the same hash of what the copy holds): an outside tester's
+ * quantum_tomography (SDP, 40.6 million entries) made five such copies of 0.5-0.7 s each in a 11.2 s presolve.
+ * BRISK_ORIGSPARE=0: a copy every time */
+static int g_bm_pipe = 0;   /* 16 November 2026: -bm 1 on several semidefinite blocks, solved inside the presolve pipeline */
+static PSOrig *g_ospare = NULL; static unsigned long long g_ospare_h = 0;
+static int orig_spare_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("BRISK_ORIGSPARE"); v = !(e && atoi(e) == 0); } return v; }
+static PSOrig *orig_take(const Problem *P, unsigned long long *h) {
+    if (!orig_spare_on()) { *h = 0; return ps_orig_build(P); }
+    *h = ps_orig_hash(P);
+    if (g_ospare && g_ospare_h == *h) { PSOrig *O = g_ospare; g_ospare = NULL; return O; }
+    if (g_ospare) { ps_orig_free(g_ospare); g_ospare = NULL; }
+    return ps_orig_build(P);
+}
+static void orig_release(PSOrig *O, unsigned long long h) {   /* O: a copy of the problem whose hash was h when it was made */
+    if (!O) return;
+    if (!orig_spare_on()) { ps_orig_free(O); return; }
+    if (g_ospare) ps_orig_free(g_ospare);
+    g_ospare = O; g_ospare_h = h;
+}
+static void orig_spare_drop(void) { if (g_ospare) { ps_orig_free(g_ospare); g_ospare = NULL; } }
 
 /* 23 October 2026: whether the trace bound changed the answer. The bound row adds R y_R to the value; of that,
  * s y_R is the row's complementarity (it vanishes at an optimum where the bound is slack) and (R - s) y_R = tr(X) y_R
@@ -601,9 +656,9 @@ static void run_free(Run *u) {
     if (u->Xo) { for (int k = 0; k < u->nXo; k++) free(u->Xo[k]); free(u->Xo); }
     free(u->xc_p); free(u->xc_o);
     if (u->X) { for (int k = 0; k < u->P.nblk; k++) free(u->X[k]); free(u->X); }
-    free(u->y); free(u->yo);
+    free(u->y); free(u->yo); free(u->undet); u->undet = NULL;
     ps_free(u->P.ps); u->P.ps = NULL;
-    ps_orig_free(u->O);
+    ps_orig_free(u->O); orig_spare_drop();
     if (u->Ofile) ps_orig_free(u->Ofile);
     if (u->Otb) ps_orig_free(u->Otb);
     if (u->Odual) ps_orig_free(u->Odual);
@@ -614,8 +669,12 @@ static void run_free(Run *u) {
     blkscale_free(u->aff); u->aff = NULL; u->Oaff = NULL;
     if (u->Osym) ps_orig_free(u->Osym);
     sym_free(u->sym);
+    if (u->Odep0) ps_orig_free(u->Odep0);
+    free(u->dep0_keep); u->dep0_keep = NULL;
     if (u->Osign) ps_orig_free(u->Osign);
     sign_free(u->sign);
+    if (u->Orref) ps_orig_free(u->Orref);
+    rref_free(u->rref);
     if (u->Oalg) ps_orig_free(u->Oalg);
     alg_free(u->alg);
     free_elim_free(u->fe);
@@ -749,6 +808,13 @@ static PSOrig *map_back(Run *u, const Params *par, double ***pXo, double **pyo, 
         Xo = Xs; yo = ys; *pnXo = u->Osym->nblk;
         O = u->Osym;
     }
+    if (u->Odep0) {
+        /* 8 November 2026: the rows removed as linearly dependent before the symmetry search get dual value 0; X unchanged */
+        double *yd = calloc(u->Odep0->m + 1, sizeof(double));
+        for (int i = 0; i < u->dep0_m; i++) yd[u->dep0_keep[i]] = yo[i];
+        free(yo); yo = yd;
+        O = u->Odep0;
+    }
     if (u->sign) {
         /* 4.33: X embedded into the file's blocks (zero between sign classes), y = 0 on the dropped constraints */
         double *ys = calloc(u->Osign->m + 1, sizeof(double)), **Xs = NULL;
@@ -762,6 +828,13 @@ static PSOrig *map_back(Run *u, const Params *par, double ***pXo, double **pyo, 
         Xo = Xs; yo = ys; *pnXo = u->Osign->nblk;
         O = u->Osign;
     }
+    if (u->rref) {
+        /* 16 November 2026: y = T' y of the rows in reduced row echelon form (0 on the dependent rows); X unchanged */
+        double *yr = calloc(u->Orref->m + 1, sizeof(double));
+        rref_unmap_y(u->rref, yo, yr);
+        free(yo); yo = yr;
+        O = u->Orref;
+    }
     if (u->aff || u->maff) {
         /* 5.14: from the scaled coordinates (5.12: of the unit ball) back to those of the file (the blocks and the rows are the same) */
         double **Xa = NULL, *ya = calloc(u->Oaff->m + 1, sizeof(double));
@@ -774,6 +847,42 @@ static PSOrig *map_back(Run *u, const Params *par, double ***pXo, double **pyo, 
     }
     *pXo = Xo; *pyo = yo;
     return O;
+}
+
+static int g_fr_dual_face = 0;   /* 7 November 2026: the duals the reduced problem does not determine returned as NaN (their number),
+                                  * the dual's errors those of the face; 0: y is a dual of the problem as read */
+/* 7 November 2026: the returned y gets NaN on the rows whose duals the reduced problem does not determine (u->undet, rows of
+ * u->O) and on every row of the problem as read whose dual the back maps derive from one of them (the free-variable
+ * elimination's pivot rows, the symmetry's orbits, the scalings): a probe, NaN on those rows and 0 elsewhere, mapped back
+ * the same way as the solution (NaN stays NaN through every sum it enters) */
+static int g_fr_prim_face = 0;   /* 9 November 2026: the entries of X (upper triangles) returned as NaN after the dual form (below) */
+static void undet_apply(Run *u, const Params *par, const PSOrig *Ofin, double *yo, double **Xo) {   /* (yo, Xo NULL: only counted) */
+    if (!u->undet || !u->O || !Ofin) return;
+    double *yp = calloc((size_t)u->O->m + 1, sizeof(double));
+    for (int i = 0; i < u->O->m; i++) yp[i] = u->undet[i] ? NAN : 0.0;
+    const PSOrig *Of = u->O;
+    double **Xn = NULL; int nX = 0;
+    if (u->Otb || u->fe || u->dual || u->alg || u->sym || u->sign || u->aff || u->maff)
+        Of = map_back(u, par, &Xn, &yp, &nX, 0, NULL);
+    int n = 0;
+    if (u->dual) {
+        /* 9 November 2026 (the owner's decision (a)): after the dual form the facial reduction acts on the dual side; the
+         * multipliers it leaves undetermined are entries of the X of the problem as read (dualize.c), returned as NaN, and
+         * the primal is judged on the face (main.c, the lost-dual branch). The map carries the NaN to those entries */
+        if (Of && Xn && Of->nblk == Ofin->nblk)
+            for (int k = 0; k < Ofin->nblk; k++) {
+                const int bn = abs(Ofin->bs[k]);
+                if (Ofin->bs[k] < 0) { for (int i = 0; i < bn; i++) if (isnan(Xn[k][i])) { if (Xo) Xo[k][i] = NAN; n++; } }
+                else for (int j = 0; j < bn; j++) for (int i = 0; i <= j; i++)
+                    if (isnan(Xn[k][i + (size_t)j * bn])) { if (Xo) { Xo[k][i + (size_t)j * bn] = NAN; Xo[k][j + (size_t)i * bn] = NAN; } n++; }
+            }
+        g_fr_prim_face = n;
+    } else {
+        if (Of && Of->m == Ofin->m) for (int i = 0; i < Ofin->m; i++) if (isnan(yp[i])) { if (yo) yo[i] = NAN; n++; }
+        g_fr_dual_face = n;
+    }
+    if (Xn) { for (int k = 0; k < nX; k++) free(Xn[k]); free(Xn); }
+    free(yp);
 }
 
 /* 23 October 2026: which blocks of this run's X are held as cone vectors (brisk.h, xc_index), or NULL. A second-order
@@ -869,6 +978,37 @@ static void run_finish(Run *u, const Params *par) {
  * 7.4e-6, the removed duals lost). When the returned point misses the tolerance on the problem as read, the solve's other
  * point (brisk_alt_take) goes through the same postsolve and the same map back, and the better of the two by the run's
  * measure is returned: one postsolve more, only for a run that missed the tolerance and had a second point. */
+/* 9 November 2026: the depth rule (a facial reduction of depth >= 2 that saves less than -frgain per iteration is undone)
+ * applies only where some certificate of the chain is numerical. A chain whose certificates all hold exactly on the data
+ * (one-signed diagonals, LP parts of one sign, exact rank-one terms) is a face of the problem as stored: undone, it leaves a
+ * problem with no strictly feasible point, whose solve ends with a wrong value the errors do not show and a futile
+ * double-double endgame (roa_vdp_inner_d12_K, SDP: depth 7, all one-signed diagonals; 3.331597 at reduced accuracy against
+ * the face's 3.332847, which the high-precision solver confirms; kept: OPTIMAL). Where a certificate passed a tolerance only,
+ * the face can be smaller than the true one (fr_full: a rank-one test on a matrix whose smallest eigenvalue is -3.6e-15;
+ * kept, the value is off by 9e-7, which the high-precision solver shows), so the rule stays there. The rule's other reason,
+ * the second solve for the removed duals, has gone with the decision of 7 November (they are returned as NaN).
+ * BRISK_FREXACT=0: the rule on every chain, as before */
+/* 10 November 2026 (the owner's decision (a), "for now", with the question to study): the rule on every chain again, as in
+ * 1.6.5. Exact chains kept left part of y undetermined where the rebuild cannot follow them: rose13, rose15, taha1a
+ * (Mittelmann, SDP) returned NaN for 468, 680 and 1001 entries of y, which 1.6.5 returned complete by solving them as read.
+ * The cost: roa_vdp_inner_d12_K and d14_K (SDP) return to the value of the problem as read (3.331597 against 3.332847; the
+ * defect behind it is to be found), roa_acrobot_d6_I 26 -> 85 s. BRISK_FREXACT=1: exact chains kept (9 November) */
+static int fr_deep_numeric(const Problem *P) {
+    static int ex = -1; if (ex < 0) { const char *e = getenv("BRISK_FREXACT"); ex = e && atoi(e) != 0; }
+    return P->fr_depth >= 2 && (!ex || P->fr_numeric > 0);
+}
+/* 9 November 2026: the duals of the constraints the facial reduction removed are rebuilt (the level-by-level recovery) with
+ * -frdual 2, and also whenever the problem was solved in its dual form: the facial reduction runs after the dualization, so
+ * the constraints it removes are those of the dual form and their multipliers are entries of the primal X of the problem as
+ * read, which must be returned in full; the rule of 7 November (the undetermined duals not rebuilt) is about the duals of
+ * the problem as read. roa_vdp_inner_d12_I (SDP) with the reduction kept: X >= 0 violated by 8.4e-3 on the problem as read
+ * after a reduced solve at 2.3e-10 (bench/sdp_1109_dd/depthrule_ab.txt) */
+/* 10 November 2026 (the owner: "It seems reasonable to try that reconstruction by default since it costs almost nothing (both for
+ * primals and duals). Only if that fails, we report that a reconstruction fails"): the rebuild is tried on both forms; when it
+ * fails, the entries it could not rebuild are NaN and the point is judged on the face (-frdual 0), or SOLVED TO REDUCED ACCURACY
+ * (-frdual 2, as up to 1.6.5). BRISK_FRREBUILD=0: not tried on the problem as read (the rule of 7 November, for comparisons) */
+static int ps_rebuild_default(void) { static int r = -1; if (r < 0) { const char *e = getenv("BRISK_FRREBUILD"); r = e ? atoi(e) != 0 : 1; } return r; }
+static void ps_rebuild_for(const Run *u, const Params *par) { extern int g_ps_rebuild; g_ps_rebuild = par->fr_dual == 2 || u->dual != NULL || ps_rebuild_default(); }
 static void alt_judge(Run *u, const Params *par) {
     Result Ra; double *ya = NULL, **Xa = NULL; const char *what = "";
     if (!brisk_alt_take(&Ra, &ya, &Xa, &what)) return;
@@ -880,6 +1020,7 @@ static void alt_judge(Run *u, const Params *par) {
         int *xc2 = u->xc_p ? malloc(sizeof(int) * (u->O->nblk + 1)) : NULL;
         PSResult pr2;
         postsolve_set_time_left(ps_time_left(par)); postsolve_set_tol(par->tol);
+        ps_rebuild_for(u, par);
         postsolve(P, u->O, Xa, ya, &Xo2, yo2, &pr2, par->verbose > 1 ? par->verbose : -1, u->xc_p, xc2);
         if (xc2) { int any = 0; for (int o = 0; o < u->O->nblk; o++) any |= xc2[o] >= 0; if (!any) { free(xc2); xc2 = NULL; } }
         int nXo2 = u->O->nblk;
@@ -892,13 +1033,26 @@ static void alt_judge(Run *u, const Params *par) {
             prf.recovered = pr2.recovered; prf.unrecovered = pr2.unrecovered; prf.fr_corrected = pr2.fr_corrected; prf.t += pr2.t;
             pr2 = prf;
         }
-        const double acc2 = pr2.have_x && Xo2 ? brisk_acc_err(pr2.err) : INFINITY;
-        used = acc2 < u->acc;
+        double acc2 = pr2.have_x && Xo2 ? brisk_acc_err(pr2.err) : INFINITY;
+        double acc1 = u->acc;
+        /* (7 November 2026) when the facial reduction left duals undetermined (returned as NaN, the dual judged on the face),
+         * the two points are compared by their errors apart from those duals: the primal errors, gap and complementarity on
+         * the problem as read, the dual errors of each point on the face. Measured with those duals at zero, both carried
+         * the same dual error of the removed constraints (a user's unsteady Navier-Stokes relaxation, SDP: 2.3e-3 each) and
+         * the point before the end phase was returned (compl 8.4e-8) instead of the end phase's (2.2e-9) */
+        if (u->undet && par->fr_dual != 2 && pr2.have_x && Xo2) {
+            /* (9 November 2026: after the dual form the primal errors are the face's and the dual errors the problem's) */
+            #define ACC_FACE(e, Rr) (u->dual ? brisk_nmax(brisk_nmax(fabs((e)[3]), fabs((e)[4])), brisk_nmax(brisk_nmax((Rr).err[3], (Rr).err[4]), brisk_nmax(fabs((e)[5]), fabs((e)[6])))) \
+                                     : brisk_nmax(brisk_nmax(fabs((e)[1]), fabs((e)[2])), brisk_nmax(brisk_nmax((Rr).err[3], (Rr).err[4]), brisk_nmax(fabs((e)[5]), fabs((e)[6])))))
+            acc1 = ACC_FACE(u->pr.err, u->R); acc2 = ACC_FACE(pr2.err, Ra);
+            #undef ACC_FACE
+        }
+        used = acc2 < acc1;
         if (par->verbose > (used ? 0 : 1))
             printf("   the solve's second point (%s): %.1e on the problem as read against %.1e, %s\n",
-                   what, acc2, u->acc, used ? "returned" : "not returned");
+                   what, acc2, acc1, used ? "returned" : "not returned");
         if (used) {
-            brisk_note_diag("%s returned instead: %.1e on the problem as read, against %.1e", what, acc2, u->acc);
+            brisk_note_diag("%s returned instead: %.1e on the problem as read, against %.1e", what, acc2, acc1);
             if (u->Xo) { for (int k = 0; k < u->nXo; k++) free(u->Xo[k]); free(u->Xo); }
             u->Xo = Xo2; u->nXo = nXo2; Xo2 = NULL;
             free(u->yo); u->yo = yo2; yo2 = NULL;
@@ -937,6 +1091,7 @@ static double **bpt_mapped(Run *u, const Params *par, const PSOrig *Op, int *pn)
     int *xc2 = u->xc_p ? malloc(sizeof(int) * (u->O->nblk + 1)) : NULL;
     PSResult pr2;
     postsolve_set_time_left(ps_time_left(par)); postsolve_set_tol(par->tol);
+    ps_rebuild_for(u, par);
     postsolve(P, u->O, Xa, ya, &Xo2, yo2, &pr2, -1, u->xc_p, xc2);
     for (int k = 0; k < P->nblk; k++) free(Xa[k]);
     free(Xa); free(ya);
@@ -1058,7 +1213,7 @@ static double symfr_ratio(void) {
     facial_reduction(&Pc, 0);
     double c1 = (double)Pc.m * Pc.m * Pc.m / 3.0;
     for (int k = 0; k < Pc.nblk; k++) if (Pc.blk[k].type == BLK_SDP) c1 += 10.0 * (double)Pc.blk[k].n * Pc.blk[k].n * Pc.blk[k].n;
-    const int kept = Pc.ps->nrec > 0 && !(g_symfr_do == 1 && Pc.fr_depth >= 2 && c0 < par->fr_gain * c1);
+    const int kept = Pc.ps->nrec > 0 && !(g_symfr_do == 1 && fr_deep_numeric(&Pc) && c0 < par->fr_gain * c1);
     const double r = kept && c1 > 0 && c0 > c1 ? c0 / c1 : 1.0;
     ps_free(Pc.ps); Pc.ps = NULL;
     problem_free(&Pc);
@@ -1087,7 +1242,7 @@ static double fe_fr_gain(const Problem *P, const Params *par, int elim, int do_f
         { extern int g_fr_maxdepth; g_fr_maxdepth = par->fr_maxdepth; }
         double c1 = (double)Pc.m * Pc.m * Pc.m / 3.0;
         for (int k = 0; k < Pc.nblk; k++) if (Pc.blk[k].type == BLK_SDP) c1 += 10.0 * (double)Pc.blk[k].n * Pc.blk[k].n * Pc.blk[k].n;
-        const int kept = Pc.ps->nrec > 0 && (maxdepth == 1 || !(do_fr == 1 && Pc.fr_depth >= 2 && c0 < par->fr_gain * c1));
+        const int kept = Pc.ps->nrec > 0 && (maxdepth == 1 || !(do_fr == 1 && fr_deep_numeric(&Pc) && c0 < par->fr_gain * c1));
         if (kept && c1 > 0 && c0 > c1) r = c0 / c1;
         ps_free(Pc.ps); Pc.ps = NULL;
     }
@@ -1097,7 +1252,7 @@ static double fe_fr_gain(const Problem *P, const Params *par, int elim, int do_f
 }
 static int run_pipeline_core(const char *fname, Params *par, int do_fr, int force_route, Run *u) {
     if (par->fr_maxdepth == 0) do_fr = 0;   /* -frdepth 0: no facial reduction, as -nofr (4 November 2026) */
-    int race_want = 0; double race_s = 0;        /* 4.42: the first-order engine first (decided after the presolve) */
+    int race_want = 0; double race_s = 0, race_est = 0; static double g_fom_overlap = 0, g_fom_single = 0;   /* 4.42: the first-order engine first (decided after the presolve); race_est: the IPM's estimated work (13 November 2026) */
     memset(u, 0, sizeof(*u));
     g_run_no++;
     brisk_alt_clear();                           /* (an earlier run's point from before its end phase: not this run's) */
@@ -1145,7 +1300,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         u->aff = mode ? blkscale_apply(P, mode, par->verbose) : NULL;
         if (u->aff) u->Oaff = Of; else if (Of) ps_orig_free(Of);
         if (!u->aff) {   /* 5.12: a moment relaxation over an ellipsoid in the coordinates of the unit ball (momaff.c; BRISK_NOAFF off) */
-            PSOrig *Om = ps_orig_build(P);
+            unsigned long long hm; PSOrig *Om = orig_take(P, &hm);
             u->maff = momaff_apply(P, par->verbose);
             if (u->maff) {
                 u->Oaff = Om;
@@ -1153,7 +1308,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
                  * user: 4.9e-8 on the problem as read at 1e-8, 5.1e-10 at 1e-11, one iteration more) */
                 u->aff_tol0 = par->tol; u->aff_par = par;
                 par->tol = fmax(1e-12, par->tol * fmin(1.0, 10.0 / momaff_amplification(u->maff)));
-            } else ps_orig_free(Om);
+            } else orig_release(Om, hm);
         }
         if (getenv("BRISK_SETUPT")) printf("   [setup: block scaling %.2fs]\n", wtime() - tpre0);
     }
@@ -1178,14 +1333,24 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
      * steps in 1.5.5), and after it the interior-point method makes no matrix-free attempt either (fom_bound_maxit -1:
      * the class where it failed, ISSUES 86). */
     int bnd_want = 0;
-    if (getenv("BRISK_BOUNDSCAN")) { printf("BOUNDSCAN m %d bounds %d\n", P->m, fom_bound_rows(P)); exit(0); }   /* (test: the rows the rule counts) */
+    { extern int g_img_bnd; if (par->fom_bound_maxit == 0) g_img_bnd = 0; }   /* (a new solve's first pass) */
+    if (getenv("BRISK_BOUNDSCAN")) { extern int fom_bound_count(const Problem *P, int *entries, int *repeats); int e_ = 0, r_ = 0; const int n_ = fom_bound_count(P, &e_, &r_); extern int fom_image_bounds(const Problem *P, long *mD); long mD_ = 0; const int ni_ = fom_image_bounds(P, &mD_); printf("BOUNDSCAN m %d bounds %d entries %d repeats %d image %d dualrows %ld\n", P->m, n_, e_, r_, ni_, mD_); fflush(stdout); exit(0); }   /* (test: what the rule counts) */
     if (par->fom < 0 && par->fom_bound > 0 && par->fom_bound_maxit == 0 && P->m >= 4000 && par->tol >= 0.99e-8 && !par->mfipm
         && !par->lralm && !par->dual && !par->bound_side && !par->crossover && !par->warm_X && !par->hp_kind && !par->fom_start_x
         && !par->fom_start_y && force_route < 0) {
         double s3 = 0, s2 = 0;
         for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) { const double n = P->blk[k].n; s3 += n * n * n; s2 += n * n; }
-        const int np = s3 > 0 ? fom_bound_rows(P) : 0;
-        if (2.0 * np >= P->m) {
+        extern int fom_bound_count(const Problem *P, int *entries, int *repeats);
+        int nent = 0, nrep = 0;
+        const int np = s3 > 0 ? fom_bound_count(P, &nent, &nrep) : 0;
+        (void)nent;
+        /* (11 November 2026: the distinct bounds (a lower and an upper bound on an entry are two; a row repeating a bound
+         * already given on the same entry and side is not counted) against all the rows: one bound row per entry, as the rule
+         * was measured, counts as before; a box 0 <= X <= 1 counts both sides (the k-means relaxation with X <= 1, CVXPY,
+         * n = 90: 8,190 bounds of 8,281 rows); a file whose bound rows repeat (fap09, Mittelmann, SDP: each X_ij >= -1/49
+         * given twice) is not counted twice: counted by its rows it passed the rule and the first-order method ran to its
+         * cap, 217 s, before the interior-point method's 60 s; the repeats a modelling layer writes are removed there) */
+        if (2.0 * (np - nrep) >= P->m) {
             /* the cap: twice the interior-point method's time as the rules below estimate it (the dense factor and the
              * block algebra, calibrated on theta12, 1et.1024 and G55mc; 6.8 s for thetap_100, which took 7.0 s), over
              * the engine's time per iteration on these files (4 threads: 1.3 ms at n = 110 to 9 ms at n = 300 for
@@ -1194,6 +1359,24 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
             bnd_want = 1;
             par->fom_bound_maxit = (long)fmin(100000.0, fmax(2000.0, 2.0 * ipm_s / it_s));
             if (par->verbose > 0) printf("first-order engine: %d of the %d constraints are bounds on single entries of X; iteration cap %ld\n", np, P->m, par->fom_bound_maxit);
+        }
+        /* 11 November 2026: the bounds stated in SDPA's primal form (min c'x s.t. sum x_i F_i - F0 >= 0, x_i >= l an LP entry;
+         * a file written by hand, CVXPY's and YALMIP's exports): the dual form with its pairs of y eliminated makes them rows
+         * of one entry of X and a private slack; when they are at least half of at least 4,000 such rows the first-order
+         * method gets the problem in that form (fom_image_bounds; the attempt below with the dual form, the elimination and no
+         * trace-bound row, whose large right-hand side spoils the method's scaling: the k-means relaxation with 90 points,
+         * 100,000 iterations with it, 110 without). BRISK_IMGBND=0: off */
+        else if (s3 > 0) {
+            static int ib = -1; if (ib < 0) { const char *e = getenv("BRISK_IMGBND"); ib = !(e && atoi(e) == 0); }
+            extern int fom_image_bounds(const Problem *P, long *mD);
+            long mD = 0;
+            const int ni = ib && par->dualize < 0 ? fom_image_bounds(P, &mD) : 0;
+            if (mD >= 4000 && 2.0 * ni >= (double)mD) {
+                const double ipm_s = ((double)P->m * P->m * P->m / 3.0 + 20.0 * s3) / 6e9, it_s = 2e-7 * s2 + 2e-9 * s3;
+                bnd_want = 1; { extern int g_img_bnd; g_img_bnd = 1; }
+                par->fom_bound_maxit = (long)fmin(100000.0, fmax(2000.0, 2.0 * ipm_s / it_s));
+                if (par->verbose > 0) printf("first-order engine: %d bounds on single entries of X stated in SDPA's primal form (%ld rows in the dual form); iteration cap %ld\n", ni, mD, par->fom_bound_maxit);
+            }
         }
     }
     int mf_want = 0; const int mf_m0 = P->m, mf_nb0 = P->nblk; double mf_s3 = 0, mf_budget = 0, mf_cgcap = 0, mf_prodcap = 0, mf_rm = 0, mf_sm = 0;
@@ -1273,14 +1456,26 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     }
     if (par->symfile && par->symsign && !strcmp(par->symfile, "auto")) {
         /* 4.33: sign symmetries first (symred.c) */
-        u->Osign = ps_orig_build(P);
+        unsigned long long hs; u->Osign = orig_take(P, &hs);
         u->sign = sign_reduce(P, par->verbose, 1, par->symmin, par->chordal != 0 ? par->chordal_minn : 1 << 30, par->chordal_density);
-        if (!u->sign) { ps_orig_free(u->Osign); u->Osign = NULL; }
+        if (!u->sign) { orig_release(u->Osign, hs); u->Osign = NULL; }
+        /* 16 November 2026: when nothing was found, the constraints in reduced row echelon form (rowspace.c) and the search
+         * again: rows that are sums of even and odd ones hide a sign symmetry that this form shows row by row */
+        if (!u->sign && par->symrref) {
+            Problem Q; PSRref *Rr = rowspace_rref(P, &Q, par->verbose);
+            if (Rr) {
+                PSOrig *OsQ = ps_orig_build(&Q);
+                Problem P0 = *P; *P = Q;
+                u->sign = sign_reduce(P, par->verbose, 1, par->symmin, par->chordal != 0 ? par->chordal_minn : 1 << 30, par->chordal_density);
+                if (u->sign) { unsigned long long h0; u->Orref = orig_take(&P0, &h0); problem_free(&P0); u->Osign = OsQ; u->rref = Rr; }
+                else { problem_free(P); *P = P0; ps_orig_free(OsQ); rref_free(Rr); }
+            }
+        }
         if (getenv("BRISK_SETUPT")) printf("   [setup: sign symmetry %.2fs]\n", wtime() - tpre0);
     }
     if (par->symfile) {
         /* 4.32: exact symmetry reduction from the generators in the file (symred.c) */
-        u->Osym = ps_orig_build(P);
+        unsigned long long hsy; u->Osym = orig_take(P, &hsy);
         { /* 5.7: with -mfipm 1 the search's budget is a share of the matrix-free solve (about 50
            * products of 4 n^3 flops and 50 eigenvalue decompositions), not of the dense Schur
            * complement's: on the truss problem tru11 the search took 8.9 s of 11.8 s. */
@@ -1294,7 +1489,12 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         {   /* 4 November 2026 (ISSUES 759): the facial reduction that follows, measured on a copy when the search is about to
              * start with a budget of half a second or more (symred.c, g_sym_fr_div); BRISK_SYMFRDIV=0: off */
             extern double g_sym_est_div; extern double (*g_sym_fr_div)(void);
-            static int sfd = -1; if (sfd < 0) { const char *e = getenv("BRISK_SYMFRDIV"); sfd = !(e && atoi(e) == 0); }
+            /* 8 November 2026: off by default (BRISK_SYMFRDIV=1: on). With the refinement's hashes updated by their changed terms
+             * the search is cheap where the facial reduction acts (at most 0.45 s on the 52 of 508 SDP files with a face), and
+             * on all 507 files with a search the slice changed no symmetry found (34.9 -> 34.3 s for the step). Its cut is a
+             * wall-clock one (the search's clock set to the slice's 1.5 s), so a sliced search could end in another place on
+             * a loaded machine; without it the search stops on its work budget alone, the same on any machine */
+            static int sfd = -1; if (sfd < 0) { const char *e = getenv("BRISK_SYMFRDIV"); sfd = e && atoi(e) == 1; }
             g_sym_est_div = 1.0; g_sym_fr_div = NULL;
             if (sfd && do_fr && !strcmp(par->symfile, "auto")) { g_symfr_P = P; g_symfr_par = par; g_symfr_do = do_fr; g_sym_est_div = 0; g_sym_fr_div = symfr_ratio; }
         }
@@ -1302,13 +1502,41 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         { extern double (*g_sym_fr_div)(void); g_sym_fr_div = NULL; g_symfr_P = NULL; }
         if (getenv("BRISK_SYMSCAN")) { extern double g_sym_est_div; fprintf(stderr, "symscan div %.4g sym %d sign %d time %.3f\n", g_sym_est_div, u->sym != NULL, u->sign != NULL, wtime() - tsy0); exit(0); }   /* (experiments: the step alone) */
         if (!u->sym) { extern double g_dec_sym_t; g_dec_sym_t += wtime() - tsy0; }   /* (4 November 2026: a search that found nothing, for the advice) */
-        if (!u->sym) { ps_orig_free(u->Osym); u->Osym = NULL; }
+        if (!u->sym) { orig_release(u->Osym, hsy); u->Osym = NULL; }
+        /* 8 November 2026: linearly dependent rows can hide a symmetry: a row that is the sum of two others belongs to no
+         * orbit, so the search's classes (or its gain bound) see no group (neu1g, Mittelmann, SDP, with 300 such rows
+         * appended: no search, 2.3 s, against 0.2 s for the problem without them, reduced 3,002 -> 112 orbits). When the
+         * search finds nothing, the dependent rows are removed (the factorization keeps the earlier rows of a dependent
+         * set) and the search runs again. Not before the first search: a set of dependent rows can be an orbit of the
+         * problem's own symmetry, which removing one of them would break. BRISK_DEPSYM=0: as before */
+        { static int depsym = -1; if (depsym < 0) { const char *e = getenv("BRISK_DEPSYM"); depsym = !(e && atoi(e) == 0); }
+          int ident = 1;
+          if (P->orig) { if (P->morig != P->m) ident = 0; else for (int i = 0; i < P->m && ident; i++) if (P->orig[i] != i) ident = 0; }
+          const int npairs = u->nfree_read;   /* (with free variables the trace bound follows, and the later removal is not made then either; counted as read) */
+          if (depsym && !u->sym && par->deprows > 0 && !strcmp(par->symfile, "auto") && ident && npairs == 0) {
+              static double dtol0 = -1; if (dtol0 < 0) dtol0 = getenv("BRISK_DEPTOL") ? atof(getenv("BRISK_DEPTOL")) : 1e-8;
+              unsigned long long h0; PSOrig *O0 = orig_take(P, &h0);
+              int ninc0 = 0;
+              const int nrem = remove_dependent_rows(P, par->verbose, dtol0, &ninc0);
+              if (nrem > 0) {
+                  u->Odep0 = O0; u->dep0_m = P->m; u->dep0_removed = nrem;
+                  u->dep0_keep = malloc(sizeof(int) * (size_t)(P->m + 1));
+                  for (int i = 0; i < P->m; i++) { u->dep0_keep[i] = P->orig[i]; P->orig[i] = i; }
+                  P->morig = P->m;
+                  if (par->verbose > 0) printf("   symmetry search again without the %d dependent constraints\n", nrem);
+                  u->Osym = ps_orig_build(P);
+                  u->sym = sym_reduce(P, par->symfile, par->verbose, par->symtime, par->symnodes, par->symbd, par->symmin, par->chordal != 0 ? par->chordal_minn : 1 << 30, par->chordal_density, par->symsigned);
+                  if (!u->sym) { ps_orig_free(u->Osym); u->Osym = NULL; }
+              } else { orig_release(O0, h0);
+                  if (ninc0 == 0) { size_t nz = 0; for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) nz += (size_t)P->blk[k].A[t].nnz;
+                                    u->dep_clean_m = P->m; u->dep_clean_nnz = nz; } }
+          } }
         if (getenv("BRISK_SETUPT")) printf("   [setup: symmetry reduction %.2fs]\n", wtime() - tpre0);
         if (par->symalg) {
             /* 4.41: hidden and non-permutation symmetry: the *-algebra of each block (symalg.c) */
-            u->Oalg = ps_orig_build(P);
+            unsigned long long hal; u->Oalg = orig_take(P, &hal);
             u->alg = alg_reduce(P, par->symalg, par->symalgmax, par->symmin, par->verbose, par->soc ? par->soc_minn : 0);
-            if (!u->alg) { ps_orig_free(u->Oalg); u->Oalg = NULL; }
+            if (!u->alg) { orig_release(u->Oalg, hal); u->Oalg = NULL; }
         }
         if (getenv("BRISK_SYMONLY")) { { printf("SYMONLY m %d -> %d order %d bd %d blocks", u->Osym ? u->Osym->m : P->m, P->m, u->sym ? u->sym->order : 1, u->sym ? u->sym->bd : 0); for (int k = 0; k < P->nblk; k++) printf(" %d", P->blk[k].type == BLK_LP ? -P->blk[k].n : P->blk[k].n); printf(" time %.2f\n", wtime() - tpre0); } exit(0); }
     }
@@ -1328,7 +1556,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         int maxn = 0, nsdp = 0;
         for (int k = 0; k < P->nblk; k++) if (FOM_SDPBLK(k)) { nsdp++; if (P->blk[k].n > maxn) maxn = P->blk[k].n; }
         int use = nsdp <= 64 && maxn >= 200 && 8.0 * (double)P->m * (double)P->m > 0.5 * ram;
-        if (!use && par->fom_race > 0 && par->tol >= 0.99e-6 && nsdp <= 64 && maxn >= 200 && !par->mfipm && !par->dual
+        if ((!use || par->fom_first > 0) && ((par->fom_race > 0 && par->tol >= 0.99e-6) || par->fom_first > 0) && nsdp <= 64 && maxn >= 200 && !par->mfipm && !par->dual
             && !par->bound_side && !par->crossover && !par->fom_start_x && !par->fom_start_y) {
             /* 4.42: at a tolerance of 1e-6 or looser, the first-order engine is tried first on
              * the problems it is made for (few large dense blocks) when the interior-point
@@ -1381,9 +1609,42 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
                     }
                     free(cnt);
                 }
+                /* the share of constraints that fix one entry of X (one stored entry over all the blocks) */
+                int *nz1 = (int *)calloc(P->m ? P->m : 1, sizeof(int)); g_fom_single = 0;
+                if (nz1) {
+                    for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) nz1[P->blk[k].con[t]] += P->blk[k].A[t].nnz;
+                    int one = 0; for (int i = 0; i < P->m; i++) one += nz1[i] == 1;
+                    g_fom_single = (double)one / fmax(1.0, (double)P->m);
+                    free(nz1);
+                }
                 gram_dense = pairs > 0.01 * (double)P->m * P->m;
+                g_fom_overlap = 2.0 * pairs / fmax(1.0, (double)P->m);   /* (13 November 2026: the constraints' mean overlap, for the work rule) */
             }
-            if (!sparse_big && ipm_s >= 20.0 && !gram_dense && 400.0 * sn2 <= 0.3 * ram) { race_want = 1; race_s = ipm_s; }
+            if (par->verbose > 1) printf("   [first-order route: IPM estimate %.2e (%.0f model-s), chordal case %d, A A' dense %d, the engine's memory %.2e of %.2e, overlap %.2f]\n", est, ipm_s, sparse_big, gram_dense, 400.0 * sn2, 0.3 * ram, 2.0 * 0 + g_fom_overlap);
+            if (!sparse_big && ipm_s >= 20.0 && !gram_dense && 400.0 * sn2 <= 0.3 * ram) {
+                race_want = 1; race_s = ipm_s; race_est = est;
+                /* 13 November 2026 (the owner, Mittelmann's sparse benchmark: theta123 1,842 s on a 128 GB host by the interior-point
+                 * method, 14.5 s by the engine): at any tolerance the engine first, by this work estimate rather than by memory
+                 * (until then only when M did not fit, so the route changed with the host), handing over by its stall rule
+                 * (fom.c) instead of a time budget; the matrix-free attempt is not made before it. -fomfirst 0: as before */
+                if (!(par->fom_race > 0 && par->tol >= 0.99e-6)) race_want = 3;
+                /* (13 November 2026) not at a tolerance tighter than the default: the engine's result is kept at 1e-6 (the
+                 * hand-over rule), so -acc high would return what the default returns; the interior-point method then */
+                if (race_want == 3 && par->tol < 0.99e-8) race_want = 0;
+                /* (13 November 2026, the owner: the engine first where it suits the problem) the work rule only where the
+                 * constraints are nearly disjoint, each sharing an entry of X with at most one other on average (2 pairs / m <= 1):
+                 * the theta problems (single entries X_ij = 0 and the trace: no overlap); not the SOS relaxations (each constraint
+                 * sums many entries shared with others; the matrix-free method is theirs: 1.3-6.7x slower by the engine), the
+                 * frames, thetaG51 as SDPLIB writes it */
+                if (race_want == 3 && g_fom_overlap > 1.0) { race_want = 0; if (par->verbose > 1) printf("   [first-order route: the constraints overlap (%.1f other constraints an entry on average): not taken]\n", g_fom_overlap); }
+                /* ... and where almost every constraint fixes a single entry of X (at least 99 %; a few dense rows such as the
+                 * trace allowed): the projection onto the affine set then sets those entries, and the splitting behaves as
+                 * alternating projections between it and the cone (theta12 converges in 82 iterations to its second phase).
+                 * Constraints that sum entries (sos_planted_n20_d2: 2.5 entries a constraint, no overlap) stall at 3e-3 */
+                if (race_want == 3 && g_fom_single < 0.99) { race_want = 0; if (par->verbose > 1) printf("   [first-order route: %.1f %% of the constraints fix a single entry of X (99 %% needed): not taken]\n", 100.0 * g_fom_single); }
+                if (race_want == 3) { mf_want = 0; use = 0; }   /* (whether M fits or not: the same route on every host) */
+                else if (use) race_want = 0;
+            }
         }
         if (use && par->chordal != 0 && !getenv("BRISK_FOMNODEFER")) {
             /* 4.40: a large block whose aggregate pattern is very sparse (AC-OPF: density
@@ -1440,11 +1701,19 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         /* 4.30: the dual form when its Schur complement is the smaller one (SOS programs
          * given in the wrong form); its y pairs are then eliminated below */
         PSOrig *Of = NULL;
-        u->dual = dualize_apply(P, par->dualize < 0, par->verbose >= 0 ? par->verbose : 0, &Of);
+        /* (11 November 2026: not automatically when the problem as given goes to the first-order method with its bounds on
+         * single entries of X (the rule below: at least half the rows such bounds, m >= 4000): the dual form makes those
+         * rows cone entries and the bounds are lost; JuMP's X .>= 0 on a PSD matrix in the kernel form, k-means n = 90:
+         * 3.3 s by the interior-point method on the dual form against 0.1 s with the bounds. BRISK_DUALBND=0: as before) */
+        static int dbnd = -1; if (dbnd < 0) { const char *e = getenv("BRISK_DUALBND"); dbnd = !(e && atoi(e) == 0); }
+        const int bnd_route = dbnd && par->dualize < 0 && par->fom_bound_maxit > 0;   /* (the rule below has chosen the route: its cap is set) */
+        if (bnd_route && par->verbose > 0) printf("presolve: dual form not considered: the bounds on single entries of X go to the first-order method\n");
+        u->dual = bnd_route ? NULL : dualize_apply(P, par->dualize < 0, par->verbose >= 0 ? par->verbose : 0, &Of);
         if (u->dual) u->Odual = Of; else if (Of) ps_orig_free(Of);
         if (getenv("BRISK_SETUPT")) printf("   [setup: dual form %.2fs]\n", wtime() - tpre0);
     }
-    u->O = ps_orig_build(P);
+    { unsigned long long hO; u->O = orig_take(P, &hO); }
+    orig_spare_drop();
     if (par->free_elim) {
         PSFreeElim *F = free_eliminate(P, par->verbose >= 0 ? par->verbose : 0, par->free_elim_fill, par->free_elim < 0);
         /* 4 November 2026 (ISSUES 760, BRISK_FEFR=1, test): an elimination refused on its estimated cost alone is weighed with
@@ -1456,7 +1725,9 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
           const double est0 = g_fe_refused_cost;   /* (read first: the copies' eliminations reset it) */
           /* (the copies only when the eliminated rows hold a candidate of the facial reduction: on the power-flow
            * relaxations the forced elimination of the copy cost up to 7.3 s and the reduction found nothing) */
+          extern double g_fe_refused_tol; extern void free_elim_force_tol(double); const double tol0 = g_fe_refused_tol;
           if (!F && fefr && par->free_elim < 0 && do_fr && est0 > 1.0 && g_fe_refused_cand > 0) {
+              free_elim_force_tol(tol0);   /* (the copies and the elimination below with the refused one's pivots) */
               /* (the gains are at least 1: a first level that reduces nothing ends the test; the copy without the
                * elimination only when the gain with it could bring the estimate to 1) */
               const double tq = wtime(), g1 = fe_fr_gain(P, par, 1, do_fr, 1);
@@ -1464,6 +1735,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
               const double gk = ge >= est0 ? fe_fr_gain(P, par, 0, do_fr, par->fr_maxdepth) : 1.0, est = est0 * gk / ge;
               if (par->verbose > 0) printf("presolve: free elimination: the facial reduction divides the solve by %.2f eliminated and by %.2f kept: estimate %.2f -> %.2f (%.2f s)\n", ge, gk, est0, est, wtime() - tq);
               if (est <= 1.0) F = free_eliminate(P, par->verbose >= 0 ? par->verbose : 0, par->free_elim_fill, 0);
+              free_elim_force_tol(0);
           } }
         if (getenv("BRISK_SETUPT")) printf("   [setup: free elimination done at %.2fs]\n", wtime() - tpre0);
         if (F) { u->fe = F; u->Ofile = u->O; u->O = ps_orig_build(P); }
@@ -1524,17 +1796,29 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     }
     P->ps = ps_new(P);
     if (getenv("BRISK_SETUPT")) printf("   [setup: orig copy + free elimination %.2fs]\n", wtime() - tpre0);
-    if (par->deprows > 0 && !(u->tbR > 0)) {
+    if (par->deprows > 0 && !(u->tbR > 0) && !u->Odep0) {
         /* 20 October 2026: linearly dependent equality constraints (presolve.c), before the facial reduction (which
          * would otherwise find their consequences, with duals it cannot always recover) */
         static double dtol = -1; if (dtol < 0) dtol = getenv("BRISK_DEPTOL") ? atof(getenv("BRISK_DEPTOL")) : 1e-8;
         int ninc = 0;
         const int m0 = P->m; const double tdep = wtime();
+        /* 9 November 2026: the same constraints, already found independent by the test before the second symmetry search at
+         * the same tolerance, are not tested again (the outside tester's dependent_measurements, SDP, 480 dense constraints
+         * of rank one that are nearly dependent: each test about 4 s of a 10 s presolve). Same constraints: the same count
+         * and the same number of entries (every reduction in between changes one of them). BRISK_DEPAGAIN=1: tested again */
+        size_t nzd = 0; for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) nzd += (size_t)P->blk[k].A[t].nnz;
+        if (u->dep_clean_m == P->m && u->dep_clean_nnz == nzd && P->m > 0 && !getenv("BRISK_DEPAGAIN")) {
+            u->dep_removed = 0;
+            if (par->verbose >= 2) printf("presolve: no dependent constraints (the same constraints were found independent before the second symmetry search)\n");
+        } else
         u->dep_removed = remove_dependent_rows(P, par->verbose, dtol, &ninc);
         if (getenv("BRISK_DEPSCAN")) { printf("depscan m %d removed %d inconsistent %d time %.3f presolve %.2f\n", m0, u->dep_removed, ninc, wtime() - tdep, wtime() - tpre0); fflush(stdout); exit(0); }   /* (experiments: the check alone) */
         if (getenv("BRISK_SETUPT")) printf("   [setup: dependent constraints done at %.2fs]\n", wtime() - tpre0);
     }
+    unsigned char *pre_fr = NULL;   /* (7 November 2026: the rows of O present before the facial reduction) */
     if (do_fr) {
+        pre_fr = calloc((size_t)u->O->m + 1, 1);
+        for (int i = 0; i < P->m; i++) if (P->orig[i] >= 0 && P->orig[i] < u->O->m) pre_fr[P->orig[i]] = 1;
         double c0 = (double)P->m * P->m * P->m / 3.0;
         for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) c0 += 10.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
         /* 4.30: restored if the reduction is rejected; 5.18: not copied when nothing can be reduced */
@@ -1551,6 +1835,16 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
             if (getenv("BRISK_CFSCAN")) { extern int g_cf_vectors, g_cf_sets; printf("cfscan m %d faces %d vectors %d sets %d\n", P->m, ncf, g_cf_vectors, g_cf_sets); fflush(stdout); exit(0); }   /* (experiments: the detection alone) */
         }
         if (getenv("BRISK_LFSCAN")) { extern double g_lf_time; printf("lfscan m %d faces %d time %.4f\n", P->m, nlf, g_lf_time); fflush(stdout); exit(0); }   /* (experiments: the detection alone) */
+        if (par->lp_face != 0) {   /* (9 November 2026, -lpface <levels>: a diagnosis, the problem unchanged; by default only where the free
+                                    * elimination was refused with an estimate a face could bring below 1, at most the facial
+                                    * reduction's gain threshold; -lpfaceall 1: wherever free variables are left as split pairs) */
+            extern int lpface_scan(const Problem *P, int maxlev, int verbose); extern double g_fe_refused_cost;
+            if (par->verbose > 0) printf("   [the face behind the free variables: the refused elimination's estimate %.2f]\n", g_fe_refused_cost);
+            extern int g_lpface_state;
+            { FreePair *fp_ = NULL; const int np_ = free_pairs_detect(P, &fp_); free(fp_); g_lpface_state = np_ > 0 ? 2 : 4; }
+            if (g_lpface_state == 2 && (par->lp_face_all || (g_fe_refused_cost > 1.0 && g_fe_refused_cost <= par->fr_gain)))
+                lpface_scan(P, par->lp_face, par->verbose);
+        }
         { extern int g_fr_maxdepth; g_fr_maxdepth = par->fr_maxdepth; }
         facial_reduction(P, par->verbose);
         if (nlf > 0 && par->deprows > 0 && !(u->tbR > 0)) {
@@ -1569,7 +1863,9 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
          * solve without it from the start (rose13, taha1a, roa_acrobot: 1.9-3.4x). */
         u->fr_cost = c1 > 0 ? c0 / c1 : 1.0;
         if (par->verbose >= 1 && P->ps->nrec > 0) printf("presolve: facial reduction: the per-iteration cost model gives %.2fx for the problem as read\n", c0 / c1);
-        if (frc && do_fr == 1 && P->fr_depth >= 2 && P->ps->nrec > 0 && c0 < par->fr_gain * c1) {
+        if (frc && do_fr == 1 && P->fr_depth >= 2 && !fr_deep_numeric(P) && P->ps->nrec > 0 && c0 < par->fr_gain * c1 && par->verbose >= 1)
+            printf("presolve: facial reduction of depth %d kept although it saves only %.1fx per iteration: every certificate holds exactly on the data\n", P->fr_depth, c0 / c1);
+        if (frc && do_fr == 1 && fr_deep_numeric(P) && P->ps->nrec > 0 && c0 < par->fr_gain * c1) {
             if (par->verbose >= 0)
                 printf("presolve: facial reduction of depth %d saves only %.1fx per iteration; solving without it\n", P->fr_depth, c0 / c1);
             { extern double g_dec_fr_t; g_dec_fr_t += wtime() - tfr0; }
@@ -1580,7 +1876,32 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         } else if (frc) problem_free(&Pc);
     }
     u->fr_removed = P->ps->nrec;
+    {   /* 8 November 2026 (experiments: the order of the facial reduction and the symmetry search): the problem after the
+         * facial reduction written in SDPA form, and the run stops */
+        const char *wf = getenv("BRISK_WRITEFR");
+        if (wf) { const int rcw = write_sdpa(P, wf); printf("WRITEFR %s: %s (m %d, %d blocks, %d facial reduction records)\n", wf, rcw ? "failed" : "written", P->m, P->nblk, P->ps->nrec); fflush(stdout); exit(rcw ? 1 : 0); }
+    }
     u->fr_faces = 0; for (int r = 0; r < P->ps->nrec; r++) if (P->ps->rec[r].con <= -2) u->fr_faces++;
+    free(u->undet); u->undet = NULL; u->nundet = 0;
+    if (pre_fr && P->ps->nrec > 0) {
+        /* 7 November 2026 (the owner): the duals the reduced problem does not determine: the rows the facial reduction removed
+         * (its certificates' constraints, the constraints dependent on its face), and the file's rows of a removed combination
+         * (lifted_faces: its multiplier would add to theirs) */
+        const Postsolve *ps_ = P->ps;
+        unsigned char *kept = calloc((size_t)u->O->m + 1, 1);
+        for (int i = 0; i < P->m; i++) if (P->orig[i] >= 0 && P->orig[i] < u->O->m) kept[P->orig[i]] = 1;
+        u->undet = calloc((size_t)u->O->m + 1, 1);
+        for (int r = 0; r < u->O->m; r++) if (pre_fr[r] && !kept[r]) u->undet[r] = 1;
+        for (int k = 0; k < ps_->nrec; k++) {
+            const int c = ps_->rec[k].con;
+            if (c >= 0 && c < u->O->m) u->undet[c] = 1;
+            else if (c <= -2 && -2 - c < ps_->ncomb) for (int q = ps_->comb_ptr[-2 - c]; q < ps_->comb_ptr[-1 - c]; q++) u->undet[ps_->comb_i[q]] = 1;
+        }
+        for (int r = 0; r < u->O->m; r++) u->nundet += u->undet[r];
+        free(kept);
+        if (!u->nundet) { free(u->undet); u->undet = NULL; }
+    }
+    free(pre_fr);
     if (getenv("BRISK_SETUPT")) printf("   [setup: facial reduction done at %.2fs]\n", wtime() - tpre0);
     if (par->chordal != 0) {
         int nc = chordal_convert(P, par, par->verbose ? 1 : 0);
@@ -1651,7 +1972,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
      * attempt's cost model and caps, computed with the rows as read, are computed again on the rows that remain. An SOS
      * polynomial SDP with 2,529 of its 15,178 rows repeated lost the attempt (P->m no longer the m of the decision) and
      * took the factored embedding: 15.3 s against 5.1 s for the problem written without them. BRISK_MFDEP=0: as before */
-    const int mf_dep_ok = u->dep_removed > 0 && P->m + u->dep_removed == mf_m0 && !(getenv("BRISK_MFDEP") && atoi(getenv("BRISK_MFDEP")) == 0);
+    const int mf_dep_ok = u->dep_removed + u->dep0_removed > 0 && P->m + u->dep_removed + u->dep0_removed == mf_m0 && !(getenv("BRISK_MFDEP") && atoi(getenv("BRISK_MFDEP")) == 0);
     if (mf_want && mf_dep_ok) {
         double s3 = 0, nz = 0;
         for (int k = 0; k < P->nblk; k++) { if (P->blk[k].type == BLK_SDP) s3 += (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
@@ -1682,6 +2003,30 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         return 6;
     }
     if (race_want == 2) { race_want = 0; par->fom_bound_maxit = -1; }
+    if (race_want == 3) {
+        /* (13 November 2026) the estimate again on the presolved problem: the route was chosen on the problem as read, and the
+         * presolve can shrink it (cancer_100, SDP: 10,098 of its 10,469 rows linearly dependent, the interior-point method 2.8 s,
+         * the engine first 16 s); below 20 model-seconds the interior-point method as before */
+        double est2 = (double)P->m * P->m * P->m / 3.0, sp2 = P->m;
+        for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) sp2 += (double)P->blk[k].ncon * P->blk[k].ncon;
+        if (pow(sp2, 1.5) < est2) est2 = pow(sp2, 1.5);
+        for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) est2 += 20.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
+        double sn2b = 0; for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SDP) sn2b += (double)P->blk[k].n * P->blk[k].n;
+        if (400.0 * sn2b > 0.3 * brisk_mem_limit()) {   /* (the engine's memory on the presolved blocks, every semidefinite block: dg3d_500, SDP, ran out with a block of order 12,929 the first count left out) */
+            if (par->verbose > 0) printf("first-order engine first: not after the presolve (its memory, %.1f GB, does not fit)\n", 400.0 * sn2b / 1e9);
+            race_want = 0;
+        } else if (est2 / 6e9 < 20.0) {
+            if (par->verbose > 0) printf("first-order engine first: not after the presolve (the interior-point method's estimated work %.2e operations)\n", est2);
+            race_want = 0;
+        } else race_est = est2;
+    }
+    if (race_want == 3 && !P->ps->chordal && !u->dual) {
+        if (getenv("BRISK_FOMPROBE")) { printf("fom-probe: first, the interior-point method's estimated work %.3e\n", race_est); fflush(stdout); exit(0); }   /* (test: the route only) */
+        par->fom_handover = 1; par->fom_handover_ipm = race_est;
+        if (par->verbose >= 0) printf("first-order engine first: the interior-point method's estimated work %.2e operations; the engine hands over when its projected work exceeds it (-fomfirst 0 turns this off)\n", race_est);
+        return 6;
+    }
+    if (race_want == 3) race_want = 0;
     if (race_want && !P->ps->chordal && !u->dual) {
         par->fom_race_budget = fmax(3.0, par->fom_race * race_s);
         if (par->verbose >= 0) printf("first-order engine first: tolerance %.0e and an interior-point solve of about %.0f s expected; it gets %.0f s (-fomrace 0 turns this off)\n", par->tol, race_s, par->fom_race_budget);
@@ -1730,13 +2075,13 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
         g_pre_logged = 1;
         char sz[200]; summary_size(sz, sizeof sz, u->Ofile ? u->Ofile : u->O, u->fe ? u->fe->np : u->nfree_read);
         g_log_user++;
-        const PSOrig *O0 = u->Oaff ? u->Oaff : u->Osign ? u->Osign : u->Osym ? u->Osym : u->Oalg ? u->Oalg : u->Odual ? u->Odual : u->Ofile ? u->Ofile : u->Otb ? u->Otb : u->O;
+        const PSOrig *O0 = u->Oaff ? u->Oaff : u->Orref ? u->Orref : u->Osign ? u->Osign : u->Odep0 ? u->Odep0 : u->Osym ? u->Osym : u->Oalg ? u->Oalg : u->Odual ? u->Odual : u->Ofile ? u->Ofile : u->Otb ? u->Otb : u->O;
         summary_size(sz, sizeof sz, O0, u->fe ? u->fe->np : u->nfree_read);
         printf("Problem:  %s\n", sz);
         /* (31 October 2026, the owner: the steps that changed the problem, then, in one line, the searches that found
          * nothing: symmetry, chordal structure, facial reduction; "off" when an option turned one off) */
         long lr_c, lr_r; const int lr_any = lowrank_used(&u->P, &lr_c, &lr_r) > 0;
-        const int applied = u->Oaff || u->Osign || u->Osym || u->Oalg || u->Odual || u->Ofile || (u->P.ps && (u->P.ps->mom || u->P.ps->chordal)) || u->dep_removed > 0 || u->fr_removed > 0 || lr_any;
+        const int applied = u->Oaff || u->Osign || u->Odep0 || u->Osym || u->Oalg || u->Odual || u->Ofile || (u->P.ps && (u->P.ps->mom || u->P.ps->chordal)) || u->dep_removed > 0 || u->fr_removed > 0 || lr_any;
         if (applied) print_preprocessing(u, "Presolve: ", "          ");
         char nf[200] = ""; size_t w = 0;
         if (!(u->Osign || u->Osym || u->Oalg)) w += snprintf(nf + w, sizeof nf - w, "%ssymmetry: %s", w ? "; " : "", par->symfile || par->symalg ? "none" : "off");
@@ -1851,6 +2196,12 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
      * pglib_opf_case4661_sdet, forming A A' before finding that it does not fit, were missing from the total) */
     const double t_disp0 = wtime();
     if (P->m == 0) { solve_m0(P, R, u->X); st_ = 0; }
+    else if (g_bm_pipe) {
+        const int ntb = brisk_threads_busy(par->verbose); brisk_log_threads(par->verbose);
+        st_ = bm_multi_solve(P, par, R, u->y, u->X);
+        if (ntb > 0) omp_set_num_threads(ntb);
+        if (st_ < 0 && par->verbose >= 0) printf("the Burer-Monteiro method takes semidefinite and LP blocks only: the interior-point method\n");
+    }
     else if (par->mfipm == 2) {
         /* 5.4: the hybrid: the matrix-free method until its CG struggles or the merit is below
          * mf_hand, then the standard method from that iterate (a few factorizations of the
@@ -1991,6 +2342,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
     free(u->xc_o); u->xc_o = u->xc_p ? malloc(sizeof(int) * (u->O->nblk + 1)) : NULL;
     postsolve_set_time_left(ps_time_left(par)); postsolve_set_tol(par->tol);
     { extern void brisk_memtrace(const char *); brisk_memtrace("postsolve start"); }
+    ps_rebuild_for(u, par);
     postsolve(P, u->O, u->X, u->y, &u->Xo, u->yo, pr, par->verbose, u->xc_p, u->xc_o);
     { extern void brisk_memtrace(const char *); brisk_memtrace("postsolve end"); }
     if (u->xc_o) { int any = 0; for (int o = 0; o < u->O->nblk; o++) any |= u->xc_o[o] >= 0; if (!any) { free(u->xc_o); u->xc_o = NULL; } }
@@ -2062,6 +2414,7 @@ static int run_pipeline_core(const char *fname, Params *par, int do_fr, int forc
             double **Xm = NULL, *ym = calloc(u->O->m + 1, sizeof(double));
             PSResult prc;
             postsolve_set_time_left(ps_time_left(par)); postsolve_set_tol(par->tol);
+            ps_rebuild_for(u, par);
             postsolve(P, u->O, s < 0 ? T->X : T->Xa[s], s < 0 ? T->y : T->ya[s], &Xm, ym, &prc, 0, NULL, NULL);
             int nX = u->O->nblk;
             map_back(u, par, &Xm, &ym, &nX, 0, NULL);
@@ -2311,12 +2664,16 @@ static void bound_hint(int hp) {
     (void)cmd;
 }
 static void resolve_hint(void);
+static int g_fom_kept = 0;   /* (13 November 2026) the first-order engine's result kept at reduced accuracy (the hand-over rule) */
 static void accuracy_hint(int lp) {
     if (lp) { printf("For higher accuracy%s:\n  %s   the tolerance (default 1e-8)\n", syn_head(), syn_kv("tol", "<t>", 0)); return; }
     const char *ka = syn_kv("acc", "high", 1), *kp = syn_kv("prec", "dd", 1);
     int w = (int)strlen(kp);
     if (!g_acc_high && (int)strlen(ka) > w) w = (int)strlen(ka);
     printf("For higher accuracy%s:\n", syn_head());
+    const char *kf = syn_kv("fomfirst", "0", 1);
+    if (g_fom_kept && (int)strlen(kf) > w) w = (int)strlen(kf);
+    if (g_fom_kept) printf("  %-*s   the interior-point method instead of the first-order method\n", w, kf);
     if (!g_acc_high) printf("  %-*s   tolerance 1e-10\n", w, ka);
     printf("  %-*s   the high-precision solver, about 31 digits (%s: about 63; a number: that many digits)\n", w, kp, syn_val("qd"));
     bound_hint(0);
@@ -2436,13 +2793,27 @@ static int run_better(Run *a, Run *b) {
 static int fr_duals_lost(const Run *u, const Params *par, int do_fr, double *acc_apart) {
     static int frkeep = -1;
     if (frkeep < 0) { const char *e = getenv("BRISK_FRKEEP"); frkeep = e ? atoi(e) != 0 : 1; }
-    const int lost = frkeep && do_fr && u->fr_removed > 0 && u->measured && u->status != ST_OPTIMAL
-        && u->status != ST_PINFEAS && u->status != ST_DINFEAS
-        && u->pr.err[4] > fmax(100.0 * fmax(par->tol, 1e-8), 1e-3 * u->acc) && u->pr.err[4] >= 0.5 * u->acc;
-    if (acc_apart) {
-        const double dred = fmax(u->R.err[3], u->R.err[4]);
-        *acc_apart = lost ? brisk_nmax(brisk_nmax(u->pr.err[1], u->pr.err[2]), brisk_nmax(dred, brisk_nmax(fabs(u->pr.err[5]), fabs(u->pr.err[6])))) : u->acc;
-    }
+    /* (9 November 2026: after the dual form the removed multipliers are entries of X, and what they spoil is the primal side
+     * of the problem as read: its residual and X >= 0; the reduced solve's dual errors are those of that primal on the face) */
+    const int dv = u->dual != NULL;
+    const double el = dv ? fmax(u->pr.err[1], u->pr.err[2]) : u->pr.err[4];
+    const int cand = frkeep && do_fr && u->fr_removed > 0 && u->measured && u->status != ST_OPTIMAL
+        && u->status != ST_PINFEAS && u->status != ST_DINFEAS;
+    const double dred = fmax(u->R.err[3], u->R.err[4]);
+    const double face = dv ? brisk_nmax(brisk_nmax(u->pr.err[3], u->pr.err[4]), brisk_nmax(dred, brisk_nmax(fabs(u->pr.err[5]), fabs(u->pr.err[6]))))
+                           : brisk_nmax(brisk_nmax(u->pr.err[1], u->pr.err[2]), brisk_nmax(dred, brisk_nmax(fabs(u->pr.err[5]), fabs(u->pr.err[6]))));
+    int lost = cand && el > fmax(100.0 * fmax(par->tol, 1e-8), 1e-3 * u->acc) && el >= 0.5 * u->acc;
+    /* 10 November 2026 (the owner: the rebuild tried by default, "Only if that fails, we report that a reconstruction fails"):
+     * the rebuild has also failed when its entries alone keep the point from the tolerance while the point on the face meets
+     * it; the entries are then returned as NaN and the status is the face's. pglib_opf_case1888_rte (SDP): the rebuilt duals
+     * at 1.1e-8 against the tolerance 1e-8 made the run SOLVED TO REDUCED ACCURACY, OPTIMAL on the face. Not with -frdual 2,
+     * which returns the rebuilt entries as they are */
+    /* (10 November 2026, the evening: off by default, the owner: "I want mittleman to return no nans"; a rebuild a little above
+     * the tolerance is returned as it is at reduced accuracy, as in 1.6.5: taha1b 2.1e-8, pglib_opf_case1888_rte 1.1e-8, SDP.
+     * BRISK_FRSTRICT=1: on) */
+    static int strict = -1; if (strict < 0) { const char *e = getenv("BRISK_FRSTRICT"); strict = e && atoi(e) != 0; }
+    if (strict && !lost && cand && par->fr_dual != 2 && el > par->tol && el >= 0.5 * u->acc && face <= par->tol) lost = 1;
+    if (acc_apart) *acc_apart = !lost ? u->acc : face;
     return lost;
 }
 static double acc_apart_fr(const Run *u, const Params *par, int do_fr) { double a; fr_duals_lost(u, par, do_fr, &a); return a; }
@@ -2487,7 +2858,130 @@ static void att_opt(const char *ok, const char *okv, const char *nk, const char 
  * side -1, the other right-hand sides are 0. Measured on the user's 2x2 and 3x3 grids: every DIMACS error <= 3e-8, the
  * largest moment 62 and 629, 9.5 s and 27.7 s after first solves of 2.2 s and 5.5 s (MOSEK 15.6 s and 36.5 s with
  * errors of 2.6e-5 and 9.8e-5). The phase's y replaces the run's when its errors on the problem as read are smaller. */
+int g_img_bnd = 0;   /* (11 November 2026: the first-order method's bounds come from SDPA's primal form: its attempt with the dual form) */
 static int run_resolve(const char *fname, Params *par, int do_fr, int force_route, Run *u);
+typedef struct { long long key; double v; } KV;
+static int cmp_ll(const void *a, const void *b) { const long long x = *(const long long *)a, y = *(const long long *)b; return x < y ? -1 : x > y; }
+static int cmp_kv_key(const void *a, const void *b) { const long long x = ((const KV *)a)->key, y = ((const KV *)b)->key; return x < y ? -1 : x > y; }
+/* 10 November 2026 (ISSUES 860; the owner: the dual reconstruction, "really creative but also solid"): the duals the facial
+ * reduction leaves undetermined, chosen all together. The constraints it removed have b = 0, so their duals t do not change
+ * the objective: with the kept duals fixed at the reduced solve's, t is the solution of the small SDP
+ *     min s  subject to  (C - sum_kept y_i A_i) - sum_r t_r A_r + s I >= 0,
+ * with one variable per undetermined row and the blocks of the problem as read. The level-by-level rebuild fixes one level at
+ * a time and asks each for an exactly semidefinite slack, which diverges where the dual optimum is not attained along the chain
+ * (rose13, Mittelmann, SDP: 2e12 at the deepest level); here the violation is shared by all the levels at once. The point is
+ * kept when it meets the reduced-accuracy level on the problem as read. BRISK_FRTONLY=1: tried where the rebuild failed
+ * (under test) */
+static int fr_tonly_phase(Run *u, const Params *par, int force_route, double *t_used) {
+    *t_used = 0;
+    const PSOrig *O = u->Ofin ? u->Ofin : u->O;
+    if (!O || !u->Xo || !u->yo || u->dual) return 0;
+    const int m = O->m, nb = O->nblk;
+    double *probe = calloc((size_t)m + 1, sizeof(double));
+    undet_apply(u, par, O, probe, NULL);
+    int *idx = malloc(sizeof(int) * ((size_t)m + 1)), k = 0;
+    for (int i = 0; i < m; i++) idx[i] = isnan(probe[i]) ? k++ : -1;
+    free(probe);
+    size_t nd = 0;
+    for (int b = 0; b < nb; b++) if (O->bs[b] > 0) nd += (size_t)O->bs[b];
+    if (k == 0 || nd == 0) { free(idx); return 0; }
+    /* 11 November 2026: the small problem's cost, known before it is built. Its work per iteration is set by the blocks the
+     * undetermined rows touch: a block of order n with c of them costs about c n^3 in the Schur matrix's assembly and c^2 n^2
+     * in its entries. The same count for the rows the reduced solve kept, on the same blocks, is the work the solve just did,
+     * in the same units. The step runs when its count is at most BRISK_FRTONLYRATIO (4) times that (SDPs: pop_wood_20 and
+     * pop_wood_1000 1.6, taha1a 0.11, rose13 0.07, roa_vdp_inner_d12_K 0.005; a user's steady cavity 2x2 44, where the
+     * small problem took 13 s after a 0.4 s solve). */
+    {
+        static double rmax = -1; if (rmax < 0) { const char *e = getenv("BRISK_FRTONLYRATIO"); rmax = e ? atof(e) : 4.0; }
+        long long *rb = malloc(sizeof(long long) * (O->nnz + 1)); size_t nrb = 0;
+        for (size_t q = 0; q < O->nnz; q++) { const int cr = O->con[q]; if (cr >= 0 && O->bs[O->blk[q]] > 0) rb[nrb++] = ((long long)O->blk[q] << 32) | cr; }
+        qsort(rb, nrb, sizeof(long long), cmp_ll);
+        double work[2] = { 0, 0 };   /* [0] the rows kept, [1] the undetermined rows */
+        for (size_t q = 0; q < nrb; ) {
+            size_t e = q; int cnt[2] = { 0, 0 }; const int b = (int)(rb[q] >> 32);
+            while (e < nrb && (int)(rb[e] >> 32) == b) { if (e == q || rb[e] != rb[e - 1]) cnt[idx[(int)(rb[e] & 0xFFFFFFFF)] >= 0]++; e++; }
+            const double n = O->bs[b];
+            for (int h = 0; h < 2; h++) work[h] += cnt[h] * n * n * n + (double)cnt[h] * cnt[h] * n * n;
+            q = e;
+        }
+        free(rb);
+        const double ratio = work[1] / fmax(work[0], 1.0);
+        if (par->verbose >= 1 || getenv("BRISK_TONLYDBG"))
+            printf("postsolve: the %d undetermined duals: their small problem's work per iteration is %.2g times the solve's\n", k, ratio);
+        if (ratio > rmax) {
+            if (par->verbose >= 0) printf("postsolve: the %d undetermined duals not chosen together: the small problem would cost %.0f times the solve's work per iteration\n", k, ratio);
+            free(idx); return 0;
+        }
+    }
+    /* F0 = -(C - sum_kept y_i A_i), summed per entry (sorted keys); F_r = A_r for the undetermined rows; s: -I */
+    KV *f0 = malloc(sizeof(KV) * (O->nnz + 1)); size_t n0 = 0, nr = 0;
+    for (size_t q = 0; q < O->nnz; q++) {
+        const int c = O->con[q];
+        if (c >= 0 && idx[c] >= 0) { nr++; continue; }
+        const double v = c < 0 ? -O->v[q] : u->yo[c] * O->v[q];
+        if (v == 0) continue;
+        f0[n0].key = ((long long)O->blk[q] << 42) | ((long long)O->ii[q] << 21) | (long long)O->jj[q]; f0[n0].v = v; n0++;
+    }
+    qsort(f0, n0, sizeof(KV), cmp_kv_key);
+    size_t w = 0;
+    for (size_t q = 0; q < n0; q++) { if (w > 0 && f0[w - 1].key == f0[q].key) f0[w - 1].v += f0[q].v; else f0[w++] = f0[q]; }
+    n0 = w;
+    const size_t nn = n0 + nr + nd + 1;
+    int *mat = malloc(sizeof(int) * nn), *blk = malloc(sizeof(int) * nn), *ii = malloc(sizeof(int) * nn), *jj = malloc(sizeof(int) * nn);
+    double *v = malloc(sizeof(double) * nn), *c = calloc((size_t)k + 2, sizeof(double));
+    int *bs = malloc(sizeof(int) * ((size_t)nb + 1));
+    size_t q2 = 0;
+    for (size_t q = 0; q < n0; q++) {
+        mat[q2] = 0; blk[q2] = (int)(f0[q].key >> 42) + 1; ii[q2] = (int)((f0[q].key >> 21) & 0x1FFFFF) + 1; jj[q2] = (int)(f0[q].key & 0x1FFFFF) + 1;
+        v[q2] = f0[q].v; q2++;
+    }
+    for (size_t q = 0; q < O->nnz; q++) {
+        const int cr = O->con[q];
+        if (cr < 0 || idx[cr] < 0) continue;
+        mat[q2] = idx[cr] + 1; blk[q2] = O->blk[q] + 1; ii[q2] = O->ii[q] + 1; jj[q2] = O->jj[q] + 1; v[q2] = O->v[q]; q2++;
+    }
+    for (int b = 0; b < nb; b++) { bs[b] = O->bs[b]; if (O->bs[b] > 0) for (int t = 1; t <= O->bs[b]; t++) { mat[q2] = k + 1; blk[q2] = b + 1; ii[q2] = jj[q2] = t; v[q2] = -1.0; q2++; } }
+    c[k] = -1.0;   /* max -s */
+    BriskData d = { k + 1, nb, bs, c, q2, mat, blk, ii, jj, v };
+    Params p2 = *par;
+    p2.fr_dual = 0; p2.fr_fallback = 0; p2.known_feasible = 1; p2.bound_side = 0; p2.symfile = NULL;
+    int kept = 0;
+    if (par->timelimit > 0) { const double left = par->timelimit - (wtime() - par->t_start); if (left < 1) goto done; p2.timelimit = wtime() - par->t_start + left; }
+    if (par->verbose >= 0) printf("postsolve: the %d undetermined duals chosen together with the others held (a small problem, %d variables)\n", k, k + 1);
+    {
+        const double t0 = wtime();
+        const BriskData *sd = g_brisk_data;
+        g_brisk_data = &d;
+        Run second;
+        const int rc = run_resolve(g_brisk_data_name, &p2, 0, force_route, &second);   /* (without the facial reduction: it would remove the unknowns again) */
+        g_brisk_data = sd;
+        *t_used = wtime() - t0;
+        if (rc == 0 && second.yo && second.Ofin && second.Ofin->m == k + 1) {
+            double *y2 = malloc(sizeof(double) * ((size_t)m + 1));
+            memcpy(y2, u->yo, sizeof(double) * (size_t)m);
+            for (int i = 0; i < m; i++) if (idx[i] >= 0) y2[i] = second.yo[idx[i]];
+            PSResult pr;
+            ps_measure_xc(O, u->Xo, y2, &pr, u->xc_o);
+            const double acc = brisk_acc_err(pr.err);
+            att_log("the undetermined duals chosen together", *t_used, &second);
+            g_att[g_att_res].acc = acc;
+            if (acc <= par->red_acc) {
+                g_att[g_att_res].kept = 1;
+                memcpy(u->yo, y2, sizeof(double) * (size_t)m);
+                pr.recovered = u->pr.recovered; pr.unrecovered = u->pr.unrecovered; pr.fr_corrected = u->pr.fr_corrected; pr.t = u->pr.t;
+                u->pr = pr; u->acc = acc;
+                u->status = acc <= par->tol ? ST_OPTIMAL : ST_REDUCED;
+                kept = 1;
+                if (par->verbose >= 0) printf("  kept: DIMACS error %.1e on the problem as read (%.2f s)\n", acc, *t_used);
+            } else if (par->verbose >= 0) printf("  not kept: DIMACS error %.1e on the problem as read (%.2f s)\n", acc, *t_used);
+            free(y2);
+        } else if (par->verbose >= 0) printf("  the small problem did not finish\n");
+        if (rc == 0 || second.Xo) run_free(&second);
+    }
+done:
+    free(mat); free(blk); free(ii); free(jj); free(v); free(c); free(bs); free(f0); free(idx);
+    return kept;
+}
 static int fr_dual_phase(Run *u, const Params *par, int force_route, double *t_used) {
     *t_used = 0;
     int kept = 0;
@@ -2496,7 +2990,8 @@ static int fr_dual_phase(Run *u, const Params *par, int force_route, double *t_u
     const int m = O->m, nb = O->nblk;
     /* the value to hold: <C,X> of the first solve (its X is feasible to its primal errors, so this bounds the optimum from above;
      * b'y of a lost dual bounds nothing), less half the tolerance, so that the gap of the pair ends inside the tolerance */
-    const double vstar = u->pr.pobj - 0.5 * par->tol * (1.0 + fabs(u->pr.pobj + O->obj_off));
+    static double vs = -1; if (vs < 0) { const char *e = getenv("BRISK_FRDUALSLACK"); vs = e ? atof(e) : 0.5; }   /* (11 November 2026, under test: how much of the tolerance the held value gives up) */
+    const double vstar = u->pr.pobj - vs * par->tol * (1.0 + fabs(u->pr.pobj + O->obj_off));
     size_t nd = 0, nbz = 0;
     for (int k = 0; k < nb; k++) if (O->bs[k] > 0) nd += (size_t)O->bs[k];
     for (int i = 0; i < m; i++) if (O->b[i] != 0) nbz++;
@@ -2536,7 +3031,9 @@ static int fr_dual_phase(Run *u, const Params *par, int force_route, double *t_u
         const double acc = brisk_acc_err(pr.err);
         att_log("the dual on the problem as read with the optimal value held", *t_used, &second);
         g_att[g_att_res].acc = acc;
-        if (acc < u->acc) {
+        /* (7 November 2026: with the undetermined duals returned as NaN, u->acc is the face's; -frdual 1 asks for a dual of the
+         * problem as read, kept when it is within the reduced-accuracy level or better than the first solve) */
+        if (acc < u->acc || (g_fr_dual_face && acc <= par->red_acc)) {
             g_att[g_att_res].kept = 1;
             memcpy(u->yo, second.yo, sizeof(double) * (size_t)m);
             pr.recovered = u->pr.recovered; pr.unrecovered = u->pr.unrecovered; pr.fr_corrected = u->pr.fr_corrected; pr.t = u->pr.t;
@@ -2757,9 +3254,11 @@ static int lowrank_used(const Problem *PP, long *ncl, long *rtot) {
 static void print_preprocessing(const Run *u, const char *lab, const char *cont) {
     const Problem *PP = &u->P;
     /* the presolve chain: each stage's PSOrig is the problem before that step */
-    const PSOrig *chain[8]; const char *what[8]; int nc = 0;
+    const PSOrig *chain[10]; const char *what[10]; int nc = 0;
     if (u->Oaff) { chain[nc] = u->Oaff; what[nc++] = u->maff ? "moment relaxation over an ellipsoid: the coordinates of the unit ball" : "diagonal scaling of the semidefinite blocks"; }
+    if (u->Orref) { chain[nc] = u->Orref; what[nc++] = "equality constraints in reduced row echelon form (dependent ones removed)"; }
     if (u->Osign) { chain[nc] = u->Osign; what[nc++] = "symmetry reduction (sign changes)"; }
+    if (u->Odep0) { chain[nc] = u->Odep0; what[nc++] = "linearly dependent equality constraints removed (dual values 0)"; }
     if (u->Osym) { chain[nc] = u->Osym; what[nc++] = "symmetry reduction"; }
     if (u->Oalg) { chain[nc] = u->Oalg; what[nc++] = "symmetry reduction (block diagonalisation)"; }
     if (u->Odual) { chain[nc] = u->Odual; what[nc++] = "dual form solved"; }
@@ -2778,7 +3277,9 @@ static void print_preprocessing(const Run *u, const char *lab, const char *cont)
             printf("%s%d of %d free variable%s eliminated by substitution (equality constraints %s -> %s)\n", npre ? cont : lab,
                    u->fe->ns, u->fe->np, u->fe->np > 1 ? "s" : "", s1, s2);
         }
-        else printf("%s%s%s\n", npre ? cont : lab, what[c], d);
+        else printf("%s%s%s%s\n", npre ? cont : lab, what[c], d,
+                    /* (13 November 2026: the constraints summed over their orbits while every block keeps its order) */
+                    before == u->Osym && !u->Oalg && !strstr(d, "block") ? "; the blocks not split" : "");
         npre++;
     }
     if (PP->ps && PP->ps->mom) { printf("%smoment-form conversion of the Schur complement\n", npre ? cont : lab); npre++; }
@@ -2867,7 +3368,8 @@ static void print_summary_lines(const Run *u, const Params *par, const PSOrig *O
     const Result *R = &u->R;
     char eng[300];
     extern int g_fom_bound_used;
-    if (par->fom > 0 && g_fom_bound_used) snprintf(eng, sizeof eng, "first-order method with bounds on the entries of X (ADMM; %d constraints taken as bounds), %d iterations", g_fom_bound_used, iters);
+    if (g_bm_pipe) snprintf(eng, sizeof eng, "Burer-Monteiro method (X_k = R_k R_k' on each block), augmented Lagrangian");
+    else if (par->fom > 0 && g_fom_bound_used) snprintf(eng, sizeof eng, "first-order method with bounds on the entries of X (ADMM; %d constraints taken as bounds), %d iterations", g_fom_bound_used, iters);
     else if (par->fom > 0) snprintf(eng, sizeof eng, "first-order method (ADMM, then semismooth Newton steps), %d iterations", iters);
     else if (par->lralm > 0) snprintf(eng, sizeof eng, "low-rank augmented Lagrangian method, %d iterations", iters);
     else if (par->mfipm == 2) snprintf(eng, sizeof eng, "matrix-free interior-point iterations, then the interior-point method from their iterate; %d iterations", iters);
@@ -2900,12 +3402,37 @@ static void print_summary_lines(const Run *u, const Params *par, const PSOrig *O
         #undef ATT_PRINT
         printf("  Method:            %s\n", eng);
     }
-    if (g_fr_dual_lost) printf("  Dual:              not recovered for the %d constraints removed by the facial reduction\n", g_fr_dual_lost);
+    if (g_fr_dual_face) printf("  Dual:              NaN for %d constraints, not determined after the facial reduction;\n"
+                               "                     dinf and Z>=0 measured on its face\n", g_fr_dual_face);
+    if (g_fr_prim_face) printf("  Primal:            NaN for %d entries of X, not determined after the facial reduction of the dual form;\n"
+                               "                     pinf and X>=0 measured on its face\n", g_fr_prim_face);
+    /* (9 November 2026: the line below hung on the Primal line's condition since that line was inserted this morning, and
+     * printed beside "NaN for N constraints") */
+    if (!g_fr_dual_face && !g_fr_prim_face && g_fr_dual_lost) printf("  Dual:              not recovered for the %d constraints removed by the facial reduction\n", g_fr_dual_lost);
     for (int i = 0; i < g_nnotes; i++) if (!(g_log_brief && g_note_diag[i])) printf("                     %s\n", g_notes[i]);
     if (extra && extra[0]) printf("                     %s\n", extra);
     if (status == ST_TIME) printf("                     stopped by the time limit%s\n", brisk_stop_flag ? " (interrupted)" : "");
     else if (status == ST_MAXIT) printf("                     stopped at the iteration limit\n");
     g_t_all_note = t_all;
+    {   /* (-lpface) the search's answer; the problem was not changed */
+        extern int g_lpface_state, g_lpface_n, g_lpface_tot, g_lpface_nlp, g_lpface_lev, g_lpface_stop;
+        if (g_lpface_state == 1) {
+            char lp[96] = "", why[200] = "";
+            if (g_lpface_nlp > 0) snprintf(lp, sizeof lp, " and %d LP variable%s", g_lpface_nlp, g_lpface_nlp == 1 ? "" : "s");
+            if (g_lpface_stop == 1) snprintf(why, sizeof why, "; the level limit ended the search (-lpface %d), more levels may find more", g_lpface_lev);
+            else if (g_lpface_stop == 2) snprintf(why, sizeof why, "; the work limit ended the search, more levels may find more");
+            else if (g_lpface_stop == 3) snprintf(why, sizeof why, "; the linear program of level %d failed", g_lpface_lev + 1);
+            if (g_lpface_n + g_lpface_nlp > 0)
+                printf("  Face search:       %d of %d indices of the semidefinite blocks%s are zero on every feasible point, found in %d level%s by a\n"
+                       "                     linear program%s; reported only, the problem was not changed\n",
+                       g_lpface_n, g_lpface_tot, lp, g_lpface_lev, g_lpface_lev == 1 ? "" : "s", why);
+            else printf("  Face search:       no face found by the linear program%s\n", why);
+        }
+        else if (g_lpface_state == 2) printf("  Face search:       not run: the free variables' elimination was not refused near its break-even, so a face could not change the presolve (-lpfaceall 1 runs it anyway)\n");
+        else if (g_lpface_state == 3) printf("  Face search:       stopped at its work limit or failed in its first level, nothing found\n");
+        else if (g_lpface_state == 4) printf("  Face search:       not run (no free variables left as split pairs, or no semidefinite block)\n");
+        g_lpface_state = 0;
+    }
     if (g_log_brief) printf("  Time:              %.2f s (presolve %.2f s, solve %.2f s)\n", t_all, tpre, fmax(0.0, t_all - tpre));
     else printf("  Time:              %.2f s (presolve %.2f, solve and re-solves %.2f; reading the file %.2f s more)\n", t_all, tpre, fmax(0.0, t_all - tpre), tread);
     /* 31 October 2026 (ISSUES 727): the line of the log's start, the same words and reason (the owner's wording) */
@@ -2933,25 +3460,48 @@ static void print_summary_lines(const Run *u, const Params *par, const PSOrig *O
     blkscale_hint(status);
     freeelim_hint(status);
     decision_hint();
-    if (g_fr_dual_lost) {   /* the fix for the dual first; more accuracy would not give it */
+    if (g_fr_dual_face) {
+        /* 7 November 2026 (the owner): the duals the problem left by the facial reduction does not determine are NaN; the
+         * advice says how to get a dual of the problem as read */
+        char kf[64]; snprintf(kf, sizeof kf, "%s", syn_kv("frdual", "1", 0));
+        const char *k = syn_kv("nofr", NULL, 0);
+        const size_t w = strlen(kf) > strlen(k) ? strlen(kf) : strlen(k);
+        /* (8 November 2026, the owner's wording, "Use that wording exactly") */
+        printf("Dual recovery after the facial reduction failed: the problem has no strictly feasible point,\n"
+               "and some dual values are not determined (returned as NaN). Better modeling possible?\n"
+               "If you really want the entire dual variable, try%s\n", syn_head());
+        printf("  %-*s   a second solve that computes a dual for the optimal value found here\n", (int)w, kf);
+        printf("  %-*s   solves without the facial reduction\n", (int)w, k);
+        bound_hint(0);
+    } else if (g_fr_prim_face) {
+        /* 9 November 2026 (the owner's decision (a)): after the dual form, the entries of X the reduced problem does not determine
+         * are NaN; the wording follows the owner's for the dual of 8 November */
+        const char *k = syn_kv("nofr", NULL, 0);
+        printf("Primal recovery after the facial reduction failed: the dual problem has no strictly feasible point,\n"
+               "and some entries of X are not determined (returned as NaN). Better modeling possible?\n"
+               "If you really want the entire X, try%s\n", syn_head());
+        printf("  %s   solves without the facial reduction\n", k);
+        bound_hint(0);
+    } else if (g_fr_dual_lost) {   /* the fix for the dual first; more accuracy would not give it */
         /* (4 November 2026, the owner) a shallower reduction first: its duals are rebuilt where the deep chain's are not */
         extern int g_fr_depth_used;
         char kf[64], kd[64]; snprintf(kf, sizeof kf, "%s", syn_kv("frdual", "1", 0)); snprintf(kd, sizeof kd, "%s", syn_kv("frdepth", "1", 0));
         const char *k = syn_kv("nofr", NULL, 0);
         /* (4 November 2026) the second solve for the dual first: the dual of least violation with the optimal value held,
          * about one solve of the problem as read (a user's moment relaxations: every DIMACS error <= 3e-8) */
-        size_t w = strlen(kf); if (strlen(k) > w) w = strlen(k); if (g_fr_depth_used >= 2 && strlen(kd) > w) w = strlen(kd);
+        size_t w = strlen(kf); if (strlen(k) > w) w = strlen(k);
         /* (5 November 2026, the owner: "Dual recovery after facial reduction failed: modeling problems? Try -frdual 1 or -nofr")
          * Both are offered: on the files where the dual was lost (bench/frdual_1104) the second solve gave a feasible dual on
          * every one, while the solve without the reduction was OPTIMAL and faster on most benchmark files (pop_wood,
          * exp_v4) but slow and less accurate on a user's Navier-Stokes relaxations; the share of constraints the reduction
          * removed does not tell them apart (exp_v4: 96 %, the faster without; Navier-Stokes: 72 %, the slower). */
+        /* (8 November 2026, the owner's wording; here the duals are returned, not NaN: y is not dual feasible) */
+        (void)kd; (void)g_fr_depth_used;
         printf("Dual recovery after the facial reduction failed: the problem has no strictly feasible point,\n"
-               "often a sign that the model can be written smaller (variables forced to zero by the constraints).\n"
-               "To recover the dual%s:\n  %-*s   a second solve for the dual, the optimal value of this one held\n", syn_head(), (int)w, kf);
-        printf("  %-*s   solves without the facial reduction (often faster, on some problems\n  %-*s   much slower)\n", (int)w, k, (int)w, "");
-        if (g_fr_depth_used >= 2)
-            printf("  %-*s   a facial reduction of depth 1 (this one: depth %d), whose duals are\n  %-*s   rebuilt more often\n", (int)w, kd, g_fr_depth_used, (int)w, "");
+               "and some dual values are not determined (the returned dual is not feasible). Better modeling possible?\n"
+               "If you really want the entire dual variable, try%s\n", syn_head());
+        printf("  %-*s   a second solve that computes a dual for the optimal value found here\n", (int)w, kf);
+        printf("  %-*s   solves without the facial reduction\n", (int)w, k);
         bound_hint(0);
     } else if (par->mfipm == 1 && status != ST_OPTIMAL && status != ST_TIME) {
         /* (3 November 2026) the matrix-free method asked for missed the tolerance: the method that factors the Schur complement,
@@ -3126,8 +3676,9 @@ static int nt_scope_begin(int argc, char **argv) {
     if (g_nt_default <= 0) g_nt_default = omp_get_max_threads();
     const int saved = omp_get_max_threads();
     const int k = threads_arg(argc, argv);
-    g_threads_forced = k > 0;
-    omp_set_num_threads(k > 0 ? k : g_nt_default);
+    g_threads_forced = k > 0 ? k : 0;
+    brisk_user_threads_clear();
+    if (k > 0) brisk_user_threads(k); else omp_set_num_threads(g_nt_default);
     return saved;
 #else
     (void)argc; (void)argv; return -1;
@@ -3326,14 +3877,38 @@ static void cone_summary(const SedumiProb *P, const SedumiRes *R) {
     printf("  Status:            %s\n", R->status_str);
     if (g_cone_objline[0]) printf("  Objective:         %s\n", g_cone_objline);
     else printf("  Objective:         primal c'x = %.10e, dual b'y = %.10e\n", R->pobj, R->dobj);
-    printf("  DIMACS errors:     pinf %.1e, x in K %.1e, dinf %.1e, z in K* %.1e, gap %.1e, compl %.1e\n", R->err[0], R->err[1], R->err[2], R->err[3], R->err[4], R->err[5]);
     double e = 0; for (int i = 0; i < 6; i++) e = fmax(e, fabs(R->err[i]));
-    brisk_out_summary_line();
-    printf("Solved to DIMACS error %.1e\n", e);
+    /* (7 November 2026, the SOCP developer; ISSUES 853) a solve that computed no point (stopped before its first iteration: out of
+     * memory) has no errors to report; its all-zero errors had read "Solved to DIMACS error 0.0e+00" */
+    if (R->status != 0 && R->iters == 0 && e == 0.0) {
+        printf("  DIMACS errors:     not available (no point was computed)\n");
+        brisk_out_summary_line();
+    } else {
+        printf("  DIMACS errors:     pinf %.1e, x in K %.1e, dinf %.1e, z in K* %.1e, gap %.1e, compl %.1e\n", R->err[0], R->err[1], R->err[2], R->err[3], R->err[4], R->err[5]);
+        brisk_out_summary_line();
+        /* (11 November 2026, the SOCP developer) a result taken on a face of the feasible set (the problem has no strictly feasible point and no
+         * optimal multipliers): the errors above are measured on the problem as given, where the dual can only approach its optimum; the
+         * closing line gives the measure the result was accepted on */
+        { extern double socp_face_err(void); const double fe = socp_face_err();
+          if (fe >= 0 && R->status == 0) printf("Solved to error %.1e on a face of the feasible set (no strictly feasible point: the gap and complementarity above are measured on the problem as given, which has no optimal multipliers)\n", fe);
+          else printf("Solved to DIMACS error %.1e\n", e); }
+    }
     /* (3 November 2026) after the LP method's attempt, how to go to the SOCP solver at once (the owner's rule: the advice
      * says how to avoid a re-solve) */
-    if (R->lpm == 2) printf("To solve it by the SOCP solver at once%s:\n  %s   the SOCP solver directly\n", syn_head(), syn_kv("lpmethod", "0", 0));
-    else accuracy_hint(0);
+    /* (11 November 2026, the owner: the facial reduction is off by default; a failed solve whose last iterate shows that the problem has
+     * no strictly feasible point says so, what the face is, and how to solve on it) */
+    { extern long socp_face_advice(long *nkz, long *nkr); long nkz = 0, nkr = 0; const long nlz = socp_face_advice(&nkz, &nkr);
+      if (nlz >= 0 && R->status != 0) {
+          char wh[200]; int o_ = 0; wh[0] = 0;
+          if (nlz) o_ += snprintf(wh + o_, sizeof wh - o_, "%ld nonnegative variable%s %s zero, ", nlz, nlz == 1 ? "" : "s", nlz == 1 ? "is" : "are");
+          if (nkz) o_ += snprintf(wh + o_, sizeof wh - o_, "%ld cone%s %s zero, ", nkz, nkz == 1 ? "" : "s", nkz == 1 ? "is" : "are");
+          if (nkr) o_ += snprintf(wh + o_, sizeof wh - o_, "%ld cone%s on one ray of %s boundary, ", nkr, nkr == 1 ? " lies" : "s lie", nkr == 1 ? "its" : "their");
+          if (o_ >= 2) wh[o_ - 2] = 0;
+          printf("No strictly feasible point. In every feasible point %s, so the optimum lies on a face of the feasible set, which an interior-point method approaches only from inside, and the problem as given has no optimal multipliers.\n"
+                 "To solve it on that face (facial reduction)%s:\n  %s   the face solved again and its result returned\n", wh, syn_head(), syn_kv("socpfr", "1", 0));
+      }
+      else if (R->lpm == 2) printf("To solve it by the SOCP solver at once%s:\n  %s   the SOCP solver directly\n", syn_head(), syn_kv("lpmethod", "0", 0));
+      else accuracy_hint(0); }
 }
 /* the command line on a MAT-file with A (or At), b, c, K: argv[ifile] is the file */
 static int log_brief_wanted(int argc, char **argv);
@@ -3412,6 +3987,20 @@ typedef struct { int sxpre, iters; double t; char why[192]; int verdict; } LpAtt
 /* 5.8: the summary of a linear program (MPS): the presolve, the LP interior-point method or the SOCP solver */
 /* (31 October 2026, ISSUES 637) the interior-point method's three errors, or "not measured" when it stopped before its first
  * iterate (they are then infinite: lpipm_core) */
+/* (7 November 2026; ISSUES 843) BRISK_LPGRBTOL=1: the Errors line gives the absolute violations on the problem as read, as
+ * Gurobi reports them (its BoundVio and ConstrVio attributes); the relative ones of lp_errors otherwise. A point of the
+ * interior-point method is taken when no row of the problem as read is violated by more than lp_accept_lim() of its
+ * activity: 1e-6 by default, 1e-3 with the switch (the check that only keeps a plainly wrong result from being optimal) */
+static double g_lp_eabs[2] = {-1, -1};
+static void lp_errors2(const LpProb *L, const double *x, double *eb, double *er) {
+    lp_errors(L, x, eb, er);
+    if (brisk_lpgrbtol()) lp_errors_abs(L, x, &g_lp_eabs[0], &g_lp_eabs[1]); else g_lp_eabs[0] = g_lp_eabs[1] = -1;
+}
+static const char *lp_errvals(double eb, double er, double *b, double *r) {
+    if (brisk_lpgrbtol() && g_lp_eabs[0] >= 0) { *b = g_lp_eabs[0]; *r = g_lp_eabs[1]; return "absolute"; }
+    *b = eb; *r = er; return "relative";
+}
+static double lp_accept_lim(void) { return brisk_lpgrbtol() & LPGRB_IPM ? 1e-3 : 1e-6; }
 static const char *lp_errtxt(char *b, size_t nb, double p, double d, double g) {
     if (isinf(p) && isinf(d) && isinf(g)) snprintf(b, nb, "not measured (no iterate)");
     else snprintf(b, nb, "pinf %.1e  dinf %.1e  gap %.1e", p, d, g);
@@ -3462,12 +4051,11 @@ static void lp_summary(const LpProb *L, const SedumiProb *P, const SedumiRes *R,
         const char *ss = R->status_str[0] ? R->status_str : "STOPPED"; const char *pp = strstr(ss, " (");
         printf("  Status:            %.*s\n", pp ? (int)(pp - ss) : (int)strlen(ss), ss);
         printf("  Objective:         %.10e\n", obj);
-        /* (3 November 2026) the dual error and the gap too, so that the last line's error is the largest number shown here
-         * (afiro, LP: row violation 1.8e-14 here, "Solved to relative error 5.2e-13" below, the dual error unshown) */
-        if (isinf(R->err[0])) printf("  Errors:            variable bounds violated by %.1e, constraints by %.1e (relative)\n", eb, er);
-        else printf("  Errors:            variable bounds violated by %.1e, constraints by %.1e, dual constraints by %.1e; gap %.1e (relative)\n",
-                    eb, er, fabs(R->err[2]), fabs(R->err[4]));
-    } else { char eb3[96]; printf("  Errors:            variable bounds violated by %.1e, constraints by %.1e (relative); of the solve: %s\n", eb, er, lp_errtxt(eb3, sizeof eb3, R->err[0], R->err[2], R->err[4])); }
+        /* (3 November 2026, kept at the merge of 7 November) the dual error and the gap too, so that the last line's error is the
+         * largest number shown here (afiro, LP: the dual error was unshown) */
+        { double b_, r_; const char *k_ = lp_errvals(eb, er, &b_, &r_); if (isinf(R->err[0])) printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (%s)\n", b_, r_, k_);
+          else printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (%s); dual violation %.1e, gap %.1e\n", b_, r_, k_, fabs(R->err[2]), fabs(R->err[4])); }
+    } else { char eb3[96]; double b_, r_; const char *k_ = lp_errvals(eb, er, &b_, &r_); printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (%s); of the solve: %s\n", b_, r_, k_, lp_errtxt(eb3, sizeof eb3, R->err[0], R->err[2], R->err[4])); }
     /* (31 October 2026, ISSUES 637) "solved" only for an optimal or reduced-accuracy result; a point returned at a limit or
      * after a failure is said to be one, with its error on the problem as read (Q003_lattice_equalities, LP: "Solved to
      * relative error 6.9e-01" after the time limit) */
@@ -3510,13 +4098,33 @@ static int brisk_main_lp_simplex(LpProb *L, int ac, char **av, const char *fname
     }
     if (getenv("BRISK_SXNOSCALE")) o.noscale = 1;
     if (getenv("BRISK_SXNOPERTURB")) o.noperturb = 1;
+    /* (12 November 2026, a diagnostic: BRISK_SXBASISFILE=<file>) a starting basis: "n m", then the n columns' and the m rows'
+     * statuses (simplex.h: 0 basic, 1 at the lower bound, 2 at the upper, 3 zero, 4 fixed; a row's status names the row's bound) */
+    int *bcs_ = NULL, *brs_ = NULL;
+    {   const char *bf_ = getenv("BRISK_SXBASISFILE");
+        if (bf_) { FILE *fb_ = fopen(bf_, "r"); int nb_ = 0, mb_ = 0;
+            if (fb_ && fscanf(fb_, "%d %d", &nb_, &mb_) == 2 && nb_ == L->n && mb_ == L->m) {
+                bcs_ = malloc(sizeof(int) * ((size_t)nb_ + 1)); brs_ = malloc(sizeof(int) * ((size_t)mb_ + 1)); int ok_ = 1;
+                for (int j = 0; j < nb_ && ok_; j++) ok_ = fscanf(fb_, "%d", &bcs_[j]) == 1;
+                for (int i = 0; i < mb_ && ok_; i++) ok_ = fscanf(fb_, "%d", &brs_[i]) == 1;
+                if (ok_) { o.cstat0 = bcs_; o.rstat0 = brs_; if (getenv("BRISK_SXBASISPERT")) o.given_perturb = 1; if (!quiet) printf("  a starting basis read from %s\n", bf_); }   /* (BRISK_SXBASISPERT=1: solved as a round of row sifting is, the costs perturbed and the weights computed lazily) */
+            } else if (!quiet) printf("  the basis file %s does not fit the problem (%d x %d)\n", bf_, mb_, nb_);
+            if (fb_) fclose(fb_); }
+    }
     double *x = calloc((size_t)L->n + 1, sizeof(double)), *y = calloc((size_t)L->m + 1, sizeof(double)), *z = calloc((size_t)L->n + 1, sizeof(double));
     SimplexInfo inf;
     /* (3 November 2026) the default log's tables: the simplex method's when it runs alone (methods 1, 2), the interior-point
      * method's before its crossover (3); none for the automatic choice, whose two methods may run at the same time */
     extern int g_stab;
     const int st0 = g_stab, it0 = g_itab; g_stab = g_log_brief && (method == 1 || method == 2); g_itab = g_log_brief && method == 3;
-    const int st = simplex_solve(L, &o, x, NULL, y, z, NULL, NULL, &inf);
+    /* (13 November 2026, a diagnostic: BRISK_SXBASISOUT=<file>) the final basis, in BRISK_SXBASISFILE's format */
+    const char *bo_ = getenv("BRISK_SXBASISOUT");
+    int *ocs_ = bo_ ? malloc(sizeof(int) * ((size_t)L->n + 1)) : NULL, *ors_ = bo_ ? malloc(sizeof(int) * ((size_t)L->m + 1)) : NULL;
+    const int st = simplex_solve(L, &o, x, NULL, y, z, ocs_, ors_, &inf);
+    if (bo_ && ocs_ && ors_) { FILE *fo_ = fopen(bo_, "w");
+        if (fo_) { fprintf(fo_, "%d %d\n", L->n, L->m); for (int j = 0; j < L->n; j++) fprintf(fo_, "%d\n", ocs_[j]);
+                   for (int i = 0; i < L->m; i++) fprintf(fo_, "%d\n", ors_[i]); fclose(fo_); } }
+    free(ocs_); free(ors_);
     g_stab = st0; g_itab = it0;
     static const char *sname[] = {"OPTIMAL", "PRIMAL INFEASIBLE", "DUAL INFEASIBLE", "ITERATION LIMIT", "NUMERICAL DIFFICULTIES", "", "TIME LIMIT"};
     const char *ss = st >= 0 && st <= 6 ? sname[st] : "UNKNOWN";
@@ -3552,10 +4160,14 @@ static int brisk_main_lp_simplex(LpProb *L, int ac, char **av, const char *fname
                        method == 2 ? "primal" : "dual", inf.iters, inf.iters_dual, inf.iters_primal, inf.iters_phase1, inf.nfactor, inf.time);
             if (brief) {
                 printf("  Time:              %.2f s\n  Number of threads: %d\n  Status:            %s\n", wtime() - t0, omp_get_max_threads(), ss);
-                if (st == 0 || st == 3 || st == 6) printf("  Objective:         %.10e\n", inf.obj);
+                if (st == 0) printf("  Objective:         %.10e\n", inf.obj);
+                else if (st == 3 || st == 6) printf("  Objective:         %.10e (of the last iterate on the presolved problem; no point is returned)\n", inf.obj);
                 if (st == 0 || st == 3 || st == 6) printf("  Errors:            on the problem as read: primal %.1e, dual %.1e (absolute)\n", inf.pinf, inf.dinf);
                 if (st == 0) printf("Solved to an optimal basic solution\n");
-                else if (st == 1 || st == 2) printf("  Status:            %s\n", st == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE");
+                /* (8 November 2026) the verdict and the last line as the default route gives them; the status was printed twice
+                 * (above, and here), without the verdict: now that an LP under 1,000 nonzeros comes here by default */
+                else if (st == 1) printf("  Verdict:           the problem is primal infeasible\nPrimal infeasible\n");
+                else if (st == 2) printf("  Verdict:           the problem is dual infeasible: it has no optimum (unbounded if it has a feasible point)\nDual infeasible\n");
                 else printf("Not solved (%s)\n", ss);
                 if (st == 6) printf("For a result%s:\n  %s   a longer time limit (seconds)\n", syn_head(), syn_kv("timelimit", "<s>", 0));
                 else if (st == 3) printf("For a result%s:\n  %s   a larger iteration limit\n", syn_head(), syn_kv("maxit", "<k>", 0));
@@ -3568,12 +4180,19 @@ static int brisk_main_lp_simplex(LpProb *L, int ac, char **av, const char *fname
             if (brief) g_log_user--;
         }
     }
-    if (xf) sedumi_write_vec(xf, x, L->n);
+    /* (10 November 2026, the outside LP benchmark's audit) the point only when the solve gave one: an optimal basis's, postsolved.
+     * A solve stopped by its iteration or time limit leaves x as it was allocated (zero) on the presolved route, and the
+     * objective it reports is its last iterate's on the presolved problem: the zero vector was returned as the point with that
+     * objective, and the objective as a dual bound as well (N041, a covering LP: objective 1,908.6, the point's 0, a row
+     * violated by 8.5) */
+    const int xok = st == 0;
+    if (xf && xok) sedumi_write_vec(xf, x, L->n);
     if (g_brisk_result) {
         BriskResult *res = g_brisk_result;
         res->status = st; snprintf(res->status_str, sizeof res->status_str, "%s", ss);
-        res->exit_code = rc; res->iters = (int)inf.iters; res->m = L->m; res->pobj = inf.obj; res->dobj = inf.obj; res->time = wtime() - t0;
-        res->sn = L->n; res->have_x = 1; res->sx = x; x = NULL;
+        res->exit_code = rc; res->iters = (int)inf.iters; res->m = L->m; res->pobj = inf.obj; res->dobj = xok ? inf.obj : NAN; res->time = wtime() - t0;
+        res->sn = L->n; res->have_x = xok; res->sx = x; x = NULL;
+        if (xok) { res->y = y; y = NULL; res->sz = z; z = NULL; }     /* (10 November 2026: the rows' duals and the reduced costs, z = c - A'y) */
     }
     (void)fname;
     free(x); free(y); free(z);
@@ -3614,7 +4233,7 @@ static double lp_std_objoff(LpProb *L, const LpMap *M, int nstd) {
  * BRISK_LPNOCONC=1: off */
 typedef struct {
     pthread_t th; int started;
-    LpProb L; SimplexOpts o; SimplexInfo inf; double *x;
+    LpProb L; SimplexOpts o; SimplexInfo inf; double *x, *y, *z;    /* (y, z: 10 November 2026, the rows' duals and the reduced costs for the result) */
     volatile int stop;          /* (set by the caller: the interior-point method's result is taken) */
     volatile int done, won;     /* (set by the thread: ended; ended with a result to take) */
     volatile int nthr;          /* (the threads it may use: 1, all of them once the interior-point method has given up) */
@@ -3622,38 +4241,100 @@ typedef struct {
     void *peer;                 /* (the other simplex job, stopped when this one wins: the bounded substitution's) */
     int st; double t0, t;
     SimplexProgress prog;       /* (4 November 2026: its progress, for the race's log) */
+    int idle;                   /* (7 November 2026: its thread at the idle scheduling priority, lp_conc_idle) */
+    volatile int declined;      /* (7 November 2026: set by its simplex solve when it declines the route through the dual problem) */
 } LpConc;
+static void lp_conc_live(LpConc *c, int on);
+static int lp_conc_solve(LpConc *c) {
+    if (brisk_fault("lpjoboom")) {
+        if (brisk_fault("lpjoboomlate")) { const struct timespec ts_ = { 0, 300000000 }; nanosleep(&ts_, NULL); }
+        fprintf(stderr, "brisk: out of memory (simplex; BRISK_FAULT=lpjoboom)\n"); exit(1);
+    }
+    return simplex_solve(&c->L, &c->o, c->x, NULL, c->y, c->z, NULL, NULL, &c->inf);
+}
 static void *lp_conc_run(void *p) {
     LpConc *c = p;
     omp_set_num_threads(1);
-    c->st = simplex_solve(&c->L, &c->o, c->x, NULL, NULL, NULL, NULL, NULL, &c->inf);
+    /* (7 November 2026) under the helper threads' guard (brisk.h): a fatal error in the job ends the job without a result
+     * (BRISK_FAULT=lpjoboom: an allocation failure injected here, a test; lpjoboomlate: 0.3 s later) */
+    BRISK_THREAD_GUARD(c->st = lp_conc_solve(c), c->st = -1);
     c->t = wtime() - c->t0;
-    if (c->st >= 0 && c->st <= 2 && !c->stop) {
-        c->won = 1;
-        if (c->anywon) *c->anywon = 1;
-        if (c->peer) ((LpConc *)c->peer)->stop = 1;
+    if (getenv("BRISK_LPDBG")) fprintf(stderr, "   [a simplex job of the race ended %.5f s after its start, status %d, stop %d]\n", c->t, c->st, brisk_flag_get(&c->stop));
+    if (c->st >= 0 && c->st <= 2 && !brisk_flag_get(&c->stop)) {
+        brisk_flag_set(&c->won, 1);
+        if (c->anywon) brisk_flag_set(c->anywon, 1);
+        if (c->peer) brisk_flag_set(&((LpConc *)c->peer)->stop, 1);
     }
-    __sync_synchronize(); c->done = 1;
+    brisk_flag_set(&c->done, 1);     /* (release: the job's result, written before, is seen by the thread that reads done) */
     return NULL;
 }
-static int lp_conc_start(LpConc *c, const LpProb *L, double tlim, int aggb, volatile int *anywon) {   /* (aggb: 1 the bounded substitution's job, 2 the direct job, no route through the dual problem) */
+/* (8 November 2026) the interior-point method's threads in the race: nt (the count asked) less the simplex jobs beside it, and no
+ * more than the CPUs the process can keep busy leave beside those jobs (brisk_avail_cpus: the affinity mask, or the container's
+ * quota). The method's OpenMP team spins at its barriers; with the jobs' threads it must not outnumber the CPUs, or a team thread
+ * waits for a CPU while the others spin: the outside LP benchmark asked for its machine's 5 logical CPUs under a quota of 4, and on
+ * this host 5 threads on 4 cores make the race 2 to 12 times slower where the method wins (dense_border 0033, LP, 2.09 -> 22.9 s;
+ * the method alone at 5 or 8 threads 1.9 s). BRISK_LPRACECAP=0: the count asked, as before */
+static int race_ipm_threads(int nt, int njobs) {
+    int k = nt - njobs; if (k < 1) k = 1;
+    { static int less = -1; if (less < 0) { const char *e_ = getenv("BRISK_LPRACEIPMLESS"); less = e_ ? atoi(e_) : 0; }   /* (8 November 2026, a test: the method on fewer threads, a core left to the simplex job's memory traffic) */
+      if (less > 0) { k -= less; if (k < 1) k = 1; } }
+    static int cap = -1; if (cap < 0) { const char *e_ = getenv("BRISK_LPRACECAP"); cap = !(e_ && atoi(e_) == 0); }
+    if (cap) { const int a = brisk_avail_cpus(); if (a > 0 && k + njobs > a) { k = a - njobs; if (k < 1) k = 1; } }
+    return k;
+}
+static double g_racet0;    /* (BRISK_LPRACET, a diagnostic: the solve's start) */
+static int lp_conc_start(LpConc *c, const LpProb *L, double tlim, int aggb, volatile int *anywon, SxCanon *canon) {   /* (aggb: 1 the bounded substitution's job, 2 the direct job, no route through the dual problem) */
     LpProb *D = &c->L; *D = *L;
     const int n = L->n, m = L->m, nz = L->Ap[n];
-#define LPC_CP(f, cnt, T) do { D->f = malloc(sizeof(T) * ((size_t)(cnt) + 1)); memcpy(D->f, L->f, sizeof(T) * (size_t)(cnt)); } while (0)
+    /* (7 November 2026) each copy checked: an allocation that fails (a large LP under a memory limit) leaves the job
+     * unstarted, and the interior-point method runs alone, instead of a write through a null pointer */
+    D->Ap = NULL; D->Ai = NULL; D->Ax = NULL; D->c = NULL; D->l = NULL; D->u = NULL; D->rl = NULL; D->ru = NULL;
+    D->rname = NULL; D->cname = NULL;
+    int lpc_ok = 1;
+#define LPC_CP(f, cnt, T) do { if (lpc_ok && (D->f = malloc(sizeof(T) * ((size_t)(cnt) + 1)))) memcpy(D->f, L->f, sizeof(T) * (size_t)(cnt)); else lpc_ok = 0; } while (0)
     LPC_CP(Ap, n + 1, int); LPC_CP(Ai, nz, int); LPC_CP(Ax, nz, double); LPC_CP(c, n, double); LPC_CP(l, n, double); LPC_CP(u, n, double);
     LPC_CP(rl, m, double); LPC_CP(ru, m, double);
 #undef LPC_CP
-    D->rname = NULL; D->cname = NULL;
+    if (!lpc_ok) { lp_free(D); return 0; }
     memset(&c->o, 0, sizeof c->o);
     c->o.method = 1; c->o.timelimit = tlim; c->o.stop = &c->stop;
     c->nthr = 1; c->o.threads = &c->nthr;
     c->o.aggb_only = aggb == 1; c->o.no_dual_route = aggb == 2; c->anywon = anywon;
     memset(&c->prog, 0, sizeof c->prog); c->o.prog = &c->prog;
-    c->x = calloc((size_t)n + 1, sizeof(double));
+    c->idle = 0; brisk_flag_set(&c->declined, 0); c->o.direct_peer = &c->declined;
+    c->o.canon = canon && canon->on ? canon : NULL;
+    c->x = calloc((size_t)n + 1, sizeof(double)); c->y = calloc((size_t)D->m + 1, sizeof(double)); c->z = calloc((size_t)n + 1, sizeof(double));
+    if (!c->x || !c->y || !c->z) { free(c->x); free(c->y); free(c->z); c->x = c->y = c->z = NULL; lp_free(D); return 0; }
     c->t0 = wtime();
-    if (pthread_create(&c->th, NULL, lp_conc_run, c)) { free(c->x); c->x = NULL; lp_free(D); return 0; }
+    if (getenv("BRISK_LPRACET")) fprintf(stderr, "   [race timing: the job starts %.5f s after the solve's start]\n", c->t0 - g_racet0);
+    if (pthread_create(&c->th, NULL, lp_conc_run, c)) { free(c->x); free(c->y); free(c->z); c->x = c->y = c->z = NULL; lp_free(D); return 0; }
     c->started = 1;
+    lp_conc_live(c, 1);
     return 1;
+}
+/* (7 November 2026) the second simplex job at the idle scheduling priority (Linux's SCHED_IDLE): it runs only on a core
+ * that no thread of normal priority wants, i.e. on the cores the interior-point method leaves idle (its serial stretches,
+ * when its other threads sleep) and on every core once the method has ended or given up. The method then keeps the
+ * thread the job would otherwise take from it: at four threads it lost a third of its speed on the tall LPs it wins
+ * (physiciansched3-3, LP: 32.8 -> 43.6 s), where neither simplex job comes near (the direct one alone over 120 s).
+ * Returns 1 when the priority is set (Linux; elsewhere 0, and the job takes a thread as before) */
+static int lp_conc_idle(LpConc *c) {
+#if defined(__linux__) && defined(SCHED_IDLE)
+    struct sched_param sp; memset(&sp, 0, sizeof sp);
+    if (c->started == 1 && pthread_setschedparam(c->th, SCHED_IDLE, &sp) == 0) { c->idle = 1; return 1; }
+#else
+    (void)c;
+#endif
+    return 0;
+}
+/* back to the normal priority when the interior-point method gives its threads to the simplex jobs (not permitted to
+ * every user: the job then keeps the idle priority, which costs it nothing on a machine with free cores) */
+static void lp_conc_unidle(LpConc *c) {
+#if defined(__linux__) && defined(SCHED_IDLE)
+    if (c->started == 1 && c->idle) { struct sched_param sp; memset(&sp, 0, sizeof sp); if (pthread_setschedparam(c->th, SCHED_OTHER, &sp) == 0) c->idle = 0; }
+#else
+    (void)c;
+#endif
 }
 /* (4 November 2026, the owner: "No iterates displayed. Try to display the race side by side with only partial info (less
  * columns) per method"; and "I want the logs to stay essentially cost-free for each method") the race's log in the default
@@ -3694,6 +4375,144 @@ static void race_ipm_cb(void *ctx, int it, double pobj, double err) {
     R->ipm_it = it; R->ipm_obj = R->maxim ? -pobj : pobj; R->ipm_err = err;
     if (it < 10 || (it < 50 && it % 5 == 0) || it % 10 == 0) race_row(R, 0);
 }
+/* the interior-point method's callback in the race: it carries the race's log, and hands the method the thread of the
+ * second simplex job when that job is stopped as a duplicate (below). The method reads the free threads at the top of each
+ * iteration and sets its own count for the iterations that follow (its results do not depend on the thread count, the
+ * reproducibility rule's thread changes during a solve). The count it adds to is the one the method started with, after
+ * the busy-machine rule (brisk_threads_busy) lowered it to the free cores. (A give-back of the thread of any simplex job
+ * that ended without a result, 5 November 2026, was removed on 7 November: on 73 tall LPs no job ended so) */
+typedef struct { RaceLog *rl; LpConc *a, *b; int base, cur; volatile int heavy, fms; int idled; int itlast, retired, snap_it; long snap_ns; double errprev, errlast, snap_t, snap_n, snap_tp; } RaceIpm;
+static void race_ipm_cb2(void *ctx, int it, double pobj, double err) {
+    RaceIpm *Q = ctx;
+    if (Q->rl && Q->rl->on) race_ipm_cb(Q->rl, it, pobj, err);
+    /* (10 November 2026; on by default, BRISK_LPRACERETIRE=0 off, =2 its predictions printed without acting) the dual simplex job
+     * retired when it cannot finish first, its thread back to the interior-point method. Only on an LP whose normal equations'
+     * factorization costs more than 2,000 products with A Theta A' (fact_heavy, the rule of the early iterations without a
+     * factorization: an extra thread speeds such an iteration; on smaller ones it barely helps and the risk is the same), and
+     * only once the method's error is below 1e-3 (before it, neither method's progress predicts its end: the error of
+     * neos-799711's method went from 1e-5 back to slow progress, and its crossover took 1.3 s more). Both rates are measured
+     * from the iteration where the method's error fell below 1e-1: the method's time left from its time per iteration since
+     * then and its error's contraction, the job's from the fall of its infeasible rows since then (none falling: it cannot
+     * finish); retired when the job's is above three times the method's. A factorization-heavy LP gave the job a core for the
+     * whole run: the outside LP benchmark's production LP E0004_6, 820.6 s by default against 599.8 s for the interior-point
+     * method alone, the job lost after 235,295 iterations. The 85 race LPs: 0.980 (the 38 the dual simplex job wins 0.984,
+     * none slower by the rule); production LP of 25,000 columns 26.4 -> 21.7 s, covering LP 27.3 -> 24.2 s, near-parallel LP
+     * 26.6 -> 23.8 s. The race decides by the clock already (the first to finish gives the result); one thread: no race */
+    /* (10 November 2026; on by default, BRISK_LPRACEIDLE=0 off; Linux, where the idle priority exists) once the method's factorization is known to be heavy (fact_heavy), the dual
+     * simplex job at the idle scheduling priority and its core to the method: the job runs only on the cycles the method
+     * leaves idle and can still win; the production LP of 60,000 columns ran 12 of its 21 iterations on three threads before
+     * the retirement below. Only for a factorization of at least 1e10 flops (fact_heavy 2; about 0.05 s on four cores): on
+     * dano3mip and dano3_5 (LPs, 9e8 flops) the starved job lost the race it wins (1.07 -> 1.7 s). With the gate, the 85 race
+     * LPs and the 3 network LPs of the outside benchmark: 0.978 (the 38 the job wins 0.974, none slower by it); highschool1-aigio
+     * 41.8 -> 34.8 s, Q094_energy 19.0 -> 16.6 s, production LP of 60,000 columns 265.8 -> 253.7 s */
+    /* (13 November 2026, the owner's decision: the form by the elapsed time, 3, by default; 1: the job idled as soon as the
+     * factorization is known heavy, as before) the job idled only when the method's time left falls below the job's time so far
+     * (or the job's own rate puts it far behind; ri == 3 below): the permuted copies of satellites4-25 and satellites2-25 (LPs)
+     * 130-147 -> 37 s and 9.5-18 -> 5.7 s, where the job wins and was starved; E0000_1_diet, E0029_7_near_parallel,
+     * E0000_0_production, highschool1-aigio 2-7 % slower, Q094_energy and Q083_energy level (REPORT_lp_r16, 06:41) */
+    {   static int ri = -1; if (ri < 0) { const char *e_ = getenv("BRISK_LPRACEIDLE"); ri = e_ ? atoi(e_) : 3; }
+        /* (and only once the job has run as long as one of the method's factorizations: a job that wins within that time keeps its
+         * core; the network LP of 60,000 nodes, whose dual simplex job wins at 5.5 s while a factorization takes 20 s: with the
+         * start without a factorization the method reached its first iteration first, the job went idle and finished at 8-15 s) */
+        const int fms_ = brisk_flag_get(&Q->fms);
+        /* (13 November 2026, an experiment: BRISK_LPRACEIDLE=2) the job idled only when its own time left, from the fall of its
+         * infeasible rows since its first sample (as the retirement below), exceeds a lower bound of the method's: its iterations
+         * still to come, at least 20 less those done, times one factorization; until the job's rate is known, not yet. On a
+         * permuted copy of satellites2-25 (LP) the job, idled at the method's first iteration, finished at 11.8-18.4 s, alone it
+         * takes 5.5 s, while the method's factorizations take 0.7 s each and it was at an error of 3e-3 after 9 iterations */
+        int idle_ok = 1;
+        /* (13 November 2026, an experiment: BRISK_LPRACEIDLE=3) with no prediction of the job's end, its time left estimated by its
+         * time so far: idled once the method's time left, at least 25 less its iterations done times one factorization, is below
+         * the job's elapsed time (satellites2-25's copy, LP: 0.7 s factorizations, the job done at 5.5 s, never idled;
+         * highschool1-aigio, LP: 0.34 s factorizations, 52 iterations, idled at about 5 s instead of 1.8 s) */
+        if (ri == 3 && Q->a) {
+            /* (the method's iterations left: from its error's contraction once it is measured, as the retirement below estimates them,
+             * else at least 25 less those done) */
+            double krem_ = it < 25 ? 25 - it : 1;
+            if (Q->errlast > 0 && Q->errprev > 0) { const double rho_ = Q->errlast / Q->errprev;
+                if (Q->errlast <= 1e-8) krem_ = 1; else if (rho_ > 0 && rho_ < 0.95) { krem_ = log(1e-8 / Q->errlast) / log(rho_); krem_ = krem_ < 1 ? 1 : krem_ > 40 ? 40 : krem_; } }
+            /* (an iteration's time: one factorization, or the method's average so far when smaller: the first factorization holds
+             * the symbolic analysis) */
+            const double tjob_ = wtime() - Q->a->t0, tper_ = it >= 1 && tjob_ / it < 1e-3 * (double)fms_ ? tjob_ / it : 1e-3 * (double)fms_;
+            const double tmeth_ = krem_ * tper_;
+            idle_ok = tmeth_ < tjob_;
+            /* (and when the job's own rate, from the fall of its infeasible rows since its first sample, puts its time left at more
+             * than three times the method's, the margin of the retirement below) */
+            const SimplexProgress *P_ = &Q->a->prog;
+            const double dn_ = P_->ninf0 - (double)P_->ninf, dt_ = P_->tpub - P_->tpub0;
+            /* (only from a falling count: rows that do not fall say nothing early on; satellites2-25's copy rose at first) */
+            const double rsx_ = P_->nsamp >= 2 && dn_ > 0 && dt_ > 0 ? (double)P_->ninf / (dn_ / dt_) : -1;
+            if (rsx_ > 3.0 * tmeth_) idle_ok = 1;
+            if (getenv("BRISK_LPDBG") && fms_ > 0 && !Q->idled) fprintf(stderr, "   [iteration %d: idle test: the job's time so far %.3g s, its rate's time left %.3g s, the method's left %.3g s: %s]\n", it, tjob_, rsx_, tmeth_, idle_ok ? "idle" : "not yet");
+        }
+        if (ri == 2 && Q->a) {
+            const SimplexProgress *P_ = &Q->a->prog;
+            const double dn_ = P_->ninf0 - (double)P_->ninf, dt_ = P_->tpub - P_->tpub0;
+            const double rsx_ = P_->nsamp >= 2 && dn_ > 0 && dt_ > 0 ? (double)P_->ninf / (dn_ / dt_) : (P_->nsamp >= 2 ? 1e300 : -1);
+            const double tmeth_ = (it < 20 ? 20 - it : 1) * 1e-3 * (double)fms_;
+            idle_ok = rsx_ >= 0 && rsx_ > tmeth_;
+            if (getenv("BRISK_LPDBG") && fms_ > 0 && !Q->idled) fprintf(stderr, "   [iteration %d: idle test: the job's time left %.3g s (%ld samples, %ld infeasible rows), the method's at least %.3g s: %s]\n", it, rsx_, P_->nsamp, P_->ninf, tmeth_, idle_ok ? "idle" : "not yet");
+        }
+        if (ri > 0 && idle_ok && Q->a && brisk_flag_get(&Q->heavy) >= 2 && fms_ > 0 && 1e3 * (wtime() - Q->a->t0) >= (double)fms_ && !Q->idled && !Q->retired && Q->a->started == 1 && !brisk_flag_get(&Q->a->done) && !brisk_flag_get(&Q->a->stop) && !Q->a->idle) {
+            Q->idled = 1;
+            if (lp_conc_idle(Q->a)) {
+                if (Q->cur == 0) Q->cur = Q->base = omp_get_max_threads();
+                const int av = brisk_avail_cpus();
+                if (Q->cur + 1 <= av) { Q->cur++; omp_set_num_threads(Q->cur); }
+                if (getenv("BRISK_LPDBG")) fprintf(stderr, "   [iteration %d: the dual simplex job at the idle priority; the method on %d threads]\n", it, Q->cur);
+            }
+        }
+    }
+    {   static int rr = -1; if (rr < 0) { const char *e_ = getenv("BRISK_LPRACERETIRE"); rr = e_ ? atoi(e_) : 1; if (rr < 0) rr = 0; }
+        if (rr && !Q->retired && Q->a && Q->a->started == 1 && !brisk_flag_get(&Q->a->done) && !brisk_flag_get(&Q->a->stop)) {
+            const double tn = wtime();
+            const SimplexProgress *P = &Q->a->prog;
+            /* a new solve of the method (a re-solve inside the route) starts the watch again */
+            if (it <= Q->itlast) { Q->snap_it = 0; Q->errprev = Q->errlast = 0; }
+            Q->itlast = it;
+            if (err > 0) { Q->errprev = Q->errlast; Q->errlast = err; }
+            /* the window starts when the method's error is below 1e-1 (before it, neither method's progress predicts its end):
+             * the job's infeasible rows and the method's time are measured from there */
+            if (!Q->snap_it && Q->errlast > 0 && Q->errlast <= 1e-1 && P->nsamp >= 1) {
+                Q->snap_it = it; Q->snap_t = tn; Q->snap_n = (double)P->ninf; Q->snap_tp = P->tpub; Q->snap_ns = P->nsamp; }
+            if (brisk_flag_get(&Q->heavy) && Q->snap_it && it - Q->snap_it >= 2 && Q->errlast <= 1e-3 && Q->errprev > 0 && P->nsamp > Q->snap_ns) {
+                const double tau = (tn - Q->snap_t) / (it - Q->snap_it);
+                const double rho = Q->errlast / Q->errprev;
+                double krem = Q->errlast <= 1e-8 ? 1 : rho > 0 && rho < 0.95 ? log(1e-8 / Q->errlast) / log(rho) : 30;
+                krem = krem < 1 ? 1 : krem > 40 ? 40 : krem;
+                const double tipm = krem * tau, dn = Q->snap_n - (double)P->ninf, dt = P->tpub - Q->snap_tp;
+                const double rsx = dn > 0 && dt > 0 ? (double)P->ninf / (dn / dt) : 1e300;
+                if (rr == 2) fprintf(stderr, "   [retire watch: it %d (window from %d, factorization-heavy %d), tau %.3g s, err %.2e, rho %.3f, krem %.1f, method left %.3g s; job: ninf %ld (window from %.0f, %.3g s), its left %.3g s]\n",
+                                     it, Q->snap_it, Q->heavy, tau, Q->errlast, rho, krem, tipm, P->ninf, Q->snap_n, dt, rsx);
+                else if (rsx > 3.0 * tipm) {
+                    brisk_flag_set(&Q->a->stop, 1); Q->retired = 1;
+                    if (Q->cur == 0) Q->cur = Q->base = omp_get_max_threads();
+                    const int av = brisk_avail_cpus();
+                    if (Q->cur + 1 <= av) { Q->cur++; omp_set_num_threads(Q->cur); }
+                    if (getenv("BRISK_LPDBG")) fprintf(stderr, "   [iteration %d: the dual simplex job retired (its time left about %.3g s, %ld infeasible rows; the method's %.3g s); the method on %d threads]\n", it, rsx, P->ninf, tipm, Q->cur);
+                }
+            }
+        }
+    }
+    /* (7 November 2026) the second simplex job that solves the problem itself stops when the first declines the route
+     * through the dual problem (it would repeat the first's solve: the first job decides on the presolved problem, the
+     * second was started on a test of the problem as read; irish-electricity, LP), and its thread comes back to the
+     * method. The first job stops it itself (simplex.h, direct_peer) once it is started; this catches a decision taken
+     * just before. BRISK_LPCONC2DUP=0: neither */
+    static int c2dup = -1; if (c2dup < 0) { const char *e_ = getenv("BRISK_LPCONC2DUP"); c2dup = !(e_ && atoi(e_) == 0); }
+    if (c2dup && Q->a && Q->b && Q->b->started == 1 && Q->b->o.no_dual_route && brisk_flag_get(&Q->a->declined) && !brisk_flag_get(&Q->b->stop)) {
+        brisk_flag_set(&Q->b->stop, 1);
+        if (getenv("BRISK_LPDBG")) printf("   [iteration %d: the first simplex job declined the route through the dual problem; the second, which solves the problem itself, stopped]\n", it);
+    }
+    /* (its stop flag is the one the first job raises when it declines; a winner's raises it too, but then this method stops) */
+    const int bfree = c2dup && Q->b && Q->b->started && brisk_flag_get(&Q->b->done) && !brisk_flag_get(&Q->b->won) && !Q->b->idle && Q->b->o.no_dual_route && brisk_flag_get(&Q->b->stop);
+    if (!bfree) return;
+    if (Q->cur == 0) Q->cur = Q->base = omp_get_max_threads();
+    if (Q->base + 1 != Q->cur) {
+        Q->cur = Q->base + 1; omp_set_num_threads(Q->cur);
+        if (getenv("BRISK_LPDBG")) printf("   [iteration %d: the stopped second simplex job's thread back; the interior-point method on %d threads]\n", it, Q->cur);
+    }
+}
 static void race_begin(RaceLog *R, LpConc *cc, double t0, int maxim) {
     memset(R, 0, sizeof *R);
     R->on = 1; R->cc = cc; R->t0 = t0; R->maxim = maxim; R->ipm_it = -1;
@@ -3708,34 +4527,46 @@ static void race_end(RaceLog *R) {
     if (R->on) race_row(R, 1);
     if (g_racelog == R) g_racelog = NULL;
 }
+/* (7 November 2026) the jobs running now (at most two), for brisk_exit on the caller's thread: they are stopped and joined
+ * before the jump back to brisk_run, which ends the frame that holds them (they wrote into it afterwards) */
+static LpConc *volatile g_conc_live[2];
+static void lp_conc_live(LpConc *c, int on) {
+    for (int k = 0; k < 2; k++) if (on ? !g_conc_live[k] : g_conc_live[k] == c) { g_conc_live[k] = on ? c : NULL; break; }
+}
+__attribute__((unused)) static void lp_conc_stop_all(void) {
+    for (int k = 0; k < 2; k++) { LpConc *c = g_conc_live[k]; if (c && c->started == 1) brisk_flag_set(&c->stop, 1); }
+    for (int k = 0; k < 2; k++) { LpConc *c = g_conc_live[k]; if (c && c->started == 1) { pthread_join(c->th, NULL); c->started = 2; } g_conc_live[k] = NULL; }
+}
 /* stops the thread unless take: waits for it either way */
 static void lp_conc_join(LpConc *c, int stop) {
     if (c->started != 1) return;      /* (not started, or joined already) */
-    if (stop) c->stop = 1;
+    if (stop) brisk_flag_set(&c->stop, 1);
     const double tj = wtime();
+    if (getenv("BRISK_LPRACET")) fprintf(stderr, "   [race timing: the join reached %.5f s after the job's start (the job ended at %.5f, done %d)]\n", tj - c->t0, c->t, brisk_flag_get(&c->done));
     pthread_join(c->th, NULL);
+    lp_conc_live(c, 0);
     if (g_racelog && g_racelog->cc == c) race_end(g_racelog);   /* (the race's log: its last row) */
     if (getenv("BRISK_LPDBG")) printf("   [the dual simplex method beside it: joined after %.4f s (stop %d), its status %d after %.4f s, ended at %.3f of the clock]\n", wtime() - tj, stop, c->st, c->t, c->t0 + c->t);
     c->started = 2;
 }
 static void lp_conc_free(LpConc *c) {
     if (c->started == 1) lp_conc_join(c, 1);
-    if (c->started) { lp_free(&c->L); free(c->x); c->x = NULL; c->started = 0; }
+    if (c->started) { lp_free(&c->L); free(c->x); free(c->y); free(c->z); c->x = c->y = c->z = NULL; c->started = 0; }
 }
 /* (28 October 2026) the two simplex jobs (the problem, and the bounded substitution's when started, b): stop both and
  * wait (stop), or wait for the first to end with a result, or for both to end, then stop the other. Afterwards a holds the
  * job whose result is the earlier one (the structs swapped when it is b's) */
 static void lp_conc_join2(LpConc *a, LpConc *b, int stop) {
-    if (b->started != 1) { lp_conc_join(a, stop); if (b->started == 2 && b->won && (!a->won || b->t < a->t)) { LpConc t = *a; *a = *b; *b = t; } return; }
-    if (stop) { a->stop = 1; b->stop = 1; }
+    if (b->started != 1) { lp_conc_join(a, stop); if (b->started == 2 && brisk_flag_get(&b->won) && (!brisk_flag_get(&a->won) || b->t < a->t)) { LpConc t = *a; *a = *b; *b = t; } return; }
+    if (stop) { brisk_flag_set(&a->stop, 1); brisk_flag_set(&b->stop, 1); }
     else {
         const struct timespec ms = { 0, 1000000 };
-        while (!(a->won || b->won) && !(a->done && b->done)) nanosleep(&ms, NULL);
-        if (!a->won) a->stop = 1;
-        if (!b->won) b->stop = 1;
+        while (!(brisk_flag_get(&a->won) || brisk_flag_get(&b->won)) && !(brisk_flag_get(&a->done) && brisk_flag_get(&b->done))) nanosleep(&ms, NULL);
+        if (!brisk_flag_get(&a->won)) brisk_flag_set(&a->stop, 1);
+        if (!brisk_flag_get(&b->won)) brisk_flag_set(&b->stop, 1);
     }
-    lp_conc_join(a, a->stop); lp_conc_join(b, b->stop);
-    if (b->won && (!a->won || b->t < a->t)) { LpConc t = *a; *a = *b; *b = t; }
+    lp_conc_join(a, brisk_flag_get(&a->stop)); lp_conc_join(b, brisk_flag_get(&b->stop));
+    if (brisk_flag_get(&b->won) && (!brisk_flag_get(&a->won) || b->t < a->t)) { LpConc t = *a; *a = *b; *b = t; }
 }
 /* the point of the problem as read from the method's (through the standard form's map, and the simplex method's
  * postsolve when its presolve ran: every reduced status basic); returns the objective as in the file */
@@ -3753,10 +4584,48 @@ static double lp_point_as_read(const LpProb *L, const LpProb *Lw, const LpMap *M
 }
 /* (1 November 2026) the point and the row duals of the problem as read from the method's (the crossover's start: x and y as
  * the simplex method returns them; through the simplex method's postsolve when its presolve ran) */
+/* (10 November 2026) the duals' error on the problem as read (minimization): |z - (c - A'y)|, a multiplier of the wrong sign at an
+ * active bound or row, a nonzero one where none is active (active: within 1e-6 of the bound's size), relative to 1 + max |c|; and
+ * the gap between c'x and the dual value relative to 1 + |c'x|. The larger of the two */
+/* (11 November 2026) the duals' measure, the standard certificate of optimality: z = c - A'y (by construction), each multiplier
+ * with the sign its side allows (y_i > 0 only with a finite lower side of row i, < 0 only with a finite upper side; z_j likewise
+ * for x_j's bounds), relative to 1 + the largest cost, and the duality gap c'x - (the dual objective) relative to 1 + |c'x|.
+ * It replaced (11 November) a componentwise test that took a multiplier of a variable more than 1e-6 from its bound as an error:
+ * an interior point is only near its bounds (adlittle, LP: 4.7e-6 from 0 with a multiplier of 0.39, a relative gap of 1e-11) */
+static double lp_dual_err(const LpProb *L, const double *x, const double *y, const double *z) {
+    const int m = L->m, n = L->n; double cmax = 0, worst = 0, px = L->c0, dv = L->c0;
+    const char *de_ = getenv("BRISK_LPDUALDBG"); const int dbg = de_ ? atoi(de_) : 0, dbg1 = de_ != NULL;   /* (read once) */
+    for (int j = 0; j < n; j++) cmax = fmax(cmax, fabs(L->c[j]));
+    for (int j = 0; j < n; j++) {
+        double r = L->c[j];
+        for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) r -= L->Ax[p] * y[L->Ai[p]];
+        worst = fmax(worst, fabs(r - z[j]));
+        px += L->c[j] * x[j];
+        const int hl = L->l[j] > -1e29, hu = L->u[j] < 1e29;
+        if (z[j] > 0) { if (hl) dv += z[j] * L->l[j]; else worst = fmax(worst, z[j]); }
+        else if (z[j] < 0) { if (hu) dv += z[j] * L->u[j]; else worst = fmax(worst, -z[j]); }
+        if (dbg >= 3 && ((z[j] > 1e-6 && !hl) || (z[j] < -1e-6 && !hu))) fprintf(stderr, "[duals] column %d: z %.4g of the wrong sign, x %.10g in [%.4g, %.4g]\n", j, z[j], x[j], L->l[j], L->u[j]);
+    }
+    for (int i = 0; i < m; i++) {
+        const int hl = L->rl[i] > -1e29, hu = L->ru[i] < 1e29;
+        if (y[i] > 0) { if (hl) dv += y[i] * L->rl[i]; else worst = fmax(worst, y[i]); }
+        else if (y[i] < 0) { if (hu) dv += y[i] * L->ru[i]; else worst = fmax(worst, -y[i]); }
+        if (dbg >= 3 && ((y[i] > 1e-6 && !hl) || (y[i] < -1e-6 && !hu))) fprintf(stderr, "[duals] row %d: y %.4g of the wrong sign, [%.4g, %.4g]\n", i, y[i], L->rl[i], L->ru[i]);
+    }
+    if (dbg1) fprintf(stderr, "[duals] sign %.3e, gap %.3e (primal %.10g, dual %.10g)\n", worst / (1 + cmax), fabs(px - dv) / (1 + fabs(px)), px, dv);
+    return fmax(worst / (1 + cmax), fabs(px - dv) / (1 + fabs(px)));
+}
+/* (10 November 2026) the reduced costs z = c - A'y of the problem as read (for the result's duals) */
+static void lp_reduced_costs(const LpProb *L, const double *y, double *z) {
+    for (int j = 0; j < L->n; j++) { double t = L->c[j]; for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) t -= L->Ax[p] * y[L->Ai[p]]; z[j] = t; }
+}
 static void lp_point_y_as_read(const LpProb *L, const LpProb *Lw, const LpMap *M, const SxPre *SP, const double *Rx, const double *Ry, double *x, double *y) {
+    if (getenv("BRISK_LPDUALDBG")) fprintf(stderr, "[duals] the %s postsolve\n", SP ? "simplex presolve's" : "standard presolve's");
     if (!SP) {
         lp_recover((LpProb *)L, (LpMap *)M, Rx, x);
         for (int i = 0; i < L->m; i++) y[i] = M->rpos[i] >= 0 ? M->rsgn[i] * Ry[M->rpos[i]] : 0.0;
+        static int dps = -1; if (dps < 0) { const char *e_ = getenv("BRISK_LPDUALPS"); dps = !(e_ && atoi(e_) == 0); }
+        if (dps) lp_dual_postsolve(L, x, y);     /* (11 November 2026) the removed rows' duals; BRISK_LPDUALPS=0: 0 as before */
         return;
     }
     const int mr = Lw->m, nr = Lw->n;
@@ -3764,13 +4633,68 @@ static void lp_point_y_as_read(const LpProb *L, const LpProb *Lw, const LpMap *M
     int *csr = calloc((size_t)nr + 1, sizeof(int)), *rsr = calloc((size_t)mr + 1, sizeof(int)), *cso = malloc(sizeof(int) * ((size_t)L->n + 1)), *rso = malloc(sizeof(int) * ((size_t)L->m + 1));
     lp_recover((LpProb *)Lw, (LpMap *)M, Rx, xr);
     for (int i = 0; i < mr; i++) yr[i] = M->rpos[i] >= 0 ? M->rsgn[i] * Ry[M->rpos[i]] : 0.0;
+    { static int dps0 = -1; if (dps0 < 0) { const char *e_ = getenv("BRISK_LPDUALPS"); dps0 = !(e_ && atoi(e_) == 0); }
+      if (dps0) lp_dual_postsolve(Lw, xr, yr); }   /* (the standard presolve ran on the reduced problem: its removed rows first) */
+    /* (11 November 2026, the LP developer) the statuses the point implies, for the postsolve's dual steps: the simplex presolve's
+     * postsolve finds the duals of the rows it removed (a singleton row made a bound, a free column singleton, ...) from which
+     * variables are at a bound, read from the statuses of a basis. A point of the interior-point method has none, and every
+     * column passed as basic (0) gave every such row the dual 0: 31 of netlib's 98 LPs returned no duals when the method gave
+     * the result. A variable is taken at a bound when its multiplier has that bound's sign and is larger than its distance to
+     * the bound (the larger of a complementary pair); a row likewise. BRISK_LPDUALPS=0: all basic, as before */
+    static int dps = -1; if (dps < 0) { const char *e_ = getenv("BRISK_LPDUALPS"); dps = !(e_ && atoi(e_) == 0); }
+    if (dps) {
+        double *ax = calloc((size_t)mr + 1, sizeof(double));
+        if (ax) {
+            for (int j = 0; j < nr; j++) {
+                double zj = Lw->c[j];
+                for (int p = Lw->Ap[j]; p < Lw->Ap[j + 1]; p++) { zj -= Lw->Ax[p] * yr[Lw->Ai[p]]; ax[Lw->Ai[p]] += Lw->Ax[p] * xr[j]; }
+                const double l = Lw->l[j], u = Lw->u[j];
+                if (l > -1e29 && u < 1e29 && l == u) csr[j] = SX_FIXED;
+                else if (l > -1e29 && zj > 0 && zj > xr[j] - l) csr[j] = SX_LOWER;
+                else if (u < 1e29 && zj < 0 && -zj > u - xr[j]) csr[j] = SX_UPPER;
+                else csr[j] = SX_BASIC;
+                /* (the point put on the bound its status names: the postsolve tests a bound to 1e-9, the method's point is
+                 * near it to its own tolerance; this point serves only for the duals, the result's x is computed apart) */
+                if (csr[j] == SX_LOWER || (csr[j] == SX_FIXED && l > -1e29)) xr[j] = l; else if (csr[j] == SX_UPPER) xr[j] = u;
+            }
+            for (int i = 0; i < mr; i++) {
+                const double rl = Lw->rl[i], ru = Lw->ru[i];
+                if (rl > -1e29 && ru < 1e29 && rl == ru) rsr[i] = SX_FIXED;
+                else if (rl > -1e29 && yr[i] > 0 && yr[i] > ax[i] - rl) rsr[i] = SX_LOWER;
+                else if (ru < 1e29 && yr[i] < 0 && -yr[i] > ru - ax[i]) rsr[i] = SX_UPPER;
+                else rsr[i] = SX_BASIC;
+            }
+            free(ax);
+        }
+    }
+    if (getenv("BRISK_LPDUALDBG")) { double *zr_ = calloc((size_t)nr + 1, sizeof(double)); if (zr_) { lp_reduced_costs(Lw, yr, zr_); fprintf(stderr, "[duals] on the reduced problem:\n"); (void)lp_dual_err(Lw, xr, yr, zr_); free(zr_); } }
     sxpre_postsolve(SP, xr, yr, csr, rsr, x, y, cso, rso);
     free(xr); free(yr); free(csr); free(rsr); free(cso); free(rso);
+}
+/* (10 November 2026, the LP developer) an LP in memory (brisk_run_lp, the library's brisk_solve_lp): the LP route copies it
+ * instead of reading a file, and solves it as the file's (the same path from there on: the race, the presolves, -lpmethod,
+ * the crossover, the log, the Summary and the result) */
+static const LpProb *g_lp_data = NULL;
+static const char g_lp_data_name[] = "(LP in memory)";
+/* a deep copy of an LP (the route frees what it reads); names left out; 0 or -1 (out of memory) */
+static int lp_copy_in(const LpProb *P, LpProb *L) {
+    memset(L, 0, sizeof *L);
+    const int m = P->m, n = P->n; const long nz = P->Ap[n];
+    L->m = m; L->n = n; L->c0 = P->c0; L->maxim = P->maxim; snprintf(L->name, sizeof L->name, "%s", P->name[0] ? P->name : "LP");
+    L->Ap = malloc(sizeof(int) * ((size_t)n + 1)); L->Ai = malloc(sizeof(int) * ((size_t)nz + 1)); L->Ax = malloc(sizeof(double) * ((size_t)nz + 1));
+    L->c = malloc(sizeof(double) * ((size_t)n + 1)); L->l = malloc(sizeof(double) * ((size_t)n + 1)); L->u = malloc(sizeof(double) * ((size_t)n + 1));
+    L->rl = malloc(sizeof(double) * ((size_t)m + 1)); L->ru = malloc(sizeof(double) * ((size_t)m + 1));
+    if (!L->Ap || !L->Ai || !L->Ax || !L->c || !L->l || !L->u || !L->rl || !L->ru) { lp_free(L); return -1; }
+    memcpy(L->Ap, P->Ap, sizeof(int) * ((size_t)n + 1)); memcpy(L->Ai, P->Ai, sizeof(int) * (size_t)nz); memcpy(L->Ax, P->Ax, sizeof(double) * (size_t)nz);
+    memcpy(L->c, P->c, sizeof(double) * (size_t)n); memcpy(L->l, P->l, sizeof(double) * (size_t)n); memcpy(L->u, P->u, sizeof(double) * (size_t)n);
+    memcpy(L->rl, P->rl, sizeof(double) * (size_t)m); memcpy(L->ru, P->ru, sizeof(double) * (size_t)m);
+    return 0;
 }
 static int brisk_main_lp(int argc, char **argv, int ifile) {
     LpProb L; char msg[400];
     const double t0 = wtime();
-    if (lp_read_mps(argv[ifile], &L, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
+    if (g_lp_data && argv[ifile] == g_lp_data_name) { if (lp_copy_in(g_lp_data, &L)) { fprintf(stderr, "brisk: out of memory (the LP's copy)\n"); return 1; } }
+    else if (lp_read_mps(argv[ifile], &L, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
     char **av = malloc(sizeof(char *) * ((size_t)argc + 1));
     int ac = 0, quiet = 0, pre = 3, lpm = 1, lpcorr = -1, lpm_given = 0;
     double tlim_lp = 0;
@@ -3785,7 +4709,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
         if (!strcmp(argv[i], "-q")) quiet = 1;
         /* (23 October 2026, the night) -threads for every LP method: only the interior-point method's branch read it, so
          * -lpmethod 2 to 5 ran on all cores whatever was asked */
-        if (i + 1 < argc && !strcmp(argv[i], "-threads") && atoi(argv[i + 1]) >= 1) { omp_set_num_threads(atoi(argv[i + 1])); g_threads_user = 1; }
+        if (i + 1 < argc && !strcmp(argv[i], "-threads") && atoi(argv[i + 1]) >= 1) { brisk_user_threads(atoi(argv[i + 1])); g_threads_user = 1; }
         av[ac++] = argv[i];
     }
     /* (31 October 2026, ISSUES 639) the default log is the user's (the owner's rule of ISSUES 725): the problem, the threads,
@@ -3835,6 +4759,35 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
         }
         free(dr);
     }
+    /* (8 November 2026, BRISK_LPTINYDUAL=k, 1000 by default, 0: off) an LP of fewer than k nonzeros by the dual simplex method
+     * alone, not the race: the race's own cost (a copy of the problem, a thread, two presolves) exceeds what the interior-point
+     * method could save there. The outside benchmark's families at 4 threads, the solve call: below 950 nonzeros the dual
+     * simplex method alone took 0.33-1.00 of the race's time (0.1-0.2 ms saved), above it both ways (dc_power_dispatch, 956
+     * nonzeros, 1.6 times; degenerate_cover, 2,756, 3.5 times). On the 35 LPs of the repository under 1,000 nonzeros (netlib,
+     * MIPLIB relaxations): 0.310 of the time, the same statuses */
+    /* (13 November 2026) an LP whose point with every column at the bound its cost prefers satisfies every row: that point is
+     * optimal (sx_bound_point, simplex.c), and the dual simplex method alone returns it before its presolve; the race would
+     * start a thread and two presolves for it (neos-3148108-pahi, LP: 0.13 s of the solve, Gurobi's presolve removes all) */
+    if (lpm == 1 && !lpm_given && sx_bound_point(&L, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) lpm = 2;
+    {   static int tinyl = -1; if (tinyl < 0) { const char *e_ = getenv("BRISK_LPTINYDUAL"); tinyl = e_ ? atoi(e_) : 1000; }
+        if (lpm == 1 && !lpm_given && tinyl > 0 && L.Ap[L.n] < tinyl) lpm = 2; }
+    /* (10 November 2026; on by default, BRISK_LPNETDUAL=0 off) an LP whose matrix is a network matrix (every column at most two nonzeros, each +-1:
+     * flows, transportation, dispatch and inventory balances) by the dual simplex method alone, not the race: its iterations are
+     * hypersparse and cheap there, while the interior-point method's normal equations are a graph's Laplacian with heavy fill; on the
+     * outside benchmark's 369 transport, network, dispatch and inventory LPs the interior-point method with crossover never came
+     * within 10 % of the dual simplex method, and the race's own cost (a thread, two presolves) made the default route 1.2-1.6
+     * times the dual simplex method alone. On the 136 network-matrix LPs at hand (those families, fresh copies of them, and the earlier
+     * benchmark's production-inventory LPs) the dual simplex method alone took 0.859 of the default route's time, nowhere slower
+     * beyond the timing's noise; no LP of the MIPLIB, netlib or Kennington sets is a network matrix. The test is one pass over the matrix */
+    {   static int netd = -1; if (netd < 0) { const char *e_ = getenv("BRISK_LPNETDUAL"); netd = e_ ? atoi(e_) : 1; }
+        if (lpm == 1 && !lpm_given && netd > 0 && L.n > 0) {
+            int net = 1;
+            for (int j = 0; j < L.n && net; j++) {
+                int k = 0;
+                for (int p = L.Ap[j]; p < L.Ap[j + 1]; p++) { if (L.Ax[p] == 0) continue; if (++k > 2 || fabs(L.Ax[p]) != 1.0) { net = 0; break; } }
+            }
+            if (net) lpm = 2;
+        } }
     if (lpm >= 2 && lpm <= 5) {
         const int rcs = brisk_main_lp_simplex(&L, ac, av, argv[ifile], lpm == 5 ? 0 : lpm == 4 ? 3 : lpm == 3 ? 2 : 1, quiet, xf, t0, lpcorr);
         lp_free(&L); free(av);
@@ -3842,11 +4795,19 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
     }
     /* (27 October 2026, the night) the dual simplex method beside the interior-point method (lp_conc_run) */
     LpConc cc, cc2; memset(&cc, 0, sizeof cc); memset(&cc2, 0, sizeof cc2);
+    /* (7 November 2026, later; BRISK_LPFOLDSCALE=1) the problem as read on the scaling that does not depend on the input's,
+     * computed once and shared by the folding check below and the dual simplex jobs' symmetry of the problem as read
+     * (simplex_pre.c, sxpre_canon_get: the first to ask computes it, the others wait for the same result) */
+    SxCanon lpcanon; memset(&lpcanon, 0, sizeof lpcanon);
+    {   static int fscc = -1; if (fscc < 0) fscc = getenv("BRISK_LPFOLDSCALE") && atoi(getenv("BRISK_LPFOLDSCALE")) > 0;
+        if (fscc && lpm == 1 && pre >= 3 && !getenv("BRISK_LPNOFOLD") && !(getenv("BRISK_LPSXPRE") && atoi(getenv("BRISK_LPSXPRE")) == 0) && L.m > 0 && L.n > 0)
+            sxpre_canon_init(&lpcanon, &L, 0.5); }
     volatile int conc_any = 0;      /* (a simplex job ended with a result: the interior-point method's stop flag; the jobs are joined before this function returns) */
     char ipm_line[1024] = "";     /* (the method's status lines: printed once its result is the one taken) */
     const int nt_all = omp_get_max_threads();
     if (getenv("BRISK_LPDBG")) printf("   [t %.3f s: the race starts; t0 %.3f of the clock]\n", wtime() - t0, t0);
-    if (lpm == 1 && !lpm_given && nt_all >= 2 && L.m > 0 && L.n > 0 && !getenv("BRISK_LPNOCONC") && lp_conc_start(&cc, &L, tlim_lp, 0, &conc_any)) {
+    g_racet0 = t0;
+    if (lpm == 1 && !lpm_given && nt_all >= 2 && L.m > 0 && L.n > 0 && !getenv("BRISK_LPNOCONC") && lp_conc_start(&cc, &L, tlim_lp, 0, &conc_any, &lpcanon)) {
         /* with four threads or more, when the simplex job would go through the dual problem of a tall problem, a second
          * simplex job solving the problem itself, the interior-point method on one thread fewer (the race pairs them
          * too: on 12 held-out LPs the route through the dual problem was taken on 5, three to four times slower on
@@ -3859,15 +4820,39 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
          * instead (satellites2-25, LP: 9.2 -> 5.4 s), not by default: on the 97 LPs where it starts, geometric mean 1.041
          * against the job off (the interior-point method on one thread fewer: rail02, LP, 42.9 -> 61.3 s); run by the
          * first simplex job itself instead, 1.013 (ofi, LP, 30 s -> the time limit of 120 s; tried and dropped) */
-        if (nt_all >= 4 && getenv("BRISK_LPCONC2") && atoi(getenv("BRISK_LPCONC2")) > 0) {
-            const char *e2 = getenv("BRISK_LPCONC2");
-            const int kind = atoi(e2) == 2 && simplex_aggb_possible(&L) ? 1 : simplex_dual_route_possible(&L) ? 2 : 0;
-            if (kind && lp_conc_start(&cc2, &L, tlim_lp, kind, &conc_any)) { cc.peer = &cc2; cc2.peer = &cc; }
-            if (getenv("BRISK_LPDBG")) fprintf(stderr, "   [the second simplex job: kind %d (1 the bounded substitution, 2 the direct solve), %s]\n", kind, cc2.started ? "started" : "not started");
+        /* (5 November 2026, the owner: "What about doing a race between dual simplex on primal vs dual simplex on dual, for
+         * this class of LPs only? ... 1 core for each simplex, remaining cores for IPM") by default when the interior-point
+         * method keeps at least BRISK_LPCONC2MIN threads (3) beside the two simplex jobs, i.e. with 5 threads or more: on 54
+         * tall LPs the dual simplex method alone takes 1.547 s directly and 1.621 s through the dual (geometric means), the
+         * better of the two 1.135 s, and no quantity known before solving tells which (ISSUES 612); at 4 threads the
+         * interior-point method on 2 threads lost on a held-out set (above). BRISK_LPCONC2=0: never; 1: from 4 threads */
+        /* (7 November 2026) BRISK_LPCONC2IDLE=1: the second job at the idle scheduling priority (lp_conc_idle), the
+         * interior-point method on the thread it would take; the threshold then counts the method's threads beside the
+         * first job only (with BRISK_LPCONC2MIN 3: from four threads) */
+        static int c2idle = -1; if (c2idle < 0) { const char *e_ = getenv("BRISK_LPCONC2IDLE"); c2idle = !(e_ && atoi(e_) == 0); }   /* (on since 7 November 2026: at four threads, the 55 tall development LPs 0.956 of the time, the 18 tall held-out LPs 1.001, the losses of the second job taking a core gone: physiciansched3-3 40.5 -> 29.9 s; BRISK_LPCONC2IDLE=0: off) */
+#if !(defined(__linux__) && defined(SCHED_IDLE))
+        c2idle = 0;
+#endif
+        static int c2min = -1; if (c2min < 0) { const char *e_ = getenv("BRISK_LPCONC2MIN"); c2min = e_ ? atoi(e_) : 3; }
+        const char *e2 = getenv("BRISK_LPCONC2");
+        const int c2on = e2 ? (atoi(e2) > 0 && nt_all >= 4) : (nt_all - (c2idle ? 1 : 2) >= c2min && c2min > 0);
+        if (c2on) {
+            const int kind = e2 && atoi(e2) == 2 && simplex_aggb_possible(&L) ? 1 : simplex_dual_route_possible(&L) ? 2 : 0;
+            /* (7 November 2026) not when the first job has declined the route through the dual problem already: the
+             * second would repeat its solve (BRISK_LPCONC2DUP=0: started all the same) */
+            const int c2dup = !(getenv("BRISK_LPCONC2DUP") && atoi(getenv("BRISK_LPCONC2DUP")) == 0);
+            if (kind && !(kind == 2 && c2dup && brisk_flag_get(&cc.declined)) && lp_conc_start(&cc2, &L, tlim_lp, kind, &conc_any, &lpcanon)) {
+                cc.peer = &cc2; cc2.peer = &cc;
+                if (c2idle) lp_conc_idle(&cc2);
+                /* the first job stops the second itself once it declines that route (simplex.h, direct_peer); a decision
+                 * taken before this assignment is caught here or at the method's next iteration (race_ipm_cb2) */
+                if (kind == 2 && c2dup) { cc.o.direct_peer = &cc2.stop; __sync_synchronize(); if (brisk_flag_get(&cc.declined)) brisk_flag_set(&cc2.stop, 1); }
+            }
+            if (getenv("BRISK_LPDBG")) fprintf(stderr, "   [the second simplex job: kind %d (1 the bounded substitution, 2 the direct solve), %s%s]\n", kind, cc2.started ? "started" : "not started", cc2.idle ? ", at the idle priority" : "");
         }
-        omp_set_num_threads(nt_all - 1 - (cc2.started ? 1 : 0));
+        omp_set_num_threads(race_ipm_threads(nt_all, 1 + (cc2.started && !cc2.idle ? 1 : 0)));
     }
-    const int nt_ipm = nt_all - (cc.started ? 1 : 0) - (cc2.started ? 1 : 0);     /* (the interior-point method's threads, for the Summary) */
+    const int nt_ipm = cc.started ? race_ipm_threads(nt_all, 1 + (cc2.started && !cc2.idle ? 1 : 0)) : nt_all;     /* (the interior-point method's threads, for the Summary) */
     g_lp_nt_total = nt_all;
     if (g_log_brief) {
         log_user("Number of threads: %d\n", nt_all);
@@ -3895,54 +4880,68 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
      * needs its reductions to converge). The partition of the problem as read: rows by their two sides, columns by cost
      * and bounds. (22 October 2026: only when that presolve would run; at -lppresolve 2 it cost lp_cheb_10000x300, 6.04
      * million nonzeros, 0.35 s for an answer not used, ISSUES 421) */
-    int lpsym = 0, lpsym_keepdep = 0;
+    int lpsym = 0, lpsym_keepdep = 0, lpfoldsc = 0;   /* (lpfoldsc: the problem as read on the scaled data was built, BRISK_LPFOLDSCALE) */
     /* (4 November 2026) the folding below stops when the dual simplex method beside it has its result (its stop flag) */
     const volatile int *lpsf0 = lp_get_stop(); if (cc.started) lp_set_stop(&conc_any);
     if (lpm == 1 && pre >= 3 && !getenv("BRISK_LPNOFOLD") && !(getenv("BRISK_LPSXPRE") && atoi(getenv("BRISK_LPSXPRE")) == 0) && L.m > 0 && L.n > 0) {
-        double *hb = malloc(sizeof(double) * ((size_t)L.m + 1)), *hc = malloc(sizeof(double) * ((size_t)L.n + 1)), *hu = malloc(sizeof(double) * ((size_t)L.n + 1));
-        int *rcl = malloc(sizeof(int) * ((size_t)L.m + 1)), *ccl = malloc(sizeof(int) * ((size_t)L.n + 1)), nrc = 0, ncc = 0;
-        for (int i = 0; i < L.m; i++) hb[i] = lp_bounds_key(L.rl[i], L.ru[i]);
-        for (int j = 0; j < L.n; j++) { hc[j] = L.c[j]; hu[j] = lp_bounds_key(L.l[j], L.u[j]); }
-        lpsym = (getenv("BRISK_LPFOLDOLD") ? lp_fold_partition(L.m, L.n, 0, L.Ap, L.Ai, L.Ax, hb, hc, hu, rcl, ccl, &nrc, &ncc)
-                 : lp_fold_partition_stop(L.m, L.n, 0, L.Ap, L.Ai, L.Ax, hb, hc, hu, rcl, ccl, &nrc, &ncc, 0.5)) && (double)nrc + ncc <= 0.5 * ((double)L.m + L.n);
-        if (getenv("BRISK_LPDBG")) printf("   [the problem as read: %d row and %d column classes of %d and %d%s]\n", nrc, ncc, L.m, L.n, lpsym ? ": folded first, the simplex method's presolve skipped" : "");
+      /* (7 November 2026) BRISK_LPFOLDSCALE=1: when the problem as read does not fold, its partition on the scaling that does
+       * not depend on the input's (lp_canon_problem; the rows' or columns' rescaled copies of a problem that folds) */
+      static int fsc0 = -1; if (fsc0 < 0) fsc0 = getenv("BRISK_LPFOLDSCALE") && atoi(getenv("BRISK_LPFOLDSCALE")) > 0;
+      LpProb Lsc; int has_lsc = 0;
+      for (int att = 0; att < 2; att++) {
+        const LpProb *Lf = att ? &Lsc : &L;
+        if (att == 1) { if (lpsym || !fsc0) break;
+            const LpProb *Sp = NULL; const int g_ = sxpre_canon_get(&lpcanon, &L, &Sp, NULL, NULL, getenv("BRISK_LPDBG") != NULL);
+            if (g_ == 0) break;
+            if (g_ > 0) Lsc = *Sp;     /* (the shared one's arrays, freed with it) */
+            else { if (!sxpre_canon_problem(&L, &Lsc, 0.5, getenv("BRISK_LPDBG") != NULL)) break; has_lsc = 1; } }
+        double *hb = malloc(sizeof(double) * ((size_t)Lf->m + 1)), *hc = malloc(sizeof(double) * ((size_t)Lf->n + 1)), *hu = malloc(sizeof(double) * ((size_t)Lf->n + 1));
+        int *rcl = malloc(sizeof(int) * ((size_t)Lf->m + 1)), *ccl = malloc(sizeof(int) * ((size_t)Lf->n + 1)), nrc = 0, ncc = 0;
+        for (int i = 0; i < Lf->m; i++) hb[i] = lp_bounds_key(Lf->rl[i], Lf->ru[i]);
+        for (int j = 0; j < Lf->n; j++) { hc[j] = Lf->c[j]; hu[j] = lp_bounds_key(Lf->l[j], Lf->u[j]); }
+        lpsym = (getenv("BRISK_LPFOLDOLD") ? lp_fold_partition(Lf->m, Lf->n, 0, Lf->Ap, Lf->Ai, Lf->Ax, hb, hc, hu, rcl, ccl, &nrc, &ncc)
+                 : lp_fold_partition_stop(Lf->m, Lf->n, 0, Lf->Ap, Lf->Ai, Lf->Ax, hb, hc, hu, rcl, ccl, &nrc, &ncc, 0.5)) && (double)nrc + ncc <= 0.5 * ((double)Lf->m + Lf->n);
+        if (att == 1) lpfoldsc = lpsym;   /* (the interior-point method tries the scaled folding only then) */
+        if (getenv("BRISK_LPDBG")) printf("   [the problem as read: %d row and %d column classes of %d and %d%s]\n", nrc, ncc, Lf->m, Lf->n, lpsym ? ": folded first, the simplex method's presolve skipped" : "");
         /* (28 October 2026, ISSUES 626) the dependent equality rows when the problem folds: dropping them may break the partition
          * (qap15, LP: one dependent row of a class of equivalent rows dropped, the fold 6,330 -> 2,121 rows lost, 1.3 -> 33 s) or
          * restore it (copies of quantile regressions with redundant equations, LP: 1,341 row classes with them, 442 without, the
          * original's). The partition without them decides: the standard presolve drops them unless it has more classes */
         if (lpsym && !(getenv("BRISK_LPDEPROWS") && atoi(getenv("BRISK_LPDEPROWS")) == 0)) {
-            int me = 0; for (int i = 0; i < L.m; i++) if (L.rl[i] == L.ru[i] && L.rl[i] > -LP_INF) me++;
+            int me = 0; for (int i = 0; i < Lf->m; i++) if (Lf->rl[i] == Lf->ru[i] && Lf->rl[i] > -LP_INF) me++;
             lpsym_keepdep = 1;
             if (me >= 2) {
-                int *ei = malloc(sizeof(int) * ((size_t)L.m + 1)), *erow = malloc(sizeof(int) * (size_t)me); long *ep = calloc((size_t)me + 2, sizeof(long));
-                for (int i = 0, t = 0; i < L.m; i++) { ei[i] = -1; if (L.rl[i] == L.ru[i] && L.rl[i] > -LP_INF) { ei[i] = t; erow[t++] = i; } }
-                for (int p = 0; p < L.Ap[L.n]; p++) if (ei[L.Ai[p]] >= 0 && L.Ax[p] != 0) ep[ei[L.Ai[p]] + 2]++;
+                int *ei = malloc(sizeof(int) * ((size_t)Lf->m + 1)), *erow = malloc(sizeof(int) * (size_t)me); long *ep = calloc((size_t)me + 2, sizeof(long));
+                for (int i = 0, t = 0; i < Lf->m; i++) { ei[i] = -1; if (Lf->rl[i] == Lf->ru[i] && Lf->rl[i] > -LP_INF) { ei[i] = t; erow[t++] = i; } }
+                for (int p = 0; p < Lf->Ap[Lf->n]; p++) if (ei[Lf->Ai[p]] >= 0 && Lf->Ax[p] != 0) ep[ei[Lf->Ai[p]] + 2]++;
                 for (int t = 0; t < me; t++) ep[t + 2] += ep[t + 1];
                 int *ej = malloc(sizeof(int) * ((size_t)ep[me + 1] + 1)); double *ev = malloc(sizeof(double) * ((size_t)ep[me + 1] + 1)), *eb = malloc(sizeof(double) * (size_t)me);
-                for (int j = 0; j < L.n; j++) for (int p = L.Ap[j]; p < L.Ap[j + 1]; p++) if (ei[L.Ai[p]] >= 0 && L.Ax[p] != 0) { const long q = ep[ei[L.Ai[p]] + 1]++; ej[q] = j; ev[q] = L.Ax[p]; }
-                for (int t = 0; t < me; t++) eb[t] = L.rl[erow[t]];
+                for (int j = 0; j < Lf->n; j++) for (int p = Lf->Ap[j]; p < Lf->Ap[j + 1]; p++) if (ei[Lf->Ai[p]] >= 0 && Lf->Ax[p] != 0) { const long q = ep[ei[Lf->Ai[p]] + 1]++; ej[q] = j; ev[q] = Lf->Ax[p]; }
+                for (int t = 0; t < me; t++) eb[t] = Lf->rl[erow[t]];
                 char *dep = malloc((size_t)me);
-                const int nd = lp_dependent_rows(me, L.n, ep, ej, ev, eb, dep, NULL);
+                const int nd = lp_dependent_rows(me, Lf->n, ep, ej, ev, eb, dep, NULL);
                 if (nd == 0) lpsym_keepdep = 0;
                 else {
                     /* the partition of the problem without them (rows renumbered, their entries left out) */
-                    int *rn = malloc(sizeof(int) * ((size_t)L.m + 1)), m2 = 0;
-                    for (int i = 0; i < L.m; i++) rn[i] = (ei[i] >= 0 && dep[ei[i]]) ? -1 : m2++;
-                    int *Ap2 = malloc(sizeof(int) * ((size_t)L.n + 1)), *Ai2 = malloc(sizeof(int) * ((size_t)L.Ap[L.n] + 1)); double *Ax2 = malloc(sizeof(double) * ((size_t)L.Ap[L.n] + 1));
-                    double *hb2 = malloc(sizeof(double) * ((size_t)m2 + 1)), *hc2 = malloc(sizeof(double) * ((size_t)L.n + 1)), *hu2 = malloc(sizeof(double) * ((size_t)L.n + 1));
-                    int *rcl2 = malloc(sizeof(int) * ((size_t)m2 + 1)), *ccl2 = malloc(sizeof(int) * ((size_t)L.n + 1)), nrc2 = 0, ncc2 = 0, w2 = 0;
-                    for (int j = 0; j < L.n; j++) { Ap2[j] = w2; for (int p = L.Ap[j]; p < L.Ap[j + 1]; p++) if (rn[L.Ai[p]] >= 0) { Ai2[w2] = rn[L.Ai[p]]; Ax2[w2++] = L.Ax[p]; } hc2[j] = L.c[j]; hu2[j] = lp_bounds_key(L.l[j], L.u[j]); }
-                    Ap2[L.n] = w2;
-                    for (int i = 0; i < L.m; i++) if (rn[i] >= 0) hb2[rn[i]] = lp_bounds_key(L.rl[i], L.ru[i]);
-                    const int ok2 = lp_fold_partition_stop(m2, L.n, 0, Ap2, Ai2, Ax2, hb2, hc2, hu2, rcl2, ccl2, &nrc2, &ncc2, 0.5);
+                    int *rn = malloc(sizeof(int) * ((size_t)Lf->m + 1)), m2 = 0;
+                    for (int i = 0; i < Lf->m; i++) rn[i] = (ei[i] >= 0 && dep[ei[i]]) ? -1 : m2++;
+                    int *Ap2 = malloc(sizeof(int) * ((size_t)Lf->n + 1)), *Ai2 = malloc(sizeof(int) * ((size_t)Lf->Ap[Lf->n] + 1)); double *Ax2 = malloc(sizeof(double) * ((size_t)Lf->Ap[Lf->n] + 1));
+                    double *hb2 = malloc(sizeof(double) * ((size_t)m2 + 1)), *hc2 = malloc(sizeof(double) * ((size_t)Lf->n + 1)), *hu2 = malloc(sizeof(double) * ((size_t)Lf->n + 1));
+                    int *rcl2 = malloc(sizeof(int) * ((size_t)m2 + 1)), *ccl2 = malloc(sizeof(int) * ((size_t)Lf->n + 1)), nrc2 = 0, ncc2 = 0, w2 = 0;
+                    for (int j = 0; j < Lf->n; j++) { Ap2[j] = w2; for (int p = Lf->Ap[j]; p < Lf->Ap[j + 1]; p++) if (rn[Lf->Ai[p]] >= 0) { Ai2[w2] = rn[Lf->Ai[p]]; Ax2[w2++] = Lf->Ax[p]; } hc2[j] = Lf->c[j]; hu2[j] = lp_bounds_key(Lf->l[j], Lf->u[j]); }
+                    Ap2[Lf->n] = w2;
+                    for (int i = 0; i < Lf->m; i++) if (rn[i] >= 0) hb2[rn[i]] = lp_bounds_key(Lf->rl[i], Lf->ru[i]);
+                    const int ok2 = lp_fold_partition_stop(m2, Lf->n, 0, Ap2, Ai2, Ax2, hb2, hc2, hu2, rcl2, ccl2, &nrc2, &ncc2, 0.5);
                     if (ok2 && (double)nrc2 + ncc2 <= (double)nrc + ncc) lpsym_keepdep = 0;
-                    if (getenv("BRISK_LPDBG")) printf("   [the problem as read without its %d dependent equations: %d row and %d column classes: they are %s]\n", nd, ok2 ? nrc2 : m2, ok2 ? ncc2 : L.n, lpsym_keepdep ? "kept (the fold)" : "dropped");
+                    if (getenv("BRISK_LPDBG")) printf("   [the problem as read without its %d dependent equations: %d row and %d column classes: they are %s]\n", nd, ok2 ? nrc2 : m2, ok2 ? ncc2 : Lf->n, lpsym_keepdep ? "kept (the fold)" : "dropped");
                     free(rn); free(Ap2); free(Ai2); free(Ax2); free(hb2); free(hc2); free(hu2); free(rcl2); free(ccl2);
                 }
                 free(ei); free(erow); free(ep); free(ej); free(ev); free(eb); free(dep);
             }
         }
         free(hb); free(hc); free(hu); free(rcl); free(ccl);
+      }
+      if (has_lsc) { free(Lsc.Ax); free(Lsc.rl); free(Lsc.c); free(Lsc.l); }
     }
     lp_set_stop(lpsf0);
     if (getenv("BRISK_LPDBG")) printf("   [t %.3f s: the folding check of the problem as read done]\n", wtime() - t0);
@@ -3954,6 +4953,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
          * after the simplex method's result at 14 s) */
         const volatile int *sxs0 = sxpre_get_stop(); if (cc.started) sxpre_set_stop(&conc_any);
         const int ps = sxpre_presolve(&L, &Lr, &SP, quiet ? 0 : 1, why, sizeof why);
+    if (getenv("BRISK_LPRACET") && cc.started) fprintf(stderr, "   [race timing: the presolve done at %.5f s after the job's start]\n", wtime() - cc.t0);
         sxpre_set_stop(sxs0);
         /* (27 October 2026, the night) its verdict of infeasible or unbounded is checked on the problem as read with the
          * standard presolve (Solve 1 and 2 in the Summary): the presolve decides in exact arithmetic on data rounded to the
@@ -3975,7 +4975,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
             if (!quiet) printf("status: %s (presolve: %s)   iterations: 0   time: %.3fs\n", ps == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE", why, wtime() - t0);
             const int rcp = ps == 1 ? 11 : 12;
             if (g_brisk_result) { g_brisk_result->status = ps; snprintf(g_brisk_result->status_str, sizeof g_brisk_result->status_str, "%s", ps == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE"); g_brisk_result->exit_code = rcp; }
-            sxpre_free(SP); lp_conc_free(&cc); lp_conc_free(&cc2); lp_free(&L); free(av);
+            sxpre_free(SP); lp_conc_free(&cc); lp_conc_free(&cc2); sxpre_canon_free(&lpcanon); lp_free(&L); free(av);
             return rcp;
         }
         if (ps == 0) Lw = &Lr; else { sxpre_free(SP); SP = NULL; }
@@ -3994,6 +4994,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
      * problem as read folds and dropping them would break the partition (lpsym_keepdep, above) */
     lp_set_nodeprows(SP != NULL || lpsym_keepdep);
     if (lpm) lp_to_std(Lw, pre, quiet ? 0 : 1, &P, &M, &ub); else lp_to_sedumi(Lw, pre, quiet ? 0 : 1, &P, &M);
+    if (getenv("BRISK_LPRACET") && cc.started) fprintf(stderr, "   [race timing: the standard form done at %.5f s after the job's start]\n", wtime() - cc.t0);
     lp_set_nodeprows(0);
     lp_set_stop(lps0);
     if (getenv("BRISK_LPDBG")) printf("   [t %.3f s: the standard presolve done]\n", wtime() - t0);
@@ -4014,7 +5015,8 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
     memset(att, 0, sizeof att);
     if (pv_st) { att[0].sxpre = pv_sx; att[0].verdict = pv_st; att[0].t = pv_t; snprintf(att[0].why, sizeof att[0].why, "%s", pv_why); natt = 1; }
     double *x = calloc((size_t)L.n + 1, sizeof(double));
-    int xo_taken = 0; SimplexInfo xo_inf; memset(&xo_inf, 0, sizeof xo_inf); double xo_t = 0, xo_tipm = 0;    /* (the crossover after a late loss, below) */
+    int xo_taken = 0; SimplexInfo xo_inf; memset(&xo_inf, 0, sizeof xo_inf); double xo_t = 0, xo_tipm = 0;
+    double *xo_y = calloc((size_t)L.m + 1, sizeof(double)), *xo_z = calloc((size_t)L.n + 1, sizeof(double)); int xo_ynone = 0;   /* (the crossover's duals for the result) */    /* (the crossover after a late loss, below) */
     if (M.status) {
         lp_conc_join2(&cc, &cc2, 1);
         if (!quiet) printf("status: %s   iterations: 0   time: %.3fs\n", M.status == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE", wtime() - t0);
@@ -4030,16 +5032,17 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
             int done = 0;
             if (lpm) {
                 /* the dedicated interior-point method on the bounded form; the SOCP solver when it gives up */
-                LpIpmOpts o; LpIpmInfo inf; memset(&o, 0, sizeof o);
+                LpIpmOpts o; LpIpmInfo inf; memset(&o, 0, sizeof o); o.foldscale = lpfoldsc;
                 o.tol = 1e-8; o.kcorr = lpcorr; o.verbose = quiet ? 0 : 1;
                 if (cc.started) o.stop = &conc_any;
-                if (rlog.on) { o.iter_cb = race_ipm_cb; o.iter_ctx = &rlog; }
+                RaceIpm rq; memset(&rq, 0, sizeof rq); rq.rl = &rlog; rq.a = &cc; rq.b = &cc2;
+                if (rlog.on || cc.started) { o.iter_cb = race_ipm_cb2; o.iter_ctx = &rq; o.fact_heavy = &rq.heavy; o.fact_ms = &rq.fms; }
                 ipm_line[0] = 0;
                 for (int i = 0; i < ac; i++) {
                     if (i + 1 < ac && !strcmp(av[i], "-tol")) o.tol = atof(av[i + 1]);
                     if (i + 1 < ac && !strcmp(av[i], "-maxit")) o.maxit = atoi(av[i + 1]);
                     if (i + 1 < ac && !strcmp(av[i], "-timelimit")) o.timelimit = atof(av[i + 1]);
-                    if (i + 1 < ac && !strcmp(av[i], "-threads") && atoi(av[i + 1]) >= 1) omp_set_num_threads(atoi(av[i + 1]) - (cc.started ? 1 : 0) - (cc2.started ? 1 : 0));   /* (the factorizations run on the threads; one less beside the dual simplex method) */
+                    if (i + 1 < ac && !strcmp(av[i], "-threads") && atoi(av[i + 1]) >= 1) omp_set_num_threads(cc.started ? race_ipm_threads(atoi(av[i + 1]), 1 + (cc2.started && !cc2.idle ? 1 : 0)) : atoi(av[i + 1]));   /* (the factorizations run on the threads; one less beside the dual simplex method; none for a second job at the idle priority) */
                     if (!strcmp(av[i], "-v") || !strcmp(av[i], "-vv")) o.verbose = 2;
                 }
                 /* (21 October 2026, the night) when the method gives up on the problem the simplex method's presolve left,
@@ -4067,7 +5070,9 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                     if (tlim_lp > 0) o.timelimit = fmax(tlim_lp - (wtime() - t0), 1e-3);
                     if (getenv("BRISK_LPDBG")) printf("   [t %.3f s: the interior-point method starts]\n", wtime() - t0);
                     const int itab0 = g_itab; g_itab = g_log_brief && !quiet;   /* (3 November 2026: the default log's iteration table) */
+                    if (getenv("BRISK_LPRACET") && cc.started) fprintf(stderr, "   [race timing: the method starts at %.5f s after the job's start]\n", wtime() - cc.t0);
                     int st = lpipm_solve(P.m, P.n, P.nf, P.Ap, P.Ai, P.Ax, P.b, P.c, ub, &o, R.x, R.y, R.z, &inf), viol_next = 0;
+                    if (getenv("BRISK_LPRACET") && cc.started) fprintf(stderr, "   [race timing: the method returned %d after %d iterations at %.5f s after the job's start]\n", st, inf.iters, wtime() - cc.t0);
                     g_itab = itab0;
                     if (getenv("BRISK_LPDBG")) printf("   [t %.3f s: the interior-point method ends, status %d]\n", wtime() - t0, st);
                     /* (2 November 2026) an optimal point of the first attempt (after the presolve of parallel rows, doubleton
@@ -4082,7 +5087,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                             lp_point_as_read(&L, Lw, &M, SP, R.x, x);
                             const double v = lp_rowviol_act(&L, x);
                             memset(x, 0, sizeof(double) * (size_t)L.n);
-                            if (v > 1e-6) { st = 4; viol_next = 1; snprintf(inf.why, sizeof inf.why, "its point violates a row of the problem as read by %.1e of its activity", v); }
+                            if (v > lp_accept_lim()) { st = 4; viol_next = 1; snprintf(inf.why, sizeof inf.why, "its point violates a row of the problem as read by %.1e of its activity", v); }
                         }
                     }
                     const int declined = arx && sx_asread_declined(arx);
@@ -4090,7 +5095,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                     if (declined) { inf.iters = 0; snprintf(inf.why, sizeof inf.why, "the problem as read costs less an iteration"); }
                     /* (27 October 2026, the night) stopped by the dual simplex method beside it, which ended with a result:
                      * nothing of this attempt is reported */
-                    if (cc.started && conc_any) {
+                    if (cc.started && brisk_flag_get(&conc_any)) {
                         done = 1; R.status = 6; snprintf(R.status_str, sizeof R.status_str, "STOPPED"); tlast = wtime() - ta;
                         break;
                     }
@@ -4123,7 +5128,8 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                      * solver's new start costs; the SOCP solver as before when it does not finish within it (the run then
                      * longer by at most that time). On the 54 LPs with dense columns and the held-out energy LPs
                      * (-lpmethod 1): 563 -> 523 s, no status changed; rmine13 88.6 -> 54.1 s, ns1905797 0.97 -> 0.63 s,
-                     * neos-4306827-ravan 2.9 -> 4.1 s (the attempt fails). BRISK_LPXOBUDGET=0: not */
+                     * neos-4306827-ravan 2.9 -> 4.1 s (the attempt fails). BRISK_LPXOBUDGET=0: not. A decision on the clock (the
+                     * crossover can end differently from run to run near its budget): approved by the owner on 11 November 2026 */
                     const int xo_budgeted = !xo_band && xobud && inf.dense_lost && xo_err <= 1e-2;
                     /* (3 November 2026) and a point optimal by the method's own measures that violates a row of the problem as
                      * read beyond 1e-6 of its activity (viol_next): the crossover from it first, the second attempt after the
@@ -4140,7 +5146,19 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                         SimplexOpts so; memset(&so, 0, sizeof so);
                         so.xstart = x0; so.ystart = yL; so.nopresolve = 1; so.verbose = o.verbose >= 2 ? 1 : 0;
                         if (tlim_lp > 0) so.timelimit = fmax(tlim_lp - (wtime() - t0), 1e-3);
-                        if (xo_budgeted) so.timelimit = so.timelimit > 0 ? fmin(so.timelimit, fmax(wtime() - ta, 1.0)) : fmax(wtime() - ta, 1.0);
+                        /* (7 November 2026, BRISK_LPXOSTALLBUD=1, off) and the crossover from a point where the method stalled
+                         * within the band, with the same budget: it is taken because from next to an optimal basis it costs a
+                         * fraction of the second attempt; when it costs more than the method spent, the second attempt follows as
+                         * when it does not end optimal. The rescaled copy of neos-799711 (LP, columns rescaled; the dual form's
+                         * 4,142 free y as exact free columns): the method stalled at 8e-7 after 4.3 s and the crossover failed
+                         * after 10.9 s (6,810 primal infeasibilities up to 5.7e9 after its pushes), the second attempt then 0.7 s.
+                         * Temporary: the crossover's failure on the rescaled copy is not explained */
+                        static int xosb = -1; if (xosb < 0) { const char *e_ = getenv("BRISK_LPXOSTALLBUD"); xosb = e_ ? atoi(e_) : 0; }
+                        if (xo_budgeted || (xosb > 0 && xo_band)) so.timelimit = so.timelimit > 0 ? fmin(so.timelimit, fmax(wtime() - ta, 1.0)) : fmax(wtime() - ta, 1.0);
+                        /* (with it, the budget for all the crossover's calls together: the reset to the time limit after the
+                         * crossover on the reduced problem below gave the call on the problem as read the whole time limit again;
+                         * the dense columns' budget has the same reset) */
+                        const double xo_bud = xosb > 0 && (xo_budgeted || xo_band) ? so.timelimit : 0.0;
                         if (cc.started) so.stop = &conc_any;
                         if (!quiet) printf("  the LP interior-point method stopped after %d iterations near the optimum (%s; errors pinf %.1e dinf %.1e gap %.1e): its point goes to the crossover\n",
                                            inf.iters, inf.why, inf.pinf, inf.dinf, inf.gap);
@@ -4184,6 +5202,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                                 SimplexInfo idr;
                                 if (xodir && simplex_postsolved_check(&L, xa, ya, cs, rs, x, &idr)) {
                                     xo_inf = idr; xo_inf.pushes = ir.pushes; xo_inf.iters = ir.iters; xst = 0;
+                                    memcpy(xo_y, ya, sizeof(double) * (size_t)L.m); lp_reduced_costs(&L, xo_y, xo_z);
                                     if (!quiet && so.verbose) printf("  the postsolved basis is optimal on the problem as read (%.2f s)\n", wtime() - tx);
                                     free(xa); free(ya); free(cs); free(rs);
                                     goto xored_done;
@@ -4191,7 +5210,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                                 SimplexOpts sof = so; sof.xstart = NULL; sof.ystart = NULL; sof.cstat0 = cs; sof.rstat0 = rs; sof.nopresolve = 1;
                                 if (tlim_lp > 0) sof.timelimit = fmax(tlim_lp - (wtime() - t0), 1e-3);
                                 SimplexInfo i2; memset(&i2, 0, sizeof i2);
-                                const int s2 = simplex_solve(&L, &sof, x, NULL, NULL, NULL, NULL, NULL, &i2);
+                                const int s2 = simplex_solve(&L, &sof, x, NULL, xo_y, xo_z, NULL, NULL, &i2);
                                 if (!quiet && so.verbose) printf("  the problem as read from its postsolved basis: status %d, %ld iterations (%.2f s)\n", s2, i2.iters, wtime() - tx);
                                 if (s2 == 0) { xo_inf = i2; xo_inf.pushes = ir.pushes; xo_inf.iters += ir.iters; xst = 0; }
                                 else memset(x, 0, sizeof(double) * (size_t)L.n);
@@ -4205,13 +5224,15 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                             free(xr0); free(yr0); free(xr); free(yr); free(csr); free(rsr);
                             if (xo_out) { xst = 6; memset(&xo_inf, 0, sizeof xo_inf); xo_inf.status = 6; }
                             else if (tlim_lp > 0) so.timelimit = fmax(tlim_lp - (wtime() - t0), 1e-3);
+                            if (!xo_out && xo_bud > 0) so.timelimit = fmax(so.timelimit > 0 && tlim_lp > 0 ? fmin(so.timelimit, xo_bud - (wtime() - tx)) : xo_bud - (wtime() - tx), 1e-3);   /* (BRISK_LPXOSTALLBUD) */
                         }
                         if (xst < 0 && xod && simplex_dual_route_possible(&L)) {
                             xst = simplex_crossover_dual(&L, &so, x0, yL, x, &xo_inf);
+                            xo_ynone = 1;     /* (this route returns no duals) */
                             if (!quiet && so.verbose) printf("  the crossover through the dual problem: status %d (%.2f s)\n", xst, wtime() - tx);
                             if (xst != 0) { memset(x, 0, sizeof(double) * (size_t)L.n); memset(&xo_inf, 0, sizeof xo_inf); xst = -1; }
                         }
-                        if (xst < 0) xst = simplex_solve(&L, &so, x, NULL, NULL, NULL, NULL, NULL, &xo_inf);
+                        if (xst < 0) xst = simplex_solve(&L, &so, x, NULL, xo_y, xo_z, NULL, NULL, &xo_inf);
                         xo_t = wtime() - tx;
                         free(yL); free(x0);
                         if (xst == 0) {
@@ -4301,11 +5322,11 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
              * method that ends first is taken once it has ended (superseded later that night: the SOCP solver stops when
              * the simplex method has its result, socp_stop_call below). BRISK_LPSOCPWAIT=1: the SOCP solver after the
              * simplex method, as before */
-            if (!done && cc.started && (cc.done || getenv("BRISK_LPSOCPWAIT"))) {
+            if (!done && cc.started && (brisk_flag_get(&cc.done) || getenv("BRISK_LPSOCPWAIT"))) {
                 cc.nthr = cc2.started == 1 ? (nt_all > 3 ? nt_all / 2 : 1) : nt_all;     /* (28 October 2026: the interior-point method's threads to the simplex method) */
-                cc2.nthr = cc.nthr;
+                cc2.nthr = cc.nthr; lp_conc_unidle(&cc2);
                 lp_conc_join2(&cc, &cc2, 0);
-                if (cc.won) { done = 1; R.status = 6; snprintf(R.status_str, sizeof R.status_str, "STOPPED"); }
+                if (brisk_flag_get(&cc.won)) { done = 1; R.status = 6; snprintf(R.status_str, sizeof R.status_str, "STOPPED"); }
                 else omp_set_num_threads(nt_all);
             }
             /* (28 October 2026, later in the night) the SOCP solver stops when the simplex method beside it has its result
@@ -4338,14 +5359,14 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
             int ipm_ok = (R.status == 0 && R.x) || R.status == 1 || R.status == 2 || xo_taken;
             if (R.status == 0 && R.x) {
                 obj_have = lp_point_as_read(&L, Lw, &M, SP, R.x, x); x_have = 1;
-                if ((ipm_viol = lp_rowviol_act(&L, x)) > 1e-6) ipm_ok = 0;
+                if ((ipm_viol = lp_rowviol_act(&L, x)) > lp_accept_lim()) ipm_ok = 0;
             }
             const double t_ipm = wtime() - cc.t0;
             /* (28 October 2026) the interior-point method ended without a result to take: the simplex method, waited for,
              * gets its threads (the simplex method reads the count at every iteration, SimplexOpts.threads; its result
              * does not depend on it). rmine13 (LP): the interior-point method at reduced accuracy after 50 s, the dual
              * simplex method on one thread not done at the 60 s limit; the race of -lpmethod 5 on four threads 26 s */
-            if (!ipm_ok) { cc.nthr = cc2.started == 1 ? (nt_all > 3 ? nt_all / 2 : 1) : nt_all; cc2.nthr = cc.nthr; }
+            if (!ipm_ok) { cc.nthr = cc2.started == 1 ? (nt_all > 3 ? nt_all / 2 : 1) : nt_all; cc2.nthr = cc.nthr; lp_conc_unidle(&cc2); }
             /* (31 October 2026, ISSUES 635) a point at reduced accuracy (within 100 times the tolerance) is a result the user can
              * have: the simplex method then gets twice the time the race has taken, on every thread, so that the call takes at
              * most three times the time at which that result was ready (an optimal basic solution is worth more than the point:
@@ -4354,23 +5375,23 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
              * (LP): the point at 7.7 s, the simplex method to the time limit, 90-100 s in all; rmine13 (LP): the point after
              * 50 s, the simplex method's result at 77-81 s, taken. BRISK_LPWAITX: the factor (2; 0 or negative: no bound) */
             int waited_out = 0;
-            if (!ipm_ok && R.status == 5 && cc.started == 1 && !cc.done) {
+            if (!ipm_ok && R.status == 5 && cc.started == 1 && !brisk_flag_get(&cc.done)) {
                 static double wx = -2; if (wx < -1) { const char *e_ = getenv("BRISK_LPWAITX"); wx = e_ ? atof(e_) : 2.0; }
                 if (wx > 0) {
                     const double tend = cc.t0 + (1.0 + wx) * t_ipm;
-                    while (!cc.done && !(cc2.started == 1 && cc2.done && cc2.won) && wtime() < tend) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
-                    if (!cc.done && !(cc2.started == 1 && cc2.done && cc2.won)) { cc.stop = 1; cc2.stop = 1; waited_out = 1; }
+                    while (!brisk_flag_get(&cc.done) && !(cc2.started == 1 && brisk_flag_get(&cc2.done) && brisk_flag_get(&cc2.won)) && wtime() < tend) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+                    if (!brisk_flag_get(&cc.done) && !(cc2.started == 1 && brisk_flag_get(&cc2.done) && brisk_flag_get(&cc2.won))) { brisk_flag_set(&cc.stop, 1); brisk_flag_set(&cc2.stop, 1); waited_out = 1; }
                 }
             }
             lp_conc_join2(&cc, &cc2, ipm_ok);
-            sx_taken = cc.won && (!ipm_ok || cc.t < t_ipm);
-            ipm_nores = sx_taken && !ipm_ok && cc.t >= t_ipm && ipm_viol <= 1e-6;
+            sx_taken = brisk_flag_get(&cc.won) && (!ipm_ok || cc.t < t_ipm);
+            ipm_nores = sx_taken && !ipm_ok && cc.t >= t_ipm && ipm_viol <= lp_accept_lim();
             /* (28 October 2026) stopped by this side only when its result was taken; otherwise it ended without one (shs1014,
              * LP: at its time limit, reported as stopped by the interior-point method) */
-            if (!sx_taken && cc.done && !quiet && !quiet_summary)
+            if (!sx_taken && brisk_flag_get(&cc.done) && !quiet && !quiet_summary)
                 brisk_note("the dual simplex method ran beside it on one thread (%ld iterations, %.2f s), %s", cc.inf.iters, cc.t,
                            waited_out ? "stopped: given twice the time the interior-point method had taken, it had no result" :
-                           cc.stop && xo_taken ? "stopped: the crossover from the interior-point method's point finished first" : cc.stop ? "stopped: the interior-point method finished first" : tlim_lp > 0 && cc.t >= 0.99 * tlim_lp ? "stopped by the time limit" : "ended without a result");
+                           brisk_flag_get(&cc.stop) && xo_taken ? "stopped: the crossover from the interior-point method's point finished first" : brisk_flag_get(&cc.stop) ? "stopped: the interior-point method finished first" : tlim_lp > 0 && cc.t >= 0.99 * tlim_lp ? "stopped by the time limit" : "ended without a result");
         }
         if (!sx_taken && ipm_line[0]) printf("%s", ipm_line);
         ipm_line[0] = 0;
@@ -4378,7 +5399,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
             const SimplexInfo *si = &cc.inf; double eb = 0, er = 0;
             static const char *const snm[] = {"OPTIMAL", "PRIMAL INFEASIBLE", "DUAL INFEASIBLE"};
             rc = cc.st == 0 ? 0 : cc.st == 1 ? 11 : 12;
-            if (cc.st == 0) lp_errors(&L, cc.x, &eb, &er);
+            if (cc.st == 0) lp_errors2(&L, cc.x, &eb, &er);
             if (!quiet) {
                 printf("status: %s   iterations: %ld   time: %.3fs (the dual simplex method, beside the interior-point method)\n", snm[cc.st], si->iters, cc.t);
                 if (cc.st == 0) {
@@ -4391,19 +5412,19 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                     printf("------------------------------------------------------------------------------------------\n");
                     printf("Summary\n  Problem as read:   %s rows, %s columns (linear program, %s)\n", a_, b_, L.maxim ? "maximized" : "minimized");
                     printf("  Solve:             dual simplex method, %ld iterations, beside the interior-point method%s\n", si->iters,
-                           ipm_viol > 1e-6 || ipm_nores ? " (which ended first without a result to take)" : " (stopped: the dual simplex method finished first)");
+                           ipm_viol > lp_accept_lim() || ipm_nores ? " (which ended first without a result to take)" : " (stopped: the dual simplex method finished first)");
                     for (int i = 0; i < g_nnotes; i++) printf("                     %s\n", g_notes[i]);
                     printf("  Time:              %.2f s\n  Number of threads: %d\n", wtime() - t0, nt_all);
                     if (cc.st == 0) {
                         printf("  Status:            OPTIMAL\n  Objective:         %.10e\n", si->obj);
-                        printf("  Errors:            variable bounds violated by %.1e, constraints by %.1e (relative)\nSolved to relative error %.1e\n", eb, er, fmax(eb, er));
-                    } else printf("  Verdict:           the problem is %s\n  Status:            %s\n", cc.st == 1 ? "primal infeasible" : "dual infeasible (unbounded)", snm[cc.st]);
+                        { double b_, r_; const char *k_ = lp_errvals(eb, er, &b_, &r_); printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (%s)\nSolved to relative error %.1e\n", b_, r_, k_, fmax(eb, er)); }
+                    } else printf("  Status:            %s\n  Verdict:           the problem is %s\n%s\n", snm[cc.st], cc.st == 1 ? "primal infeasible" : "dual infeasible (unbounded)", cc.st == 1 ? "Primal infeasible" : "Dual infeasible");
                     g_log_user--;
                 } else if (!quiet_summary) {
                     char a_[32], b_[32]; fmt_count(a_, sizeof a_, L.m); fmt_count(b_, sizeof b_, L.n);
                     printf("------------------------------------------------------------------------------------------\n");
                     printf("Summary\n  Problem as read:   %s rows, %s columns (linear program, %s)\n", a_, b_, L.maxim ? "maximized" : "minimized");
-                    if (ipm_viol > 1e-6)
+                    if (ipm_viol > lp_accept_lim())
                         printf("  Solve 1:           LP interior-point method on %d threads: its point violates a row of the problem as read by %.1e of its activity; the dual simplex method beside it was waited for\n", nt_ipm, ipm_viol);
                     else if (ipm_nores)
                         printf("  Solve 1:           LP interior-point method on %d threads: %s, not a result to take; the dual simplex method beside it was waited for\n", nt_ipm,
@@ -4414,8 +5435,8 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                            cc.o.aggb_only ? " on the problem with the bounded substitution of columns without cost" : cc.o.no_dual_route ? " on the problem itself (not through its dual problem)" : "",
                            ipm_nores ? ", more once the interior-point method had ended" : "", si->iters, si->iters_dual, si->iters_primal, si->nfactor, cc.t);
                     printf("  Time:              %.2f s\n", wtime() - t0);
-                    if (cc.st == 0) printf("  Status:            OPTIMAL\n  Errors:            variable bounds violated by %.1e, constraints by %.1e (relative)\nSolved to relative error %.1e\n", eb, er, fmax(eb, er));
-                    else printf("  Verdict:           the problem is %s\n  Status:            %s\n", cc.st == 1 ? "primal infeasible" : "dual infeasible (unbounded)", cc.st == 1 ? "PRIMAL INFEASIBLE" : "DUAL INFEASIBLE");
+                    if (cc.st == 0) { double b_, r_; const char *k_ = lp_errvals(eb, er, &b_, &r_); printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (%s)\n%s\n", b_, r_, k_, snm[0]); }
+                    else printf("  Verdict:           the problem is %s\n%s\n", cc.st == 1 ? "primal infeasible" : "dual infeasible (unbounded)", cc.st == 1 ? "Primal infeasible" : "Dual infeasible");
                 }
             }
             if (xf) sedumi_write_vec(xf, cc.x, L.n);
@@ -4424,11 +5445,12 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                 res->status = cc.st; snprintf(res->status_str, sizeof res->status_str, "%s", snm[cc.st]);
                 res->exit_code = rc; res->iters = (int)si->iters; res->m = L.m; res->pobj = si->obj; res->dobj = si->obj; res->time = wtime() - t0;
                 res->sn = L.n; res->have_x = 1; res->sx = cc.x; cc.x = NULL;
+                if (cc.st == 0) { res->y = cc.y; cc.y = NULL; res->sz = cc.z; cc.z = NULL; }
             }
         }
         if (xo_taken && !sx_taken) {    /* (1 November 2026) the crossover's optimal basic solution after the late loss */
             const SimplexInfo *si = &xo_inf; double eb = 0, er = 0;
-            lp_errors(&L, x, &eb, &er);
+            lp_errors2(&L, x, &eb, &er);
             if (!quiet) {
                 printf("status: OPTIMAL   iterations: %ld   time: %.3fs (the crossover from the interior-point method's point)\n", si->iters, xo_t);
                 printf("objective value (as in the file, %s): %.12e\n", L.maxim ? "maximized" : "minimized", si->obj);
@@ -4443,7 +5465,7 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                     for (int i = 0; i < g_nnotes; i++) printf("                     %s\n", g_notes[i]);
                     printf("  Time:              %.2f s\n", wtime() - t0);
                     printf("  Status:            OPTIMAL\n  Objective:         %.10e\n", si->obj);
-                    printf("  Errors:            variable bounds violated by %.1e, constraints by %.1e (relative)\nSolved to relative error %.1e\n", eb, er, fmax(eb, er));
+                    { double b_, r_; const char *k_ = lp_errvals(eb, er, &b_, &r_); printf("  Errors:            on the problem as read: bound violation %.1e, row violation %.1e (%s)\nOPTIMAL\n", b_, r_, k_); }
                     if (g_log_brief) g_log_user--;
                 }
             }
@@ -4453,19 +5475,20 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                 res->status = 0; snprintf(res->status_str, sizeof res->status_str, "OPTIMAL");
                 res->exit_code = 0; res->iters = (int)si->iters; res->m = L.m; res->pobj = si->obj; res->dobj = si->obj; res->time = wtime() - t0;
                 res->sn = L.n; res->have_x = 1; res->sx = malloc(sizeof(double) * ((size_t)L.n + 1)); memcpy(res->sx, x, sizeof(double) * (size_t)L.n);
+                if (!xo_ynone) { res->y = xo_y; xo_y = NULL; res->sz = xo_z; xo_z = NULL; }
             }
         }
         if (!sx_taken && R.status >= 0 && R.x) {
             const double obj = x_have ? obj_have : lp_point_as_read(&L, Lw, &M, SP, R.x, x);
             if (R.status == 0 || R.status == 5 || R.status == 3 || R.status == 4 || R.status == 6) {
-                double eb, er; lp_errors(&L, x, &eb, &er);
+                double eb, er; lp_errors2(&L, x, &eb, &er);
                 /* (21 October 2026, the night) not optimal when a row of the problem as read is violated by more than
                  * 100 times the tolerance of its activity: the SOCP solver, when it takes over, measures its errors
                  * against norms that rows of size 1e3 can drown in (piperout-08 as read: 2.3e-3, its objective off by
                  * 1.3e-3; triptim1 after the simplex method's presolve: 1e-3), and called such points optimal */
                 if (R.status == 0) {
                     const double ea = lp_rowviol_act(&L, x);
-                    if (ea > 1e-6) {
+                    if (ea > lp_accept_lim()) {
                         R.status = 5; snprintf(R.status_str, sizeof R.status_str, "SOLVED TO REDUCED ACCURACY"); rc = 10;
                         if (!quiet) printf("status: SOLVED TO REDUCED ACCURACY: a row of the problem as read is violated by %.1e of its activity\n"
                                            "  (an optimal basic solution by the simplex method: -lpmethod 5)\n", ea);
@@ -4483,13 +5506,29 @@ static int brisk_main_lp(int argc, char **argv, int ifile) {
                 BriskResult *res = g_brisk_result;
                 res->status = R.status; snprintf(res->status_str, sizeof res->status_str, "%s", R.status_str);
                 res->exit_code = rc; res->iters = R.iters; res->m = L.m; res->pobj = obj; res->dobj = obj; res->time = wtime() - t0;
+                /* (10 November 2026) the rows' duals through the postsolve, z = c - A'y: the presolves have no exact dual postsolve
+                 * for a point that is not a basic solution (the standard presolve sets a removed row's dual to 0: 25fv47's duals off by
+                 * 9e-2), so they are returned only when they pass the measure below; the simplex methods and the crossover give the duals
+                 * in every case (-lpmethod 2-5) */
+                if (R.y && (R.status == 0 || R.status == 5) && !L.maxim) {
+                    double *yv = calloc((size_t)L.m + 1, sizeof(double)), *zv = calloc((size_t)L.n + 1, sizeof(double)), *xt = calloc((size_t)L.n + 1, sizeof(double));
+                    /* (and only when they are the duals of the returned point: measured on the problem as read, 1e-6; the presolves'
+                     * postsolve of a point that is not a basic solution does not carry every dual back: agg, boeing1, e226 of netlib
+                     * up to 6.4 off) */
+                    if (yv && zv && xt) { lp_point_y_as_read(&L, Lw, &M, SP, R.x, R.y, xt, yv); lp_reduced_costs(&L, yv, zv);
+                        const double de_ = lp_dual_err(&L, x, yv, zv);
+                        if (getenv("BRISK_LPDUALDBG")) fprintf(stderr, "[duals] error %.3e (presolve ops %d)\n", de_, lp_presolve_nops());
+                        if (getenv("BRISK_LPDUALDBG") && atoi(getenv("BRISK_LPDUALDBG")) >= 2) { for (int i_ = 0; i_ < L.m; i_++) fprintf(stderr, "[duals] y[%d] %.6g (rows %.4g %.4g)\n", i_, yv[i_], L.rl[i_], L.ru[i_]); }
+                        if (de_ <= 1e-6) { res->y = yv; res->sz = zv; yv = zv = NULL; } }
+                    free(yv); free(zv); free(xt);
+                }
                 res->sn = L.n; res->have_x = 1; res->sx = x; x = NULL;
             }
         }
         sedumi_result_free(&R);
     }
-    lp_conc_free(&cc); lp_conc_free(&cc2);
-    free(x); free(ub); sedumi_free(&P); lp_map_free(&M); lp_free(&L); free(av);
+    lp_conc_free(&cc); lp_conc_free(&cc2); sxpre_canon_free(&lpcanon);
+    free(x); free(ub); free(xo_y); free(xo_z); sedumi_free(&P); lp_map_free(&M); lp_free(&L); free(av);
     if (SP) { lp_free(&Lr); sxpre_free(SP); }
     return rc;
 }
@@ -4533,7 +5572,7 @@ static int brisk_main_qp(int argc, char **argv, int ifile) {
         else if (!strcmp(argv[i], "-tol") && i + 1 < argc) o.tol = atof(argv[++i]);
         else if (!strcmp(argv[i], "-maxit") && i + 1 < argc) o.maxit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-timelimit") && i + 1 < argc) o.timelimit = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-threads") && i + 1 < argc) { const int t = atoi(argv[++i]); if (t > 0) { omp_set_num_threads(t); g_threads_user = 1; } }
+        else if (!strcmp(argv[i], "-threads") && i + 1 < argc) { const int t = atoi(argv[++i]); if (t > 0) { brisk_user_threads(t); g_threads_user = 1; } }
         else if (!strcmp(argv[i], "-x") && i + 1 < argc) xout = argv[++i];
         else if (!strcmp(argv[i], "-q")) o.verbose = 0;
         else if (!strcmp(argv[i], "-v")) o.verbose = 2;
@@ -4624,9 +5663,14 @@ summary_done:
 static int brisk_main_cbf(int argc, char **argv, int ifile) {
     SedumiProb P; char msg[400]; double c0 = 0; int maxim = 0, nint = 0, nvar = 0, *vmap = NULL; signed char *vmsgn = NULL;
     const char *xout = NULL;     /* (27 October 2026) -x <file>: x in the file's own variables, one value per line */
-    for (int i = 1; i + 1 < argc; i++) if (i != ifile && !strcmp(argv[i], "-x")) xout = argv[i + 1];
+    const char *yout = NULL, *zout = NULL;   /* (12 November 2026) -y: one multiplier per constraint of the file; -z: one dual slack per variable */
+    for (int i = 1; i + 1 < argc; i++) if (i != ifile) {
+        if (!strcmp(argv[i], "-x")) xout = argv[i + 1]; else if (!strcmp(argv[i], "-y")) yout = argv[i + 1]; else if (!strcmp(argv[i], "-z")) zout = argv[i + 1];
+    }
+    CbfDualMap dm; const int wmap = xout || zout;
     const double t0 = wtime();
-    if (cbf_read_vmap(argv[ifile], &P, &c0, &maxim, &nint, xout ? &vmap : NULL, xout ? &vmsgn : NULL, &nvar, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
+    if (cbf_read_vmap(argv[ifile], &P, &c0, &maxim, &nint, wmap ? &vmap : NULL, wmap ? &vmsgn : NULL, &nvar, yout || zout ? &dm : NULL, msg, sizeof msg)) { fprintf(stderr, "brisk: %s\n", msg); return 2; }
+    if (!(yout || zout)) memset(&dm, 0, sizeof dm);
     g_cone_tread = wtime() - t0;
     if (maxim) for (int j = 0; j < P.n; j++) P.c[j] = -P.c[j];
     char **av = malloc(sizeof(char *) * ((size_t)argc + 1));
@@ -4655,6 +5699,26 @@ static int brisk_main_cbf(int argc, char **argv, int ifile) {
             FILE *fx = brisk_out_open(xout);
             if (fx) { for (int j = 0; j < nvar; j++) fprintf(fx, "%.17g\n", vmap[j] >= 0 ? vmsgn[j] * R.x[vmap[j]] : 0.0); brisk_out_close(fx, xout); }
         }
+        /* -y and -z in the file's terms (CBF's dual: c - A'y = z in the dual of the variables' cones, y in the dual of the constraints'
+         * cones; a maximized file: both negated, z then in the negated dual cone); an infeasible problem: the certificate y */
+        const double ys = maxim ? -1.0 : 1.0;
+        if (yout && R.y && dm.rmap) {
+            FILE *fy = brisk_out_open(yout);
+            if (fy) { for (int i = 0; i < dm.ncon; i++) fprintf(fy, "%.17g\n", dm.rmap[i] >= 0 ? ys * R.y[dm.rmap[i]] : 0.0); brisk_out_close(fy, yout); }
+        }
+        if (zout && R.z && R.y && vmap && dm.rmap) {
+            FILE *fz = brisk_out_open(zout);
+            if (fz) {
+                int q = 0;
+                for (int j = 0; j < nvar; j++) {
+                    double v;
+                    if (vmap[j] >= 0) v = ys * vmsgn[j] * R.z[vmap[j]];
+                    else { v = dm.c0col[q]; for (long t = dm.zp[q]; t < dm.zp[q + 1]; t++) v -= dm.zx[t] * ys * R.y[dm.zi[t]]; q++; }
+                    fprintf(fz, "%.17g\n", v);
+                }
+                brisk_out_close(fz, zout);
+            }
+        }
         g_cone_fobj_set = 1; g_cone_fobj_max = maxim; g_cone_fobj = obj; g_cone_fdual = (maxim ? -R.dobj : R.dobj) + c0;
         if (!quiet && R.cone && !quiet_summary) cone_summary(&P, &R);
         g_cone_objline[0] = 0;
@@ -4666,7 +5730,7 @@ static int brisk_main_cbf(int argc, char **argv, int ifile) {
             res->y = R.y; R.y = NULL; res->sn = P.n; res->have_x = 1; res->sx = R.x; R.x = NULL; res->sz = R.z; R.z = NULL;
         }
     }
-    sedumi_result_free(&R); sedumi_free(&P); free(av); free(vmap); free(vmsgn);
+    sedumi_result_free(&R); sedumi_free(&P); free(av); free(vmap); free(vmsgn); cbf_dualmap_free(&dm);
     return rc;
 }
 static int brisk_main_run(int argc, char **argv);
@@ -4748,7 +5812,7 @@ static int brisk_main_run(int argc, char **argv) {
     g_threads_user = getenv("OMP_NUM_THREADS") != NULL;   /* 4.42: set also by -threads */
     /* 31 October 2026 (ISSUES 727): -threads k (k >= 1) forces k threads for this solve, no automatic reduction; set
      * here for the command line and the outermost library call (nested calls keep the outer solve's choice) */
-    if (g_caller_depth <= 1 && !g_hp_inner) g_threads_forced = threads_arg(argc, argv) > 0;
+    if (g_caller_depth <= 1 && !g_hp_inner) g_threads_forced = threads_arg(argc, argv);   /* (the count given, a limit; 0: none) */
     /* (31 October 2026, the LP developer; PLAN_lp_1031.md P1.5) the automatic count within the container's CPU quota
      * (brisk_cpu_quota, solver.c): the runtime counts the CPUs the process may run on, not the time a quota lets it run
      * (the owner's benchmarks of 29 October: 5 CPUs visible, a quota of 4, 5 busy threads). Not when OMP_NUM_THREADS or
@@ -4757,9 +5821,15 @@ static int brisk_main_run(int argc, char **argv) {
         const int q = brisk_cpu_quota();
         if (q > 0 && q < omp_get_max_threads()) omp_set_num_threads(q);
     }
+    /* (8 November 2026, the owner: "Cap everywhere") a count from OMP_NUM_THREADS at most the CPUs available, as -threads k */
+    if (g_caller_depth <= 1 && !g_hp_inner && g_threads_user && !g_threads_forced) {
+        const int a = brisk_avail_cpus();
+        if (a > 0 && omp_get_max_threads() > a && !getenv("BRISK_NOTHREADCAP")) omp_set_num_threads(a);
+    }
     if (argc < 2) { usage(); return 1; }
     log_version(argc, argv);
     for (int i = 1; i < argc; i++) if (g_qp_data && argv[i] == g_qp_data_name) return brisk_main_qp(argc, argv, i);
+    for (int i = 1; i < argc; i++) if (g_lp_data && argv[i] == g_lp_data_name) return brisk_main_lp(argc, argv, i);
     for (int i = 1; i < argc; i++) {       /* a MAT-file: a problem in SeDuMi format */
         const size_t l = argv[i] ? strlen(argv[i]) : 0;
         if (l > 4 && argv[i][0] != '-' && !strcmp(argv[i] + l - 4, ".mat")
@@ -4815,7 +5885,7 @@ opts_only:;
         OPT_I("-hsdsig", hsd_sig) OPT_D("-hsdbeta", hsd_beta) OPT_I("-hsddir", hsd_dir) OPT_I("-hsdcorr", hsd_corr) OPT_I("-hsdrefine", hsd_refine) OPT_I("-hsdfree", hsd_free) OPT_I("-hsdstall", hsd_stall) OPT_D("-hsdpshrink", hsd_pshrink) OPT_I("-hsdreghint", hsd_reghint) OPT_D("-hsdx0", hsd_x0) OPT_I("-hsdqscale", hsd_qscale) OPT_I("-hsdbatch", hsd_batch) OPT_I("-hsdctrace", hsd_ctrace) OPT_I("-hsdctarget", hsd_ctarget) OPT_D("-hsdcbmin", hsd_cbmin) OPT_D("-hsdcbmax", hsd_cbmax) OPT_D("-hsdcacc", hsd_cacc) OPT_D("-hsdsoltol", hsd_soltol) OPT_D("-hsdcfrac", hsd_cfrac) OPT_D("-hsdfomega", hsd_fomega) OPT_D("-hsdpivtol", hsd_pivtol) OPT_D("-hsdcucap", hsd_cucap) OPT_D("-hsdcgain", hsd_cgain) OPT_I("-ddit", dd_iters) OPT_I("-ddmaxm", dd_maxm) OPT_D("-ddmaxn2", dd_maxn2)
         OPT_D("-ddbudget", dd_budget) OPT_D("-ddtime", dd_time) OPT_D("-ddfactor", dd_factor)
         OPT_D("-ddminwork", dd_minwork) OPT_D("-regill", reg_ill) OPT_D("-cblas", c_blas)
-        OPT_I("-hsdhoc", hsd_hoc) OPT_D("-hsdnb", hsd_nb) OPT_I("-lanczos", lanczos_k) OPT_I("-ntfast", nt_fast) OPT_I("-hsdpat", hsd_pat) OPT_I("-parblocks", par_blocks) OPT_I("-knownfeas", known_feasible) OPT_D("-retryacc", retry_acc) OPT_D("-warm", warm_lam) OPT_D("-tracebound", tracebound) OPT_I("-dualize", dualize) OPT_I("-fom", fom) OPT_I("-fomhalpern", fom_halpern) OPT_I("-fommaxit", fom_maxit) OPT_D("-fomtol", fom_tol) OPT_D("-fomsigma", fom_sigma) OPT_D("-fomsigma0", fom_sigma0) OPT_I("-fomaadr", fom_aadr) OPT_D("-fomsingle", fom_single) OPT_I("-fomssnstall", fom_ssn_stall) OPT_I("-fomsigrule", fom_sigrule) OPT_I("-fomsigint", fom_sigint) OPT_I("-fomaa", fom_aa) OPT_I("-fombm", fom_bm) OPT_I("-fombmrank0", fom_bm_rank0) OPT_I("-fombmouter", fom_bm_outer) OPT_I("-fombminner", fom_bm_inner) OPT_D("-fombmrho", fom_bm_rho) OPT_D("-fombmgtol", fom_bm_gtol) OPT_D("-fombmnegtol", fom_bm_negtol) OPT_I("-fomssn", fom_ssn) OPT_I("-fomssnafter", fom_ssn_after) OPT_D("-fomssnres", fom_ssn_res) OPT_D("-fomssnrho", fom_ssn_rho) OPT_I("-fomssnprec", fom_ssn_prec) OPT_D("-fomssnsig0", fom_ssn_sig0) OPT_D("-fomssneta", fom_ssn_eta) OPT_I("-fomssnwarm", fom_ssn_warm) OPT_I("-fomssnouter", fom_ssn_outer) OPT_I("-fomssnnewton", fom_ssn_newton) OPT_I("-fomssncg", fom_ssn_cg) OPT_D("-fomaasafe", fom_aasafe) OPT_D("-fomsigmax", fom_sigmax) OPT_I("-hsdfirst", hsd_first) OPT_D("-hsdfirstc", hsd_first_c) OPT_D("-hsdfirstasm", hsd_first_asm) OPT_I("-stdslow", std_slow) OPT_I("-crossover", crossover) OPT_D("-frgain", fr_gain) OPT_I("-frdepth", fr_maxdepth) OPT_I("-frdual", fr_dual) OPT_D("-frfallback", fr_fallback) OPT_D("-symfallback", sym_fallback) OPT_I("-soc", soc) OPT_I("-socmin", soc_minn)
+        OPT_I("-hsdhoc", hsd_hoc) OPT_D("-hsdnb", hsd_nb) OPT_I("-lanczos", lanczos_k) OPT_I("-ntfast", nt_fast) OPT_I("-hsdpat", hsd_pat) OPT_I("-parblocks", par_blocks) OPT_I("-knownfeas", known_feasible) OPT_D("-retryacc", retry_acc) OPT_D("-warm", warm_lam) OPT_D("-tracebound", tracebound) OPT_I("-dualize", dualize) OPT_I("-fom", fom) OPT_I("-fomfirst", fom_first) OPT_I("-fomhalpern", fom_halpern) OPT_I("-fommaxit", fom_maxit) OPT_D("-fomtol", fom_tol) OPT_D("-fomsigma", fom_sigma) OPT_D("-fomsigma0", fom_sigma0) OPT_I("-fomaadr", fom_aadr) OPT_D("-fomsingle", fom_single) OPT_I("-fomssnstall", fom_ssn_stall) OPT_I("-fomsigrule", fom_sigrule) OPT_I("-fomsigint", fom_sigint) OPT_I("-fomaa", fom_aa) OPT_I("-fombm", fom_bm) OPT_I("-fombmrank0", fom_bm_rank0) OPT_I("-fombmouter", fom_bm_outer) OPT_I("-fombminner", fom_bm_inner) OPT_D("-fombmrho", fom_bm_rho) OPT_D("-fombmgtol", fom_bm_gtol) OPT_D("-fombmnegtol", fom_bm_negtol) OPT_I("-fomssn", fom_ssn) OPT_I("-fomssnafter", fom_ssn_after) OPT_D("-fomssnres", fom_ssn_res) OPT_D("-fomssnrho", fom_ssn_rho) OPT_I("-fomssnprec", fom_ssn_prec) OPT_D("-fomssnsig0", fom_ssn_sig0) OPT_D("-fomssneta", fom_ssn_eta) OPT_I("-fomssnwarm", fom_ssn_warm) OPT_I("-fomssnouter", fom_ssn_outer) OPT_I("-fomssnnewton", fom_ssn_newton) OPT_I("-fomssncg", fom_ssn_cg) OPT_D("-fomaasafe", fom_aasafe) OPT_D("-fomsigmax", fom_sigmax) OPT_I("-hsdfirst", hsd_first) OPT_D("-hsdfirstc", hsd_first_c) OPT_D("-hsdfirstasm", hsd_first_asm) OPT_I("-stdslow", std_slow) OPT_I("-crossover", crossover) OPT_D("-frgain", fr_gain) OPT_I("-frdepth", fr_maxdepth) OPT_I("-lpface", lp_face) OPT_I("-lpfaceall", lp_face_all) OPT_I("-frdual", fr_dual) OPT_D("-frfallback", fr_fallback) OPT_D("-symfallback", sym_fallback) OPT_I("-soc", soc) OPT_I("-socmin", soc_minn)
         else if (!strcmp(a, "-acc")) {
             /* accuracy level: the tolerance and the thresholds derived from it */
             i = need(i, argc, a);
@@ -4852,7 +5922,8 @@ opts_only:;
         else if (!strcmp(a, "-dual")) par.dual = 1;
         else if (!strcmp(a, "-dualold")) par.dual = 2;
         else if (!strcmp(a, "-fomstart-x")) { i = need(i, argc, a); par.fom_start_x = argv[i]; }
-        else if (!strcmp(a, "-conesolver")) { i = need(i, argc, a); par.conesolver = atoi(argv[i]) != 0; }   /* (SeDuMi format: sedumi.c; 26 October 2026: also a problem whose blocks are cones in disguise, solver.c socp_route) */
+        else if (!strcmp(a, "-socpfr")) { i = need(i, argc, a); const double v_ = num(argv[i], a); if (!(v_ == 0 || v_ == 1 || v_ == 2)) { fprintf(stderr, "brisk: invalid value '%s' for %s (0, 1 or 2)\n", argv[i], a); exit(1); } }   /* (11 November 2026: read by the SOCP route, sedumi.c) */
+        else if (!strcmp(a, "-socpsolver") || !strcmp(a, "-conesolver")) { i = need(i, argc, a); par.socpsolver = atoi(argv[i]) != 0; }   /* (SeDuMi format: sedumi.c; 26 October 2026: also a problem whose blocks are cones in disguise, solver.c socp_route) */
         else if (!strcmp(a, "-fomstart-y")) { i = need(i, argc, a); par.fom_start_y = argv[i]; }
         else if (!strcmp(a, "-boundanchor")) { i = need(i, argc, a); par.bound_anchor = argv[i]; }
         else if (!strcmp(a, "-prec")) {       /* 5.0: high precision */
@@ -4885,8 +5956,8 @@ opts_only:;
             else { fprintf(stderr, "brisk: -bound must be p, d or pd\n"); return 1; }
         }
         OPT_I("-boundprior", bound_prior) OPT_I("-boundprec", bound_prec) OPT_D("-boundtol", bound_tol) OPT_D("-boundmargin", bound_margin) OPT_D("-boundtrack", bound_track_tol)
-        OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-fombound", fom_bound) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-blkscale", blkscale) OPT_I("-bm", bm) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle) OPT_D("-mfhand", mf_hand) OPT_I("-mfhandcg", mf_handcg) OPT_I("-mfproj", mf_proj) OPT_D("-mfeta", mf_eta) OPT_I("-mftry", mf_try)
-        else if (!strcmp(a, "-threads")) { i = need(i, argc, a); const int nt = (int)num(argv[i], a); if (nt >= 1) { omp_set_num_threads(nt); g_threads_user = 1; } }   /* 4.32: BRISK's OpenMP threads (default OMP_NUM_THREADS / all cores) */
+        OPT_D("-symtime", symtime) OPT_I("-symnodes", symnodes) OPT_I("-symbd", symbd) OPT_D("-symmin", symmin) OPT_I("-symsign", symsign) OPT_I("-symrref", symrref) OPT_I("-symsigned", symsigned) OPT_D("-fomrace", fom_race) OPT_I("-fombound", fom_bound) OPT_I("-returnx", returnx) OPT_I("-symalg", symalg) OPT_I("-symalgmax", symalgmax) OPT_I("-blkscale", blkscale) OPT_I("-bm", bm) OPT_I("-mfipm", mfipm) OPT_I("-lralm", lralm) OPT_I("-lrrank", lr_rank) OPT_I("-lrrmax", lr_rmax) OPT_I("-lrouter", lr_outer) OPT_I("-lrinner", lr_inner) OPT_I("-lrescape", lr_escape) OPT_I("-lrprec", lr_prec) OPT_I("-lrnewton", lr_newton) OPT_D("-lrsigma", lr_sigma) OPT_D("-lrtol", lr_tol) OPT_D("-lrtrace", lr_trace) OPT_D("-mfrho", mf_rho) OPT_I("-mfrmax", mf_rmax) OPT_D("-mfdrop", mf_drop) OPT_I("-mfkmax", mf_kmax) OPT_I("-mfcgmax", mf_cgmax) OPT_D("-mfcgtol", mf_cgtol_min) OPT_D("-mfcgtolmax", mf_cgtol_max) OPT_I("-mfdiag", mf_diag) OPT_I("-mfwarm", mf_warm) OPT_I("-mfstall", mf_stall) OPT_D("-mfcgtime", mf_cgtime) OPT_I("-mfrecycle", mf_recycle) OPT_D("-mfhand", mf_hand) OPT_I("-mfhandcg", mf_handcg) OPT_I("-mfproj", mf_proj) OPT_D("-mfeta", mf_eta) OPT_I("-mftry", mf_try)
+        else if (!strcmp(a, "-threads")) { i = need(i, argc, a); const int nt = (int)num(argv[i], a); if (nt >= 1) { brisk_user_threads(nt); g_threads_user = 1; } }   /* 4.32: BRISK's OpenMP threads (default OMP_NUM_THREADS / all cores) */
         else if (!strcmp(a, "-route")) { i = need(i, argc, a); force_route = (int)num(argv[i], a); }
         else if (!strcmp(a, "-densemem")) { i = need(i, argc, a); par.dense_mem = num(argv[i], a) * 1048576.0; }
         else if (a[0] == '-') { fprintf(stderr, "brisk: unknown option %s\n", a); usage(); return 1; }
@@ -4922,11 +5993,12 @@ opts_only:;
         return brisk_hp_certify_given(fname, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result, cert_x, cert_y, par.hp_kind, par.hp_digits, par.verbose);
     g_certify_prior = par.bound_prior; g_certify_verbose = par.verbose;
     if (cert_x || cert_y) return certify_given(fname, cert_x, cert_y);
+    { extern int g_ps_rebuild; g_ps_rebuild = par.fr_dual == 2 || ps_rebuild_default(); }   /* the level-by-level rebuild of the removed duals: tried by default since 10 November 2026 (ps_rebuild_default) */
     { extern int g_ps_fr_correct; const char *ef = getenv("BRISK_FRFIX"); g_ps_fr_correct = ef ? atoi(ef) != 0 : 0; }   /* 5.17: opt-in (BRISK_FRFIX=1): the default path pays nothing and says plainly that the recovery failed */
     { extern int g_ps_need_x; g_ps_need_x = (xfile != NULL || getenv("BRISK_XOUT") != NULL || par.crossover != 0 || par.bound_side != 0 || (g_brisk_result != NULL && par.returnx > 0)) ? 1
                                          : (g_brisk_result != NULL && par.returnx < 0) ? 2 : 0; }
     g_rank_par = &par;
-    g_natt = 0; g_run_no = 0; g_pre_logged = 0; g_infeas_unconf = 0; { extern int g_dup_inexact; g_dup_inexact = 0; } { extern int g_log_nmethod; g_log_nmethod = 0; } g_fr_dual_lost = 0; { extern int g_fr_depth_used; g_fr_depth_used = 0; } g_dec_sym_t = 0; g_dec_fr_t = 0; g_t_all_note = 0; g_amp_warn[0] = 0; g_fe_band = 0; g_first_name = NULL; g_mf_hand_t = -1; g_mf_hand_kept = 0;
+    g_natt = 0; g_run_no = 0; g_pre_logged = 0; g_infeas_unconf = 0; { extern int g_dup_inexact; g_dup_inexact = 0; } { extern int g_log_nmethod; g_log_nmethod = 0; } g_fr_dual_lost = 0; g_fr_dual_face = 0; g_fr_prim_face = 0; { extern int g_fr_depth_used; g_fr_depth_used = 0; } g_dec_sym_t = 0; g_dec_fr_t = 0; g_t_all_note = 0; g_amp_warn[0] = 0; g_fe_band = 0; g_first_name = NULL; g_mf_hand_t = -1; g_mf_hand_kept = 0; g_fom_kept = 0;
     { extern int g_soc_used; g_soc_used = 0; }
     if (!(par.tol > 0)) { fprintf(stderr, "brisk: -tol must be positive\n"); return 1; }
     if (par.fom > 0) {
@@ -4936,6 +6008,17 @@ opts_only:;
         if (par.dualize < 0) par.dualize = 0;
         if (par.tracebound < 0) par.tracebound = 0;
         if (par.chordal < 0) par.chordal = 0;     /* the moment form of the conversion is the IPM's; the engine takes the blocks as read */
+    }
+    g_bm_pipe = 0;
+    if (par.bm == 1 && !getenv("BRISK_BMRAW") && bm_header_nsdp(fname, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL) >= 2) {
+        /* 16 November 2026 (ISSUES 898): the multi-block Burer-Monteiro method solves the presolved problem (the sign symmetry
+         * reduced Nakata's RDM problems 1.6-5 times in m), in the blocks as read otherwise (no dual form, trace bound or
+         * chordal conversion: those serve the Schur complement); BRISK_BMRAW=1: the file as read, as before */
+        g_bm_pipe = 1; par.fom = 0; par.mfipm = 0;
+        if (par.dualize < 0) par.dualize = 0;
+        if (par.tracebound < 0) par.tracebound = 0;
+        if (par.chordal < 0) par.chordal = 0;
+        if (par.free_elim < 0) par.free_elim = 0;
     }
     if (par.mfipm > 0) {
         /* 4.34: the matrix-free IPM takes the blocks as read (the dual form, the trace bound and
@@ -4997,7 +6080,7 @@ opts_only:;
         if (par.verbose > 0 && !g_hp_inner && !getenv("BRISK_NOSUMMARY") && (rc == 0 || rc == 10) && !(g_log_brief && rc == 0)) { g_log_user++; bound_hint(1); g_log_user--; }
         return rc;
     }
-    if (par.bm > 0) return bm_run_x(fname, &par, yfile, xfile, zfile, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result, 0);   /* 5.14 */
+    if (par.bm > 0 && !g_bm_pipe) return bm_run_x(fname, &par, yfile, xfile, zfile, g_brisk_data && fname == g_brisk_data_name ? g_brisk_data : NULL, g_brisk_result, 0);   /* 5.14 */
     double t_bm_miss = 0;   /* (the time of a Burer-Monteiro attempt that missed) */
     {   /* 5.14: one block of order >= 500 whose constraints fix its diagonal (max-cut and its relatives): the
          * Burer-Monteiro method first, to the tolerance with a certified bound; the interior-point method if it misses */
@@ -5097,8 +6180,10 @@ opts_only:;
             if (pr.dualize < 0) pr.dualize = 0;
             if (pr.tracebound < 0) pr.tracebound = 0;
             if (pr.chordal < 0) pr.chordal = 0;
+            if (bnd && g_img_bnd) { pr.dualize = 1; pr.free_elim = 1; pr.tracebound = 0; }   /* (11 November 2026: the bounds from SDPA's primal form) */
             const double tr0 = wtime();
             if (bnd) pr.fom_maxit = (int)(par.fom_maxit > 0 && par.fom_maxit < par.fom_bound_maxit ? par.fom_maxit : par.fom_bound_maxit);   /* (-fommaxit lowers it: the test of the hand-over) */
+            else if (par.fom_handover) { pr.fom_handover = 1; pr.fom_handover_ipm = par.fom_handover_ipm; }   /* (the stall rule, no clock) */
             else {
                 /* with a time limit, at most the same share of what is left of it */
                 if (par.timelimit > 0) par.fom_race_budget = fmin(par.fom_race_budget, fmax(0.0, par.fom_race * (par.timelimit - (tr0 - par.t_start))));
@@ -5106,14 +6191,22 @@ opts_only:;
                 pr.timelimit = lim;
             }
             rc = run_pipeline(fname, &pr, do_fr, force_route, u);
+            extern double g_fom_work;
+            /* (13 November 2026, the owner) no hand-over when the engine's best point has DIMACS errors of at most 1e-6, nor when
+             * they are at most 1e-5 and the interior-point method's estimated work exceeds twice the engine's so far */
+            const int keep_fom = !bnd && par.fom_handover && rc == 0 && u->measured && u->status != ST_OPTIMAL
+                                 && (u->acc <= 1e-6 || (u->acc <= 1e-5 && par.fom_handover_ipm > 2.0 * g_fom_work));
             if (rc == 0 && u->status == ST_OPTIMAL && u->measured) {
                 par.fom = 1;                                 /* kept: the run is a first-order run from here on */
                 if (par.verbose >= 0) printf("first-order engine first: reached the tolerance in %.1f s\n", wtime() - tr0);
+            } else if (keep_fom) {
+                par.fom = 1; g_fom_kept = 1;
+                if (par.verbose >= 0) printf("first-order engine first: %.1e, no hand-over (%s); kept\n", u->acc, u->acc <= 1e-6 ? "its errors are at most 1e-6" : "at most 1e-5, and the interior-point method's work is more than twice the engine's");
             } else {
                 if (par.verbose >= 0) printf("first-order engine first: %.1e after %.1f s, continuing with the interior-point method\n", rc == 0 ? u->acc : NAN, wtime() - tr0);
-                if (rc == 0) { att_log(bnd ? "first-order method with entrywise bounds on X (within its iteration budget)" : "first-order method (within its time budget)", wtime() - tr0, u); g_att[g_att_res].before = 1; att_opt(NULL, NULL, bnd ? "fombound" : "fomrace", "0"); textra += wtime() - tr0; }
+                if (rc == 0) { att_log(bnd ? "first-order method with entrywise bounds on X (within its iteration budget)" : par.fom_handover ? "first-order method (handed over: its projected work above the interior-point method's)" : "first-order method (within its time budget)", wtime() - tr0, u); g_att[g_att_res].before = 1; att_opt(NULL, NULL, bnd ? "fombound" : par.fom_handover ? "fomfirst" : "fomrace", "0"); textra += wtime() - tr0; }
                 run_free(u);
-                par.fom_race = 0; par.fom_bound_maxit = -1;
+                par.fom_race = 0; par.fom_bound_maxit = -1; par.fom_first = 0; par.fom_handover = 0;
                 rc = run_pipeline(fname, &par, do_fr, force_route, u);
                 if (rc == 3) { run_free(u); do_fr = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }
                 if (rc == 4) { run_free(u); par.fom = 1; if (par.chordal < 0) par.chordal = 0; rc = run_pipeline(fname, &par, do_fr, force_route, u); }
@@ -5541,18 +6634,51 @@ opts_only:;
                  * what is correct, and how to solve again without the reduction, in the caller's syntax (the command
                  * line, Python, CVXPY, Julia, JuMP, MATLAB: the machinery of the advice at the end of the log) */
                 const int resolve_follows = fr_retry && par.fr_fallback > 0;
-                if (par.verbose >= 0) {
+                if (par.verbose >= 0 && u->dual)
+                    printf("postsolve: facial reduction of the dual form: the entries of X its %d removed constraint(s) stand for could not be\n"
+                           "  rebuilt; y and the optimal value are correct to %.1e, X misses them (X>=0 error %.1e on the problem as read)\n", u->fr_removed, acc_k, u->pr.err[2]);
+                else if (par.verbose >= 0) {
                     /* 20 October 2026 (the owner): said once here; the summary has one line, the advice the option */
                     printf("postsolve: facial reduction: the duals of the %d removed constraint(s) could not be rebuilt; X and the optimal value\n"
                            "  are correct to %.1e, y is not dual feasible (dual error %.1e on the problem as read)\n", u->fr_removed, acc_k, u->pr.err[4]);
                 }
                 if (!resolve_follows) g_fr_dual_lost = u->fr_removed;
-                u->status = ST_REDUCED;
-                u->acc = fmax(acc_k, fmin(u->pr.err[4], 1.0));
+                if (!resolve_follows && u->undet && u->dual && par.fr_dual != 2) {
+                    /* 9 November 2026 (the owner's decision (a)): after the dual form, the entries of X the reduced problem does not
+                     * determine are returned as NaN, and the primal is judged on the face: the residual and X >= 0 are the reduced
+                     * solve's dual errors (the dual form's dual is the primal of the problem as read), y's errors, the gap and the
+                     * complementarity those of the problem as read */
+                    undet_apply(u, &par, u->Ofin ? u->Ofin : u->O, NULL, NULL);   /* (the count of the entries) */
+                    u->pr.err[1] = u->R.err[3]; u->pr.err[2] = u->R.err[4];
+                    u->acc = acc_k;
+                    u->status = acc_k <= par.tol ? ST_OPTIMAL : ST_REDUCED;
+                } else if (!resolve_follows && u->undet && par.fr_dual != 2 && !u->dual) {
+                    /* 7 November 2026 (the owner: "No need to rebuild moments that the relaxation does not determine. Just
+                     * do not return them"): the duals of the rows the facial reduction removed are not determined by the
+                     * reduced problem; they are returned as NaN (with every dual the back maps derive from them), and the
+                     * dual is judged where it is defined, on the face: dinf and Z>=0 are the reduced solve's, the primal
+                     * errors, the gap and complementarity those of the problem as read (the removed rows have b = 0 and
+                     * A_r(X) = 0, so they do not depend on the missing duals). Not after the dual form (dualize.c), whose
+                     * rows are entries of the file's X. -frdual 1: a dual of the problem as read by a second solve;
+                     * -frdual 2: the level-by-level rebuild, as up to 1.6.5. */
+                    g_fr_dual_face = u->nundet;
+                    undet_apply(u, &par, u->Ofin ? u->Ofin : u->O, NULL, NULL);   /* (the count on the problem as read) */
+                    u->pr.err[3] = u->R.err[3]; u->pr.err[4] = u->R.err[4];
+                    u->acc = acc_k;
+                    u->status = acc_k <= par.tol ? ST_OPTIMAL : ST_REDUCED;
+                } else {
+                    u->status = ST_REDUCED;
+                    u->acc = fmax(acc_k, fmin(u->pr.err[4], 1.0));
+                }
                 fr_kept = 1;
-                if (par.fr_dual > 0 && !resolve_follows) {   /* -frdual: the dual on the problem as read, the value held */
+                {   static int tonly = -1; if (tonly < 0) { const char *e = getenv("BRISK_FRTONLY"); tonly = e && atoi(e) != 0; }
+                    double tph0 = 0;
+                    if (tonly && !resolve_follows && !u->dual && fr_tonly_phase(u, &par, force_route, &tph0)) g_fr_dual_lost = g_fr_dual_face = 0;
+                    textra += tph0;
+                }
+                if (par.fr_dual == 1 && !resolve_follows && g_fr_dual_lost) {   /* -frdual 1: the dual on the problem as read, the value held */
                     double tph = 0;
-                    if (fr_dual_phase(u, &par, force_route, &tph)) g_fr_dual_lost = 0;
+                    if (fr_dual_phase(u, &par, force_route, &tph)) g_fr_dual_lost = g_fr_dual_face = 0;
                     textra += tph;
                 }
             }
@@ -5890,6 +7016,7 @@ opts_only:;
     g_log_user--;
     /* 4.37 (B1): the re-solves are reported in the summary (Solve 1, Solve 2, ...) and the advice says how to avoid
      * them (20 October 2026, the owner: no note above the line) */
+    if ((g_fr_dual_face || g_fr_prim_face) && u->undet) undet_apply(u, &par, O, yo, Xo);   /* (7 November 2026: before y, Z and the library's result; 9 November: X after the dual form) */
     if (yfile) {
         FILE *f = brisk_out_open(yfile);
         if (f) {
@@ -6416,11 +7543,25 @@ void brisk_result_free(BriskResult *res) {
 #undef exit
 static jmp_buf g_brisk_jmp;
 static int g_brisk_jmp_on = 0;
+static pthread_t g_brisk_jmp_th;                 /* (7 November 2026) the thread of brisk_run's jump point */
+static _Thread_local jmp_buf *g_brisk_tguard;    /* (a helper thread's own way out: BRISK_THREAD_GUARD, brisk.h) */
+void brisk_thread_guard_set(jmp_buf *jb) { g_brisk_tguard = jb; }
 
 /* exit() anywhere in the solver (an out-of-memory, an invalid option) returns to brisk_run
- * instead of ending the host process; the memory of the aborted solve is not reclaimed */
+ * instead of ending the host process; the memory of the aborted solve is not reclaimed.
+ * (7 November 2026) Only on the thread that called brisk_run, after the LP race's jobs are stopped and joined; on a helper
+ * thread under BRISK_THREAD_GUARD, to the guard; on any other thread the process is stopped: the jump point is on the
+ * caller's stack, and a jump to it from another thread ran the rest of the solve on the wrong thread while the caller's
+ * thread went on (the outside LP benchmark of 1.6.5: neos-4535459-waipa and supportcase11, LPs, under a memory limit) */
 void brisk_exit(int code) {
-    if (g_brisk_jmp_on) longjmp(g_brisk_jmp, code == 0 ? 1000 : code);
+    const int v = code == 0 ? 1000 : code;
+    if (g_brisk_tguard) longjmp(*g_brisk_tguard, v);
+    if (g_brisk_jmp_on) {
+        if (pthread_equal(pthread_self(), g_brisk_jmp_th)) { lp_conc_stop_all(); longjmp(g_brisk_jmp, v); }
+        fprintf(stderr, "brisk: a fatal error (code %d) in a helper thread, which cannot return to the caller: the process is stopped\n", code);
+        fflush(stderr);
+        abort();
+    }
     exit(code);
 }
 
@@ -6475,6 +7616,22 @@ int brisk_run_data(const BriskData *d, int argc, char **argv, BriskResult *res) 
     return rc;
 }
 
+/* (10 November 2026, the LP developer) BRISK_LIBRARY: the LP P with the command-line options argv[1..argc-1] (argv[0] ignored),
+ * solved as an MPS file of the same LP would be */
+int brisk_run_lp(const LpProb *P, int argc, char **argv, BriskResult *res) {
+    char **av = malloc(sizeof(char *) * ((size_t)(argc > 1 ? argc : 1) + 2));
+    if (!av) { memset(res, 0, sizeof(*res)); res->status = -1; return -1; }
+    av[0] = "brisk"; av[1] = (char *)g_lp_data_name;
+    for (int i = 1; i < argc; i++) av[i + 1] = argv[i];
+    const int ac = (argc > 1 ? argc : 1) + 1;
+    av[ac] = NULL;
+    g_lp_data = P;
+    const int rc = brisk_run(ac, av, res);
+    g_lp_data = NULL;
+    free(av);
+    return rc;
+}
+
 /* (22 October 2026) BRISK_LIBRARY: the QP or QCQP P with the command-line options argv[1..argc-1] (argv[0] ignored) */
 int brisk_run_qp(const QpProb *P, int argc, char **argv, BriskResult *res) {
     char **av = malloc(sizeof(char *) * ((size_t)(argc > 1 ? argc : 1) + 2));
@@ -6520,7 +7677,7 @@ int brisk_qp_run_lean(const QpProb *P, int nopt, const char *const *opts, double
     /* (one thread unless -threads asks for more: the callers are small QPs, which the tiny-problem rule of the general route
      *  gives one thread too; the method's results are the same at any count) */
     const int nt0 = omp_get_max_threads();
-    omp_set_num_threads(nt > 0 ? nt : 1);
+    if (nt > 0) brisk_user_threads(nt); else omp_set_num_threads(1);
 #if defined(BRISK_LIBRARY) && !defined(BRISK_NO_IO_MACROS)
     qp_printf = brisk_printf;
 #endif
@@ -6563,7 +7720,12 @@ int brisk_run(int argc, char **argv, BriskResult *res) {
      * brisk_exit (27 October 2026: read before the setjmp). 31 October 2026 (ISSUES 727): also after an explicit
      * -threads k, which is for this call only, and the call starts from the automatic count (nt_scope_begin) */
     volatile int nt_saved = nt_scope_begin(argc, argv);
-    g_brisk_jmp_on = 1;
+    /* (7 November 2026) a nested call (the semidefinite solver under a SeDuMi problem) keeps the outer call's jump point:
+     * it was overwritten, and switched off at the nested call's end, so an exit() later in the outer solve jumped into
+     * the nested call's ended frame or ended the host process */
+    jmp_buf jmp_outer; memcpy(jmp_outer, g_brisk_jmp, sizeof(jmp_buf));
+    const int jmp_on_outer = g_brisk_jmp_on; const pthread_t jmp_th_outer = g_brisk_jmp_th;
+    g_brisk_jmp_on = 1; g_brisk_jmp_th = pthread_self();
     volatile int rc;
     volatile int log_brief0 = g_log_brief, log_user0 = g_log_user;   /* (ISSUES 725: also after a solve left through brisk_exit) */
     const int j = setjmp(g_brisk_jmp);
@@ -6571,7 +7733,7 @@ int brisk_run(int argc, char **argv, BriskResult *res) {
     else rc = j == 1000 ? -1000 : -j;
     g_log_brief = log_brief0; g_log_user = log_user0;
     nt_scope_end(nt_saved);
-    g_brisk_jmp_on = 0;
+    memcpy(g_brisk_jmp, jmp_outer, sizeof(jmp_buf)); g_brisk_jmp_on = jmp_on_outer; g_brisk_jmp_th = jmp_th_outer;
     g_brisk_result = NULL;
     caller_leave(av_caller);
     if (g_caller_depth == 0) brisk_threads_restore();     /* and its OpenBLAS thread count (not for a nested call) */

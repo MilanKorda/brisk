@@ -1,5 +1,67 @@
 # BRISK change log
 
+## Version 1.7 (November 2026)
+
+Semidefinite programs:
+- **The Burer-Monteiro method on several blocks.** `-bm 1` now takes problems with several semidefinite blocks, LP
+  variables and rows beside a fixed diagonal, solves the presolved problem (after the sign symmetry and the scaling),
+  and widens a block's factor when the gap misses the tolerance and the dual slack shows why. Its certificate checks
+  cost a few dense factorizations instead of tens.
+- **The first-order method first where it pays:** on theta problems and matrix completion, by default, when the
+  interior-point method's estimated work is large; it hands over to the interior-point method when its own projected
+  work exceeds that method's.
+- **Symmetry:** a symmetric block is split however large its irreducible representations; sign symmetries include free
+  variables and are no longer hidden by redundant constraints; `-symrref 1` also finds sign symmetries hidden by sums
+  of the constraints. The symmetry search's pretest runs on the threads.
+- **Faster iterations:** the Schur complement of the NT direction with about half the products on large blocks; sparse
+  triangular solves on the threads for factors of few supernodes; the low-rank data's dense constraints factored on the
+  threads; the projection after the iterations preconditioned by a factored A A'.
+- **Facial reduction:** the removed entries are rebuilt by default, also on the problem as read; duals or entries that
+  the reduced problem does not determine are returned as NaN instead of an arbitrary value; a reduction made of exact
+  certificates is kept whatever its depth.
+- **Endings and time limits:** no re-solve starts when the time left cannot hold it; the end phases no longer depend on
+  the clock and stop when they cannot beat the polished point; the matrix-free attempt hands over its iterate earlier.
+
+Second-order cone programs:
+- **An SOCP in general form** from memory: `brisk_solve_socp` (C) and `brisk.solve_socp` (Python), with row and variable
+  bounds and cones given as lists of variables; the result in the problem's own variables and rows.
+- **The dual form chosen better** for problems with free variables, by comparing how near each form's start is to
+  feasibility; the linear system chosen by its work, and the normal equations left when their directions fail.
+- **More robust:** a blocked step after leaving the normal equations continues on the full system; consistent starts
+  for cones whose scale the problem fixes; the double-double factorizations regularized at their own precision and on
+  the threads; a full system that does not fit in memory ends with a message instead of a crash.
+- **Faster factorizations:** METIS's order where it pays, and the triangular solves of a large supernode on the threads.
+- The command line writes the duals of a CBF file (`-y`, `-z`). `-socpsolver` replaces `-conesolver` (still accepted).
+
+Quadratic programs:
+- **Model predictive control:** a QP with stage structure (whatever the order of its variables) is factored stage by
+  stage on dense blocks, in work linear in the horizon, chosen automatically; a QP model kept for a stream of solves
+  chooses its method for the stream, and its interior-point re-solve keeps its setup and starts from its last solution.
+- **Large QPs whose factorization fills in:** the Newton systems by preconditioned conjugate gradients, without
+  factoring H (a bounded regression of 34,000 variables: 4 s instead of 10 minutes).
+- **The same result whatever the thread count** of the solver or of the BLAS library.
+- **Faster small and mid-size solves:** a column-by-column factorization where supernodes do not pay, a cheaper
+  convexity test of H, fewer passes in the setup and in each iteration; a stall next to the boundary is left by
+  raising the centring target; the presolve's test for dependent rows on scaled data.
+
+Linear programs:
+- **An LP in general form from memory:** `brisk_solve_lp` (C), `brisk.solve_lp` (Python), `Brisk.solve_lp` (Julia),
+  `brisk_lp` (MATLAB/Octave), with the duals (the rows' multipliers and the reduced costs) carried through the presolves.
+- **Faster:** small LPs and network LPs by the dual simplex method alone; the choice between solving the problem and
+  its dual priced more cheaply; the interior-point method's start without a factorization when it is heavy and its
+  early iterations without one; dense-column candidates skipped by the ordering's count; the dual simplex method's
+  re-solves and ties cost less; the presolve no longer rescans long rows, substitutes more columns, and removes the same
+  columns whatever the order of the rows.
+- **More robust:** an LP whose factor does not fit beside the rest of the solve no longer ends with "out of memory";
+  the crossover honours the time limit; the method run beside the interior-point method gives up its thread when it
+  cannot finish first, and is no longer starved where it would win; a simplex solve stopped by a limit returns no
+  point; the MPS reader checks its numbers.
+
+Threads:
+- **A given thread count is a limit** in every solver: at most the CPUs the process may use (and its container's
+  quota); below it, the count is chosen as without it. METIS is bundled, and its nested dissection runs on the threads,
+  in the MATLAB/Octave interface as well.
+
 ## Version 1.6.5 (November 2026)
 
 Semidefinite programs:

@@ -9,8 +9,17 @@
  */
 #ifndef BRISK_H
 #define BRISK_H
+#ifndef BRISK_FLAG_FNS
+#define BRISK_FLAG_FNS
+/* (10 November 2026, the outside LP benchmark's audit) the flags one thread sets and another reads (the LP race's stop flags,
+ * a job's end and result): atomic loads (acquire) and stores (release) on the plain int the flag is, so that no access races
+ * and a job's result, written before its flag, is seen by the thread that reads the flag (the volatile qualifier alone gave
+ * neither). The flags keep their type (volatile int), so that the modules' interfaces do not change */
+static inline int brisk_flag_get(const volatile int *p) { return p ? __atomic_load_n(p, __ATOMIC_ACQUIRE) : 0; }
+static inline void brisk_flag_set(volatile int *p, int v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+#endif
 
-#define BRISK_VERSION "1.6.5"
+#define BRISK_VERSION "1.7"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -200,6 +209,21 @@ void brisk_log_problem(char *b, size_t n, const void *P);   /* (a const Problem 
 void brisk_exit(int code) __attribute__((noreturn));
 #define exit(c) brisk_exit(c)
 #endif
+/* (7 November 2026) a helper thread of the solver (a simplex job of the LP race, the simplex method's own jobs) runs its
+ * work under BRISK_THREAD_GUARD: a fatal error in it (an allocation that fails: exit() is brisk_exit in the library) ends
+ * that work with onfail done, on that thread, instead of a jump to brisk_run's point on the caller's thread, which another
+ * thread cannot take (its stack is the caller's: the solve went on on the wrong thread, with the caller's thread still
+ * running; the outside LP benchmark of 1.6.5 lost neos-4535459-waipa and supportcase11, LPs, so). brisk_exit on a thread
+ * without a guard and not the caller's stops the process (abort) with a message. The command line: exit() ends the
+ * process from any thread, and the guard is the call alone. */
+#if defined(BRISK_LIBRARY)
+#include <setjmp.h>
+void brisk_thread_guard_set(jmp_buf *jb);
+#define BRISK_THREAD_GUARD(call, onfail) do { jmp_buf brisk_tg_; \
+        if (setjmp(brisk_tg_) == 0) { brisk_thread_guard_set(&brisk_tg_); call; } else { onfail; } brisk_thread_guard_set(NULL); } while (0)
+#else
+#define BRISK_THREAD_GUARD(call, onfail) do { call; } while (0)
+#endif
 
 #define BLK_SDP 0
 #define BLK_LP  1
@@ -319,6 +343,7 @@ typedef struct {
     int *orig;           /* orig[i] = file index of constraint i */
     int fr_removed;      /* constraints removed by facial reduction */
     int fr_depth;        /* longest chain of dependent reductions (4.20) */
+    int fr_numeric;      /* 9 November 2026: reductions certified by a numerical test (rank one within a tolerance, eigenvalues, the clique faces); 0: every certificate holds exactly on the data */
     int fr_coupled;      /* 5.17: removed constraints whose index is coupled to a kept one by the data (ISSUES 93) */
     double tbR;          /* 4.30: rhs of the trace-bound row (excluded from the rhs norms and scaling), 0 = none */
     double obj_off;      /* 4.30: objective constant dropped by the free elimination (file objective = this problem's + obj_off);
@@ -404,6 +429,8 @@ typedef struct {
     int crossover;       /* 0 off, 1 on, -1 auto (when cheap) */
     double fr_gain;      /* facial reduction of depth >= 2 kept only if it cuts the cost per iteration this much (4) */
     int fr_maxdepth;     /* facial reduction: the chain of reductions cut at this depth (-1: no limit, the default; 0: none, as -nofr) */
+    int lp_face;         /* 9 November 2026 (-lpface <k>): the search for the faces hidden behind free variables by linear programs, at most k levels (-1: no limit), reported only (the problem unchanged; 0, the default: no search) */
+    int lp_face_all;     /* (-lpfaceall 1) that search wherever free variables are left as split pairs, not only where their elimination was refused near its break-even */
     int fr_dual;            /* -frdual (4 November 2026): when the facial reduction's dual is lost, solve for the dual on the problem as read with the optimal value held (1) */
     double fr_fallback;  /* removed duals not rebuilt: the re-solve without facial reduction may take this multiple of the solve's time (0 = none, the default: the user is told) */
     double sym_fallback; /* a solve after an automorphism reduction that ends worse than reduced accuracy is repeated without it within this multiple of the solve's time (4; 0 = never) */
@@ -468,12 +495,15 @@ typedef struct {
     int fom_bound; long fom_bound_maxit;   /* 25 October 2026: rows g X_ij + alpha s = b (s >= 0 in that row alone) taken as bounds on X's entries in the
                                            first-order engine (fom.c); 1 (default) also the engine first when at least half the rows are such
                                            bounds and m >= 2000 (main.c), 0 off; the iteration cap of that attempt (set by run_pipeline; -1 made) */
+    int fom_first;                      /* 13 November 2026: the first-order engine first by the interior-point method's estimated work (1, the default; 0 off): the problems the engine is made for, the IPM estimate above 20 model-seconds (ipm_s); the hand-over by the stall rule (fom_handover) */
+    int fom_handover; double fom_handover_ipm;   /* the engine stops for the interior-point method when its projected work exceeds fom_handover_ipm (operations) in two windows of 50 iterations */
     double fom_race, fom_race_budget;   /* 4.42: the first-order engine first at tol >= 1e-6 on few large dense blocks: share of the expected IPM time (0 off, the default since 19 October 2026; 0.2 before); the budget in seconds (set by run_pipeline) */
     int returnx;         /* 4.42 (library): X of a chordal-decomposed block: -1 returned unless its dense form exceeds 30% of the memory, 0 never (measured on the cliques, fastest), 1 always */
     int symalg;          /* 4.41: *-algebra block diagonalisation (symalg.c): -1 auto (blocks up to symalgmax), 0 off, 1 every block */
     int bm;              /* 5.14: the Burer-Monteiro solver (bm.c): 0 off, 1 on */
     int blkscale;        /* 5.14: diagonal congruence scaling of the semidefinite blocks (blkscale.c): 0 off, 1 on, -1 auto */
     int symalgmax;       /* 4.41: ... -symalg -1: largest block size tried (1000) */
+    int symrref;         /* 16 November 2026: -sym auto: when the sign search finds nothing, again on the constraints in reduced row echelon form (rowspace.c) (0) */
     int symsigned;       /* 4.37: -sym auto: signed permutations (a search on |data|, signs lifted over GF(2)) (1) */
     int mfipm;           /* 4.34: matrix-free interior-point method (mfipm.c): 1 on, 0 off; 5.4: 2 the hybrid (hand-off to the standard method) */
     int mf_proj; double mf_eta;      /* 5.5: 1 = exact primal projection of dX and CG to the P^-1-norm tolerance (the 4.34 scheme); 0 = residual-controlled CG, no projection; eta: the share of |Rp| CG may leave (0.1) */
@@ -521,7 +551,7 @@ typedef struct {
     int bound_prior;         /* -boundprior: when the margin check fails, a bound from a-priori bounds of the other side (1, default; 0 off; 2 first, on the returned point, a certificate only when it fails) */
     int soc;                 /* 5.16: semidefinite blocks with arrow data as second-order cones in the embedding: 1 on (default), 0 off */
     int soc_minn;            /* ... blocks of at least this order (3) */
-    int conesolver;          /* 26 October 2026: 1 (default) a problem whose semidefinite blocks are all of order 1 or 2 or
+    int socpsolver;          /* 26 October 2026 (named conesolver until 11 November 2026): 1 (default) a problem whose semidefinite blocks are all of order 1 or 2 or
                               * have arrow data (a second-order cone program) is solved by the SOCP solver; 0 by this one */
     const int *xcone;        /* 23 October 2026, internal (main.c): per block of the problem solved, its hub when brisk_solve is to
                               * return X of this block (arrow data) as its cone vector (x_0 = tr X, x_t = 2 X_{hub, t-th other index}),
@@ -591,6 +621,7 @@ typedef struct {
 } Result;
 
 int  read_sdpa(const char *fname, Problem *P);
+int  write_sdpa(const Problem *P, const char *fname);   /* 8 November 2026: the problem as it stands (experiments: the presolved problem) */
 int  problem_from_sdpa_data(const BriskData *d, Problem *P);   /* 4.37: read_sdpa from memory */
 void problem_prepare(Problem *P, const Params *par);
 /* 5.15: the generators of the randomized steps (low-rank detection, symmetry's block
@@ -671,6 +702,9 @@ int    schol_factor(SChol *S, double shift);
 void   schol_set_stop(SChol *S, const volatile int *f, double deadline); /* stop flag and deadline (omp_get_wtime; 0 none), read at every supernode */
 int    schol_stopped(const SChol *S);
 int    brisk_cpu_quota(void);    /* the CPUs the container's quota allows (cgroup cpu.max), rounded up; 0: none */
+int    brisk_avail_cpus(void);   /* the CPUs the process can keep busy: its affinity mask, or the quota when lower; 0: unknown */
+int    brisk_user_threads(int k);   /* sets a thread count the user gave, at most brisk_avail_cpus(); returns the count set */
+void   brisk_user_threads_clear(void);
 void   schol_release_factor(SChol *S);
 size_t schol_pansz(const SChol *S);
 void   schol_set_inplace(SChol *S, int on);
@@ -894,6 +928,7 @@ void free_elim_refine(const PSFreeElim *F, const PSOrig *O, double **Xo, int ver
 void free_elim_free(PSFreeElim *F);
 void free_elim_post(const PSFreeElim *F, const PSOrig *Ofile, double **Xo, const double *yred, double *yfile, const int *xc);
 PSOrig *ps_orig_build(const Problem *P);
+unsigned long long ps_orig_hash(const Problem *P);   /* 9 November 2026: a hash of what ps_orig_build copies */
 /* 4.32 symmetry reduction (symred.c): generators of the automorphism group -> constraint orbits aggregated */
 typedef struct { int k, t, d, n, lp, p, rblk; double *W; } SymBlk;   /* rblk: block of the reduced problem; lp: a 1 x 1 piece kept as LP variable p of block lpblk */   /* 4.33: reduced block of type t (-1: LP) of file block k: d copies (the dimension of the irreducible), size n; W: d matrices n_k x n */
 typedef struct { int m, mr, order, NI, nblk; int *cls; int **G; int *off, *gblk; double *b0; int ngen; int **gen;
@@ -956,7 +991,9 @@ int mfipm_solve_hand(Problem *P, const Params *par, Result *R, double **Xint, do
 /* 4.40 low-rank augmented Lagrangian (lralm.c): reads, solves, reports; returns the exit code */
 int lralm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);
 int bm_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);   /* 5.14: bm.c */
-int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfile, const char *zfile, const BriskData *data, BriskResult *res, int autom);   /* -1: not applicable (automatic route) */
+int bm_run_x(const char *fname, Params *par, const char *yfile, const char *xfile, const char *zfile, const BriskData *data, BriskResult *res, int autom);
+int bm_multi_solve(Problem *P, Params *par, Result *R, double *yout, double **Xout);   /* 16 November 2026: the multi-block method on the presolved problem (-1: blocks it does not take) */
+int bm_header_nsdp(const char *fname, const BriskData *data);   /* -1: not applicable (automatic route) */
 int bmip_run(const char *fname, Params *par, const char *yfile, const BriskData *data, BriskResult *res);   /* 5.16: bmip.c (-bm 2) */
 int bm_auto_candidate(const char *fname, const BriskData *data, const Params *par, int need_dense);
 extern int g_read_maxn;   /* 4.40: largest SDP block the reader accepts (46340; lralm lifts it) */
@@ -965,6 +1002,13 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
 typedef struct { int m, mk, nblk, ncls, ngen, NI, nbr; char *keep; int *cls, *cpos, *csz, *off, *bs, *qblk, *qpos0; } PSSign;   /* qblk: class -> reduced block; qpos0: offset of a size-1 class in the LP block */
 PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int chordal_minn, double chordal_density);
 void sign_unmap(const PSSign *S, double **Xred, const double *yred, double **Xo, double *yo);
+/* 16 November 2026: the constraints in reduced row echelon form (rowspace.c), so that the sign-symmetry search sees the
+ * symmetries hidden by recombined rows; y of the problem before = T' y of the new one, X the same */
+typedef struct PSRref PSRref;
+PSRref *rowspace_rref(const Problem *P, Problem *Q, int verbose);
+void rref_unmap_y(const PSRref *R, const double *yq, double *yp);
+int  rref_rows(const PSRref *R, int *m0);
+void rref_free(PSRref *R);
 void sign_free(PSSign *S);
 /* 4.41 (symalg.c): numerical block diagonalisation of the *-algebra of each SDP block (any
  * symmetry group, also non-permutation); component g of file block ck[g]: size cd[g],

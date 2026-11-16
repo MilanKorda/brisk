@@ -175,7 +175,7 @@ static void drop_con(AS *S, int l) {
 /* dense Cholesky of G (lower, column-major) */
 static int chol(int n, const double *G, double *L) {
     memcpy(L, G, sizeof(double) * (size_t)n * n);
-    { static int lap = -1; if (lap < 0) { const char *e = getenv("BRISK_QPASLAPACK"); lap = !(e && atoi(e) == 0); }
+    { static int lap = -1; if (lap < 0) { const char *e = qp_getenv("BRISK_QPASLAPACK"); lap = !(e && atoi(e) == 0); }
       if (lap) {          /* (28 October 2026: LAPACK's dpotrf, G = U'U with U upper (L = U' is not formed: J = L^-T = U^-1, init_J),
                            * the strict lower triangle set to zero; the diagonal is L's) */
           int info = 0; as_dpotrf("U", &n, L, &n, &info);
@@ -198,7 +198,7 @@ static int chol(int n, const double *G, double *L) {
  * bits (the terms left out are products with exact zeros); it was 87 % of an active-set solve of WHLIPBAL0 (QP, n = 50) */
 static void init_J(AS *S) {
     const int n = S->n;
-    { static int lap = -1; if (lap < 0) { const char *e = getenv("BRISK_QPASLAPACK"); lap = !(e && atoi(e) == 0); }
+    { static int lap = -1; if (lap < 0) { const char *e = qp_getenv("BRISK_QPASLAPACK"); lap = !(e && atoi(e) == 0); }
       if (lap) {          /* (28 October 2026: J = L^-T = U^-1 by LAPACK's dtrtri on chol's U; its strict lower triangle is zero) */
           memcpy(S->J, S->L, sizeof(double) * (size_t)n * n);
           int info = 0; as_dtrtri("U", "N", &n, S->J, &n, &info);
@@ -394,7 +394,15 @@ struct QpSolver {
     struct QpElim *E;             /* the equality rows eliminated (qp_elim_build), or NULL */
     int elim;                     /* 0: not tried, 1: in use (E), -1: not used */
     void *memo;                   /* (1 November 2026) the interior-point method's analysis kept between solves (qpipm.c) */
+    /* (14 November 2026, the QP developer) the model's own choice of method (QP_METHOD_AUTO), made once (qp.c's
+     * qp_as_stream): chosen, the choice is made; auto_as, the active-set method; wstep, the work a solve may use before the
+     * interior-point method takes it over (0: none, the one-shot rule's own budget); over, the solves in a row that did */
+    int chosen, auto_as, over; double wstep;
 };
+static int qp_auto_as(QpSolver *Q) {
+    if (!Q->chosen) { Q->chosen = 1; Q->auto_as = qp_as_stream(&Q->P, &Q->wstep); }
+    return Q->auto_as;
+}
 
 static void as_alloc(AS *S, const QpProb *P) {
     const int n = P->n, m = P->m;
@@ -537,7 +545,7 @@ static int as_run(AS *S, const QpOpts *o, QpRes *Res, double t0) {
     /* the result; at an optimal active set, up to three steps of refinement (as_refine) while the errors on the problem as
      * given are above the tolerance and fall; then OPTIMAL only within ten times the tolerance, the interior-point method's
      * rule (it was a thousand times, 28 October 2026). BRISK_QPASREFINE=0: no refinement */
-    static int nref = -1; if (nref < 0) { const char *e = getenv("BRISK_QPASREFINE"); nref = e ? atoi(e) : 3; }
+    static int nref = -1; if (nref < 0) { const char *e = qp_getenv("BRISK_QPASREFINE"); nref = e ? atoi(e) : 3; }
     double *xs = NULL, *us = NULL; double ebest = INFINITY;
     for (int pass = 0; ; pass++) {
         const double e = as_result(S, Res);
@@ -687,7 +695,7 @@ static void update_cons(QpSolver *Q) {
     if (!Q->built || !Q->dirty) return;
     Q->dirty = 0;
     AS *S = &Q->S; AS T; memset(&T, 0, sizeof(T));
-    static int fast = -1; if (fast < 0) { const char *e = getenv("BRISK_QPASFASTB"); fast = !(e && atoi(e) == 0); }
+    static int fast = -1; if (fast < 0) { const char *e = qp_getenv("BRISK_QPASFASTB"); fast = !(e && atoi(e) == 0); }
     build_cons(&T, &Q->P);
     int same = fast && T.nc == S->nc;
     for (int k = 0; same && k < T.nc; k++) {
@@ -726,6 +734,7 @@ static int qp_resolve_ipm(QpSolver *Q, const QpProb *P, QpRes *Res) {
     qp_ipm_memo_use(NULL);
     return st;
 }
+static void qp_elim_step_budget(QpSolver *Q, double wstep);
 static int qp_resolve_body(QpSolver *Q, QpRes *Res) {
     const double t0 = now();
     const QpProb *P = &Q->P;
@@ -739,14 +748,32 @@ static int qp_resolve_body(QpSolver *Q, QpRes *Res) {
      * optimal, the interior-point method from the start. (31 October 2026, the merge: the build through qp_prepare, which
      * also makes the equality rows' elimination) */
     const int autom = Q->o.method == QP_METHOD_AUTO;
-    if (Q->o.method == QP_METHOD_IPM || (autom && !qp_as_small(P))) { qp_res_free(Res); return qp_resolve_ipm(Q, P, Res); }
-    if (autom) { qp_prepare(Q); if (Q->failed) { Q->o.method = QP_METHOD_IPM; qp_res_free(Res); return qp_resolve_ipm(Q, P, Res); } }
+    if (Q->o.method == QP_METHOD_IPM || (autom && !qp_auto_as(Q))) { qp_res_free(Res); return qp_resolve_ipm(Q, P, Res); }
+    if (autom) { qp_prepare(Q); if (Q->failed || !Q->auto_as) { if (Q->failed) Q->o.method = QP_METHOD_IPM; qp_res_free(Res); return qp_resolve_ipm(Q, P, Res); } }
     if (Q->elim == 1 && !qp_elim_same(Q)) { qp_elim_free(Q); Q->elim = -1; }      /* (the equality rows changed: the full method) */
+    /* (14 November 2026) a model that chose the active-set method because the equality rows' elimination made it cheap lives
+     * on the elimination. Without it (the equality rows changed, or its point missed the tolerance: the states' solution
+     * operator loses accuracy over a long horizon of unstable dynamics) the dense method on every variable is not the
+     * method that was chosen, unless the problem is within the fixed bound for it: the interior-point method keeps the
+     * model. (Until now the dense method was tried on all variables at every later solve before the interior-point method
+     * solved the problem.) */
+    if (autom && Q->elim != 1 && qp_elim_setup_work(P) >= 0 && !qp_as_dense_small(P)) { Q->auto_as = 0; qp_res_free(Res); return qp_resolve_ipm(Q, P, Res); }
     if (Q->elim == 1) {
+        if (autom && Q->wstep > 0) qp_elim_step_budget(Q, Q->wstep);
         const int st = qp_elim_solve(Q, Res, t0);
+        if (autom && Q->wstep > 0) {
+            if (st == QP_OPTIMAL) { Q->over = 0; return st; }
+            /* the budget ran out, or the solve ended otherwise: the interior-point method solves this problem; after
+             * three such solves in a row the stream is not one the active-set method serves, and it keeps the model */
+            if (++Q->over >= 3) Q->auto_as = 0;
+            if (qp_getenv("BRISK_QPSTREAMDBG")) fprintf(stderr, "[stream: the active-set solve ended %d (%s) after %d iterations, budget %d; over %d]\n", st, st >= 0 ? qp_status_name(st) : "missed the tolerance", Res->iter, Q->E ? 0 : -1, Q->over);
+            if (Q->o.verbose) qp_printf("  [active-set method: this solve handed to the interior-point method%s]\n", Q->auto_as ? "" : ", and the model from here on");
+            qp_res_free(Res); return qp_resolve_ipm(Q, P, Res);
+        }
         if (st >= 0) return st;
         qp_elim_free(Q); Q->elim = -1;                    /* (its point missed the tolerance on the problem as given) */
         if (Q->o.verbose) qp_printf("  [active-set method: the equality rows' elimination missed the tolerance; the full problem solved]\n");
+        if (autom && !qp_as_dense_small(P)) { Q->auto_as = 0; qp_res_free(Res); return qp_resolve_ipm(Q, P, Res); }   /* (as above) */
     }
     update_cons(Q);
     qp_prepare(Q);
@@ -852,7 +879,7 @@ static void qp_elim_data(QpSolver *Q, double *cr, double *rl, double *ru, double
     for (int j = 0; j < r; j++) { xl[j] = P->xl[E->perm[k + j]]; xu[j] = P->xu[E->perm[k + j]]; }
 }
 static int qp_elim_wanted(const QpProb *P) {
-    { static int off = -1; if (off < 0) { const char *e = getenv("BRISK_QPASELIM"); off = e && atoi(e) == 0; } if (off) return 0; }
+    { static int off = -1; if (off < 0) { const char *e = qp_getenv("BRISK_QPASELIM"); off = e && atoi(e) == 0; } if (off) return 0; }
     if (P->nqc > 0 || !P->Hp || P->m == 0) return 0;
     int k = 0; for (int i = 0; i < P->m; i++) k += is_eqrow(P, i);
     return k >= 8 && 8 * k >= P->n && k < P->n;
@@ -864,7 +891,7 @@ static int qp_eq_peel(const QpProb *P, int *piv, int *ordr);
 static int qp_eq_peelable(const QpProb *P) { return qp_eq_peel(P, NULL, NULL); }
 /* the peeling itself: piv[i] the basic variable of equality row i, ordr[t] the row peeled t-th (both may be NULL) */
 static int qp_eq_peel(const QpProb *P, int *piv, int *ordr) {
-    { static int pon = -1; if (pon < 0) { const char *e_ = getenv("BRISK_QPELIMPEEL"); pon = !(e_ && atoi(e_) == 0); } if (!pon) return 0; }
+    { static int pon = -1; if (pon < 0) { const char *e_ = qp_getenv("BRISK_QPELIMPEEL"); pon = !(e_ && atoi(e_) == 0); } if (!pon) return 0; }
     const int n = P->n, m = P->m;
     int *rp = calloc((size_t)m + 2, sizeof(int)), *cnt = calloc((size_t)n + 1, sizeof(int)), *stk = malloc(sizeof(int) * ((size_t)n + 1));
     double *rmax = calloc((size_t)m + 1, sizeof(double)); char *dead = calloc((size_t)m + 1, 1), *used = calloc((size_t)n + 1, 1);
@@ -914,6 +941,12 @@ static void qp_elim_budget(QpSolver *Q, double wipm) {
     const double was = k * k * n + 2 * n * r * r + 2 * r * r * r / 3 + 2 * r * nza, wit = 64 * r * r + 2 * nza;
     const double cap = fmin(1e9, fmax(10.0, (wipm - was) / wit));
     if (I->o.maxit <= 0 || I->o.maxit > cap) I->o.maxit = (int)cap;
+}
+/* (14 November 2026) a solve's budget in a stream (qp_as_stream): the changes of the active set that the work of one
+ * interior-point solve pays beyond the solve's own 2 r^2 + 2 nnz of the reduced rows, each 10 r^2, at least 10 */
+static void qp_elim_step_budget(QpSolver *Q, double wstep) {
+    QpSolver *I = Q->E->in; const double r = Q->E->r, wbase = 2.0 * r * r + 2.0 * (double)I->P.Ap[I->P.n];
+    I->o.maxit = (int)fmin(1e9, fmax(10.0, (wstep - wbase) / (10.0 * r * r)));
 }
 static int qp_elim_build(QpSolver *Q) {
     const QpProb *P = &Q->P; const int n = P->n, m = P->m;
@@ -1115,11 +1148,12 @@ static int qp_elim_solve(QpSolver *Q, QpRes *Res, double t0) {
 static int qp_elim_build(QpSolver *Q);
 static void qp_prepare(QpSolver *Q) {
     if ((Q->o.method != QP_METHOD_ACTIVESET && Q->o.method != QP_METHOD_AUTO) || Q->built || Q->failed) return;
-    if (Q->o.method == QP_METHOD_AUTO && !qp_as_small(&Q->P)) return;      /* (the automatic choice takes the interior-point method) */
+    if (Q->o.method == QP_METHOD_AUTO && !qp_auto_as(Q)) return;      /* (the automatic choice takes the interior-point method) */
     if (!Q->convex) Q->convex = qp_convex_exact(&Q->P) ? -1 : 1;
     if (Q->convex < 0) return;
     if (Q->elim == 0) { Q->elim = qp_elim_build(Q) ? 1 : -1; if (Q->elim == 1) return; }
     if (Q->elim == 1) return;
+    if (Q->o.method == QP_METHOD_AUTO && qp_elim_setup_work(&Q->P) >= 0 && !qp_as_dense_small(&Q->P)) { Q->auto_as = 0; return; }   /* (chosen for the elimination, which could not be built) */
     as_alloc(&Q->S, &Q->P);
     if (as_factor(&Q->S)) { as_free(&Q->S); Q->failed = 1; return; }
     as_reset(&Q->S);

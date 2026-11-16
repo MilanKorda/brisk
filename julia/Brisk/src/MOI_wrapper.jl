@@ -7,7 +7,7 @@
 #             PositiveSemidefiniteConeTriangle}.
 #
 # A model with second-order cones, or with linear constraints only, is passed in SeDuMi form
-# (`_build_cone`, `Brisk.ConeData`): BRISK's second-order cone solver takes it when there is no
+# (`_build_cone`, `Brisk.ConeData`): BRISK's SOCP solver takes it when there is no
 # semidefinite constraint, the semidefinite solver otherwise (second-order cones as arrow
 # blocks). A model with Zeros, Nonnegatives and semidefinite constraints only is handed to BRISK in one of two SDPA forms (`_build_image`, `_build_kernel`; the
 # optimizer attribute "form" = "auto" (default), "image" or "kernel"):
@@ -199,8 +199,8 @@ Attributes: `MOI.Silent`, `MOI.TimeLimitSec` (BRISK's `-timelimit`), `MOI.Number
     (written by C), `:silent`;
   * `"form"`: `"auto"` (default), `"image"` or `"kernel"`: the SDPA form the model is
     passed in (see `src/MOI_wrapper.jl`);
-  * `"conesolver"`: `1` (default) or `0`. A model without semidefinite constraints (linear
-    and second-order cone constraints only) is solved by BRISK's second-order cone solver;
+  * `"socpsolver"` (earlier `"conesolver"`): `1` (default) or `0`. A model without semidefinite constraints (linear
+    and second-order cone constraints only) is solved by BRISK's SOCP solver;
     `0` sends it to the semidefinite solver. Models with `MOI.SecondOrderCone` or
     `MOI.RotatedSecondOrderCone` constraints are passed in SeDuMi form (`Brisk.ConeData`);
   * `"write_sdpa"`: a file name; the SDPA file of the model is written there before each
@@ -501,8 +501,15 @@ function _build_kernel(cache::OptimizerCache, S::_Structure, sense::MOI.Optimiza
             nlp += 2
         end
     end
+    # (11 November 2026) a slack row that repeats another's bound on one variable (the same variable, coefficient and
+    # constant: `X .>= 0` on a symmetric matrix variable states each off-diagonal bound twice) is not written again: the
+    # repeats doubled the rows BRISK sees and kept its bounds on single entries of X from the first-order method's native
+    # treatment (k-means relaxation, n = 90: 3.3 s against 0.12 s); its dual is 0 (rowblk 0), the first row carries the
+    # bound's multiplier
+    dup = _repeated_bounds(S, b, rp, ci, cv, isvar_nn, nrow)
     for (k, rows) in enumerate(S.nncons)
         for r in rows
+            dup[r] && continue
             nlp += 1
             rowblk[r] = 1; rowi[r] = nlp; rowj[r] = nlp
             if isvar_nn[k]
@@ -537,7 +544,7 @@ function _build_kernel(cache::OptimizerCache, S::_Structure, sense::MOI.Optimiza
     end
     m = 0
     for r in 1:nrow
-        isvarrow[r] && continue
+        (isvarrow[r] || dup[r]) && continue
         m += 1
         rowt[r] = m
     end
@@ -586,6 +593,22 @@ function _build_kernel(cache::OptimizerCache, S::_Structure, sense::MOI.Optimiza
                     lpblock, col, varkind, varblk, vari, varj, cvar)
 end
 
+# (11 November 2026) the slack rows of Nonnegatives constraints that repeat another's bound on one variable (the same
+# variable, coefficient and constant), e.g. `X .>= 0` on a symmetric matrix variable: not written in the kernel form
+function _repeated_bounds(S::_Structure, b, rp, ci, cv, isvar_nn, nrow::Int)
+    seenb = Dict{Tuple{Int,Float64,Float64},Int}()
+    dup = falses(nrow)
+    for (k, rows) in enumerate(S.nncons)
+        isvar_nn[k] && continue
+        for r in rows
+            rp[r+1] - rp[r] == 1 || continue
+            key = (Int(ci[rp[r]+1]), cv[rp[r]+1], b[r])
+            haskey(seenb, key) ? (dup[r] = true) : (seenb[key] = r)
+        end
+    end
+    return dup
+end
+
 function _build(cache::OptimizerCache, sense::MOI.OptimizationSense, a0::Vector{Float64}, form::String)
     A = cache.constraints.coefficients
     b = cache.constraints.constants
@@ -597,12 +620,38 @@ function _build(cache::OptimizerCache, sense::MOI.OptimizationSense, a0::Vector{
     nfree = nused - count(claimed)
     nslack = A.m - S.nz - sum(length(S.psd[k]) for k in eachindex(S.psd) if isvar_psd[k]; init = 0) -
              sum(length(S.nncons[k]) for k in eachindex(S.nncons) if isvar_nn[k]; init = 0)
+    dup = _repeated_bounds(S, b, rp, ci, cv, isvar_nn, A.m)
+    nrep = count(dup)
+    nslack -= nrep                                                     # (not written)
     mkernel = S.nz + nslack
     if form == "auto"
         # rows after BRISK eliminates the split pairs (one row each): the form with fewer
         # pairs, unless the other has less than half its rows (dualize.c's rule)
         effI, effK = nused - S.nz, mkernel - nfree
-        form = nfree <= S.nz ? (2effI < effK ? "image" : "kernel") : (2effK < effI ? "kernel" : "image")
+        # (11 November 2026) where BRISK takes the kernel form's bounds on entries of PSD variables natively (at least half
+        # of its rows, at least 4,000 rows; main.c) the kernel form; elsewhere the rule as before, the repeated bounds counted
+        # as rows (below that size the bounds are rows of the interior-point method in the kernel form, diagonal terms in the
+        # image form)
+        psdvar = falses(A.n)
+        for (k, rows) in enumerate(S.psd)
+            isvar_psd[k] || continue
+            for r in rows
+                psdvar[ci[rp[r]+1]] = true
+            end
+        end
+        nbnd = 0
+        for (k, rows) in enumerate(S.nncons)
+            isvar_nn[k] && continue
+            for r in rows
+                (!dup[r] && rp[r+1] - rp[r] == 1 && psdvar[ci[rp[r]+1]]) && (nbnd += 1)
+            end
+        end
+        if mkernel >= 4000 && 2nbnd >= mkernel
+            form = "kernel"
+        else
+            effK0 = effK + nrep
+            form = nfree <= S.nz ? (2effI < effK0 ? "image" : "kernel") : (2effK0 < effI ? "kernel" : "image")
+        end
     end
     (form == "kernel" && mkernel >= 1) || return _build_image(cache, S, sense, a0)
     return _build_kernel(cache, S, sense, a0, rp, ci, cv, claimed, isvar_psd, isvar_nn)
@@ -671,7 +720,7 @@ function _wants_cone(o, cache::OptimizerCache)
     nsoc > 0 && return true
     MOI.get(cache, MOI.NumberOfConstraints{F,MOI.PositiveSemidefiniteConeTriangle}()) > 0 && return false
     MOI.get(cache, MOI.NumberOfConstraints{F,MOI.Zeros}()) + MOI.get(cache, MOI.NumberOfConstraints{F,MOI.Nonnegatives}()) == 0 && return false
-    string(get(o.options, "conesolver", 1)) in ("0", "false") && return false
+    string(get(o.options, "socpsolver", get(o.options, "conesolver", 1))) in ("0", "false") && return false   # (conesolver: the earlier name)
     any(k -> haskey(o.options, k), ("prec", "bound", "fom", "mfipm", "lralm", "form", "write_sdpa")) && return false
     return true
 end
@@ -815,7 +864,7 @@ function _qp_args(o::Optimizer)
     args = String[]
     method = "-qpauto"
     for (k, v) in o.options
-        k in ("output", "write_sdpa", "form", "conesolver") && continue
+        k in ("output", "write_sdpa", "form", "socpsolver", "conesolver") && continue
         if k in ("qpas", "qpipm")
             (v === true || string(v) in ("1", "true")) && (method = "-" * k)
         elseif k in ("tol", "maxit")
@@ -898,7 +947,7 @@ function _run_options(o::Optimizer)
     opts = Pair{String,Any}[]
     for (k, v) in o.options
         k in ("output", "write_sdpa", "form") && continue
-        k == "conesolver" && o.cone === nothing && continue
+        k in ("socpsolver", "conesolver") && o.cone === nothing && continue
         if k == "bound"
             # 4.38 (untested here: no Julia in the build environment): "primal"/"sos" is the
             # side of the model's variables (the SOS Gram matrices), "dual" the other; MOI's
@@ -1030,6 +1079,7 @@ function _map_kernel(D::SDPAData, res::Result, nvar::Int, nrow::Int, dual_ray::B
             dual[r] = res.y[D.rowt[r]]
         else
             k = D.rowblk[r]
+            k == 0 && continue                       # (a repeated bound, not written: dual 0)
             dual[r] = _entry(res.Z[k], D.rowi[r], D.rowj[r])
             dual_ray && (dual[r] -= get(cpos, (Int32(k), D.rowi[r], D.rowj[r]), 0.0))
         end

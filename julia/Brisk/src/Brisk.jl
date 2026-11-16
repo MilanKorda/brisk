@@ -546,7 +546,7 @@ with `A` an m x n matrix (sparse or dense) and `K` a named tuple or dictionary w
 variables), `l` (nonnegative variables), `q` (second-order cones x0 >= |x(1:)|: a vector of
 dimensions), `r` (rotated cones 2 x0 x1 >= |x(2:)|^2) and `s` (semidefinite blocks, each as
 its d*d entries by columns), in this order: `K = (f = 2, l = 10, q = [4, 7])`. Without
-semidefinite blocks the problem is solved by BRISK's second-order cone solver, with them by
+semidefinite blocks the problem is solved by BRISK's SOCP solver, with them by
 the semidefinite solver. `file` is a MAT-file (version 5 to 7) with `A` (or `At`), `b`, `c`, `K`.
 """
 function solve_sedumi(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Real}, c::AbstractVector{<:Real}, K;
@@ -690,6 +690,87 @@ function solve_qp(H, c::AbstractVector{<:Real}, A = nothing, l = nothing, u = no
 end
 
 """
+    Brisk.LpResult
+
+The solution of an LP given as data ([`Brisk.solve_lp`](@ref)): `status` (0 optimal, 1 primal infeasible, 2 dual infeasible,
+3 iteration limit, 4 numerical difficulties, 5 reduced accuracy, 6 time limit), `status_string`, `objective` (with `c0`),
+`x` (`nothing` when no point is returned), `y` (the rows' multipliers: `y[i] >= 0` where row i is at its lower side, `<= 0`
+at its upper side) and `z = c - A'y` (the bounds' multipliers, the same signs for `x[j]`'s bounds), `nothing` when the route
+gives no exact duals (the simplex methods and the crossover always give them; the interior-point method's point only when its
+duals measure exact to 1e-6 on the LP as given: `lpmethod = 4` gives them always), `iterations`, `solve_time`.
+"""
+struct LpResult
+    status::Int
+    status_string::String
+    iterations::Int
+    objective::Float64
+    x::Union{Nothing,Vector{Float64}}
+    y::Union{Nothing,Vector{Float64}}
+    z::Union{Nothing,Vector{Float64}}
+    solve_time::Float64
+end
+
+function Base.show(io::IO, r::LpResult)
+    print(io, "Brisk.LpResult(", r.status_string, ", ", r.iterations, " iterations, objective ", r.objective,
+          r.y === nothing ? ", no duals" : "", ")")
+end
+
+function _read_lp_result(r::Ptr{Cvoid})
+    vec(p, k) = p == C_NULL ? nothing : copy(unsafe_wrap(Array, p, k))
+    n = Int(ccall(_fn(:brisk_result_sn), Cint, (Ptr{Cvoid},), r))
+    m = Int(ccall(_fn(:brisk_result_m), Cint, (Ptr{Cvoid},), r))
+    havex = ccall(_fn(:brisk_result_have_x), Cint, (Ptr{Cvoid},), r) != 0
+    return LpResult(Int(ccall(_fn(:brisk_result_status), Cint, (Ptr{Cvoid},), r)),
+                    unsafe_string(ccall(_fn(:brisk_result_status_str), Cstring, (Ptr{Cvoid},), r)),
+                    Int(ccall(_fn(:brisk_result_iterations), Cint, (Ptr{Cvoid},), r)),
+                    ccall(_fn(:brisk_result_pobj), Cdouble, (Ptr{Cvoid},), r),
+                    havex ? vec(ccall(_fn(:brisk_result_sx), Ptr{Cdouble}, (Ptr{Cvoid},), r), n) : nothing,
+                    vec(ccall(_fn(:brisk_result_y), Ptr{Cdouble}, (Ptr{Cvoid},), r), m),
+                    vec(ccall(_fn(:brisk_result_sz), Ptr{Cdouble}, (Ptr{Cvoid},), r), n),
+                    ccall(_fn(:brisk_result_time), Cdouble, (Ptr{Cvoid},), r))
+end
+
+# an LP's exit code follows the command line's for an MPS file; the call failed only when it returned no solution
+function _check_lp(rc, res)
+    rc < 0 && throw(BriskError(rc, "BRISK stopped (out of memory); see the messages above"))
+    res.status < 0 && throw(BriskError(rc, rc == 2 ? "invalid LP data (a value not finite, an index out of range, a lower side above its upper side)" :
+                                                    "BRISK returned no solution (an option it does not take?); see the messages above"))
+    return res
+end
+
+"""
+    Brisk.solve_lp(c, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
+                   c0 = 0.0, output = :julia, options...) -> Brisk.LpResult
+
+Solve the LP
+
+    min c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub
+
+by the same path as an MPS file of the same LP (`Brisk.solve_file`): the default choice of method (the interior-point method
+and the dual simplex method side by side), the presolves, the crossover; `lpmethod = 1`-`5` as on the command line, other
+options `tol`, `timelimit`, `threads`, ... A (m x n) dense or sparse; `nothing` for a bound vector: no bounds of that kind
+(note: no default lower bound 0 as in an MPS file), and `-Inf`, `Inf` for an absent bound; an equality row has `l[i] == u[i]`.
+"""
+function solve_lp(c::AbstractVector{<:Real}, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
+                  c0::Real = 0.0, output::Symbol = :julia, options...)
+    n = length(c)
+    As = A === nothing ? SparseArrays.spzeros(0, n) : SparseArrays.sparse(A)
+    size(As, 2) == n || throw(DimensionMismatch("A has $(size(As, 2)) columns, c has $n entries"))
+    m = size(As, 1)
+    Ap, Ai, Ax = Vector{Cint}(As.colptr .- 1), Vector{Cint}(As.rowval .- 1), Vector{Cdouble}(As.nzval)
+    cc = Vector{Cdouble}(c)
+    rl, ru = _bound_vector(l, m, -Inf, "l"), _bound_vector(u, m, Inf, "u")
+    xl, xu = _bound_vector(lb, n, -Inf, "lb"), _bound_vector(ub, n, Inf, "ub")
+    args = _tagged(option_args(options), "julia:solve_lp")
+    return _call(args, output, _read_lp_result, _check_lp) do r, cargs
+        Int(ccall(_fn(:brisk_solve_lp), Cint,
+                  (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}, Ptr{Cdouble},
+                   Ptr{Cdouble}, Ptr{Cdouble}, Cint, Ptr{Cstring}, Ptr{Cvoid}),
+                  n, m, Ap, Ai, Ax, cc, Float64(c0), rl, ru, xl, xu, length(cargs), cargs, r))
+    end
+end
+
+"""
     mdl = Brisk.QpModel(H, c, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
                         c0 = 0.0, output = :silent, options...)
     r = Brisk.solve!(mdl)                       # a Brisk.QpResult
@@ -699,9 +780,11 @@ end
     r = Brisk.solve!(mdl)                       # from the previous active set
 
 A convex QP (the data as in [`Brisk.solve_qp`](@ref)) kept for re-solves after changes of its bounds or its linear
-cost, each solve starting from the previous active set (BRISK's dual active-set method): model predictive control,
-branch and bound. `qpipm = true`: the interior-point method, every solve from the start. Options `tol`, `maxit`,
-`timelimit`; `output = :julia` prints each solve's line. The C object is freed with the model (or by `Brisk.free!`).
+cost: model predictive control, branch and bound. BRISK chooses the method for the stream of solves: its dual
+active-set method, each solve from the previous active set, for a small QP and where eliminating the equality rows
+leaves a problem that the stream pays for; its interior-point method otherwise, which keeps its setup between the
+solves and starts from the last solution. `qpas = true`: the active-set method; `qpipm = true`: the interior-point
+method. Options `tol`, `maxit`, `timelimit`; `output = :julia` prints each solve's line. The C object is freed with the model (or by `Brisk.free!`).
 """
 mutable struct QpModel
     ptr::Ptr{Cvoid}
@@ -718,7 +801,10 @@ end
 function QpModel(H, c::AbstractVector{<:Real}, A = nothing, l = nothing, u = nothing, lb = nothing, ub = nothing;
                  c0::Real = 0.0, output::Symbol = :silent, options...)
     D = _qp_arrays(H, c, A, l, u, lb, ub)
-    return _qp_model(D, Float64(c0), option_args(options), output)
+    args = option_args(options)
+    # (the model's own choice of method unless one is asked for: -qpauto, as Python's QpModel and the JuMP wrapper)
+    any(a -> a in ("-qpas", "-qpipm", "-qpauto"), args) || (args = vcat(args, ["-qpauto"]))
+    return _qp_model(D, Float64(c0), args, output)
 end
 
 # (also the JuMP wrapper's: brisk_qp_create's options are -qpas (its default), -qpipm, -qpauto, -tol, -maxit,

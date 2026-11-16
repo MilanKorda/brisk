@@ -66,7 +66,8 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `symtime`, `symnodes` | the automatic search's budget: at least `symtime` and 1 % of the expected solve (up to 900 s), at most 15 % of it, counted in operations, not on the clock; the node cap | 20 s, 500 nodes |
 | `symalg` | block structure shared by all the data matrices of an SDP block. The matrix *-algebra that C and the constraint matrices of the block generate is block-diagonalised numerically: the block splits into its components, and equal copies are kept once. This finds a symmetry group that leaves every constraint matrix unchanged (any such group, not only permutations, also in a rotated basis), commuting data (the block becomes an LP block) and hidden direct sums. It does not find a symmetry that maps the constraints onto each other; for permutations `sym` does that. −1 auto: blocks up to `symalgmax`, applied when the gain is ≥ `symmin`; an O(nnz) test first skips the blocks it proves irreducible. 0 off; 1 every block, any gain. `sym none` turns it off too. The gain counts the Schur assembly on the transformed (dense) data as well as the block algebra. | −1 |
 | `symalgmax` | largest block `symalg −1` checks. The check costs one eigendecomposition and two n × n products: 0.2 s at n = 1000. | 1000 |
-| `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little) |
+| `nofr` / `fr` | facial reduction off / whatever its depth | on (skipped at depth ≥ 2 when it saves little and rests on a certificate that holds only to a tolerance) |
+| `frdual` | the duals of the constraints the facial reduction removed, when zero is not a dual of the problem as read (the problem has no strictly feasible point): they are rebuilt level by level from the reduction's certificates; when that fails, `0` they are returned as NaN, not being determined by the reduced problem (the dual's errors are measured on its face); `1` a second solve finds the dual of least violation on the problem as read with the optimal value held; `2` the rebuilt duals are returned as they are, at reduced accuracy. After the dual form, the same holds for the entries of X | `0` |
 | `deprows` | remove the equality constraints that are linear combinations of others (found by a factorization of the matrix of inner products ⟨A_i, A_j⟩, each one verified in the data with its right-hand side; their dual values are 0; inconsistent right-hand sides are reported and nothing is removed): `1` on, `0` off | `1` |
 | `freeelim` | eliminate split free variables (kernel-form SOS): `-1` auto, `0` off, `1` on | `-1` |
 | `dualize` | solve the dual form when its Schur complement is at most half the size and the problem has an objective (not for a feasibility problem): `-1` auto, `0` off, `1` force | `-1` |
@@ -87,6 +88,7 @@ Output files (`-x`, `-y`, `-z`) and the stand-alone certificate checks (`-certif
 | `dual` | sparse dual-scaling method (falls back to the primal-dual method unless certified) | off |
 | `fom` | first-order engine: `-1` automatic (dense Schur complement does not fit), `0` off, `1` force | `-1` |
 | `fombound` | constraints g X_ij + a s = b whose extra variable s ≥ 0 appears in no other constraint and has no cost are bounds on single entries of X (doubly nonnegative programs: k-means and theta-plus relaxations): the first-order engine solves the problem without them, with the bounds as a cone of their own on X; when at least half the constraints are such bounds and there are 4,000 or more, it runs *first* (not at `acc high`), within an iteration cap of about twice the interior-point method's estimated time, and the interior-point method follows if it misses the tolerance; `0` off | 1 |
+| `fomfirst` | the first-order engine *first*, at the default tolerance or looser (not `acc high`), on problems with at most 64 SDP blocks, one of order ≥ 200, a sparse Gram matrix A A', constraints that barely overlap and at least 99 % of them fixing a single entry of X (theta problems, matrix completion; a few dense rows such as the trace allowed), when the interior-point work is estimated at 20 s or more from the sizes (the same on every host); the matrix-free attempt is not made before it; it hands over to the interior-point method when its projected work exceeds that method's in two windows of 50 iterations in a row, unless its DIMACS errors are at most 1e-6 (the result kept at reduced accuracy, the log names `fomfirst 0`) or at most 1e-5 with the interior-point estimate above twice its work so far; `0` off | `1` |
 | `fomrace` | at tolerance ≥ 1e-6 (`acc low`): share of the estimated interior-point time the first-order engine gets *first* on few-large-dense-block problems with a sparse Gram matrix A A' (theta-type; interior-point estimate ≥ 20 s); the interior-point method follows if it misses the tolerance; `0` off (the default since 19 October 2026: it lost wherever it ran on the sets) | 0 |
 | `mfipm` | matrix-free interior-point method (problems with a low-rank optimal side); `2` the hybrid: matrix-free while its CG is cheap (merit > `mfhand` 1e-3, under `mfhandcg` 600 CG steps an iteration), then the interior-point method with the factored Schur complement from that iterate | 0 |
 | `mftry` | the matrix-free interior-point method *first*, automatically, on problems with one to four dense blocks of order ≥ 100 that the presolve leaves unchanged (not moment relaxations with localizing blocks) and whose Schur factorization is estimated at 3.5 matrix-free solves or more (at one or more when every constraint has an entry in an LP block and each LP variable is in one constraint at most); the attempt is limited in work (CG steps a solve worth a sixth of a factorization, and stopped earlier when the steps of a solve grow geometrically; a quarter of the solve with the factored Schur complement in all), and the interior-point method with the factored Schur complement follows unless it ends OPTIMAL (from the attempt's best iterate between merits 1e-3 and 1e-5, if it got below 1e-3); also when the Schur complement does not fit (the first-order engine follows then); `0` off | `1` |
@@ -122,7 +124,7 @@ the end are those of the problem as read.
 
 | option | meaning | default |
 |---|---|---|
-| `conesolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the SOCP solver, and so is a problem whose semidefinite blocks are all of order 1 or 2 or have arrow data (a block of order 2 as a second-order cone of dimension 3); `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
+| `socpsolver` | `1`: a problem in SeDuMi form (a `.mat` file, `solve_sedumi`, `brisk_sedumi`, a CVXPY or JuMP model) without semidefinite blocks is solved by the SOCP solver, and so is a problem whose semidefinite blocks are all of order 1 or 2 or have arrow data (a block of order 2 as a second-order cone of dimension 3); `0`: by the semidefinite solver, with the second-order cones as arrow blocks. The semidefinite solver is also used whenever one of `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm` is given. | 1 |
 | `soc` | `1`: semidefinite blocks whose data are arrow matrices (the second-order cones of a problem with semidefinite blocks, and norm constraints written as matrix inequalities) are solved as second-order cones in the self-dual embedding, O(q) work per cone of dimension q instead of O(q³); `0`: as semidefinite blocks. A solve with cones that ends worse than reduced accuracy is repeated with them as semidefinite blocks. | 1 |
 | `socmin` | the smallest order of an arrow block that `soc` solves as a cone | 3 |
 
@@ -165,6 +167,7 @@ digits (the usual result holds it rounded to doubles).
 |---|---|---|
 | `lppresolve` | `0` none; `1` rows and columns (empty, singleton, redundant, forcing rows; fixed and empty columns; dual fixing; linearly dependent equality rows); `2` also the substitutions: costless one-direction columns, free column singletons, opposite column pairs as free variables, implied upper bounds dropped, the eliminator (implied free columns through their equality rows); `3` with `lpmethod` 1, first parallel rows and columns, doubleton equations and slack columns, then as `2` | 3 |
 | `lpmethod` | not given: the LP interior-point method and, with two threads or more, the dual simplex method beside it on one thread (the first to end with a result gives it; it can then differ from run to run; `-threads 1` gives the same result every run; a result at reduced accuracy waits for the dual simplex method at most twice the time taken); `1` the LP interior-point method alone (bounds as bounds, normal equations; when it stops near the optimum its point goes to the crossover; the SOCP solver takes over when it gives up and the crossover cannot finish), `0` the SOCP solver directly (also for an LP given in SeDuMi form, from CVXPY or JuMP, which otherwise goes to the LP interior-point method first), `2`-`5` the simplex method (see the full list) | not given |
+| `lpmethod` | not given: the LP interior-point method and, with two threads or more, the dual simplex method beside it on one thread (on a problem with many more rows than columns and four threads or more (five elsewhere than on Linux), two dual simplex methods, one on the problem and one on its dual; the first to end with a result gives it; it can then differ from run to run; `-threads 1` gives the same result every run; a result at reduced accuracy waits for the dual simplex method at most twice the time taken); `1` the LP interior-point method alone (bounds as bounds, normal equations; when it stops near the optimum its point goes to the crossover; the SOCP solver takes over when it gives up and the crossover cannot finish), `0` the SOCP solver directly, `2`-`5` the simplex method (see the full list) | not given |
 | `lpcorr` | the interior-point method's centrality correctors per iteration (`lpmethod` 1, 4 and 5) | 0–3 from the cost of a factorization against a solve (flop ratio above 10, 30, 50) |
 
 Also `tol` (1e-8), `maxit` (200), `timelimit`, `q`, `v`, and `-x file` (x of the problem as read).
@@ -203,8 +206,13 @@ to the crossover, and the SOCP solver takes over when it gives up and the crosso
                    2 also substitutions: free column singletons, opposite column pairs, implied free
                    columns by their equality rows; 3 (default) with -lpmethod 1, first parallel rows
                    and columns, doubleton equations and slack columns, then as 2
-  -lpmethod <k>    not given (default): the LP interior-point method and, with two threads or more, the
-                   dual simplex method beside it on one thread; the first to end with a result gives it, which
+  -lpmethod <k>    not given (default): below 1,000 nonzeros, or when the matrix is a network matrix (every
+                   column at most two entries, each +-1), the dual simplex method alone; otherwise
+                   the LP interior-point method and, with two threads or more, the
+                   dual simplex method beside it on one thread (on a problem with many more rows than columns
+                   and four threads or more, a second one at a low priority, on the problem's dual and on the problem
+                   itself; five threads elsewhere than on Linux);
+                   the first to end with a result gives it, which
                    can then differ from run to run (-threads 1: the interior-point method alone, the same result
                    every run); a result at reduced accuracy waits for the dual simplex method at most twice the
                    time taken; 1 the LP interior-point method alone, 0 the SOCP solver directly (also for an
@@ -216,13 +224,13 @@ to the crossover, and the SOCP solver takes over when it gives up and the crosso
   -lpcorr <k>      the interior-point method's centrality correctors per iteration (-lpmethod 1, 4
                    and 5; default: 0-3 from the cost of a factorization against a solve)
 A problem in SeDuMi format without semidefinite blocks (a linear or second-order cone program)
-is solved by the second-order cone solver: its options are -tol, -acc, -maxit, -timelimit, -q,
+is solved by the SOCP solver: its options are -tol, -acc, -maxit, -timelimit, -q,
 -v, and -x, -y, -z (x, y and z = c - A'y of the SeDuMi form, one value per line). With
-semidefinite blocks, or with -conesolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem
+semidefinite blocks, or with -socpsolver 0, -prec, -bound, -fom, -mfipm, -lralm, the problem
 goes to the semidefinite solver (second-order cones as arrow blocks, which its self-dual embedding
 solves as second-order cones again: -soc) with all the options below. A problem whose semidefinite
 blocks are all of order 1 or 2 or have arrow data (an SOCP written in semidefinite form) is again
-solved by the SOCP solver, a block of order 2 as a second-order cone of dimension 3 (-conesolver 0: not).
+solved by the SOCP solver, a block of order 2 as a second-order cone of dimension 3 (-socpsolver 0: not).
 output
   -q | -v          quiet | the diagnosis: every step of the solver (the default log shows the problem, the
                    presolve's changes, the method, one line per iteration and the Summary)
@@ -230,6 +238,8 @@ output
   -y <file>        write y (SDPA primal x = -y), one value per line, original numbering
   -x <file>        write X of the original problem (SDPA sparse-like: block i j value, upper triangle)
   -z <file>        write Z = C - A'y of the original problem, same format
+                   (a CBF file of an LP or SOCP: -x one value per variable, -y one multiplier per constraint,
+                   -z = c - A'y one value per variable, CBF's dual; a maximized file: y and z negated)
 termination
   -acc <level>     accuracy: low (tol 1e-6), default (1e-8) or high (1e-10). low also scales the
                    re-solve thresholds (10 tol, 100 tol after the embedding) and the reduced-
@@ -313,9 +323,15 @@ high precision
                    (1e-24 for dd, 1e-48 for qd, 1e-77 for 100 digits) and a result within
                    2^(-0.6 bits) (1e-19, 1e-38, 1e-62) counts as OPTIMAL; -fom / -lralm aim at the latter
 method
-  -conesolver 0    a problem in SeDuMi format without semidefinite blocks, or one whose semidefinite
+  -socpsolver 0    a problem in SeDuMi format without semidefinite blocks, or one whose semidefinite
                    blocks are all of order 1 or 2 or have arrow data: by the semidefinite solver
                    (second-order cones as arrow blocks) instead of the SOCP solver (default 1)
+  -socpfr <k>      facial reduction in the SOCP solver (LPs and SOCPs it solves): 0 none (default: a solve that
+                   fails because the problem has no strictly feasible point says so in the Summary); 1 the
+                   face of the feasible set that such a solve shows (variables zero and cones on one ray in
+                   every feasible point) is solved again and its result returned; 2 also the faces single
+                   constraints prove (a row whose terms are all of one sign with right-hand side 0),
+                   removed before the solve
   -dual            dual-scaling method (DSDP-style: potential reduction, correctors, verified
                    certificates); falls back to the primal-dual method unless certified
   -hsd | -nohsd    force | forbid the self-dual embedding (default: automatic - the embedding first
@@ -356,20 +372,30 @@ presolve
   -frdepth <k>     facial reduction cut at depth k: the reductions resting on k earlier ones are not made
                    (default: no limit; 0: none, as -nofr); a shallower reduction keeps more of the dual (the
                    multipliers, e.g. the moments of a moment relaxation) recoverable
-  -fr              facial reduction whatever its depth (default: skipped when of depth >= 2 and saving < frgain)
-  -frgain <g>      per-iteration saving that justifies a facial reduction of depth >= 2 (4)
+  -fr              facial reduction whatever its depth (default: skipped when of depth >= 2, saving < frgain
+                   and resting on a certificate that holds only to a tolerance)
+  -frgain <g>      per-iteration saving that justifies a facial reduction of depth >= 2 resting on a
+                   certificate that holds only to a tolerance (4)
+  -lpface <k>      search, by linear programs, for faces of the feasible set hidden behind free variables, at
+                   most k levels (each level removes what the one before found and searches again; -1: until a
+                   level finds nothing), and report them in the Summary; the problem is not changed (default 0:
+                   no search). It runs where the free variables' elimination was refused near its break-even
+  -lpfaceall 1     the search of -lpface wherever free variables are left as split pairs
   -soc <0|1>       semidefinite blocks whose data are arrow matrices (second-order cones written
                    as matrix inequalities; the SeDuMi reader writes cones so next to semidefinite
                    blocks) solved as second-order cones in the self-dual embedding (1)
   -socmin <n>      ... blocks of at least this order (3)
   -nofrretry       no re-solve when the removed duals are not recovered and the reduced solve misses the tolerance
-  -frdual <k>      1: when the facial reduction's duals cannot be rebuilt, a second solve finds them on the problem as
-                   read: the dual of least violation whose objective equals the optimal value of the first solve (X and the
-                   value are kept; about one solve of the problem as read; 0, the default: the log says that the dual is lost)
+  -frdual <k>      the duals of the constraints the facial reduction removed, when zero is not a dual of the
+                   problem as read: they are rebuilt level by level from the reduction's certificates; when that fails:
+                   0 (default) they are returned as NaN (the reduced problem does not determine them), the dual's
+                   errors measured on its face; 1 a second solve finds a dual on the problem as read: the dual of
+                   least violation whose objective equals the optimal value of the first solve (X and the value are
+                   kept; about one solve of the problem as read); 2 the rebuilt duals are returned as they are,
+                   SOLVED TO REDUCED ACCURACY. After the dual form the same holds for the entries of X
   -frfallback <f>  removed duals not rebuilt though the reduced solve is good: with f > 0 the problem is solved again
                    without facial reduction, within f times the solve's time (0, the default: no re-solve; the reduced
-                   solve is returned as SOLVED TO REDUCED ACCURACY, the log says that the recovery failed, what is
-                   correct, and how to solve again without the reduction for the dual)
+                   solve is returned with the undetermined duals as NaN, -frdual)
   -symfallback <f> a solve after an automorphism reduction that ends worse than reduced accuracy is repeated
                    without the reduction, within this multiple of the solve's time (4; 0 = never)
   -deprows <k>     remove the equality constraints that are linear combinations of others (their dual values
@@ -418,7 +444,8 @@ presolve
                    does not fit in memory; a very sparse large block waits for the
                    chordal conversion first), 0 off, 1 force (-1)
   -bm <k>          the Burer-Monteiro solver (X = R R', nothing of size n^2 formed) for large sparse
-                   SDPs with low-rank solutions, one semidefinite block (and LP blocks):
+                   SDPs with low-rank solutions (with 1 also several semidefinite blocks and LP
+                   variables):
                    1 always, 0 never, -1 (default) automatically when the problem has one block of
                    order n >= 500 and every constraint fixes a diagonal entry, once the linearly
                    dependent constraints are removed (max-cut and its
@@ -437,6 +464,12 @@ presolve
                    -lrescape (1), -lrtrace R (with tr X <= R: report b'y - R lambda as a lower bound,
                    Z >= -lambda I by a sparse Cholesky ladder); SDP blocks above n = 46 340 are
                    accepted on this path
+  -fomfirst <0|1>  on problems with few large dense blocks and a sparse A A' whose interior-point solve
+                   is expected to be long (by its work, counted from the sizes), the first-order
+                   engine first; it hands over to the interior-point method when its projected work
+                   exceeds the interior-point method's, unless its errors are at most 1e-6; taken where at
+                   least 99 0f the constraints fix a single entry of X (theta problems, matrix
+                   completion) and at the default tolerance or looser (default 1; 0: off)
   -fomrace <f>     at a tolerance of 1e-6 or looser (-acc low), on problems with few large dense
                    and a sparse Gram matrix A A' (theta-type problems)
                    that the presolve leaves as they are (no chordal conversion, no dual form)
@@ -476,6 +509,9 @@ presolve
                    representation (1 on, 0 off)
   -symsign <k>     ... -sym auto: sign symmetries (D A D = ±A, D diagonal ±1) first: blocks split by
                    sign pattern, odd constraints dropped (1 on, 0 off)
+  -symrref <k>     ... -sym auto: when no sign symmetry is found, the equality constraints in
+                   reduced row echelon form and the search again (finds the symmetries that
+                   sums of constraints hide; 1 on, 0 off, the default)
   -symsigned <k>   ... -sym auto: signed permutations (x_i -> ±x_g(i)): a second search on the
                    absolute values of the data, signs lifted over GF(2), exact (1 on, 0 off)
   -symmin <f>      ... -sym auto applies the reduction only when the constraints, the block
@@ -512,13 +548,15 @@ Schur complement and linear algebra
                    values grouped: localizing matrices): -1 auto, 0 off, 1 force
   -mixed <k>       single-precision Schur factor + PCG: -1 auto (m>=1000), 0 off, 1 on
   -route <r>       force Schur route of sparse constraints: 0 sparse-sparse, 1 row-product, 3 row-product on the union pattern
-  -threads <k>     OpenMP threads for this solve: k >= 1 forces k (no automatic reduction);
-                   0 or absent: automatic (OMP_NUM_THREADS, else all cores within the container's
-                   CPU quota (cgroup cpu.max, Linux); problems too small
-                   for threads run on one; on Linux fewer while other processes occupy the
-                   cores, BRISK_NOBUSY=1 keeps the count). For this solve only: a later solve of
-                   the same process starts again from the automatic count. The log states it
-                   ("Number of threads: k", "(forced by user)", "(problem too small for multithreading)")
+  -threads <k>     OpenMP threads for this solve: k >= 1 is a limit, at most the CPUs the process
+                   can run on or its container's CPU quota; under it the automatic rules apply (problems
+                   too small for threads run on one; on Linux fewer while other processes occupy the
+                   cores, BRISK_NOBUSY=1 keeps the count). 0 or absent: automatic (OMP_NUM_THREADS, a
+                   limit too, else all cores within the CPU quota). For this solve only: a later solve
+                   of the same process starts again from the automatic count. The log states it
+                   ("Number of threads: k", "(at most k as set by the user)", "(problem too small for
+                   multithreading)"). An LP's interior-point method and the dual simplex method beside it
+                   share the threads
   -parblocks <k>   threads over blocks: -1 auto (several blocks, all n <= 256), 0 off, 1 on
   -cblas <c>       routing cost of a BLAS-3 flop relative to a sparse flop (0.05)
   -densemem <MB>   memory for dense constraint copies and the low-rank routes' products (768)

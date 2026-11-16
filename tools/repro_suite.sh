@@ -63,7 +63,10 @@ ${BRISK_BENCH:-benchmarks}/socp/cblib/chainsing-10000-1.cbf.gz
 ${BRISK_BENCH:-benchmarks}/kennington/ken-07.mps
 ${BRISK_BENCH:-benchmarks}/socp/cblib/db-shear-wall.cbf.gz ${BRISK_BENCH:-benchmarks}/dimacs/mat/sched_100_100_orig.mat
 ${BRISK_BENCH:-benchmarks}/dimacs/mat/sched_200_100_orig.mat
-${BRISK_BENCH:-benchmarks}/mittelmann/trto3.dat-s"
+${BRISK_BENCH:-benchmarks}/mittelmann/trto3.dat-s
+${BRISK_BENCH:-benchmarks}/poema_option_pricing/mom/option_prices_example1x5_inf__r3.dat-s"
+# (option_prices_example1x5_inf__r3, POEMA, SDP: few free variables natively, GMRES on the bordered system after a
+# factorization that dropped tiny pivots, 8 November 2026)
 # (trto3, Mittelmann, SDP: its double-double endgame factors a Schur complement of order between 512 and 1,024, where
 # the endgame chose its Cholesky algorithm by the thread count until 1 November 2026: other bits at one thread than at
 # four, ISSUES 739)

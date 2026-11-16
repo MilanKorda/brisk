@@ -14,6 +14,8 @@
  * Objective values are unchanged: <C, V W V'> = <V'CV, W>.
  */
 #include "brisk.h"
+#include "lpio.h"
+#include "simplex.h"
 int g_fr_maxdepth = -1;   /* -frdepth (main.c sets it per solve; -1: no limit) */
 int g_fr_depth_used = 0;  /* the depth of the facial reduction made in this run (for the advice; main.c resets it) */
 #include <stdio.h>
@@ -1597,7 +1599,7 @@ int facial_reduction(Problem *P, int verbose) {
      * sweep continues with the next constraint; sweeps repeat until one finds nothing
      * (a reduction can make earlier constraints reducible). Restarting from the first
      * constraint after every reduction, as before, costs (reductions x m) tests.     */
-    int progress = 1, maxlev = 0, ncoupled = 0;
+    int progress = 1, maxlev = 0, ncoupled = 0, nnum = 0;
     int *clev = calloc(P->m + 1, sizeof(int));
     /* 23 October 2026: the constraints lifted_faces added are each an exact certificate on the data as read (a
      * combination of its constraints): their level stays 0 until their own reduction, however the others change
@@ -1700,6 +1702,17 @@ int facial_reduction(Problem *P, int verbose) {
                  * Navier-Stokes moment relaxation: depth 16, the moments lost; depth 1, every moment rebuilt) */
                 extern int g_fr_maxdepth;
                 if (g_fr_maxdepth > 0 && clev[i] + 1 > g_fr_maxdepth) { free(cfS); free(cfN); free(cfU); free(cfdrop); continue; }
+            }
+            if (getenv("BRISK_FRKINDS")) {   /* (diagnosis, 9 November 2026: each reduction's level and the test of each part: 0 rank one, 1 one-signed diagonal, 2 LP of one sign, 3 eigenvalues, 4 exact rank-one terms, 5 the clique faces' numerical face) */
+                fprintf(stderr, "   [FRKINDS row %d (file row %d) level %d parts", i, P->orig[i], clev[i] + 1);
+                for (int q = 0; q < np; q++) fprintf(stderr, " %d:%d", parts[2 * q] + 1, parts[2 * q + 1]);
+                fprintf(stderr, "]\n");
+            }
+            {   /* (9 November 2026) a certificate is exact when every part passed an exact test: a one-signed diagonal (1), an LP
+                 * part of one sign (2), exact rank-one terms (4), or no part at all; rank one within a tolerance (0), eigenvalues (3)
+                 * and the clique faces (5) are numerical */
+                int num = 0; for (int q = 0; q < np; q++) { const int kd = parts[2 * q + 1]; if (kd == 0 || kd == 3 || kd == 5) num = 1; }
+                nnum += num;
             }
             /* apply (and log the reduction for postsolve) */
             PSRecord *rec = g_ps_P ? ps_record_begin(P, P->orig[i], sgn0 != 0 ? sgn0 : 1.0) : NULL;
@@ -1818,6 +1831,7 @@ int facial_reduction(Problem *P, int verbose) {
     free(a); free(parts); free(clev); free(mask);
     P->fr_removed = removed;
     P->fr_depth = maxlev;
+    P->fr_numeric = nnum;
     { extern int g_fr_depth_used; if (maxlev > g_fr_depth_used) g_fr_depth_used = maxlev; }
     P->fr_coupled = ncoupled;
     unused += remove_unused_indices(P);
@@ -1967,6 +1981,58 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
         if (sc < 0 && verbose >= 2) printf("presolve: dependent constraints: the dense rows' Gram matrix may be singular (%.2fs); the full check follows\n", wtime() - t0);
     }
     if (ne == 0) return 0;
+    {   /* (9 November 2026) the peeling below (constraints alone at some position set aside one after another) first on a
+         * light structure, positions and constraints without the values: an int count per position, each entry's constraint
+         * grouped by position, each constraint's positions. When it sets every constraint aside there is no dependence and
+         * the full test (values, merged duplicates, the Gram matrix of the core) is not needed. A D-optimal design (SDP with
+         * SOCP, 18.8 million entries): the full test 2.0 s, its arrays of 24 bytes an entry twice. A constraint has at most
+         * one entry at a position (its matrix in one block), so no merge is needed here. Only where the positions are not
+         * many more than the entries (the counting sort's condition below). BRISK_DEPLIGHT=0: the full test always */
+        static int dl = -1; if (dl < 0) { const char *e = getenv("BRISK_DEPLIGHT"); dl = !(e && atoi(e) == 0); }
+        size_t R = 0;
+        size_t *off = malloc(sizeof(size_t) * ((size_t)P->nblk + 1));
+        for (int k = 0; k < P->nblk; k++) { off[k] = R; const size_t n = (size_t)P->blk[k].n; R += P->blk[k].type == BLK_SDP ? n * (n + 1) / 2 : n; }
+        if (dl && R <= 4 * ne + ((size_t)1 << 20) && R < ((size_t)1 << 31) && ne < ((size_t)1 << 31)) {
+            unsigned *pp = calloc(R + 2, sizeof(unsigned));          /* per position: start of its constraints */
+            unsigned *crp = calloc((size_t)m + 2, sizeof(unsigned)); /* per constraint: start of its positions */
+            #define DL_POS(k_, S_, e_) (off[k_] + (P->blk[k_].type == BLK_SDP ? (size_t)(S_)->col[e_] * ((size_t)(S_)->col[e_] + 1) / 2 + (size_t)(S_)->row[e_] : (size_t)(S_)->row[e_]))
+            size_t nz = 0;
+            for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) {
+                const SpSym *S = &P->blk[k].A[t];
+                for (int e = 0; e < S->nnz; e++) if (S->val[e] != 0.0) { pp[DL_POS(k, S, e) + 1]++; crp[P->blk[k].con[t] + 1]++; nz++; }
+            }
+            for (size_t d = 0; d < R; d++) pp[d + 1] += pp[d];
+            for (int i = 0; i < m; i++) crp[i + 1] += crp[i];
+            int *pcon = malloc(sizeof(int) * (nz + 1));               /* the constraints at each position */
+            unsigned *cpos = malloc(sizeof(unsigned) * (nz + 1));     /* the positions of each constraint */
+            unsigned *fp = malloc(sizeof(unsigned) * (R + 1)), *fc = malloc(sizeof(unsigned) * ((size_t)m + 1));
+            memcpy(fp, pp, sizeof(unsigned) * R); memcpy(fc, crp, sizeof(unsigned) * m);
+            for (int k = 0; k < P->nblk; k++) for (int t = 0; t < P->blk[k].ncon; t++) {
+                const SpSym *S = &P->blk[k].A[t]; const int c = P->blk[k].con[t];
+                for (int e = 0; e < S->nnz; e++) if (S->val[e] != 0.0) { const size_t d = DL_POS(k, S, e); pcon[fp[d]++] = c; cpos[fc[c]++] = (unsigned)d; }
+            }
+            #undef DL_POS
+            free(fp); free(fc);
+            int *pc = malloc(sizeof(int) * (R + 1));                  /* constraints left at each position */
+            for (size_t d = 0; d < R; d++) pc[d] = (int)(pp[d + 1] - pp[d]);
+            char *aside = calloc((size_t)m + 1, 1);
+            unsigned *stk = malloc(sizeof(unsigned) * (R + 1)); size_t ns = 0;
+            for (size_t d = 0; d < R; d++) if (pc[d] == 1) stk[ns++] = (unsigned)d;
+            int naside = 0;
+            while (ns > 0) {
+                const size_t d = stk[--ns];
+                if (pc[d] != 1) continue;
+                int r = -1;
+                for (unsigned q = pp[d]; q < pp[d + 1]; q++) if (!aside[pcon[q]]) { r = pcon[q]; break; }
+                if (r < 0) continue;
+                aside[r] = 1; naside++;
+                for (unsigned q = crp[r]; q < crp[r + 1]; q++) { const unsigned d2 = cpos[q]; if (--pc[d2] == 1) stk[ns++] = d2; }
+            }
+            free(pp); free(crp); free(pcon); free(cpos); free(pc); free(aside); free(stk); free(off);
+            if (getenv("BRISK_DEPDBG")) printf("   [dependent constraints, light peeling: %d of %d set aside; %.2fs]\n", naside, m, wtime() - t0);
+            if (naside == m) { if (verbose >= 2) printf("presolve: no dependent constraints (each constraint alone at some position once the others are set aside)\n"); return 0; }
+        } else free(off);
+    }
     DepEnt *E = malloc(sizeof(DepEnt) * ne);
     size_t w = 0;
     for (int k = 0; k < P->nblk; k++) {
@@ -2137,7 +2203,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     const double budget = getenv("BRISK_DEPWORK") ? atof(getenv("BRISK_DEPWORK")) : 2e9;
     int removed = 0;
     int *rp = NULL, *ri = NULL, *deg = NULL, **nbr = NULL, *pool = NULL, *mark = NULL;
-    double *acc = NULL, *d0 = NULL, *piv = NULL, *x = NULL, *u = NULL, *wk = NULL, *Gacc = NULL;
+    double *acc = NULL, *d0 = NULL, *piv = NULL, *x = NULL, *u = NULL, *wk = NULL, *Gacc = NULL, *Adv = NULL;
     char *dead = NULL;
     SChol *S = NULL;
     /* dense data (every constraint at most positions): G = A A' by one BLAS-3 product of the dense m x positions matrix,
@@ -2249,7 +2315,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
         for (size_t q = 0; q < ne; q++) Ad[(size_t)E[q].con + (size_t)colof[q] * m] = E[q].v;
         const int ngi = (int)ng; const double one = 1.0, zero = 0.0;
         BL(dsyrk_)("L", "N", &m, &ngi, &one, Ad, &m, &zero, Gd, &m);
-        free(Ad);
+        if (getenv("BRISK_DEPDENSEV") && atoi(getenv("BRISK_DEPDENSEV")) == 0) free(Ad); else Adv = Ad;   /* (kept for the verification below) */
         for (int i = 0; i < m; i++) d0[i] = Gd[(size_t)i * m + i];
         schol_gather_dense(S, Gd);
         free(Gd);
@@ -2337,10 +2403,51 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
         if (xc) for (size_t q_ = 0; q_ < ne; q_++) if (!flag[E[q_].con]) uu[colof[q_]] -= E[q_].v * (xc)[E[q_].con]; } while (0)
     char *ok = malloc((size_t)ch + 1);
     double t_solve = 0;
+    double *Afl = NULL, *Vres = NULL;
+    if (Adv && (double)nfl * ng * 8.0 > 2e9) { free(Adv); Adv = NULL; }
+    if (Adv) {   /* the flagged rows a_i (positions by candidate), then those rows zeroed: Adv is A_K */
+        Afl = malloc(sizeof(double) * ((size_t)nfl * ng + 1)); Vres = malloc(sizeof(double) * ((size_t)ch * ng + 1));
+        for (int c = 0; c < nfl; c++) { const int i = fl[c]; for (size_t q = 0; q < ng; q++) Afl[(size_t)c * ng + q] = Adv[(size_t)i + q * m]; }
+        for (int i = 0; i < m; i++) if (flag[i]) for (size_t q = 0; q < ng; q++) Adv[(size_t)i + q * m] = 0.0;
+    }
     for (int c0 = 0; c0 < nfl; c0 += ch) {
         const int nc = nfl - c0 < ch ? nfl - c0 : ch;
         memset(x, 0, sizeof(double) * (size_t)m * nc); memset(ok, 0, (size_t)nc);
         for (int pass = 0; pass < 2; pass++) {
+            if (Adv) {
+                /* 9 November 2026: dense data (the matrix of the entries kept from the Gram matrix's product above, constraints
+                 * by positions): the candidates' products A_K v and residuals a_i - A_K' x as matrix products on a chunk at a
+                 * time instead of a pass over the entries per candidate. The outside tester's dependent_measurements (SDP, 480
+                 * dense constraints of order 160, 160 flagged): 3.4 s of verification. BRISK_DEPDENSEV=0: the entry loops */
+                if (pass == 0) {
+                    memcpy(Vres, Afl + (size_t)c0 * ng, sizeof(double) * (size_t)nc * ng);
+                }
+                for (int c = 0; c < nc; c++) if (ok[c]) memset(Vres + (size_t)c * ng, 0, sizeof(double) * ng);
+                {   const int ngi = (int)ng, nci = nc; const double one = 1.0, zero = 0.0;
+                    BL(dgemm_)("N", "N", &m, &nci, &ngi, &one, Adv, &m, Vres, &ngi, &zero, g, &m); }       /* g = A_K v */
+                { const double ts_ = wtime(); schol_solve_many_t(S, g, nc, wk); t_solve += wtime() - ts_; }
+                for (int c = 0; c < nc; c++) {
+                    if (ok[c]) continue;
+                    double *xc = x + (size_t)c * m, *gc = g + (size_t)c * m;
+                    for (int j = 0; j < m; j++) if (!flag[j]) xc[j] += gc[j];
+                    memcpy(Vres + (size_t)c * ng, Afl + (size_t)(c0 + c) * ng, sizeof(double) * ng);
+                }
+                {   const int ngi = (int)ng, nci = nc; const double mone = -1.0, one = 1.0;
+                    BL(dgemm_)("T", "N", &ngi, &nci, &m, &mone, Adv, &m, x, &m, &one, Vres, &ngi); }       /* v = a_i - A_K' x */
+                for (int c = 0; c < nc; c++) {
+                    if (ok[c]) continue;
+                    const int i = fl[c0 + c]; const double *xc = x + (size_t)c * m, *uc = Vres + (size_t)c * ng;
+                    double vv = 0; for (size_t q = 0; q < ng; q++) vv += uc[q] * uc[q];
+                    snc[c] = sqrt(vv / d0[i]);
+                    if (pass == 0 && snc[c] <= 1e-3 * stol) ok[c] = 1;
+                    if (pass == 1 || ok[c]) {
+                        double r = bb[i];
+                        for (int j = 0; j < m; j++) if (!flag[j]) r -= xc[j] * bb[j];
+                        relc[c] = fabs(r) / sqrt(d0[i]);
+                    }
+                }
+                continue;
+            }
             /* (each candidate on its own, on the threads: the same result at any thread count) */
             #pragma omp parallel num_threads(nth) if (nth > 1 && nc > 1)
             {
@@ -2397,7 +2504,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
             if (rel > rd) rd = rel;
         }
     }
-    free(ok); free(rv); free(rcl); free(ubuf); free(snc); free(relc);
+    free(ok); free(rv); free(rcl); free(ubuf); free(snc); free(relc); free(Afl); free(Vres); free(Adv); Adv = NULL;
     if (getenv("BRISK_DEPDBG")) printf("   [... verification: solves %.2fs]\n", t_solve);
     #undef DEP_RESID
     free(fl);
@@ -2416,6 +2523,7 @@ int remove_dependent_rows(Problem *P, int verbose, double tol, int *ninc) {
     if (verbose >= 1) printf("presolve: %d linearly dependent equality constraints removed (%d multiples of another, %d more by the factorization; rank %d of %d; distance to the span of the others at most %.1e of their norm, right-hand sides consistent to %.1e)\n",
                              nd + npar, npar, nd, mfull - nd - npar, mfull, sdep, fmax(rd / (bsc > 0 ? bsc : 1), rpar / (bsc0 > 0 ? bsc0 : 1)));
 out:
+    free(Adv);
     if (!removed && npar > 0 && *ninc == 0) {   /* (the multiples alone: the rest has no dependence, or was not checked) */
         { int *clev = calloc((size_t)mfull + 1, sizeof(int)); compact_removed(P, pdead, clev); free(clev); }
         removed = npar;
@@ -2426,4 +2534,195 @@ out:
     free(E); free(colof); free(gs); free(rp); free(ri); free(deg); free(nbr); free(pool); free(mark); free(Gacc);
     free(acc); free(d0); free(piv); free(x); free(u); free(wk); free(dead); free(cmap); free(bb);
     return removed;
+}
+
+/* the face behind the free variables by a linear program (9 November 2026, the SDP developer; a diagnostic,
+ * -lpface <levels>: it changes nothing in the problem).
+ *
+ * A face of the feasible set {X in the cone : <A_i, X> = b_i} is exposed by a combination y of the constraints with
+ * S = sum_i y_i A_i in the dual cone and b'y = 0: every feasible X has <S, X> = 0. With free variables (split pairs of an LP
+ * block, columns a and -a) the combination must cancel them (sum_i y_i a_i = 0); the other LP variables need sum_i y_i a_i >= 0.
+ * On the semidefinite blocks S is asked to be diagonally dominant, which makes the search a linear program (the partial facial
+ * reduction of Permenter and Parrilo): S_jj - sum_k |S_jk| >= u_j with 0 <= u_j <= 1, maximize sum_j u_j. The indices with
+ * u_j > 0 are exposed: S is strictly diagonally dominant there and zero elsewhere on the diagonal (so zero in those rows), the
+ * face is X_jj = 0 for them (rows and columns of X zero). One LP gives the largest set a diagonally dominant certificate can
+ * expose (a sum of certificates is one). Unlike the single-constraint facial reduction after the free elimination, the result
+ * does not depend on the order or the scale of the rows (roa_acrobot_d6_K and 8 transformed copies: the same 20 indices at the
+ * first level; bench/sdp_1109_fefr/README.md).
+ * The LP: columns y (m, bounds +-1e4), t (one per off-diagonal entry of the blocks' pattern), u (one per index of a block that
+ * some constraint touches); rows: the free columns (= 0), the other LP columns (>= 0), b'y = 0, +-S_jk - t_jk <= 0,
+ * S_jj - sum t - u_j >= 0. Solved by the dual simplex method (simplex.c). */
+typedef struct { long key; int col; } DdKey;
+static int ddk_cmp(const void *a, const void *b) { const long x = ((const DdKey *)a)->key, y = ((const DdKey *)b)->key; return (x > y) - (x < y); }
+static int ddk_find(const DdKey *K, int n, long key) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) { const int mid = (lo + hi) / 2; if (K[mid].key == key) return K[mid].col; if (K[mid].key < key) lo = mid + 1; else hi = mid - 1; }
+    return -1;
+}
+typedef struct { int r, c; double v; } DdTrip;
+static int ddt_cmp(const void *a, const void *b) {
+    const DdTrip *x = a, *y = b; if (x->c != y->c) return x->c - y->c; return x->r - y->r;
+}
+
+int g_lpface_state = 0, g_lpface_n = 0, g_lpface_tot = 0, g_lpface_nlp = 0, g_lpface_lev = 0, g_lpface_stop = 0;
+/* (for the Summary: state 0 not asked, 1 run, 2 not run by the guard, 3 the first level's LP stopped or failed, 4 no free
+ * variables or no semidefinite block; n the semidefinite indices exposed of tot touched, nlp the LP variables, lev the levels
+ * that exposed something, stop why the search ended: 0 a level found nothing, 1 the level limit, 2 the work limit, 3 an LP
+ * failed) */
+
+/* One level of the search on the problem with the indices marked in dead[k] removed (their rows and columns of X are zero on
+ * the face found so far; an LP variable so marked is zero). Builds and solves the LP; marks the indices and LP variables it
+ * exposes in dead[k]. Returns the simplex method's status (0 optimal); *nsd, *nlp the counts exposed, *ntouch the semidefinite
+ * indices the remaining data touch; *work the simplex method's work. */
+static int lpface_level(const Problem *P, int **role, unsigned char **dead, double budget, int *nsd, int *nlp, int *ntouch,
+                        long *iters, double *work, int verbose) {
+    const int m = P->m, nb = P->nblk;
+    *nsd = *nlp = *ntouch = 0;
+    /* the off-diagonal pattern and the indices touched, per SDP block: keys boff[k] + r * n + c (the entries on removed indices
+     * left out: X is zero there) */
+    long ntrip = 0;
+    for (int k = 0; k < nb; k++) for (int t = 0; t < P->blk[k].ncon; t++) ntrip += P->blk[k].A[t].nnz;
+    DdKey *off = malloc(sizeof(DdKey) * (ntrip + 1)), *idx = malloc(sizeof(DdKey) * (ntrip * 2 + 1));
+    long noff = 0, nidx = 0;
+    long *boff = calloc(nb + 1, sizeof(long));
+    for (int k = 0; k < nb; k++) boff[k + 1] = boff[k] + (P->blk[k].type == BLK_SDP ? (long)P->blk[k].n * P->blk[k].n : 0);
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k]; if (B->type != BLK_SDP) continue;
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *A = &B->A[t];
+            for (int q = 0; q < A->nnz; q++) {
+                const int r = A->row[q], c = A->col[q];
+                if (A->val[q] == 0 || dead[k][r] || dead[k][c]) continue;
+                if (r != c) off[noff++].key = boff[k] + (long)r * B->n + c;
+                idx[nidx++].key = boff[k] + r; idx[nidx++].key = boff[k] + c;
+            }
+        }
+    }
+    qsort(off, noff, sizeof(DdKey), ddk_cmp); qsort(idx, nidx, sizeof(DdKey), ddk_cmp);
+    { long w = 0; for (long a = 0; a < noff; a++) if (w == 0 || off[w - 1].key != off[a].key) off[w++] = off[a]; noff = w; }
+    { long w = 0; for (long a = 0; a < nidx; a++) if (w == 0 || idx[w - 1].key != idx[a].key) idx[w++] = idx[a]; nidx = w; }
+    *ntouch = (int)nidx;
+    /* rows: [0, nf) free pairs (their '+' slot), [nf, nf + nl) the other LP variables left, one b'y row, 2 per off-diagonal
+     * entry, one per index */
+    int nf = 0, nl = 0;
+    int **lprow = calloc(nb, sizeof(int *));
+    for (int k = 0; k < nb; k++) if (role[k]) { lprow[k] = malloc(sizeof(int) * ((size_t)P->blk[k].n + 1)); for (int p = 0; p < P->blk[k].n; p++) lprow[k][p] = -1; }
+    for (int k = 0; k < nb; k++) if (role[k]) for (int p = 0; p < P->blk[k].n; p++) if (role[k][p] == 1) lprow[k][p] = nf++;
+    for (int k = 0; k < nb; k++) if (role[k]) for (int p = 0; p < P->blk[k].n; p++) if (role[k][p] == 0 && !dead[k][p]) lprow[k][p] = nf + nl++;
+    const int rb = nf + nl, roff0 = rb + 1, ridx0 = roff0 + 2 * (int)noff, mr = ridx0 + (int)nidx;
+    /* columns: y (m), t (noff), u of the semidefinite indices (nidx) */
+    const int ct0 = m, cu0 = m + (int)noff, ncol = cu0 + (int)nidx;
+    for (long a = 0; a < noff; a++) off[a].col = (int)a;
+    for (long a = 0; a < nidx; a++) idx[a].col = (int)a;
+    size_t cap = (size_t)ntrip * 2 + (size_t)m + 4 * (size_t)noff + nidx + 16, ne = 0;
+    DdTrip *T = malloc(sizeof(DdTrip) * cap);
+    #define DD_PUT(rr, cc, vv) do { if (ne == cap) { cap *= 2; T = realloc(T, sizeof(DdTrip) * cap); } T[ne].r = (rr); T[ne].c = (cc); T[ne].v = (vv); ne++; } while (0)
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k];
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *A = &B->A[t]; const int i = B->con[t];
+            for (int q = 0; q < A->nnz; q++) {
+                const double v = A->val[q]; if (v == 0) continue;
+                const int r = A->row[q], c = A->col[q];
+                if (B->type == BLK_LP) { if (lprow[k] && lprow[k][r] >= 0) DD_PUT(lprow[k][r], i, v); continue; }
+                if (B->type != BLK_SDP || dead[k][r] || dead[k][c]) continue;
+                if (r == c) { const int a = ddk_find(idx, (int)nidx, boff[k] + r); DD_PUT(ridx0 + a, i, v); }
+                else { const int a = ddk_find(off, (int)noff, boff[k] + (long)r * B->n + c); DD_PUT(roff0 + 2 * a, i, v); DD_PUT(roff0 + 2 * a + 1, i, -v); }
+            }
+        }
+    }
+    for (int i = 0; i < m; i++) if (P->b[i] != 0) DD_PUT(rb, i, P->b[i]);
+    for (long a = 0; a < noff; a++) {
+        const long key = off[a].key; int k = 0; while (boff[k + 1] <= key) k++;
+        const int n = P->blk[k].n; const long loc = key - boff[k]; const int r = (int)(loc / n), c = (int)(loc % n);
+        DD_PUT(roff0 + 2 * (int)a, ct0 + (int)a, -1.0); DD_PUT(roff0 + 2 * (int)a + 1, ct0 + (int)a, -1.0);
+        DD_PUT(ridx0 + ddk_find(idx, (int)nidx, boff[k] + r), ct0 + (int)a, -1.0);
+        DD_PUT(ridx0 + ddk_find(idx, (int)nidx, boff[k] + c), ct0 + (int)a, -1.0);
+    }
+    for (long a = 0; a < nidx; a++) DD_PUT(ridx0 + (int)a, cu0 + (int)a, -1.0);
+    #undef DD_PUT
+    qsort(T, ne, sizeof(DdTrip), ddt_cmp);
+    LpProb L; memset(&L, 0, sizeof L);
+    L.m = mr; L.n = ncol; L.maxim = 1;
+    L.Ap = calloc((size_t)ncol + 1, sizeof(int)); L.Ai = malloc(sizeof(int) * (ne + 1)); L.Ax = malloc(sizeof(double) * (ne + 1));
+    for (size_t e = 0; e < ne; e++) { L.Ap[T[e].c + 1]++; L.Ai[e] = T[e].r; L.Ax[e] = T[e].v; }
+    for (int j = 0; j < ncol; j++) L.Ap[j + 1] += L.Ap[j];
+    L.c = calloc((size_t)ncol + 1, sizeof(double)); L.l = malloc(sizeof(double) * (ncol + 1)); L.u = malloc(sizeof(double) * (ncol + 1));
+    L.rl = malloc(sizeof(double) * (mr + 1)); L.ru = malloc(sizeof(double) * (mr + 1));
+    for (int j = 0; j < m; j++) { L.l[j] = -1e4; L.u[j] = 1e4; }
+    for (int j = ct0; j < cu0; j++) { L.l[j] = 0; L.u[j] = LP_INF; }
+    for (int j = cu0; j < ncol; j++) { L.l[j] = 0; L.u[j] = 1; L.c[j] = 1; }
+    for (int r = 0; r < nf; r++) { L.rl[r] = 0; L.ru[r] = 0; }
+    for (int r = nf; r < rb; r++) { L.rl[r] = 0; L.ru[r] = LP_INF; }
+    L.rl[rb] = 0; L.ru[rb] = 0;
+    for (int r = roff0; r < ridx0; r++) { L.rl[r] = -LP_INF; L.ru[r] = 0; }
+    for (int r = ridx0; r < mr; r++) { L.rl[r] = 0; L.ru[r] = LP_INF; }
+    SimplexOpts so; memset(&so, 0, sizeof so); so.method = 1; so.deterministic = 1; so.workbudget = budget;
+    SimplexInfo si; memset(&si, 0, sizeof si);
+    double *x = malloc(sizeof(double) * (ncol + 1)), *ax = malloc(sizeof(double) * (mr + 1));
+    const int st = simplex_solve(&L, &so, x, ax, NULL, NULL, NULL, NULL, &si);
+    *iters = si.iters; *work = si.work;
+    if (st == 0) {
+        if (verbose >= 1) printf("   exposed (block, index):");
+        for (long a = 0; a < nidx; a++) if (x[cu0 + a] > 1e-7) {
+            const long key = idx[a].key; int k = 0; while (boff[k + 1] <= key) k++;
+            dead[k][key - boff[k]] = 1; (*nsd)++;
+            if (verbose >= 1) printf(" %d:%ld", k + 1, key - boff[k] + 1);
+        }
+        for (int k = 0; k < nb; k++) if (lprow[k]) for (int p = 0; p < P->blk[k].n; p++)
+            if (lprow[k][p] >= nf && ax[lprow[k][p]] > 1e-7) {   /* (its coefficient in the combination, sum_i y_i a_ip > 0: x_p = 0) */
+                dead[k][p] = 1; (*nlp)++;
+                if (verbose >= 1) printf(" %d:%d (LP)", k + 1, p + 1);
+            }
+        if (verbose >= 1) printf("\n");
+    }
+    free(x); free(ax); free(L.Ap); free(L.Ai); free(L.Ax); free(L.c); free(L.l); free(L.u); free(L.rl); free(L.ru);
+    free(T); free(off); free(idx); free(boff);
+    for (int k = 0; k < nb; k++) free(lprow[k]);
+    free(lprow);
+    return st;
+}
+
+/* The search by levels (9 November 2026, the owner: "Implement the multi-level search and allow the user to cap the depth"):
+ * a level's exposed indices are removed (their rows and columns of X are zero on the face) and the LP is solved again on what
+ * is left, until a level exposes nothing, maxlev levels have run (maxlev < 0: no limit), the work limit is reached, or an LP
+ * fails. Each level is a face of the one before, so the indices found are zero on every feasible point (on the face of the
+ * earlier levels, which holds every feasible point). The work limit is for all the levels together: the simplex method's
+ * work at most a share (BRISK_LPFACEW, 0.005) of 20 iterations of the facial reduction's cost model (m^3/3 + 10 sum n^3).
+ * Returns the semidefinite indices exposed (-1: the first level's LP failed or stopped). */
+int lpface_scan(const Problem *P, int maxlev, int verbose) {
+    FreePair *pr = NULL; const int npr = free_pairs_detect(P, &pr);
+    int nsdp = 0; for (int k = 0; k < P->nblk; k++) nsdp += P->blk[k].type == BLK_SDP;
+    g_lpface_n = g_lpface_tot = g_lpface_nlp = g_lpface_lev = g_lpface_stop = 0;
+    if (npr == 0 || nsdp == 0 || maxlev == 0) { free(pr); g_lpface_state = 4; return 0; }
+    const double t0 = wtime();
+    const int m = P->m, nb = P->nblk;
+    int **role = calloc(nb, sizeof(int *));   /* per LP block: 0 an ordinary variable, 1 a pair's '+' slot, 2 its '-' slot */
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP) role[k] = calloc((size_t)P->blk[k].n + 1, sizeof(int));
+    for (int f = 0; f < npr; f++) { role[pr[f].blk][pr[f].ip] = 1; role[pr[f].blk][pr[f].im] = 2; }
+    unsigned char **dead = calloc(nb, sizeof(unsigned char *));
+    for (int k = 0; k < nb; k++) dead[k] = calloc((size_t)P->blk[k].n + 1, 1);
+    double c0 = (double)m * m * m / 3.0;
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) c0 += 10.0 * (double)P->blk[k].n * P->blk[k].n * P->blk[k].n;
+    const char *e = getenv("BRISK_LPFACEW"); const double sh = e ? atof(e) : 0.005, budget = sh * 20.0 * c0;
+    double used = 0; long itsum = 0; int st = 0;
+    for (int lev = 1; maxlev < 0 || lev <= maxlev; lev++) {
+        if (lev > 1 && used >= budget) { g_lpface_stop = 2; break; }
+        int nsd = 0, nlp = 0, ntouch = 0; long its = 0; double w = 0;
+        st = lpface_level(P, role, dead, budget - used, &nsd, &nlp, &ntouch, &its, &w, verbose);
+        used += w; itsum += its;
+        if (lev == 1) g_lpface_tot = ntouch;
+        if (st != 0) { g_lpface_stop = st == 6 ? 2 : 3; break; }
+        if (verbose >= 0) printf("presolve: the face behind the free variables (diagnosis), level %d: %d semidefinite indices and %d LP variables exposed (%ld simplex iterations, %.2f s in all)\n",
+                                 lev, nsd, nlp, its, wtime() - t0);
+        if (nsd == 0 && nlp == 0) { g_lpface_stop = 0; break; }
+        g_lpface_n += nsd; g_lpface_nlp += nlp; g_lpface_lev = lev;
+        if (maxlev > 0 && lev == maxlev) g_lpface_stop = 1;
+    }
+    if (st != 0 && verbose >= 0) printf("presolve: the face behind the free variables (diagnosis): the LP of level %d ended with status %d (%.2f s)\n", g_lpface_lev + 1, st, wtime() - t0);
+    g_lpface_state = (g_lpface_lev == 0 && st != 0) ? 3 : 1;
+    for (int k = 0; k < nb; k++) { free(role[k]); free(dead[k]); }
+    free(role); free(dead); free(pr);
+    (void)itsum;
+    return g_lpface_state == 3 ? -1 : g_lpface_n;
 }

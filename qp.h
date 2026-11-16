@@ -100,6 +100,7 @@ int qp_psd_exact(int n, int ne, const int *qi, const int *qj, const double *qv, 
 /* one solve */
 void qp_deadline_enter(const QpOpts *o, const QpProb *P);   /* (1 November 2026) one deadline for a whole solve: the outermost entry sets it */
 void qp_deadline_leave(void);
+const char *qp_getenv(const char *name);    /* getenv for the solver's BRISK_ variables: no scan of the environment inside a solve when it holds none (qp.c) */
 int qp_time_up(void);                       /* 1 when the solve's deadline has passed */
 int qp_input_check(const QpProb *P, char *msg, size_t nmsg);
 long qp_csc_drop_subnormal(int n, int *p, int *ix, double *v);   /* (1 November 2026) entries below 2.2e-308 dropped in place; the count */   /* (1 November 2026) the data checked: 0, or QP_INPUT with the reason */
@@ -107,6 +108,10 @@ int qp_solve(const QpProb *P, const QpOpts *o, QpRes *R);
 int qp_solve_ipm(const QpProb *P, const QpOpts *o, QpRes *R);
 int qp_solve_ipm_dbl(const QpProb *P, const QpOpts *o, QpRes *R);   /* (1 November 2026) the interior-point method after the doubleton presolve, as qp_solve's */
 int qp_as_small(const QpProb *P);   /* the default's size bound for the active-set method (qp.c) */
+/* (14 November 2026) a persistent model's own choice: 1 for the active-set method, its setup weighed against a stream of
+ * solves; *wstep the work a solve may use before the interior-point method takes it over (0: no limit) */
+int qp_as_stream(const QpProb *P, double *wstep);
+int qp_as_dense_small(const QpProb *P);   /* the dense active-set method on every variable is within the default's fixed bound */
 int qp_solve_activeset(const QpProb *P, const QpOpts *o, QpRes *R);
 int qp_solve_activeset_pd(const QpProb *P, const QpOpts *o, QpRes *R);   /* only for H positive definite; else -1, nothing solved */
 /* as qp_solve_activeset_pd, with the iterations limited by a budget of wipm operations (wipm > 0): its setup and each

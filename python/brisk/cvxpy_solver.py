@@ -26,10 +26,17 @@ one of two SDPA forms (form="auto" (default), "image" or "kernel"), as in the Ju
            X_e + G_e w = g_e per entry and A_r x = b_r per Zeros row. An entry that is exactly
            one variable (g_e = 0, one coefficient: what CVXPY makes for X >> 0 on a symmetric
            variable, or x >= 0) CLAIMS that variable: w_j = -X_e / G_ej is substituted and the
-           row dropped. The other variables are free, split pairs in the LP block.
+           row dropped. The other variables are free, split pairs in the LP block. An entry of a
+           semidefinite cone claims before an LP entry (a bound X_ij >= l on a PSD variable is then
+           a row with an LP slack of its own and no cost: BRISK's bound on X's entry), and an LP
+           entry that repeats another's bound on one variable (X >= 0 on a symmetric variable states
+           each off-diagonal bound twice) is no row: its LP slot is unused, its dual 0.
   auto   - counts the rows left after BRISK eliminates the split pairs (one row each):
-           image  n_w - n_zero,  kernel  n_zero + n_entries - n_w, and takes the form with fewer
-           split pairs unless the other has under half its rows (dualize.c's rule).
+           image  n_w - n_zero,  kernel  n_zero + n_entries - n_w (repeated bounds included), and
+           takes the form with fewer split pairs unless the other has under half its rows
+           (dualize.c's rule); but the kernel form when its bounds on entries of PSD variables
+           are at least half of at least 4,000 rows, which BRISK solves by its first-order method
+           with the bounds as a cone (the k-means relaxation with 90 points: 0.13 s against 4.1 s).
 
 Duals (CVXPY: c + A'z = 0, z in K*): z = T'(d o D) with D = BRISK's X (image) or Z (kernel) at
 the entries and d = 2 on off-diagonal entries (the adjoint), except in PSD cones, where CVXPY's
@@ -40,8 +47,9 @@ from BRISK's X ray (image) or its y ray and Z - C (kernel). Statuses: in the ima
 
 Options (solver_opts): any command-line option of ./brisk as a keyword, e.g. acc="high",
 timelimit=60, threads=2, tol=1e-9, fomssn=0; options=[...] for raw strings; form, soc,
-soc_arrow_max as above; conesolver=0 sends a problem without semidefinite cones to the
-semidefinite solver (by default it goes to BRISK's second-order cone solver); write_sdpa="f.dat-s" writes the SDPA file handed to BRISK;
+soc_arrow_max as above; socpsolver=0 sends a problem without semidefinite cones to the
+semidefinite solver (by default it goes to BRISK's SOCP solver); socpfr=1 solves again, on the face of the
+feasible set it shows, a problem without a strictly feasible point (facial reduction; off by default); write_sdpa="f.dat-s" writes the SDPA file handed to BRISK;
 inaccurate_tol (default 1e-4): iteration/time limits, interrupts and numerical difficulties
 give OPTIMAL_INACCURATE when the largest DIMACS error is at most this, else USER_LIMIT /
 SOLVER_ERROR.
@@ -260,10 +268,23 @@ def cone_program_to_sdpa(A, b, c, dims, form="auto", soc="auto", soc_arrow_max=N
         G, g, nw, E = K["G"], K["g"], K["nw"], K["E"]
         cnt = np.diff(G.indptr)
         cand = np.nonzero((cnt == 1) & (g == 0))[0]           # entries that are one variable
+        # (11 November 2026) an entry of a semidefinite cone claims its variable before an LP entry does: a bound on an entry
+        # of a PSD matrix variable (X >= 0) is then a row with an LP slack of its own and no cost, which BRISK takes as a bound
+        # on X's entry; the LP entry claiming it made the semidefinite entry the row and put the variable's cost on the LP side
+        cand = cand[np.argsort(E.blk[cand] == 0, kind="stable")]
         js = G.indices[G.indptr[cand]]
         _, first = np.unique(js, return_index=True)           # each variable claimed once
         K["ce"], K["cj"] = cand[first], js[first]
         K["ca"] = G.data[G.indptr[K["ce"]]]
+        # (11 November 2026) an entry that repeats another's bound on one variable (the same variable, coefficient and
+        # constant; X >= 0 on a symmetric matrix variable states each off-diagonal bound twice) is not a row: its LP slot is
+        # left unused (dual 0) and the first entry carries the bound
+        one = np.nonzero(cnt == 1)[0]
+        keys = np.stack([G.indices[G.indptr[one]].astype(float), G.data[G.indptr[one]], g[one]], axis=1)
+        _, firstk = np.unique(keys, axis=0, return_index=True)
+        rep = np.ones(one.size, bool); rep[firstk] = False
+        rep &= E.blk[one] == 0                                # (LP entries only)
+        K["rep"] = one[rep]
         used = np.zeros(nw, bool)
         used[G.indices] = True
         used[Az.indices] = True
@@ -271,8 +292,15 @@ def cone_program_to_sdpa(A, b, c, dims, form="auto", soc="auto", soc_arrow_max=N
         claimed = np.zeros(nw, bool)
         claimed[K["cj"]] = True
         K["freej"] = np.nonzero(used & ~claimed)[0]
-        K["m"] = nz + E.ne - K["ce"].size                     # rows of (P)
+        K["m"] = nz + E.ne - K["ce"].size - K["rep"].size     # rows of (P)
         K["pairs"] = K["freej"].size
+        # (11 November 2026) the bounds on entries of a semidefinite cone: LP entries that are one variable claimed by a
+        # semidefinite entry, not repeats; BRISK takes them as bounds by its first-order method when they are at least half
+        # its rows and the rows at least 4,000 (main.c)
+        sdpclaim = np.zeros(nw, bool)
+        sdpclaim[K["cj"][E.blk[K["ce"]] != 0]] = True
+        lp1 = one[(E.blk[one] == 0) & ~np.isin(one, K["rep"]) & ~np.isin(one, K["ce"])]
+        K["nbnd"] = int(sdpclaim[G.indices[G.indptr[lp1]]].sum())
 
     if form == "auto":
         I, K = prep("image"), prep("kernel")
@@ -280,8 +308,14 @@ def cone_program_to_sdpa(A, b, c, dims, form="auto", soc="auto", soc_arrow_max=N
         usedI = np.zeros(I["nw"], bool)
         usedI[I["G"].indices] = True
         effI, effK = int(usedI.sum()) - nz, K["m"] - K["pairs"]
-        form = ("image" if 2 * effI < effK else "kernel") if K["pairs"] <= nz else \
-               ("kernel" if 2 * effK < effI else "image")
+        # (11 November 2026) where BRISK will take the kernel form's bounds natively (their rows at least half of at least
+        # 4,000) the kernel form; elsewhere the rule as before, the repeated bounds counted as rows (below that size the
+        # bounds are rows of the interior-point method in the kernel form and diagonal terms in the image form:
+        # theta-plus with 70 vertices, kernel 2,990 rows 1.0 s against image 1,980 rows 0.4 s)
+        route = K["m"] >= 4000 and 2 * K["nbnd"] >= K["m"]
+        effK0 = effK + K["rep"].size
+        form = "kernel" if route else \
+               (("image" if 2 * effI < effK0 else "kernel") if K["pairs"] <= nz else ("kernel" if 2 * effK0 < effI else "image"))
         if K["m"] < 1:
             form = "image"
         S = I if form == "image" else K
@@ -310,6 +344,7 @@ def cone_program_to_sdpa(A, b, c, dims, form="auto", soc="auto", soc_arrow_max=N
     Q = sp.csr_matrix((np.ones(nf), (freej, np.arange(nf))), shape=(nw, nf))
     unc = np.ones(E.ne, bool)
     unc[ce] = False
+    unc[S["rep"]] = False                                     # (repeated bounds: not rows)
     U = np.nonzero(unc)[0]
     GU = G[U]
     Ie = sp.csr_matrix((np.ones(U.size), (np.arange(U.size), U)), shape=(U.size, E.ne))
@@ -451,7 +486,7 @@ class BRISK(ConicSolver):
         P = data.get(s.P)
         if P is not None and sp.csc_matrix(P).nnz > 0:
             # a QP: BRISK's QP solver on  min 1/2 x'Px + c'x,  A x + s = b,  s in {0}^zero x R+^nonneg  (CVXPY's conic form)
-            for k in ("conesolver", "form", "soc", "soc_arrow_max"):
+            for k in ("socpsolver", "conesolver", "form", "soc", "soc_arrow_max"):
                 opts.pop(k, None)
             if bound or wfile:
                 raise SolverError("BRISK: bound and write_sdpa are for problems with cones, not for a QP")
@@ -467,10 +502,12 @@ class BRISK(ConicSolver):
             except RuntimeError as e:
                 raise SolverError(str(e)) from e
             return {"qp": res, "itol": itol}
-        cone = opts.pop("conesolver", 1)
+        cone = opts.pop("socpsolver", None)                # (11 November 2026: the earlier name conesolver still accepted)
+        cone_old = opts.pop("conesolver", None)
+        cone = cone if cone is not None else (cone_old if cone_old is not None else 1)
         if (int(cone) != 0 and not list(dims.psd) and not bound and form == "auto" and soc == "auto"
                 and not wfile and not any(k in opts for k in ("prec", "fom", "mfipm", "lralm"))):
-            # no semidefinite cone: BRISK's second-order cone solver, on the SeDuMi form whose
+            # no semidefinite cone: BRISK's SOCP solver, on the SeDuMi form whose
             # dual is CVXPY's problem (A_s = A', b_s = -c, c_s = b; y = x, x_s = CVXPY's dual)
             A = sp.csc_matrix(data[s.A]).T
             K = dict(f=int(dims.zero), l=int(dims.nonneg), q=[int(k) for k in dims.soc])
@@ -584,7 +621,7 @@ class BRISK(ConicSolver):
         return failure_solution(status, attr)
 
     def _invert_cone(self, solution, inverse_data):
-        """The result of the second-order cone solver (the SeDuMi form's dual is CVXPY's problem)."""
+        """The result of the SOCP solver (the SeDuMi form's dual is CVXPY's problem)."""
         res = solution["cone"]
         attr = {s.SOLVE_TIME: res.time, s.NUM_ITERS: res.iterations,
                 s.EXTRA_STATS: {"status": res.status_str, "dimacs": res.dimacs, "exit_code": res.exit_code,

@@ -401,6 +401,28 @@ bad:
     return -1;
 }
 
+/* 8 November 2026: the problem as it stands, in SDPA sparse form (F0 = -C, F_i = A_i, c = b): for experiments on the
+ * presolved problem (BRISK_WRITEFR, main.c). Semidefinite and LP blocks only; returns 0, or -1 */
+int write_sdpa(const Problem *P, const char *fname) {
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type != BLK_SDP && P->blk[k].type != BLK_LP) return -1;
+    FILE *f = fopen(fname, "w");
+    if (!f) return -1;
+    fprintf(f, "%d\n%d\n", P->m, P->nblk);
+    for (int k = 0; k < P->nblk; k++) fprintf(f, "%d%c", P->blk[k].type == BLK_LP ? -P->blk[k].n : P->blk[k].n, k + 1 < P->nblk ? ' ' : '\n');
+    for (int i = 0; i < P->m; i++) fprintf(f, "%.17g%c", P->b[i], i + 1 < P->m ? ' ' : '\n');
+    for (int k = 0; k < P->nblk; k++) {
+        const SpSym *C = &P->blk[k].C;
+        for (int q = 0; q < C->nnz; q++) fprintf(f, "0 %d %d %d %.17g\n", k + 1, C->row[q] + 1, C->col[q] + 1, -C->val[q]);
+    }
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *A = &B->A[t];
+            for (int q = 0; q < A->nnz; q++) fprintf(f, "%d %d %d %d %.17g\n", B->con[t] + 1, k + 1, A->row[q] + 1, A->col[q] + 1, A->val[q]);
+        }
+    }
+    return fclose(f) == 0 ? 0 : -1;
+}
 int read_sdpa(const char *fname, Problem *P) {
     FILE *f = fopen(fname, "rb");
     if (!f) { fprintf(stderr, "brisk: cannot open %s\n", fname); return -1; }
@@ -939,6 +961,13 @@ fail:
     return -1;
 }
 
+/* 8 November 2026: a near tie goes to the routes: the low-rank route is taken only where it is cheaper by more than a
+ * hundredth. equalG11 (SDPLIB, SDP) took it on a tie (5.17e7 against 5.17e7), and its rounding left the iterations at
+ * 2.1e-8, so the end phases ran: 5.8 s against 2.8 s without. A margin of a fifth, as the dictionary and entry-class
+ * routes have, was measured on the 195 SDP files that take the low-rank route: 156.7 -> 149.7 s but OPTIMAL lost on five
+ * AC-OPF and truss files and won on two (the route's rounding moves ill-posed statuses both ways); the hundredth changes
+ * four files, equalG11 and three graph partitions, no status. BRISK_LRMARGIN=x: the factor (1: a tie wins, as before) */
+static double lr_margin(void) { static double v = -1; if (v < 0) { const char *e = getenv("BRISK_LRMARGIN"); v = e ? atof(e) : 0.99; } return v; }
 /* Decide whether a block should use the low-rank Schur route and build it. */
 static void lowrank_block(Block *B, const Params *par, double cost_now) {
     const int n = B->n, nc = B->ncon;
@@ -1003,7 +1032,7 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
 #define LR_MEM(R_) (8.0 * (double)(R_) * (R_) <= par->dense_mem ? 8.0 * (double)(R_) * (R_) : 16.0 * nd * (double)(R_))
     double mem = LR_MEM(R);
     if (getenv("BRISK_LRDBG")) printf("   [low-rank block: n %d, %d constraints, rank %ld (ok %d): cost %.3g against the routes' %.3g, memory %.3g of %.3g]\n", n, nc, R, ok, cost_lr, cost_now, mem, par->dense_mem);
-    if (ok && (par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) {
+    if (ok && (par->lowrank > 0 || (cost_lr < lr_margin() * cost_now && mem <= par->dense_mem))) {
         lr_rng = rng0;
         long R2 = 0;
         const long used0 = lr_range_used;
@@ -1022,10 +1051,10 @@ static void lowrank_block(Block *B, const Params *par, double cost_now) {
         if (getenv("BRISK_LRDBG")) printf("   [low-rank factors: %ld of %d constraints from the range of their matrix]\n", lr_range_used - used0, nc);
         if (ok && R2 != R) {     /* (the vectors' pass found another rank somewhere: decide again on it) */
             R = R2; cost_lr = cb * (nd * nd * R + nd * (double)R * R) + 0.3 * cs * (double)R * R; mem = LR_MEM(R);
-            if (!(par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) ok = 0;
+            if (!(par->lowrank > 0 || (cost_lr < lr_margin() * cost_now && mem <= par->dense_mem))) ok = 0;
         }
     }
-    if (ok && (par->lowrank > 0 || (cost_lr < cost_now && mem <= par->dense_mem))) {
+    if (ok && (par->lowrank > 0 || (cost_lr < lr_margin() * cost_now && mem <= par->dense_mem))) {
         B->lowrank = 1;
         B->lrR = (int)R;
         B->lr_off = xmalloc(sizeof(int) * (nc + 1));
@@ -1310,6 +1339,18 @@ double analyze_sdp_block(Block *B, const Params *par) {
             cost_now += (cr < c3) ? cr : c3;
         }
     }
+    if (getenv("BRISK_ORDDBG")) {   /* (8 November 2026, diagnosis) the sparse routes' cost in the given order and with the constraints by decreasing entries */
+        double c_given = 0, c_sorted = 0, suf = 0;
+        EfIdx *o = xmalloc(sizeof(EfIdx) * (nc ? nc : 1)); int no = 0;
+        for (int t = nc - 1; t >= 0; t--) { if (B->dpos[t] >= 0) continue; const SpSym *S = &B->A[t]; suf += S->ef;
+            const double c3 = cs * S->ef * suf, cr = cb * S->nr * n2 + cs * ((double)S->ef * n + suf); c_given += cr < c3 ? cr : c3; o[no].ef = S->ef; o[no].t = t; no++; }
+        qsort(o, no, sizeof(EfIdx), cmp_ef_desc);
+        suf = 0;
+        for (int u = no - 1; u >= 0; u--) { const SpSym *S = &B->A[o[u].t]; suf += S->ef;
+            const double c3 = cs * S->ef * suf, cr = cb * S->nr * n2 + cs * ((double)S->ef * n + suf); c_sorted += cr < c3 ? cr : c3; }
+        printf("   [block n %d, %d constraints: the sparse routes %.3g in the given order, %.3g by decreasing entries]\n", n, nc, c_given, c_sorted);
+        free(o);
+    }
     /* dictionary route first (linear-time detection with gates), then low-rank;
      * the cheapest of {current routes, dictionary, low-rank} wins */
     /* 22 October 2026: the analysis's parts timed with BRISK_SETUPT (delay_indep_n32, a control LMI: 0.57 s of 0.86 s here) */
@@ -1329,6 +1370,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
         } else cost_dict = c_lrd;
     }
     if (setupt) { ts_lrd = wtime() - ts0; ts0 = wtime(); }
+    if (getenv("BRISK_ORDDBG")) printf("   [block n %d, %d constraints: routes %.3g, dictionary %.3g (%s)]\n", n, nc, cost_now, cost_dict, B->vb ? "built" : "none");
     if (!(B->vb && par->dict > 0)) lowrank_block(B, par, fmin(cost_now, cost_dict));
     if (setupt) { ts_lr = wtime() - ts0; ts0 = wtime(); }
     if (B->lowrank) dict_free(B);
@@ -1367,18 +1409,39 @@ double analyze_sdp_block(Block *B, const Params *par) {
         const double fsz = (double)n * B->lrR;
         if (2.0 * fsz <= ent && 8.0 * fsz <= 2.6e8) {
             const double ftol = 32.0 * 1.1102230246251565e-16;
-            int okf = 1;
-            for (int t = 0; t < nc && okf; t++) {
+            int okf = 1; double wr = 0, wrn = 0, wrp = 0; const int lrdbg = getenv("BRISK_LRDBG") != NULL;
+            /* (test, 9 November 2026: BRISK_LRNORM=1 measures the error against the constraint's Frobenius norm, the scale of
+             * a backward-stable factorization and of the rounding of the products through the entries) */
+            static int lrnorm = -1; if (lrnorm < 0) { const char *e = getenv("BRISK_LRNORM"); lrnorm = e && atoi(e) != 0; }
+            for (int t = 0; t < nc && (okf || lrdbg); t++) {
                 const SpSym *S = &B->A[t];
-                double amax = 0, emax = 0;
+                double amax = 0, emax = 0, fn = 0, en = 0;
+                for (int q = 0; q < S->ef; q++) fn += S->fv[q] * S->fv[q];
+                fn = sqrt(fn);
                 for (int q = 0; q < S->ef; q++) {
                     double v = 0;
                     for (int k = B->lr_off[t]; k < B->lr_off[t + 1]; k++) v += B->lr_sig[k] * B->lr_W[S->fr[q] + (size_t)k * n] * B->lr_W[S->fc[q] + (size_t)k * n];
                     amax = fmax(amax, fabs(S->fv[q])); emax = fmax(emax, fabs(v - S->fv[q]));
+                    en += (v - S->fv[q]) * (v - S->fv[q]);
                 }
-                if (emax > ftol * amax) okf = 0;
+                /* 9 November 2026: or the factors' error within the rounding of the products through the entries: the inner
+                 * product <A_t, X> summed over its ef entries in double has an error of about sqrt(ef) u |A_t|_F |X|_F (the
+                 * probabilistic bound of Higham and Mary, SIAM J. Sci. Comput. 41 (2019) A2815), the factors' error at most
+                 * |E_t|_F |X|_F: within 32 times that scale, as the entrywise test allows 32 u. Dense constraints of order
+                 * 160 factored by an eigendecomposition miss their small entries by about 600 u of the largest while
+                 * |E_t|_F is 3.2 sqrt(ef) u |A_t|_F (an outside tester's dependent_measurements, SDP; with the operators
+                 * through the factors 17.0 -> 4.3 s, the errors on the data as read as good). BRISK_LRFRO=0: the entrywise
+                 * test alone */
+                static int lrfro = -1; if (lrfro < 0) { const char *e = getenv("BRISK_LRFRO"); lrfro = !(e && atoi(e) == 0); }
+                const int ok_ent = emax <= ftol * (lrnorm ? fn : amax);
+                const int ok_fro = lrfro && sqrt(en) <= 32.0 * sqrt((double)S->ef) * 1.1102230246251565e-16 * fn;
+                if (!ok_ent && !ok_fro) okf = 0;
+                if (amax > 0) wr = fmax(wr, emax / amax);
+                if (fn > 0) wrn = fmax(wrn, emax / fn);
+                if (fn > 0) wrp = fmax(wrp, sqrt(en) / (sqrt((double)S->ef) * 1.1102230246251565e-16 * fn));
             }
-            B->lrop = okf;
+            if (lrdbg) printf("   [low-rank block: the factors' largest error relative to a constraint's largest entry %.2e, to its Frobenius norm %.2e (the limit 32 u = %.1e); |E|_F / (sqrt(entries) u |A|_F) %.3g]\n", wr, wrn, ftol, wrp);
+            B->lrop = okf || getenv("BRISK_LROPFORCE") != NULL;   /* (BRISK_LROPFORCE: a test of the operators through the factors) */
             if (getenv("BRISK_LRDBG")) printf("   [low-rank block: the operators through the factors: %s]\n", okf ? "yes" : "no (a factor misses its entries)");
         }
     }
@@ -1397,12 +1460,44 @@ double analyze_sdp_block(Block *B, const Params *par) {
          * dense constraint has a factor that gives its entries back to 32 u of the largest */
         int *rk = xcalloc(nc, sizeof(int)); double **Ws = xcalloc(nc, sizeof(double *)), **Ss = xcalloc(nc, sizeof(double *));
         int okf = 1; long Rd = 0;
+        /* 9 November 2026: the factors first on the threads by the shared-direction routine (its exact rank-one test, then
+         * a range from fixed directions drawn here by their own generator, not the stream of lr_rand), each constraint's
+         * own: an outside tester's quantum_tomography (SDP, 900 dense constraints of order 300) spent 2.5 s here one
+         * constraint after another. A constraint the routine leaves without a factor of rank 1 to 8 goes to the serial
+         * routine below as before. BRISK_DFACPAR=0: the serial routine for every constraint */
+        static int dfpar = -1; if (dfpar < 0) { const char *e = getenv("BRISK_DFACPAR"); dfpar = !(e && atoi(e) == 0); }
+        int *rpre = NULL;
+        if (dfpar && nd >= 16) {
+            const int KM = 8 < n ? 8 : n;
+            double *Om = xmalloc(sizeof(double) * (size_t)n * KM), *Zv = xmalloc(sizeof(double) * (size_t)n * 2);
+            unsigned long long sm = 0x9e3779b97f4a7c15ULL ^ (unsigned long long)n;
+            for (size_t i = 0; i < (size_t)n * (KM + 2); i++) {   /* (splitmix64, uniform in [-1, 1)) */
+                unsigned long long z = (sm += 0x9e3779b97f4a7c15ULL); z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL; z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL; z ^= z >> 31;
+                const double u = (double)(z >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0;
+                if (i < (size_t)n * KM) Om[i] = u; else Zv[i - (size_t)n * KM] = u;
+            }
+            rpre = xcalloc(nc, sizeof(int));
+#ifdef _OPENMP
+            const int dpar = omp_get_max_threads() > 1 && !omp_in_parallel();
+#else
+            const int dpar = 0;
+#endif
+            #pragma omp parallel for schedule(dynamic, 4) if (dpar)
+            for (int t = 0; t < nc; t++) {
+                if (B->dpos[t] < 0) continue;
+                double *W = NULL, *sg = NULL;
+                const int r = lowrank_factor_mm(&B->A[t], n, 8, Om, KM, Zv, &W, &sg, -1);
+                if (r >= 1 && r <= 8) { if (r == 1) rank1_exact(&B->A[t], n, W, sg); Ws[t] = W; Ss[t] = sg; rpre[t] = r; }
+                else { free(W); free(sg); }
+            }
+            free(Om); free(Zv);
+        }
         for (int t = 0; t < nc && okf; t++) {
             if (B->dpos[t] < 0) continue;
             const SpSym *S = &B->A[t];
-            const int r = lowrank_factor(S, n, 8, &Ws[t], &Ss[t], -1);
+            const int r = rpre && rpre[t] ? rpre[t] : lowrank_factor(S, n, 8, &Ws[t], &Ss[t], -1);
             if (r <= 0 || r > 8) { okf = 0; break; }
-            if (r == 1) rank1_exact(S, n, Ws[t], Ss[t]);
+            if (r == 1 && !(rpre && rpre[t])) rank1_exact(S, n, Ws[t], Ss[t]);   /* (done on the threads above) */
             double amax = 0, emax = 0;
             for (int q = 0; q < S->ef; q++) {
                 double v = 0;
@@ -1419,6 +1514,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
             if (emax > ftol * amax) okf = 0;
             rk[t] = r; Rd += r;
         }
+        free(rpre);
         if (getenv("BRISK_LRDBG")) printf("   [low-rank dictionary: the operators through the factors: %s (%d dense constraints)]\n", okf ? "yes" : "no", nd);
         if (okf) {
             B->dfac = 1;
@@ -1477,8 +1573,17 @@ double analyze_sdp_block(Block *B, const Params *par) {
     }
 
     /* flattened full entries of sparse constraints */
+    /* 10 November 2026: not formed for a block whose operators go through its low-rank factors (`lrop`): their readers are
+     * the operators' entry loops (after the factor route, which returns first), the row-product routes of the Schur assembly
+     * (a low-rank block is assembled by schur_lowrank), the sparse-Z route (not on a low-rank block) and the live-region and
+     * upper-part structures below (built only from fe > 0). The monomial and Weyl routes, which precede the low-rank one in the
+     * assembly, need every constraint of one entry a column: a constraint with more entries than n excludes them. An outside
+     * tester's dependent_measurements (SDP, 765 dense constraints of order 255): 1.9 s of copies over 50 million entries.
+     * BRISK_FLATALL=1: formed as before */
+    int noflat = B->lowrank && B->lrop && !ENV_ON("BRISK_FLATALL");
+    if (noflat) { int big = 0; for (int a = 0; a < B->ns && !big; a++) if (B->A[B->slist[a]].ef > n) big = 1; noflat = big; }
     size_t fe = 0;
-    for (int a = 0; a < B->ns; a++) fe += B->A[B->slist[a]].ef;
+    if (!noflat) for (int a = 0; a < B->ns; a++) fe += B->A[B->slist[a]].ef;
     B->foff = xmalloc(sizeof(int) * (B->ns + 1));
     B->ffr = xmalloc(sizeof(int) * (fe ? fe : 1));
     B->ffc = xmalloc(sizeof(int) * (fe ? fe : 1));
@@ -1487,6 +1592,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
     for (int a = 0; a < B->ns; a++) {
         const SpSym *S = &B->A[B->slist[a]];
         B->foff[a] = (int)fe;
+        if (noflat) continue;
         memcpy(B->ffr + fe, S->fr, sizeof(int) * S->ef);
         memcpy(B->ffc + fe, S->fc, sizeof(int) * S->ef);
         memcpy(B->ffv + fe, S->fv, sizeof(double) * S->ef);
@@ -1498,7 +1604,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
     /* 4.23: the stored entries flattened the same way (blk_Aop: contiguous loads, and the
      * summation order of the per-constraint loop, so its rounding is unchanged) */
     size_t le = 0;
-    for (int a = 0; a < B->ns; a++) le += B->A[B->slist[a]].nnz;
+    if (!noflat) for (int a = 0; a < B->ns; a++) le += B->A[B->slist[a]].nnz;
     B->lfoff = xmalloc(sizeof(int) * (B->ns + 1));
     B->lfr = xmalloc(sizeof(int) * (le ? le : 1));
     B->lfc = xmalloc(sizeof(int) * (le ? le : 1));
@@ -1507,6 +1613,7 @@ double analyze_sdp_block(Block *B, const Params *par) {
     for (int a = 0; a < B->ns; a++) {
         const SpSym *S = &B->A[B->slist[a]];
         B->lfoff[a] = (int)le;
+        if (noflat) continue;
         memcpy(B->lfr + le, S->row, sizeof(int) * S->nnz);
         memcpy(B->lfc + le, S->col, sizeof(int) * S->nnz);
         memcpy(B->lfv + le, S->val, sizeof(double) * S->nnz);

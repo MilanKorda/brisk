@@ -128,7 +128,7 @@ end
     r = Brisk.solve_sedumi(reshape(vec([1.0 0 0; 0 1 0; 0 0 1]), 1, 9), [1.0], vec(M), (s = [3],); output = :silent)
     @test r.primal_objective ≈ 2 - sqrt(2) atol = 1e-6
     @test_throws DimensionMismatch Brisk.solve_sedumi(A, [1.0, 1.0], [1.0, 2, 3, 4], (l = 3,); output = :silent)
-    # JuMP: second-order and rotated cones go to the cone solver; conesolver = 0: the semidefinite solver
+    # JuMP: second-order and rotated cones go to the SOCP solver; socpsolver = 0: the semidefinite solver
     n = 12
     M = [sin(i * j) for i in 1:20, j in 1:n]; d = [cos(3i) for i in 1:20]
     model = Model(Brisk.Optimizer); set_silent(model)
@@ -146,7 +146,7 @@ end
     v1 = objective_value(model); x1 = value.(x); d5 = dual(c5); d1 = dual(c1)
     @test value(t) ≈ norm(M * x1 - d) atol = 1e-6
     @test norm(x1[1:5]) <= 1 + 1e-7 && sum(abs2, x1[6:10]) <= 4 + 1e-7
-    set_attribute(model, "conesolver", 0); optimize!(model)
+    set_attribute(model, "socpsolver", 0); optimize!(model)
     @test termination_status(model) in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL)
     @test objective_value(model) ≈ v1 atol = 1e-6
     @test dual(c5) ≈ d5 atol = 1e-4
@@ -527,6 +527,8 @@ end
     @test_throws ArgumentError Brisk.solve!(mdl)
     mdl = Brisk.QpModel(H, c, A, [10.0], nothing, lb, ub; c0 = -100, qpipm = true)
     @test isapprox(Brisk.solve!(mdl).objective, -99.96; atol = 1e-6)
+    mdl = Brisk.QpModel(H, c, A, [10.0], nothing, lb, ub; c0 = -100, qpas = true)      # (the method asked for; by default the model chooses)
+    @test isapprox(Brisk.solve!(mdl).objective, -99.96; atol = 1e-7)
     @test_throws ArgumentError Brisk.QpModel(H, c, A, [10.0], nothing, lb, ub; nosuchoption = 1, output = :silent)
     # a file of each kind by its own reader
     ex = joinpath(@__DIR__, "..", "..", "..", "examples")
@@ -534,6 +536,27 @@ end
     @test rf isa Brisk.QpResult && rf.status == 0 && isapprox(rf.objective, -99.96; atol = 1e-7) && isapprox(rf.x, [2, 0]; atol = 1e-7)
     rs = Brisk.solve_file(joinpath(ex, "theta1.dat-s"); output = :silent)
     @test rs isa Brisk.Result && rs.status == 0
+end
+
+@testset "LP without JuMP" begin
+    # min -x1 - 2 x2 + 10  s.t.  x1 + x2 <= 4,  x1 + 3 x2 <= 6,  -1 <= x1 - x2 <= 3,  0 <= x1 <= 3,  x2 >= 0:  x = (3, 1), 5
+    c, A = [-1.0, -2.0], [1.0 1; 1 3; 1 -1]
+    l, u, lb, ub = [-Inf, -Inf, -1], [4.0, 6, 3], [0.0, 0], [3.0, Inf]
+    r = Brisk.solve_lp(c, A, l, u, lb, ub; c0 = 10, output = :silent, threads = 1)
+    @test r isa Brisk.LpResult && r.status == 0 && isapprox(r.objective, 5; atol = 1e-9) && isapprox(r.x, [3, 1]; atol = 1e-9)
+    # the dual simplex method: exact duals, z = c - A'y, y <= 0 at the upper sides, the dual value equal to the optimum
+    rd = Brisk.solve_lp(c, Brisk.SparseArrays.sparse(A), l, u, lb, ub; output = :silent, threads = 1, lpmethod = 2)
+    @test rd.y !== nothing && rd.z !== nothing && isapprox(rd.z, c - A' * rd.y; atol = 1e-12)
+    @test all(rd.y .<= 1e-9) && abs(rd.y[3]) <= 1e-9 && isapprox(4rd.y[1] + 6rd.y[2] + 3rd.z[1], -5; atol = 1e-9)
+    for m in 1:5
+        rm = Brisk.solve_lp(c, A, l, u, lb, ub; output = :silent, threads = 1, lpmethod = m)
+        @test rm.status == 0 && isapprox(rm.objective, -5; atol = 1e-7) && isapprox(rm.x, [3, 1]; atol = 1e-6)
+    end
+    # infeasible, unbounded, bad data
+    @test Brisk.solve_lp([1.0], [1.0;;], [2.0], nothing, [0.0], [1.0]; output = :silent).status == 1
+    @test Brisk.solve_lp([-1.0, 0], [1.0 -1], nothing, [1.0], [0.0, 0]; output = :silent).status == 2
+    @test_throws Brisk.BriskError Brisk.solve_lp([NaN, -2.0], A, l, u, lb, ub; output = :silent)
+    @test_throws DimensionMismatch Brisk.solve_lp(c, A, [1.0], u; output = :silent)
 end
 
 if get(ENV, "BRISK_TEST_MOI", "1") != "0"

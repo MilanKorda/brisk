@@ -9,12 +9,12 @@
     import cvxpy as cp
     prob.solve(solver=brisk.BRISK(), acc="high")      # needs cvxpy >= 1.9
 """
-from ._core import (STATUS, ConeResult, QpModel, QpResult, Result, SocpModel, certify, hp_solution, interrupt, library_path, load_library, options_to_argv,
-                    set_interruptible, solve_file, solve_qp, solve_sdpa, solve_sedumi, version, write_sdpa)
+from ._core import (STATUS, ConeResult, LpResult, QpModel, QpResult, Result, SocpModel, certify, hp_solution, interrupt, library_path, load_library, options_to_argv,
+                    set_interruptible, solve_file, solve_lp, solve_qp, solve_sdpa, solve_sedumi, solve_socp, version, write_sdpa)
 
-__version__ = "1.6.5"
-__all__ = ["STATUS", "ConeResult", "QpModel", "QpResult", "Result", "SocpModel", "certify", "hp_solution", "interrupt", "set_interruptible", "library_path", "load_library", "options_to_argv", "solve_file",
-           "solve_qp", "solve_sdpa", "solve_sedumi", "version", "write_sdpa", "BRISK", "BRISK_QP"]
+__version__ = "1.7"
+__all__ = ["STATUS", "ConeResult", "LpResult", "QpModel", "QpResult", "Result", "SocpModel", "certify", "hp_solution", "interrupt", "set_interruptible", "library_path", "load_library", "options_to_argv", "solve_file",
+           "solve_lp", "solve_qp", "solve_sdpa", "solve_sedumi", "solve_socp", "version", "write_sdpa", "BRISK", "BRISK_QP"]
 
 
 def __getattr__(name):              # cvxpy is optional: imported on first use of brisk.BRISK

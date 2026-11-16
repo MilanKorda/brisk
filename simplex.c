@@ -22,6 +22,7 @@
 #include "socp.h"
 #include "amd/amd.h"
 #include <math.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,16 @@ void sx_env_refresh(void);
                                supportcase19 from an optimal crossover basis no longer runs the primal method for 11,700
                                iterations to tighten 2.3e-9 (unsolved in 300 s -> 47 s at four threads) */
 /* (BRISK_SXTARGET: an experiment; read by sx_setup into env_target) */
+/* (7 November 2026, the owner's decision; ISSUES 843) BRISK_LPGRBTOL=1 (lpsolve.h): Gurobi's stopping criteria. The primal
+ * and dual tolerances 1e-6, absolute, on the scaled problem the method works on (FeasibilityTol, OptimalityTol); the final
+ * rounds after the perturbations and shifts are removed check the same tolerances on the same scaled problem (they serve
+ * the postsolve; no tighter target on the problem before the scaling); the postsolved basic solution is taken when it is
+ * optimal on the problem as read within 1e-6 (sx_direct); one check on the problem as read keeps a plainly wrong result
+ * from being reported optimal (SX_SANITY, simplex_solve) */
+#define SX_GRB_TOL 1e-6
+#define SX_SANITY 1e-3
+#define SX_PSCALE_REL 1e-7  /* (11 November 2026) the primal simplex method's scaling: entries below this fraction of the largest of their row and of their column are left out of the geometric passes (the feasibility tolerance's level) */
+#define SX_SCALE_REL 1e-9   /* (BRISK_LPGRBTOL bit 8: the scaling's geometric passes leave out entries below this fraction of their row's or column's largest; the level tiny_keep drops such entries at, where it may) */
 
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); } return p; }
 static void *xcalloc(size_t n, size_t s) { void *p = calloc(n ? n : 1, s ? s : 1); if (!p) { fprintf(stderr, "brisk: out of memory (simplex)\n"); exit(1); } return p; }
@@ -73,14 +84,32 @@ static double sx_tleft(const SimplexOpts *o, double t0) {
 
 /* an indexed max-heap over 0..cap-1: keys > 0 are in it; ties go to the lower index (the choice is the same as a
  * scan's that takes the first largest) */
+/* (12 November 2026, a diagnostic: BRISK_SXENTDBG=1, log_line) */
+static int g_entdbg = -1; static int g_priceunsc = -1; static int g_dsefull = -1; static int g_dserows = -1; static int g_wlb = -1;   /* (12-13 November 2026, BRISK_SXWLB: an experiment, the weights' update bounded below by (alpha_i / alpha_r)^2 w_r) */   /* (BRISK_SXPRICEUNSC, BRISK_SXDSEFULL: below) */   /* (BRISK_SXPRICEUNSC, below) */ static long g_ent_long, g_ent_long_d0, g_leave_long, g_ent_all;
 typedef struct { int *h, *pos, n; double *key; } SxHeap;
 /* (4 November 2026) the primal method from the start basis prices by steepest edge (BRISK_SXPSE=1) or by Devex (=0) */
 struct SxBp { double t; int e; };     /* (a breakpoint of phase 1's ratio test: its step, its entry) */
+static int cmp_bp(const void *a, const void *b);
 #ifndef PH1LONG_DEFAULT
 #define PH1LONG_DEFAULT 0
 #endif
+/* (5 November 2026, ISSUES 839) the primal method from the start basis: the ratio test's stability test (BRISK_SXPRT, the
+ * threshold relative to the column's largest entry; 0: off; recommended 1e-6), the end of phase 2 at a basis seen at the
+ * last verification (BRISK_SXPCYC; recommended 1), the step back to the last good basis when a factorization changes the
+ * basic values by more than this many times their scale (BRISK_SXPBACKREL; 0: off; recommended 1) */
+#ifndef PRT_DEFAULT
+#define PRT_DEFAULT 1e-6   /* (5 November 2026: on, momentum2, LP, solved on 13 of 13 random sequences with either pricing; neutral in time on 40 LPs) */
+#endif
+#ifndef PCYC_DEFAULT
+#define PCYC_DEFAULT 1
+#endif
+#ifndef PBACKREL_DEFAULT
+#define PBACKREL_DEFAULT 1.0
+#endif
 #ifndef PSE_DEFAULT
-#define PSE_DEFAULT 0   /* (4 November 2026) off: on 34 LPs 0.68 of the iterations but 1.05 of the time, minutedispatchstrategy 3.9 times slower, and momentum2 (LP) failing at the default random sequence (ISSUES 839); BRISK_SXPSE=1: on */
+#define SX_PSE_MAXROWS 10000
+#define SX_PSE_MINROWNZ 5.0
+#define PSE_DEFAULT 2   /* (10 November 2026) by the problem's size (BRISK_SXPSE=2, below; 0 Devex, 1 steepest edge always): the primal method alone, 4 threads, 67 LPs 0.798, the 53 where it acts 0.754 (the outside benchmark's production, network, workforce and diet LPs 0.61-0.79); slower: near-parallel LPs of 7,000 rows 1.30 and 1.53 (a longer path), co-100 1.21, neos-4647030-tutaki 1.09. Until then 0 (Devex): (4 November 2026) off: on 34 LPs 0.68 of the iterations but 1.05 of the time, minutedispatchstrategy 3.9 times slower, and momentum2 (LP) failing at the default random sequence (ISSUES 839); BRISK_SXPSE=1: on */
 #endif
 #define SX_PC_K 128          /* the primal method's candidate list: its length after a scan (pheap_rebuild) */
 static void hp_init(SxHeap *H, int cap) { H->h = malloc(sizeof(int) * (cap + 1)); H->pos = malloc(sizeof(int) * (cap + 1)); H->key = malloc(sizeof(double) * (cap + 1)); H->n = 0; for (int i = 0; i < cap; i++) H->pos[i] = -1; }
@@ -125,6 +154,7 @@ typedef struct {
     double *cscale, *rscale;           /* x = cscale * x_s; row i scaled by rscale_i */
     double *icscale, *irscale;         /* (27 October 2026) their inverses (the factors are powers of two: the same bits as a division) */
     double *pert_u, pert_bigc; int pert_u_ok;     /* (27 October 2026, the re-solves) each column's perturbation factor, kept while the costs stay */
+    int nbox_given, nbox_given_ok;     /* (11 November 2026) the boxed variables counted by sxm_solve's pass over the bounds, for its next perturb_first (ok: given) */
     double *lo0, *up0, *cost0;         /* the scaled problem's bounds and costs (N) */
     double *lo, *up, *cost;            /* working bounds and costs (phase 1 boxes, perturbation, shifts) */
     double *shift;                     /* the cost shift of each variable (removed when it leaves the basis) */
@@ -138,15 +168,29 @@ typedef struct {
     double *x;                         /* values of all variables */
     double *d;                         /* reduced costs (0 for basic) */
     double *w;                         /* dual steepest-edge weights (by position) */
+    int *dsnz; long *dsst;            /* (13 November 2026, BRISK_SXDEGSPARSE=2) each variable's |B^-1 a_j| as last solved and the factorization it was solved on */
+    int *ds_el, ds_nel, ds_elcap;      /* (13 November 2026) the qualifying members of the last group (for BRISK_SXDEGCHECK) */
+    int ds_scratch;   /* (13 November 2026) the dual simplex method of a solve from the logicals' basis (not from a given basis, the crossover, the re-solves of sxm_solve, the clean-up rounds): where the sparsest-member rule acts */
+    int ds_tq; double ds_tst; long ds_nsh; double ds_shmax;   /* (13 November 2026, BRISK_SXDEGSHIFT) the rule's member and the dual step it takes; the shifts made and the largest */
+    long ds_grp, ds_chg, ds_solve, ds_hit, ds_memb, ds_oob, ds_oob0, ds_cr0, ds_stsm, ds_stlg, ds_inc, ds_shref; double ds_t, ds_ar, ds_strat;   /* (13 November 2026, the sparsest-member rule's cost at -v 2: groups examined, entering
+                                        * choices changed, fresh solves, counts taken from the cache, eligible members, time) */
+    long dc_n, dc_ag[8], dc_near[8], dc_sol[8]; double dc_lr[8]; int *dc_nz[3]; long *dc_it[3];   /* (13 November 2026, a diagnostic: BRISK_SXDEGCHECK=1, the estimates' agreement with the exact counts) */
     char *wk; int wlazy; SxVec wv;     /* (27 October 2026, the option BRISK_SXMLAZYW=1) whether a weight is known (exact up to
                                         * the updates); with wlazy, a candidate's unknown weight is computed when it comes
                                         * to the top of the leaving rows' heap (chuzr), in wv */
     double *dvx;                       /* Devex weights (by variable) */
+    long cut_skip;                     /* (7 November 2026) after a cutoff claim the returned duals did not prove: no check before this iteration */
     int *gb_basic, *gb_pos; signed char *gb_move; double *gb_x, *gb_lo, *gb_up; int gb_ok, nback;   /* (4 November 2026) the primal method's last good basis (ISSUES 839) */
+    double prt, prt_tol; long n_prt, n_prtfail, n_prtshift; int *prt_list, prt_n;   /* (5 November 2026, ISSUES 839) the primal ratio test's stability test (BRISK_SXPRT, BRISK_SXPRTTOL): its threshold and tolerance, its counts, phase 1's list of the rows it relaxed */
+    double *px_old, pback_rel; int pcyc_on; unsigned long long vhash; long n_pcyc;   /* (5 November 2026) the basic values before a factorization, the change that counts as a basis that lost its conditioning (BRISK_SXPBACKREL); the end of phase 2 at a basis seen at the last verification (BRISK_SXPCYC) */
+    double pv_minrel; int pv_nsmall, pv_n; double fl_pse, fl_prod, t_prod, n_alpha, n_row;   /* (statistics: the pivots' sizes relative to their column's largest (SXDBG=2), the steepest-edge pricing's work) */
     unsigned char *dvref; int dvx2, dvbad, pstab, nptrouble;   /* (27 October 2026; by default since 28 October, BRISK_SXDEVEX2=0: off) the reference framework of the Devex weights, the rule on its resets, the weights found too large since the last */
     int pse, pse_on, pse_route; long npar_pse;   /* (4 November 2026) the primal method's steepest-edge pricing: chosen (BRISK_SXPSE), in use, allowed in this call (the primal method from the start basis); its solves beside the row's */
     SxVec pv, row2; double dens_pv, t_pse;       /* (its solve B^{-T} alpha_q, the products a_j' v, the solve's density and time) */
-    int ph1long; double *bp_r, *bp_t; int *bp_i; struct SxBp *bp_o; long n_ph1pass;   /* (4 November 2026, BRISK_SXPH1LONG) phase 1's ratio test past the points where infeasible variables become feasible: its lists; the points passed */
+    long iter_rdbg0;
+    int dsefull_init;
+    long n_dvxreset;                   /* (SXDUALDEVEX=2: the reference framework's resets) */                  /* (BRISK_SXDSEFULL: the starting weights set) */                   /* (a diagnostic, BRISK_SXROWDBG: the iteration at which to print, 0 at the set-up) */
+    int ph1long, ph1flat; long n_ph1flat; double *bp_r, *bp_t; int *bp_i; struct SxBp *bp_o; long n_ph1pass;   /* (4 November 2026, BRISK_SXPH1LONG) phase 1's ratio test past the points where infeasible variables become feasible: its lists; the points passed */
     double tolp, told;
     double cpiv;                /* the dual ratio test's pivot tolerance (0: 1e-7; 1e-9 for the second test of an infeasibility claim) */
     int nfkretry, nfkfail;      /* infeasibility claims not proved: the second ratio test found a column / none (status 4) */
@@ -162,11 +206,13 @@ typedef struct {
     int taupart;                       /* the weights' solve may be restricted to the entering column's nonzeros (ftran2; 2: always) */
     double tw_part, tw_full;           /* the work of the weights' restricted and full solves lately (ftran2) */
     long tw_last, n_taupart, n_taufull; /* the last trial of the solve not chosen; the counts of each (ftran2) */
+    double dbg_wcol, dbg_wtau, dbg_ncol;    /* (a diagnostic, BRISK_SXFTDBG: the entering columns' solves' work and the weights' solves') */
     int price_dense_div;               /* the pricing by rows accumulates densely past N / this many entries (8; BRISK_SXPRICEDIV: an experiment) */
     int *out;
     /* the leaving-row candidates: an indexed max-heap of the rows with a primal infeasibility, keyed by
      * infeasibility^2 / weight (ties: the lower row index), updated for the rows an iteration changes */
     int *heap, *hpos, nheap; double *hkey;
+    int *rrank;                        /* (14 November 2026, BRISK_SXRANKTIE=1) each basis position's rank in the rows' reverse Cuthill-McKee order: the pricing's ties by it */
     int heap_ok;
     char *inI; int *Ilist, nI, Ifull;  /* the rows that may be primal infeasible (a superset; Ifull: unknown, all rows) */
     /* candidates of the ratio test */
@@ -193,6 +239,7 @@ typedef struct {
     long maxit;
     int verbose, dbg;
     double work, workbudget;           /* entries touched by solves, pricing and factorizations (deterministic); a limit */
+    long pg_it; double pg_work; int pg_ninf, pg_ext;   /* (13 November 2026, BRISK_LPAUTOPROG) the last progress snapshot, the extensions made */
     double (*budget_cb)(void *, double); void *budget_ctx;   /* called when the work passes the budget: a new one */
     int nthreads; long npar_ftran; SxWs ws2;   /* the threads; the solves run in parallel; the second solve's workspace */
     const volatile int *threads; int cur_threads;   /* (the race) the threads allowed now, and those set */
@@ -203,6 +250,19 @@ typedef struct {
     int perturbed, shifted;
     double pert_base; int pert_level, pert_pending; long zw_it, zw_zero, nrepert;   /* the perturbation's base; its escalations on stalling */
     int lazy_pert;                     /* (the re-solves: the costs perturbed at the first stall, not at the start) */
+    int xo_pert_tol;                   /* (13 November 2026, BRISK_SXXOPERTTOL=1) the crossover's dual method: its perturbation below the dual tolerance */
+    int lazy_main;                     /* (13 November 2026) lazy_pert set by BRISK_SXLAZYPERT for a whole solve, not by a re-solve */
+    int xo_deg_only;                   /* (BRISK_SXXODEG=1: the rule nowhere else in that solve's process) */
+    /* (14 November 2026, a test: BRISK_SXVFAC=P; bench/lp_r16/uccase7b) a factor on the leaving row's merit kept per basic variable: every P
+     * iterations each structural column that became basic since the previous time and lies outside its bounds gets the factor
+     * max(1, c sqrt(its entries)) (c BRISK_SXVFACC, 0.5), kept until it enters again; Gurobi's default dual pricing on uccase7 (LP) favours
+     * such columns' rows so, and its long columns leave within a few dozen iterations (an agent's replay of its path) */
+    double *vfac; long *vent; long vf_last; int vf_p; double vf_c;
+    int *vden; int vf_d;               /* (BRISK_SXVFACD=1: only a column whose entering solve was denser than the running average) */
+    unsigned char *vonce; int vf_once;  /* (BRISK_SXVFACONCE=1: the factor at most once a column in a solve) */
+    int xo_deg;                        /* (14 November 2026, BRISK_SXXODEG=1) the crossover's dual method: the sparsest-member rule once its costs are perturbed */
+    long n_tr_rowcol, n_tr_jump, n_tr_lost;   /* (11 November 2026) the primal method's numerical troubles by kind, for its log */
+    int scale_prim;                    /* (11 November 2026) the primal simplex method's solve: the scaling leaves out the entries small in their row and their column */
     long nchk;                         /* passes through check_stop (the clock read every 16th) */
     long xo_dnoblock;                  /* the crossover's dual pushes that changed no basis (a measurement) */
     SimplexProgress *prog; long prog_base;   /* (4 November 2026) the race's log (simplex.h) */
@@ -227,7 +287,16 @@ typedef struct {
     double env_refac_w, env_target; int env_noshiftback, env_nostall;
     long ntiny;                        /* entries dropped by sx_setup as too small to matter */
     int fg_n;                          /* (chuzc_dual) the size of the final group of the last ratio test */
-    int env_grp, env_grpflip; double env_grprel;   /* (final_group: BRISK_SXGRP, BRISK_SXGRPFLIP, BRISK_SXGRPREL) */
+    double env_grpbf;   /* (final_group_bf: BRISK_SXGRPBF, the pivot threshold gamma; 0.1 by default; 0: off) */
+    /* (7 November 2026, the MIP developer's idea; BRISK_SXINTPREF=gamma, off by default) the integer columns of a mixed-integer
+     * program's relaxation (sxm_set_integer: n flags, NULL when none were given, as for an LP read from a file), and the
+     * preference of the dual ratio test: among the members of its final group (the candidates within the Harris bound,
+     * any of which keeps every reduced cost within the dual tolerance) whose |alpha| is at least gamma times the group's
+     * largest, a row logical or a continuous column enters rather than an integer column (int_pref_pick) */
+    const signed char *isint; double env_intpref; long n_intpref, n_ent_int, n_ent_oth, n_ip_small, n_ip_none;
+    long env_stopit;                   /* (experiments, BRISK_SXSTOPIT) the dual simplex method stopped after this many iterations */
+    FILE *trace;                       /* (experiments, BRISK_SXTRACE) one line per dual iteration */
+    int trace_nf, trace_fl[512];        /* the iteration's bound flips (the first 16) */
 } Sx;
 
 static double urand(Sx *S) { S->rng ^= S->rng << 13; S->rng ^= S->rng >> 7; S->rng ^= S->rng << 17; return (S->rng >> 11) * (1.0 / 9007199254740992.0); }
@@ -259,36 +328,109 @@ static void scale(Sx *S, int on) {
     if (!on) return;
     double *rmin = xmalloc(sizeof(double) * m), *rmax = xmalloc(sizeof(double) * m);
     double prev = SX_INF;
-    for (int pass = 0; pass < 8; pass++) {
+    /* (8 November 2026; ISSUES 843, BRISK_LPGRBTOL bit 8) the geometric passes take a row's (a column's) smallest entry among
+     * those at least SX_SCALE_REL of its largest: an entry below that is at the level of the rounding of the row's other
+     * terms and says nothing of the row's scale, but 1 / sqrt(min max) follows it. ns1904248 (LP) holds cosines, 6.1e-17 for
+     * cos(pi/2) in rows of entries near 1, in free columns (which tiny_keep cannot drop): its rows got factors near 1e8 and its
+     * columns near 3e-8, and a reduced cost of 2.4e-8 on the scaled problem was 0.81 on the problem as read. Any factors give
+     * an exact scaling (powers of two); only the choice changes */
+    const double srel = brisk_lpgrbtol() & LPGRB_SXSCALE ? SX_SCALE_REL : 0.0;
+    static double srel_env = -1; if (srel_env < 0) { const char *e_ = getenv("BRISK_SXSCALEREL"); srel_env = e_ ? atof(e_) : 0; }   /* (10 November 2026, a test: the level below which an entry is left out of the geometric passes, for every method) */
+    /* (11 November 2026, by default; BRISK_SXPSCALEREL=0: off) the primal simplex method's solve: an entry below SX_PSCALE_REL of
+     * the largest of its row and of its column is left out of the geometric passes. One such entry sets a row's factor
+     * (1 / sqrt(min max)): on the near-parallel LPs (A stacked on A + 1e-8 I) each pair's second row was scaled up by about 1e4,
+     * its slack's feasibility tolerance became 1e4 times finer than its twin's, and the method's bases with both rows active
+     * were nearly singular: on Hnear_parallel_3500 (LP) 7,393 refactorizations forced by the check of the pivot from the row
+     * against the pivot from the column, 186,135 iterations; with the rule 32 and 47,195. The dual simplex method shows no such
+     * troubles on these LPs and its path only changes (better or worse), so the rule is the primal method's alone */
+    static int psr = -1; if (psr < 0) { const char *e_ = getenv("BRISK_SXPSCALEREL"); psr = !(e_ && atoi(e_) == 0); }
+    const double srel_p = srel_env > 0 ? srel_env : (psr && S->scale_prim ? SX_PSCALE_REL : 0);
+    const double srelx_ = srel_p > 0 ? srel_p : srel;
+    /* (8 November 2026, a test: BRISK_SXSCALEMODE bits) 1 no final equilibration of the columns, 2 every pass (no stop on a
+     * pass that gains less than a tenth), 4 the rows equilibrated after the columns, 8 twenty passes */
+    static int scmode = -1; if (scmode < 0) { const char *e_ = getenv("BRISK_SXSCALEMODE"); scmode = e_ ? atoi(e_) : 0; }
+    /* (13 November 2026, an experiment: BRISK_SXSCALEMODE bit 128) Gurobi's scaling as found on satellites4-25's copy (LP;
+     * bench/lp_r16/mystery/A): one geometric-mean pass (rows, then columns), then equilibration of the rows, then of the columns */
+    const int npass = scmode & 128 ? 1 : scmode & 8 ? 20 : 8;
+    /* (10 November 2026, a test: BRISK_SXSCALEMODE bit 16) the passes divide by the geometric mean of a row's (a column's) entries
+     * instead of the geometric mean of its smallest and largest: one tiny entry among many does not set the factor */
+    const int lmean = (scmode & 16) != 0;
+    double *rls = lmean ? xmalloc(sizeof(double) * (m + 1)) : NULL; int *rcn = lmean ? xmalloc(sizeof(int) * (m + 1)) : NULL;
+    /* (10 November 2026, BRISK_SXSCALEREL) an entry left out only when it is below the level in its row and in its column:
+     * one small in its row but not in its column (a big-M row's ordinary coefficients, neos-4264598-oueme, LP) is brought
+     * in line by its column's factor, while one small in both (1e-8 beside entries near 1: the near-parallel LPs) cannot be
+     * by any factors and only drags them */
+    const int both = srel_p > 0;
+    double *cmx = both ? xmalloc(sizeof(double) * (n + 1)) : NULL, *rmx2 = both ? xmalloc(sizeof(double) * (m + 1)) : NULL;
+    /* (13 November 2026, an experiment: BRISK_SXSCALEMODE bit 64) Ruiz's equilibration (2001) in place of the geometric passes and the
+     * column equilibration: rows and columns divided at once by the square roots of their largest entries, repeated until every
+     * row's and column's largest entry is within 1 +- 0.05 of 1 (at most 30 passes), then rounded to powers of two. Gurobi on
+     * satellites4-25's copy (LP), its scaling off, on a copy so scaled: 29,673 iterations and 3.2-4.6 s, as with its own scaling
+     * (31,879, 3.7 s); on a copy scaled as ours 35,541 and 8.5-16 s (bench/lp_r16/mystery/C) */
+    if (scmode & 64) {
+        double *cmxr = xmalloc(sizeof(double) * (n + 1));
+        for (int pass = 0; pass < 30; pass++) {
+            for (int i = 0; i < m; i++) rmax[i] = 0;
+            double dev = 0;
+            for (int j = 0; j < n; j++) { cmxr[j] = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > rmax[S->Ai[p]]) rmax[S->Ai[p]] = a; if (a > cmxr[j]) cmxr[j] = a; } }
+            for (int i = 0; i < m; i++) if (rmax[i] > 0) dev = fmax(dev, fabs(1 - rmax[i]));
+            for (int j = 0; j < n; j++) if (cmxr[j] > 0) dev = fmax(dev, fabs(1 - cmxr[j]));
+            if (dev < 0.05) break;
+            for (int i = 0; i < m; i++) if (rmax[i] > 0) r[i] /= sqrt(rmax[i]);
+            for (int j = 0; j < n; j++) if (cmxr[j] > 0) c[j] /= sqrt(cmxr[j]);
+        }
+        free(cmxr);
+        goto sc_round;
+    }
+    for (int pass = 0; pass < npass; pass++) {
         for (int i = 0; i < m; i++) { rmin[i] = SX_INF; rmax[i] = 0; }
+        if (lmean) for (int i = 0; i < m; i++) { rls[i] = 0; rcn[i] = 0; }
+        if (srelx_ > 0) for (int j = 0; j < n; j++) { if (both) cmx[j] = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > rmax[S->Ai[p]]) rmax[S->Ai[p]] = a; if (both && a > cmx[j]) cmx[j] = a; } }
         double gmin = SX_INF, gmax = 0;
         for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) {
             const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j];
-            if (a == 0) continue;
+            if (a == 0 || (a < srelx_ * rmax[S->Ai[p]] && (!both || a < srelx_ * cmx[j]))) continue;
             if (a < rmin[S->Ai[p]]) rmin[S->Ai[p]] = a;
             if (a > rmax[S->Ai[p]]) rmax[S->Ai[p]] = a;
+            if (lmean) { rls[S->Ai[p]] += log(a); rcn[S->Ai[p]]++; }
             if (a < gmin) gmin = a;
             if (a > gmax) gmax = a;
         }
         const double ratio = gmax > 0 ? gmax / gmin : 1;
-        if (pass > 0 && ratio > 0.9 * prev) break;
+        if (pass > 0 && ratio > 0.9 * prev && !(scmode & 2)) break;
         prev = ratio;
-        for (int i = 0; i < m; i++) if (rmax[i] > 0) r[i] /= sqrt(rmin[i] * rmax[i]);
+        if (lmean) { for (int i = 0; i < m; i++) if (rcn[i] > 0) r[i] /= exp(rls[i] / rcn[i]); }
+        else for (int i = 0; i < m; i++) if (rmax[i] > 0) r[i] /= sqrt(rmin[i] * rmax[i]);
+        if (both) { for (int i = 0; i < m; i++) rmx2[i] = 0; for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > rmx2[S->Ai[p]]) rmx2[S->Ai[p]] = a; } }
         for (int j = 0; j < n; j++) {
             double mn = SX_INF, mx = 0;
-            for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a == 0) continue; if (a < mn) mn = a; if (a > mx) mx = a; }
-            if (mx > 0) c[j] /= sqrt(mn * mx);
+            if (srelx_ > 0) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > mx) mx = a; }
+            double ls = 0; int cn = 0;
+            for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a == 0 || (a < srelx_ * mx && (!both || a < srelx_ * rmx2[S->Ai[p]]))) continue; if (a < mn) mn = a; if (a > mx) mx = a; if (lmean) { ls += log(a); cn++; } }
+            if (lmean) { if (cn > 0) c[j] /= exp(ls / cn); }
+            else if (mx > 0) c[j] /= sqrt(mn * mx);
         }
     }
+    if (scmode & 128) {   /* (bit 128: the rows equilibrated before the columns) */
+        for (int i = 0; i < m; i++) rmax[i] = 0;
+        for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > rmax[S->Ai[p]]) rmax[S->Ai[p]] = a; }
+        for (int i = 0; i < m; i++) if (rmax[i] > 0) r[i] /= rmax[i];
+    }
     /* equilibrate columns to a largest entry of about 1 */
-    for (int j = 0; j < n; j++) {
+    if (!(scmode & 1)) for (int j = 0; j < n; j++) {
         double mx = 0;
         for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > mx) mx = a; }
         if (mx > 0) c[j] /= mx;
     }
+    if (scmode & 4) {
+        for (int i = 0; i < m; i++) rmax[i] = 0;
+        for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double a = fabs(S->Ax[p]) * r[S->Ai[p]] * c[j]; if (a > rmax[S->Ai[p]]) rmax[S->Ai[p]] = a; }
+        for (int i = 0; i < m; i++) if (rmax[i] > 0) r[i] /= rmax[i];
+    }
+sc_round:
     for (int i = 0; i < m; i++) r[i] = pow2round(r[i]);
     for (int j = 0; j < n; j++) c[j] = pow2round(c[j]);
-    free(rmin); free(rmax);
+    free(rmin); free(rmax); free(rls); free(rcn); free(cmx); free(rmx2);
 }
 
 /* (25 October 2026) the entries of A worth keeping (keep[p] = 1): not the explicit zeros, nor the entries too small to
@@ -320,6 +462,7 @@ static long tiny_keep(const LpProb *L, unsigned char *keep) {
     return nd;
 }
 
+static void cn_rcm_rows(const LpProb *L, int *q);
 static void sx_setup(Sx *S, const LpProb *L, const SimplexOpts *o) {
     const int m = L->m, n = L->n, N = n + m;
     S->m = m; S->n = n; S->N = N;
@@ -337,6 +480,18 @@ static void sx_setup(Sx *S, const LpProb *L, const SimplexOpts *o) {
     }
     S->Ap[n] = e;
     free(keep);
+    {   /* (14 November 2026, an experiment: BRISK_SXRANKTIE=1) the leaving row's ties broken by each position's rank in the rows' reverse
+         * Cuthill-McKee order instead of its index: the problem kept in its order (the rows-only reordering, BRISK_SXRCM=2, changes what
+         * the factorization and the row sifting see as well) */
+        static int rt_ = -1; if (rt_ < 0) { const char *e_ = getenv("BRISK_SXRANKTIE"); rt_ = e_ && atoi(e_) != 0; }
+        S->rrank = NULL;
+        if (rt_ && m > 0) {
+            LpProb T_; memset(&T_, 0, sizeof T_); T_.m = m; T_.n = n; T_.Ap = S->Ap; T_.Ai = S->Ai; T_.Ax = S->Ax;
+            int *q_ = xmalloc(sizeof(int) * ((size_t)m + 1)); cn_rcm_rows(&T_, q_);
+            S->rrank = xmalloc(sizeof(int) * ((size_t)m + 1)); for (int k = 0; k < m; k++) S->rrank[q_[k]] = k;
+            free(q_);
+        }
+    }
     S->rscale = xmalloc(sizeof(double) * (m + 1)); S->cscale = xmalloc(sizeof(double) * (n + 1));
     if (S->cs_in) {
         /* (22 October 2026, sxm_new) the scaling given: the columns' and the first m_in rows' factors kept, so that a
@@ -353,7 +508,7 @@ static void sx_setup(Sx *S, const LpProb *L, const SimplexOpts *o) {
         }
         for (int i = 0; i < m; i++) S->rscale[i] = i < S->m_in ? S->rs_in[i] : rmax[i] > 0 ? pow2round(1.0 / sqrt(rmin[i] * rmax[i])) : 1.0;
         free(rmin); free(rmax);
-    } else scale(S, !(o && o->noscale));
+    } else { S->scale_prim = o && o->method == 2; scale(S, !(o && o->noscale)); }
     for (int j = 0; j < n; j++) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) S->Ax[p] *= S->rscale[S->Ai[p]] * S->cscale[j];
     build_rows(S);
     S->icscale = xmalloc(sizeof(double) * (n + 1)); S->irscale = xmalloc(sizeof(double) * (m + 1));
@@ -408,8 +563,18 @@ static void sx_setup(Sx *S, const LpProb *L, const SimplexOpts *o) {
     sxv_init(&S->rho, m); sxv_init(&S->col, m); sxv_init(&S->tau, m); sxv_init(&S->bfrt, m); sxv_init(&S->spike, m); sxv_init(&S->upart, m);
     sxv_init(&S->row, N);
     { const char *e = getenv("BRISK_SXPH1LONG"); S->ph1long = e ? atoi(e) : PH1LONG_DEFAULT;
+      e = getenv("BRISK_SXPH1FLAT"); S->ph1flat = !(e && atoi(e) == 0);   /* (on by default since 7 November 2026: the default route, 4 threads, 23 problem LPs 1.004, 40 development LPs 1.012, 46 rescaled copies 1.005, the iterations the same on 108 of 109; lectsched-1's root LP, MILP, fewer fractional columns, ISSUES 842); BRISK_SXPH1FLAT=0: off */
       if (S->ph1long) { S->bp_r = xmalloc(sizeof(double) * (2 * (size_t)m + 2)); S->bp_t = xmalloc(sizeof(double) * (2 * (size_t)m + 2)); S->bp_i = xmalloc(sizeof(int) * (2 * (size_t)m + 2)); S->bp_o = xmalloc(sizeof(struct SxBp) * (2 * (size_t)m + 2)); } }
-    { const char *e = getenv("BRISK_SXPSE"); S->pse = e ? atoi(e) != 0 : PSE_DEFAULT; }
+    /* (10 November 2026, BRISK_SXPSE=2, the default: by the problem's size) steepest edge where its extra solve per iteration can pay
+     * for itself: at most 10,000 rows (on 39 LPs of the primal method's random set, one thread: 0.847 below, 1.180 above; its
+     * losers minutedispatchstrategy, prosna, cryptanalysis, ken-13 have 10,800 rows or more) and at least 5 nonzeros a row
+     * (where rows have 2-4, the iterations are so cheap that the extra solve doubles their work for the same path: the outside
+     * benchmark's triangular, dispatch and inventory LPs 1.05-1.8 times slower) */
+    { const char *e = getenv("BRISK_SXPSE"); const int v = e ? atoi(e) : PSE_DEFAULT;
+      S->pse = v == 2 ? (m <= SX_PSE_MAXROWS && (double)S->Ap[n] >= SX_PSE_MINROWNZ * (double)m) : v != 0; }
+    { const char *e = getenv("BRISK_SXPRT"); S->prt = e ? atof(e) : PRT_DEFAULT; e = getenv("BRISK_SXPRTTOL"); S->prt_tol = e ? atof(e) : 100; }
+    { const char *e = getenv("BRISK_SXPCYC"); S->pcyc_on = e ? atoi(e) : PCYC_DEFAULT; }
+    { const char *e = getenv("BRISK_SXPBACKREL"); S->pback_rel = e ? atof(e) : PBACKREL_DEFAULT; }
     S->out = xmalloc(sizeof(int) * (m + 1));
     S->heap = xmalloc(sizeof(int) * (m + 1)); S->hpos = xmalloc(sizeof(int) * (m + 1)); S->hkey = xmalloc(sizeof(double) * (m + 1));
     S->inI = xcalloc(m + 1, 1); S->Ilist = xmalloc(sizeof(int) * (m + 1)); S->nI = 0; S->Ifull = 1;
@@ -429,8 +594,9 @@ static void sx_setup(Sx *S, const LpProb *L, const SimplexOpts *o) {
     S->cand = xmalloc(sizeof(int) * (N + 8)); S->ca = xmalloc(sizeof(double) * (N + 8)); S->cr = xmalloc(sizeof(double) * (N + 8));
     S->ck = xmalloc(sizeof(double) * (N + 1)); S->chm = xmalloc(sizeof(double) * (N + 1)); S->cp = xmalloc(sizeof(int) * (N + 1));
     S->cti = xmalloc(sizeof(int) * (N + 1)); S->ctd = xmalloc(sizeof(double) * (N + 1));
-    S->tolp = o && o->tol_primal > 0 ? o->tol_primal : 1e-7;
-    S->told = o && o->tol_dual > 0 ? o->tol_dual : 1e-7;
+    S->tolp = o && o->tol_primal > 0 ? o->tol_primal : brisk_lpgrbtol() & LPGRB_SXTOL ? SX_GRB_TOL : 1e-7;
+    S->told = o && o->tol_dual > 0 ? o->tol_dual : brisk_lpgrbtol() & LPGRB_SXTOL ? SX_GRB_TOL : 1e-7;
+    { const char *e = getenv("BRISK_SXTOLP"); if (e) S->tolp = atof(e); e = getenv("BRISK_SXTOLD"); if (e) S->told = atof(e); }   /* (10 November 2026, an experiment: each tolerance alone) */
     S->dens_col = S->dens_rho = S->dens_tau = S->dens_row = S->dens_taulr = 0;
     S->taupart = getenv("BRISK_SXTAUFULL") ? 0 : getenv("BRISK_SXTAUPART") ? 2 : 1;   /* (switches: the full solve always, the restricted one always) */
     S->price_dense_div = getenv("BRISK_SXPRICEDIV") ? atoi(getenv("BRISK_SXPRICEDIV")) : 8; if (S->price_dense_div < 1) S->price_dense_div = 8;
@@ -440,20 +606,37 @@ static void sx_setup(Sx *S, const LpProb *L, const SimplexOpts *o) {
     { const char *e = getenv("BRISK_SXSEED"); if (e && atoi(e) > 0) { S->rng ^= (unsigned long long)atoi(e) * 0xBF58476D1CE4E5B9ULL; for (int k_ = 0; k_ < 4; k_++) urand(S); } }   /* (experiments: another random sequence) */
     { const char *e = getenv("SXREFAC_W"); S->env_refac_w = e ? atof(e) : 10.0; }
     { const char *e = getenv("SXSLACKPREF"); S->env_slackpref = e ? atof(e) : 0; }
+    if (g_entdbg < 0) g_entdbg = getenv("BRISK_SXENTDBG") != NULL;
+    if (g_priceunsc < 0) { const char *e_ = getenv("BRISK_SXPRICEUNSC"); g_priceunsc = e_ && atoi(e_) != 0; }
+    if (g_dsefull < 0) { const char *e_ = getenv("BRISK_SXDSEFULL"); g_dsefull = e_ && atoi(e_) != 0; }
+    if (g_dserows < 0) { const char *e_ = getenv("BRISK_SXDSEROWS"); g_dserows = e_ && atoi(e_) != 0; }
+    if (g_wlb < 0) { const char *e_ = getenv("BRISK_SXWLB"); g_wlb = e_ && atoi(e_) != 0; }
     { const char *e = getenv("SXDUALDEVEX"); S->env_ddevex = e ? atoi(e) : 0; }
     { const char *e = getenv("SXSTALLOBJ"); S->env_stallobj = e ? atoi(e) : 0; S->stall_obj = NAN; }
     { const char *e = getenv("BRISK_SXTARGET"); S->env_target = e ? atof(e) : SX_TARGET_DEF; if (!(S->env_target > 0)) S->env_target = SX_TARGET_DEF; }
     S->env_noshiftback = getenv("SXNOSHIFTBACK") != NULL;
     S->env_nostall = getenv("BRISK_SXSTALL") == NULL;
-    { const char *e = getenv("BRISK_SXGRP"); S->env_grp = e ? atoi(e) : 0; }
-    { const char *e = getenv("BRISK_SXGRPFLIP"); S->env_grpflip = e ? atoi(e) : 0; }
-    { const char *e = getenv("BRISK_SXGRPREL"); S->env_grprel = e ? atof(e) : 0.1; }
+    { const char *e = getenv("BRISK_SXGRPBF"); S->env_grpbf = e ? atof(e) : 0.1; }   /* (0.1 by default since 7 November 2026: the default route, 23 problem LPs 0.983, the 47-LP dual simplex set 0.988, 40 fresh held-out LPs 0.983 (159.4 -> 112.7 s); BRISK_SXGRPBF=0: off) */
+    { const char *e = getenv("BRISK_SXINTPREF"); S->env_intpref = e ? atof(e) : 0; if (!(S->env_intpref > 0)) S->env_intpref = 0; if (S->env_intpref > 1) S->env_intpref = 1; }
+    { const char *e = getenv("BRISK_SXSTOPIT"); S->env_stopit = e ? atol(e) : 0; }
+    /* (5 November 2026, experiments on ISSUES 835) BRISK_SXTRACE=<file>: a line per dual iteration (appended: the dual
+     * simplex method of every solve of the run): the iteration, the leaving row and variable, the entering variable and its
+     * column's entries, the leaving infeasibility, the row's steepest-edge weight, the pivot, the dual and primal steps, the
+     * entries of the entering column's and the weights' solves, the final group's size, the bound flips and the first 16
+     * flipped variables (variables: columns 0..n-1, then the logicals n + row) */
+    S->trace = getenv("BRISK_SXTRACE") ? fopen(getenv("BRISK_SXTRACE"), "a") : NULL;
 }
 static void sx_free(Sx *S) {
+    if (S->trace) { fclose(S->trace); S->trace = NULL; }
+    free(S->dsnz); free(S->dsst); S->dsnz = NULL; S->dsst = NULL;
+    free(S->ds_el); S->ds_el = NULL; S->ds_nel = S->ds_elcap = 0;
+    for (int t_ = 0; t_ < 3; t_++) { free(S->dc_nz[t_]); free(S->dc_it[t_]); S->dc_nz[t_] = NULL; S->dc_it[t_] = NULL; }
     free(S->Ap); free(S->Ai); free(S->Ax); free(S->Rp); free(S->Ri); free(S->Rx); free(S->Rnb); free(S->Rc); free(S->Cr); free(S->cscale); free(S->rscale); free(S->icscale); free(S->irscale); free(S->pert_u);
     free(S->lo0); free(S->up0); free(S->cost0); free(S->lo); free(S->up); free(S->cost); free(S->shift);
-    free(S->gb_basic); free(S->gb_pos); free(S->gb_move); free(S->gb_x); free(S->gb_lo); free(S->gb_up);
+    free(S->prt_list); free(S->px_old); free(S->gb_basic); free(S->gb_pos); free(S->gb_move); free(S->gb_x); free(S->gb_lo); free(S->gb_up);
     free(S->tiny); free(S->basic); free(S->pos); free(S->move); free(S->x); free(S->d); free(S->w); free(S->dvx); free(S->dvref); free(S->wk); free(S->wvar); sxv_free(&S->wv);
+    free(S->rrank); S->rrank = NULL;
+    free(S->vfac); free(S->vent); free(S->vden); free(S->vonce); S->vfac = NULL; S->vent = NULL; S->vden = NULL; S->vonce = NULL;   /* (BRISK_SXVFAC) */
     sxv_free(&S->rho); sxv_free(&S->col); sxv_free(&S->tau); sxv_free(&S->bfrt); sxv_free(&S->spike); sxv_free(&S->upart); sxv_free(&S->row); free(S->bp_r); free(S->bp_t); free(S->bp_i); free(S->bp_o); if (S->pv.val) { sxv_free(&S->pv); sxv_free(&S->row2); }
     free(S->out); free(S->heap); free(S->hpos); free(S->hkey); free(S->inI); free(S->Ilist); if (S->ws2.stack) sxws_free(&S->ws2); free(S->cand); hp_free(&S->ch); free(S->pc_set); free(S->pc_kv); free(S->pc_at); free(S->pc_mb); free(S->pc_mj); free(S->pc_mk); free(S->c1); free(S->ca); free(S->cr); free(S->ck); free(S->chm); free(S->cp); free(S->cti); free(S->ctd);
     sxlu_free(&S->F);
@@ -497,6 +680,7 @@ static void rows_partition(Sx *S);
 static int refactor(Sx *S);
 static void compute_primal(Sx *S);
 static void compute_dual(Sx *S);
+static void compute_primal_dual(Sx *S);
 static void sx_sort_by_key_desc(int *ord, int k, const double *key);
 /* (4 November 2026) the free columns into the basis of logicals before the dual method starts (a crash, as Gurobi's "handle
  * free variables"): a nonbasic free column with a nonzero reduced cost is dual infeasible, and from the logicals' basis the
@@ -541,7 +725,7 @@ static int free_crash(Sx *S) {
         for (int i = 0; i < m; i++) S->w[i] = 1.0;
         memset(S->wk, 1, (size_t)m); S->wlazy = 0;
         rows_partition(S);
-        refactor(S); compute_primal(S); compute_dual(S);
+        refactor(S); compute_primal_dual(S);
     }
     return nc;
 }
@@ -596,7 +780,140 @@ static int primal_crash(Sx *S) {
         memset(S->wk, 1, (size_t)m); S->wlazy = 0;
         for (int j = 0; j < S->N; j++) S->dvx[j] = 1.0;
         rows_partition(S);
-        refactor(S); compute_primal(S); compute_dual(S);
+        refactor(S); compute_primal_dual(S);
+    }
+    return done;
+}
+/* (8 November 2026, a test: BRISK_SXEQCRASH=1) the dual method's start on equations: from the logicals' basis an equation's
+ * logical is basic and fixed, so it must leave, one iteration per such row at least (heldout2_dc_power_dispatch_2160, LP: 2,156
+ * equations, 3,051 iterations; Gurobi's dual simplex method 562). A nonbasic fixed logical is dual feasible whatever its reduced
+ * cost, and so is a nonbasic boxed column at the bound its reduced cost's sign names: structural columns that are free or boxed
+ * may take the place of equations' logicals without making the start dual infeasible beyond what the bounds repair. Bixby's
+ * rules (primal_crash): free columns first, then boxed ones, the sparser first; each in the row of an equation holding its
+ * largest entry (at least 0.99 of it) not yet taken, and only when its entries in the rows taken are at most 1 % of their
+ * pivots (a nearly triangular, well-conditioned basis) */
+static int eq_crash(Sx *S) {
+    /* (12 November 2026) on by default in its form with columns of cost zero (2), with the settings it was judged with (every
+     * equation, the threshold 0.5 of the column's largest entry, entries in the rows taken up to 1 of their pivots, only a column
+     * that absorbs its row's violation), and not on row sifting's sets (sx_solve_core): the 76 LPs it acts on and the 618
+     * development LPs by the default route 0.993 and 1.002 (0.989 on the 59 whose iterations changed, three rounds), one status
+     * gained (rail03), the held-out set unchanged; heldout2_dc_power_dispatch_2160 (LP) 0.47 -> 0.11 s with the dual simplex
+     * method, supportcase34 1.29 -> 1.06 s, neos-4531126-vouga 2.52 -> 1.79 s by default. Losses: piperout-03 +26 ms, roll3000
+     * +16 ms, rd-rplusc-21 +57 ms by default; ns1644855 with the dual simplex method alone past 60 s (the default route solves it
+     * by the interior-point method). BRISK_SXEQCRASH=0: off; 1: the form of 8 November */
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_SXEQCRASH"); on = e ? atoi(e) : 2; }
+    if (!on) return 0;
+    const int eqzero = on == 2;
+    static int eqabs = -1; if (eqabs < 0) { const char *e = getenv("BRISK_SXEQCRASHABS"); eqabs = e ? atoi(e) != 0 : 1; }
+    if (!eqzero) eqabs = 0;
+    /* (11 November 2026, with BRISK_SXEQCRASH=2) only from a dual feasible start: the columns of cost zero keep it so, which is
+     * the point of the rule; a start with dual infeasibilities (columns with one bound and a cost of the wrong sign) goes to a
+     * dual phase 1 whose kind depends on whether the start is primal feasible, and a crash that makes it so changes that kind
+     * (ns1690781, LP: one column brought in, 1,126 -> 3,888 iterations by the auxiliary problem's phase 1) */
+    if (eqzero) {
+        compute_dual(S);
+        for (int j = 0; j < S->N; j++) {
+            if (S->pos[j] >= 0 || is_boxed(S, j) || S->lo[j] == S->up[j]) continue;
+            const double dj = S->d[j];
+            if (S->lo[j] <= -SX_INF && S->up[j] >= SX_INF ? fabs(dj) > S->told : S->lo[j] > -SX_INF ? dj < -S->told : dj > S->told) return 0;
+        }
+    }
+    const int n = S->n, m = S->m;
+    /* (the rows of equations the start violates: an equation it meets keeps its logical basic at its value, no iteration
+     * needed; BRISK_SXEQCRASHALL=1: every equation) */
+    static int eqall = -1; if (eqall < 0) { const char *e = getenv("BRISK_SXEQCRASHALL"); eqall = e ? atoi(e) != 0 : eqzero; }
+    compute_primal(S);
+    unsigned char *viol = xcalloc((size_t)m + 1, 1);
+    int neq = 0;
+    for (int i = 0; i < m; i++) {
+        if (S->basic[i] != n + i || S->lo[n + i] != S->up[n + i]) continue;
+        const double v = S->x[n + i], b = S->lo[n + i];
+        if (eqall || fabs(v - b) > S->tolp) { viol[i] = 1; neq++; }
+    }
+    if (neq == 0) { free(viol); return 0; }
+    static double eqrel = -1; if (eqrel < 0) { const char *e = getenv("BRISK_SXEQCRASHREL"); eqrel = e ? atof(e) : eqzero ? 0.5 : 0.99; }
+    static double eqtol = -1; if (eqtol < 0) { const char *e = getenv("BRISK_SXEQCRASHTOL"); eqtol = e ? atof(e) : eqzero ? 1.0 : 0.01; }
+    static double eqlen = -1; if (eqlen < 0) { const char *e = getenv("BRISK_SXEQCRASHLEN"); eqlen = e ? atof(e) : 0; }
+    const double avglen_ = n > 0 ? fmax(1.0, (double)S->Ap[n] / n) : 1.0;
+    int *cand = xmalloc(sizeof(int) * ((size_t)n + 1)); double *key = xmalloc(sizeof(double) * ((size_t)n + 1)); int nc = 0;
+    for (int j = 0; j < n; j++) {
+        if (S->pos[j] >= 0 || S->Ap[j + 1] == S->Ap[j]) continue;
+        const int lf = S->lo[j] > -SX_INF, uf = S->up[j] < SX_INF;
+        if (lf != uf || (lf && S->lo[j] == S->up[j])) continue;       /* (free or boxed only) */
+        /* (11 November 2026, a test: BRISK_SXEQCRASH=2) only columns of cost zero: with the logicals' costs zero the duals
+         * stay zero and every reduced cost as it was, so the start stays dual feasible exactly and only its primal
+         * infeasibility changes */
+        if (eqzero && S->cost[j] != 0) continue;
+        if (eqlen > 0 && S->Ap[j + 1] - S->Ap[j] > eqlen * avglen_) continue;   /* (12 November 2026, an experiment: BRISK_SXEQCRASHLEN=r) */
+        key[j] = -((lf ? 1e7 : 0.0) + (double)(S->Ap[j + 1] - S->Ap[j]));
+        cand[nc++] = j;
+    }
+    sx_sort_by_key_desc(cand, nc, key);
+    if (getenv("BRISK_SXEQCRASHDBG")) {   /* (13 November 2026, a diagnostic) the start's candidates and equations */
+        int nlo = 0, nbox = 0, nfree = 0, ncz = 0;
+        for (int j = 0; j < n; j++) { if (S->pos[j] >= 0) continue; const int lf = S->lo[j] > -SX_INF, uf = S->up[j] < SX_INF;
+            if (lf && uf) nbox++; else if (!lf && !uf) nfree++; else nlo++; if (S->cost[j] == 0) ncz++; }
+        int nrng = 0; for (int i = 0; i < m; i++) if (S->lo[n + i] > -SX_INF && S->up[n + i] < SX_INF && S->lo[n + i] < S->up[n + i]) nrng++;
+        int neqt = 0, nlogb = 0; for (int i = 0; i < m; i++) { if (S->lo[n + i] == S->up[n + i]) neqt++; if (S->basic[i] == n + i) nlogb++; }
+        printf("  [eq_crash: %d rows, %d equations, %d logicals basic]\n", m, neqt, nlogb);
+        printf("  [eq_crash: %d equations to take, %d candidates; nonbasic columns: %d boxed, %d free, %d with one bound, %d of cost zero; %d ranged rows]\n", neq, nc, nbox, nfree, nlo, ncz, nrng);
+    }
+    double *rpiv = xcalloc((size_t)m + 1, sizeof(double));
+    int done = 0;
+    for (int t = 0; t < nc && done < neq; t++) {
+        const int j = cand[t];
+        double cmax = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) cmax = fmax(cmax, fabs(S->Ax[p]));
+        int bi = -1; double ba = 0, worst = 0;
+        for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) {
+            const int i = S->Ai[p]; const double a = fabs(S->Ax[p]);
+            if (rpiv[i] > 0) { const double r = a / rpiv[i]; if (r > worst) worst = r; continue; }
+            if (a < eqrel * cmax || S->basic[i] != n + i || !viol[i]) continue;
+            /* (11 November 2026, with BRISK_SXEQCRASH=2) among entries within the threshold the row of fewest entries, as
+             * Bixby's crash (less fill; a flow column of a network's equations then takes its own definition row, not a node's
+             * balance row), then the larger entry */
+            if (eqzero) { const int rl_ = S->Rp[i + 1] - S->Rp[i], rb_ = bi >= 0 ? S->Rp[bi + 1] - S->Rp[bi] : INT_MAX;
+                if (bi < 0 || rl_ < rb_ || (rl_ == rb_ && a > ba)) { bi = i; ba = a; } continue; }
+            if (a > ba) { bi = i; ba = a; }
+        }
+        if (bi < 0 || worst > eqtol) continue;
+        /* (11 November 2026, with BRISK_SXEQCRASH=2, BRISK_SXEQCRASHABS=1) only a column that absorbs its row's violation
+         * within its own bounds: the move t = (s_i - b_i) / a_ij that satisfies the equation (s = -Ax its logical) leaves
+         * x_j + t inside [l_j, u_j]; the logicals of the column's other rows follow the move, so later choices see the rows as
+         * they are then. A column that cannot moves the infeasibility to itself instead of removing it */
+        if (eqabs) {
+            double aij = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) if (S->Ai[p] == bi) { aij = S->Ax[p]; break; }
+            const double t = (S->x[n + bi] - S->lo[n + bi]) / aij, xn = S->x[j] + t;
+            if (xn < S->lo[j] - S->tolp * (1 + fabs(S->lo[j])) || xn > S->up[j] + S->tolp * (1 + fabs(S->up[j]))) continue;
+            S->x[j] = xn;
+            for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) S->x[n + S->Ai[p]] -= S->Ax[p] * t;
+        }
+        rpiv[bi] = ba;
+        S->basic[bi] = j; S->pos[j] = bi; S->move[j] = 0;
+        S->pos[n + bi] = -1; set_nonbasic(S, n + bi, S->cost[n + bi]);
+        done++;
+    }
+    { static int cdb = -1; if (cdb < 0) cdb = getenv("BRISK_SXEQCRASHDBG") != NULL;   /* (a diagnostic: the start's coverage) */
+      if (cdb) fprintf(stderr, "[eqcrash] %d of %d equations (m %d)\n", done, neq, m); }
+    free(cand); free(key); free(rpiv); free(viol);
+    if (done) {
+        for (int i = 0; i < m; i++) S->w[i] = 1.0;
+        memset(S->wk, 1, (size_t)m); S->wlazy = 0;
+        rows_partition(S);
+        refactor(S); compute_primal_dual(S);
+        /* (11 November 2026, a test: BRISK_SXEQCRASHW=1) the dual steepest-edge weights of the crashed basis computed lazily, a
+         * row's the first time it is a candidate to leave (as for a basis given to the re-solves, sxm_set_basis_w's mode 1),
+         * instead of the logicals' basis's 1 for every row: with structural columns in the basis the rows of B^-1 are not unit
+         * vectors. The stand-in for an unknown weight is the lower bound 1 / |b_i|^2 of the row's basic column */
+        static int crw = -1; if (crw < 0) { const char *e = getenv("BRISK_SXEQCRASHW"); crw = e && atoi(e) != 0; }
+        if (crw) {
+            memset(S->wk, 0, (size_t)m); S->wlazy = 1;
+            for (int i = 0; i < m; i++) {
+                const int j = S->basic[i];
+                if (j >= n) continue;
+                double c2 = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) c2 += S->Ax[p] * S->Ax[p];
+                S->w[i] = c2 > 1 ? fmax(1.0 / c2, 1e-4) : 1.0;
+            }
+        }
     }
     return done;
 }
@@ -669,7 +986,11 @@ static void ftran2(Sx *S, SxVec *col, SxVec *tau) {
     const long f0 = S->F.nflops, e0f = S->F.nedges;
     const double work = (S->dens_col + S->dens_tau) * S->m + 0.02 * S->m;
     if (S->taupart && S->dens_col < SX_TAUPART_DENS) {
+        static int ftd_ = -1; if (ftd_ < 0) ftd_ = getenv("BRISK_SXFTDBG") != NULL;
+        const long wc0 = S->F.nflops + S->F.nedges;
         sxlu_ftran(&S->F, col, S->dens_col, &S->spike);
+        if (ftd_) { S->dbg_wcol += (double)(S->F.nflops + S->F.nedges - wc0); S->dbg_ncol += col->cnt >= 0 ? col->cnt : S->m; }
+        const long wt0 = S->F.nflops + S->F.nedges;
         /* (23 October 2026) the restricted solve or the full one, whichever cost less work lately (entries touched and
          * the searches' edges, counted: the same choice on every run); the other is tried again every SX_TAUPROBE
          * iterations. The restricted solve's two searches cost more than the whole full solve on some problems (sing44,
@@ -699,6 +1020,7 @@ static void ftran2(Sx *S, SxVec *col, SxVec *tau) {
             sxlu_ftran(&S->F, tau, S->dens_tau, NULL);
             if (tau->cnt >= 0) S->dens_tau = 0.95 * S->dens_tau + 0.05 * (double)tau->cnt / S->m;
         }
+        if (ftd_) S->dbg_wtau += (double)(S->F.nflops + S->F.nedges - wt0);
         if (col->cnt >= 0) S->dens_col = 0.95 * S->dens_col + 0.05 * (double)col->cnt / S->m;
         S->work += (double)(S->F.nflops - f0) + (col->cnt >= 0 ? col->cnt : S->m) + (tau->cnt >= 0 ? tau->cnt : S->m);
         sw_note(S, (double)(S->F.nflops - f0 + S->F.nedges - e0f), 2);
@@ -746,7 +1068,13 @@ static void btran_pse_note(Sx *S, const SxVec *v, double t) {
     S->F.nflops += W->nflops; S->F.nedges += W->nedges;
     S->work += (double)W->nflops + (v->cnt >= 0 ? v->cnt : S->m);
     S->dens_pv = 0.95 * S->dens_pv + 0.05 * (v->cnt >= 0 ? (double)v->cnt / S->m : 1.0);
-    S->t_pse += t;
+    S->t_pse += t; S->fl_pse += (double)W->nflops + W->nedges;
+    /* (11 November 2026, a test: BRISK_SXREFACPSE=1) the weights' solve counted in the refactorization rule's measure of the
+     * solves' work as well: it runs through the same updates, and when it is dense (Hdiet_5000, LP: 0.99 of the rows) its cost
+     * grows with every update while the row's sparser solve hides that growth. Noted here, after the parallel section and
+     * after the row's solve in either case, so the order of the notes is the same at every thread count */
+    static int rpse = -1; if (rpse < 0) { const char *e_ = getenv("BRISK_SXREFACPSE"); rpse = e_ ? atoi(e_) : 0; }
+    if (rpse) sw_note(S, (double)W->nflops + W->nedges, 1);
 }
 static void btran_pse(Sx *S, SxVec *v) {
     const double t = now();
@@ -757,7 +1085,17 @@ static void btran_pse(Sx *S, SxVec *v) {
 /* x_B = -B^{-1} N x_N */
 static void compute_primal(Sx *S) {
     SxVec *v = &S->col; sxv_clear(v);
-    for (int j = 0; j < S->N; j++) if (S->pos[j] < 0 && S->x[j] != 0) col_scatter(S, j, v, -S->x[j]);
+    /* (11 November 2026) accumulated as a dense vector and listed once (the forward solve lists it: cnt -1), instead of a
+     * check for a new nonzero at every entry (col_scatter): this sum was 10 % of the time of a node LP of the mixed-integer
+     * solver (a multiple knapsack LP, 10 rows, 300 columns, half of them at their upper bound). The same sums in the same order */
+    double *rv = v->val; const int n = S->n;
+    for (int j = 0; j < n; j++) {
+        const double xj = S->x[j];
+        if (S->pos[j] >= 0 || xj == 0) continue;
+        for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) rv[S->Ai[p]] -= xj * S->Ax[p];
+    }
+    for (int i = 0; i < S->m; i++) { const int j = n + i; if (S->pos[j] < 0 && S->x[j] != 0) rv[i] -= S->x[j]; }
+    v->cnt = -1;
     double dd = 1; ftran(S, v, &dd, NULL);
     for (int i = 0; i < S->m; i++) S->x[S->basic[i]] = v->val[i];
     sxv_clear(v);
@@ -776,6 +1114,41 @@ static void compute_dual(Sx *S) {
         S->d[j] = s;
     }
     for (int i = 0; i < S->m; i++) { const int j = S->n + i; S->d[j] = S->pos[j] >= 0 ? 0 : S->cost[j] - y[i]; }
+    sxv_clear(v);
+}
+/* (12 November 2026) compute_primal and compute_dual with one pass over the columns: the nonbasic values' sum and the
+ * reduced costs read each nonbasic column once instead of twice. The two computations are independent (the forward solve
+ * of the sum and the backward solve of the basic costs use the factorization only, on separate vectors), and each sum is
+ * formed in the same order as in the separate calls, so the results have the same bits. The final check of every re-solve
+ * computes both (the mixed-integer solver's node LPs). BRISK_SXPDFUSE=0: the two calls */
+static void compute_primal_dual(Sx *S) {
+    static int on = -1; if (on < 0) { const char *e_ = getenv("BRISK_SXPDFUSE"); on = !(e_ && atoi(e_) == 0); }
+    if (!on) { compute_primal(S); compute_dual(S); return; }
+    SxVec *v = &S->col; sxv_clear(v);
+    SxVec *w = &S->rho; sxv_clear(w);
+    for (int i = 0; i < S->m; i++) w->val[i] = S->cost[S->basic[i]];
+    sxv_reindex(w);
+    double dd = 1; btran(S, w, &dd, NULL);
+    const double *y = w->val;
+    double *rv = v->val; const int n = S->n;
+    for (int j = 0; j < n; j++) {
+        if (S->pos[j] >= 0) { S->d[j] = 0; continue; }
+        const double xj = S->x[j];
+        double s = S->cost[j];
+        if (xj != 0) { for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const int i = S->Ai[p]; rv[i] -= xj * S->Ax[p]; s -= S->Ax[p] * y[i]; } }
+        else for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) s -= S->Ax[p] * y[S->Ai[p]];
+        S->d[j] = s;
+    }
+    for (int i = 0; i < S->m; i++) {
+        const int j = n + i;
+        if (S->pos[j] >= 0) { S->d[j] = 0; continue; }
+        if (S->x[j] != 0) rv[i] -= S->x[j];
+        S->d[j] = S->cost[j] - y[i];
+    }
+    sxv_clear(w);
+    v->cnt = -1;
+    dd = 1; ftran(S, v, &dd, NULL);
+    for (int i = 0; i < S->m; i++) S->x[S->basic[i]] = v->val[i];
     sxv_clear(v);
 }
 /* (1 November 2026) one step of iterative refinement of the basic values and of the duals with the current factorization
@@ -828,7 +1201,36 @@ static int refactor(Sx *S) {
      * network (LP, 575,040 rows and 1,376,640 columns), a pass over all variables where the basis has a third of them */
     double *wvar = S->wvar;
     for (int i = 0; i < S->m; i++) wvar[S->basic[i]] = S->wk[i] ? S->w[i] : -S->w[i];   /* (an unknown weight carried negative) */
+    {   static int ftd = -1; if (ftd < 0) ftd = getenv("BRISK_SXFTDBG") != NULL;     /* (8 November 2026, a diagnostic) */
+        if (ftd) fprintf(stderr, "[ftdbg] it %ld: before the factorization L %ld U %ld (at the factorization %ld) R %ld, %d updates; solves so far: forward %.3f s, entries %ld, edges %ld; restricted path: columns %.3g (their entries %.3g), weights %.3g; weights restricted %ld, full %ld\n",
+                         (long)S->iter, S->F.nnz_l, S->F.nnz_u, S->F.nnz_u0, S->F.nnz_r, S->F.nupd, S->t_ftran, S->F.nflops, S->F.nedges, S->dbg_wcol, S->dbg_ncol, S->dbg_wtau, S->n_taupart, S->n_taufull);
+        if (ftd) fprintf(stderr, "[ftdbg] the rule: factor_work %.3g, solve work at the start %.3g now %.3g (%d noted), growth an update %.3g; times: forward %.3f backward %.3f weights %.3f factorizations %.3f s\n",
+                         S->F.factor_work, S->sw_base, S->sw_ew, S->sw_n, S->F.nupd > 0 ? (S->sw_ew - S->sw_base) / S->F.nupd : 0.0, S->t_ftran, S->t_btran, S->t_pse, S->t_factor);
+        if (ftd) fprintf(stderr, "[ftdbg] the dual's parts so far: leaving row %.3f pivot row %.3f ratio test %.3f dual update %.3f primal step %.3f weights %.3f candidates %.3f rebuilds %.3f s\n",
+                         S->t_chuzr, S->t_row, S->t_chuzc, S->t_dupd, S->t_pupd, S->t_dse, S->t_heap, S->t_rebuild); }
+    const double tf_dbg = now();
+    if (getenv("BRISK_SXLUSTAT") && S->F.m == S->m) fprintf(stderr, "[lu] before: %d updates, U %ld (from %ld), R %ld, L %ld\n", S->F.nupd, S->F.nnz_u, S->F.nnz_u0, S->F.nnz_r, S->F.nnz_l);
     const int nout = sxlu_factor(&S->F, S->m, S->n, S->Ap, S->Ai, S->Ax, S->basic, S->out);
+    {   /* (12 November 2026, a diagnostic: BRISK_SXLUSTAT=1 prints each factorization's size; BRISK_SXLUDUMP=<file> with
+         * BRISK_SXLUDUMPK=<k> writes the k-th factorization's basis as triplets (row, position, value; logicals as unit columns)) */
+        static int lst = -1, nfac_ = 0; if (lst < 0) lst = getenv("BRISK_SXLUSTAT") != NULL;
+        const char *df_ = getenv("BRISK_SXLUDUMP"); nfac_++;
+        if (lst || df_) {
+            long bnz = 0; int nst = 0;
+            for (int i = 0; i < S->m; i++) { const int j = S->basic[i]; if (j < S->n) { nst++; bnz += S->Ap[j + 1] - S->Ap[j]; } else bnz++; }
+            if (lst) fprintf(stderr, "[lu] %d: m %d, structurals %d, basis %ld entries, L %ld, U %ld (fill %.2f)\n", nfac_, S->m, nst, bnz, S->F.nnz_l, S->F.nnz_u0, (double)(S->F.nnz_l + S->F.nnz_u0) / (double)bnz);
+            if (df_ && getenv("BRISK_SXLUDUMPK") && atoi(getenv("BRISK_SXLUDUMPK")) == nfac_) {
+                FILE *fd = fopen(df_, "w");
+                if (fd) { fprintf(fd, "%d %ld\n", S->m, bnz);
+                    for (int i = 0; i < S->m; i++) { const int j = S->basic[i];
+                        if (j < S->n) { for (int k = S->Ap[j]; k < S->Ap[j + 1]; k++) fprintf(fd, "%d %d %.17g\n", S->Ai[k], i, S->Ax[k]); }
+                        else fprintf(fd, "%d %d 1\n", j - S->n, i); }
+                    fclose(fd); }
+            }
+        }
+    }
+    {   static int ftd2 = -1; if (ftd2 < 0) ftd2 = getenv("BRISK_SXFTDBG") != NULL;
+        if (ftd2) fprintf(stderr, "[ftdbg] the factorization: %.3f s, L %ld U %ld\n", now() - tf_dbg, S->F.nnz_l, S->F.nnz_u); }
     for (int k = 0; k < nout; k++) {
         const int j = S->out[k]; S->pos[j] = -1;
         if (!S->keepx) { set_nonbasic(S, j, S->d[j]); continue; }
@@ -859,8 +1261,48 @@ static double infeas(const Sx *S, int i) {
     if (v > S->up[j] + S->tolp) return v - S->up[j];
     return 0;
 }
+/* (12 November 2026, an experiment: BRISK_SXPRICEUNSC=1) the leaving row's merit by the infeasibility in the problem's own units
+ * (the scaled infeasibility divided by the row's scale for a logical, times the column's scale for a structural): Gurobi's choices on
+ * uccase7 (LP) fit that measure, rows 105.8 y - x >= 0 violated by 105.8 chosen before columns 78 above their bound, which our scaled
+ * measure ranks first (REPORT_lp_r16) */
+static double col_rand(int j);
+static inline double infeas_merit(const Sx *S, int i) {
+    double f = infeas(S, i);
+    if (g_priceunsc > 0 && f > 0 && S->cscale && S->rscale) { const int j = S->basic[i]; f = j < S->n ? f * S->cscale[j] : f / S->rscale[j - S->n]; }
+    /* (12 November 2026, an experiment: BRISK_SXPRICERANGE=1) a basic variable with a finite range: its merit divided by
+     * (1 + the range), squared into the score (f^2 / (w (1 + range))) */
+    { static int pr_ = -1; if (pr_ < 0) { const char *e_ = getenv("BRISK_SXPRICERANGE"); pr_ = e_ && atoi(e_) != 0; }
+      if (pr_ && f > 0) { const int j = S->basic[i]; const double rg = S->up[j] - S->lo[j]; if (rg < SX_INF) f /= sqrt(1 + rg); } }
+    /* (13 November 2026, an experiment: BRISK_SXSTRUCTW=k) a row whose basic variable is a structural column: its score divided
+     * by k (Gurobi's dual simplex method on satellites4-25's copy takes a row's logical as the leaving variable in 750 of 750
+     * iterations, where 505 basic structural columns are infeasible and our scores rank them first) */
+    { static double sw_ = -1; if (sw_ < 0) { const char *e_ = getenv("BRISK_SXSTRUCTW"); sw_ = e_ ? atof(e_) : 0; }
+      if (sw_ > 0 && f > 0 && S->basic[i] < S->n) f /= sqrt(sw_); }
+    /* (13 November 2026, an experiment: BRISK_SXINFCAP=c, BRISK_SXINFPOW=p) the merit capped, min(f, c), or raised to the power p
+     * (0 < p < 1): the score f^2 / w then leans on the weight, so among rows violated by c or more the one with the sparsest row of
+     * B^-1 leaves. Gurobi's leaving rows on satellites4-25's copy (LP) are violated by 1 where hundreds of rows are violated more,
+     * with rows of B^-1 of 8-14 entries, ranked 150-237 by our exact score (bench/lp_r16/mystery/B) */
+    { static double cap_ = -1, pw_ = -1; if (cap_ < 0) { const char *e_ = getenv("BRISK_SXINFCAP"); cap_ = e_ ? atof(e_) : 0; e_ = getenv("BRISK_SXINFPOW"); pw_ = e_ ? atof(e_) : 0; }
+      if (f > 0) { if (pw_ > 0) f = pow(f, pw_); if (cap_ > 0 && f > cap_) f = cap_; } }
+    return f;
+}
 /* the heap of the leaving-row candidates */
-static int hbetter(const Sx *S, int a, int b) { return S->hkey[a] > S->hkey[b] || (S->hkey[a] == S->hkey[b] && a < b); }
+/* candidates of equal merit by the lowest index (a scrambled order was tried and dropped: ISSUES 835) */
+/* (13 November 2026, an experiment: BRISK_SXTIEVAR=1) equal merits by the lowest index of the basic variable, not of the row's
+ * position: Gurobi's first pivot from its basis on satellites4-25's copy with perturbed costs (LP) takes variable 17154 of two rows
+ * tied at the infeasibility 480.023 (ours the first position, variable 71612) */
+static int g_tievar = -1;
+static long g_forcedit = -1;   /* (BRISK_SXFORCEPATH: the iteration forced last) */
+static int hbetter(const Sx *S, int a, int b) {
+    if (g_tievar < 0) { const char *e_ = getenv("BRISK_SXTIEVAR"); g_tievar = e_ && atoi(e_) != 0; }
+    /* (the merits equal within 1e-12 relative: the two rows' infeasibilities differ in the last bit by rounding) */
+    if (g_tievar) { const double ka = S->hkey[a], kb = S->hkey[b];
+        if (fabs(ka - kb) > 1e-12 * fmax(ka, kb)) return ka > kb;
+        return S->basic[a] < S->basic[b]; }
+    if (S->hkey[a] != S->hkey[b]) return S->hkey[a] > S->hkey[b];
+    if (S->rrank) return S->rrank[a] < S->rrank[b];
+    return a < b;
+}
 static void hswap(Sx *S, int p, int q) { const int a = S->heap[p], b = S->heap[q]; S->heap[p] = b; S->heap[q] = a; S->hpos[b] = p; S->hpos[a] = q; }
 static void hup(Sx *S, int p) { while (p > 0) { const int q = (p - 1) / 2; if (!hbetter(S, S->heap[p], S->heap[q])) break; hswap(S, p, q); p = q; } }
 static void hdown(Sx *S, int p) {
@@ -873,6 +1315,7 @@ static void hdown(Sx *S, int p) {
     }
 }
 /* the heap from the rows that may be infeasible (all rows when that set is not known: after a recomputation) */
+#define VFAC(S_, i_) ((S_)->vfac ? (S_)->vfac[(S_)->basic[i_]] : 1.0)   /* (BRISK_SXVFAC: the merit's factor of the row's basic variable) */
 static void heap_rebuild(Sx *S) {
     S->nheap = 0;
     if (S->Ifull) {
@@ -883,10 +1326,10 @@ static void heap_rebuild(Sx *S) {
     int c = 0;
     for (int k = 0; k < S->nI; k++) {
         const int i = S->Ilist[k];
-        const double f = infeas(S, i);
+        const double f = infeas_merit(S, i);
         if (f == 0) { S->inI[i] = 0; continue; }
         S->Ilist[c++] = i;
-        S->hkey[i] = f * f / S->w[i];
+        S->hkey[i] = f * f / S->w[i] * VFAC(S, i);
         S->hpos[i] = S->nheap; S->heap[S->nheap++] = i;
     }
     S->nI = c;
@@ -894,7 +1337,7 @@ static void heap_rebuild(Sx *S) {
     S->heap_ok = 1;
 }
 static void heap_touch(Sx *S, int i) {
-    const double f = infeas(S, i);
+    const double f = infeas_merit(S, i);
     if (f > 0 && !S->inI[i]) { S->inI[i] = 1; S->Ilist[S->nI++] = i; }
     const int p = S->hpos[i];
     if (f == 0) {
@@ -904,7 +1347,7 @@ static void heap_touch(Sx *S, int i) {
         else { S->nheap--; S->hpos[i] = -1; }
         return;
     }
-    const double k = f * f / S->w[i];
+    const double k = f * f / S->w[i] * VFAC(S, i);
     if (p < 0) { S->hkey[i] = k; S->hpos[i] = S->nheap; S->heap[S->nheap++] = i; hup(S, S->nheap - 1); return; }
     const double old = S->hkey[i];
     S->hkey[i] = k;
@@ -934,10 +1377,47 @@ static int chuzr(Sx *S) {
         else for (int k = 0; k < S->m; k++) w += v->val[k] * v->val[k];
         sxv_clear(v);
         S->w[i] = w > 1e-4 ? w : 1e-4; S->wk[i] = 1;
-        const double f = infeas(S, i);
-        S->hkey[i] = f * f / S->w[i];
+        const double f = infeas_merit(S, i);
+        S->hkey[i] = f * f / S->w[i] * VFAC(S, i);
         hdown(S, 0);
     }
+    /* (13 November 2026, an experiment: BRISK_SXNEARTOL=e) among the rows whose score is within the factor 1 - e of the best (their
+     * weight known), the one of the smallest steepest-edge weight, |row of B^-1|^2, leaves: a sparser row of B^-1 at almost the same
+     * merit (a pass over the heap's candidates; satellites4-25's copy, LP, bench/lp_r16/mystery/B) */
+    { static double ntol_ = -1; if (ntol_ < 0) { const char *e_ = getenv("BRISK_SXNEARTOL"); ntol_ = e_ ? atof(e_) : 0; }
+      if (ntol_ > 0 && S->nheap > 1) { const int b0 = S->heap[0]; const double lim = (1 - ntol_) * S->hkey[b0]; int b = b0;
+          for (int p = 1; p < S->nheap; p++) { const int i = S->heap[p]; if (S->hkey[i] < lim || (S->wlazy && !S->wk[i])) continue; if (S->w[i] < S->w[b]) b = i; }
+          return b; } }
+    {   /* (13 November 2026, a diagnostic: BRISK_SXTRACEHEAP=k with BRISK_SXTRACE) at iteration k, the leaving-row candidates
+         * whose score is within 1e-6 of the best, and any row listed in BRISK_SXTRACEROWS (comma-separated positions), on an "H" line:
+         * position basic-variable score infeasibility weight weight-known */
+        static long th_ = -2; if (th_ == -2) { const char *e_ = getenv("BRISK_SXTRACEHEAP"); th_ = e_ ? atol(e_) : -1; }
+        if (th_ >= 0 && S->iter == th_ && S->trace && S->nheap) {
+            const double top_ = S->hkey[S->heap[0]]; fprintf(S->trace, "H %ld top %d :", S->iter, S->heap[0]);
+            for (int p_ = 0; p_ < S->nheap; p_++) { const int i_ = S->heap[p_]; if (S->hkey[i_] >= top_ * (1 - 1e-6)) fprintf(S->trace, " %d %d %.17g %.17g %.10g %d", i_, S->basic[i_], S->hkey[i_], infeas(S, i_), S->w[i_], S->wk ? S->wk[i_] : 1); }
+            const char *rl_ = getenv("BRISK_SXTRACEROWS");
+            if (rl_) { fprintf(S->trace, " | listed:"); char buf_[512]; snprintf(buf_, sizeof buf_, "%s", rl_);
+                for (char *t_ = strtok(buf_, ","); t_; t_ = strtok(NULL, ",")) { const int i_ = atoi(t_); if (i_ >= 0 && i_ < S->m)
+                    fprintf(S->trace, " %d %d inheap %d key %.10g infeas %.10g w %.10g x %.10g lo %.10g up %.10g", i_, S->basic[i_], S->hpos ? S->hpos[i_] : -9, S->hkey[i_], infeas(S, i_), S->w[i_], S->x[S->basic[i_]], S->lo[S->basic[i_]], S->up[S->basic[i_]]); } }
+            fputc('\n', S->trace);
+            /* (13 November 2026, a diagnostic: BRISK_SXTRACEHEAPN=n) the n best leaving candidates by score on a "HN" line: position
+             * basic-variable score infeasibility weight weight-known */
+            static int thn_ = -2; if (thn_ == -2) { const char *e_ = getenv("BRISK_SXTRACEHEAPN"); thn_ = e_ ? atoi(e_) : 0; }
+            if (thn_ > 0) { int *ix_ = xmalloc(sizeof(int) * (size_t)S->nheap); for (int p_ = 0; p_ < S->nheap; p_++) ix_[p_] = S->heap[p_];
+                fprintf(S->trace, "HN %ld :", S->iter);
+                for (int t_ = 0; t_ < thn_ && t_ < S->nheap; t_++) { int b_ = t_; for (int p_ = t_ + 1; p_ < S->nheap; p_++) if (S->hkey[ix_[p_]] > S->hkey[ix_[b_]]) b_ = p_;
+                    const int tmp_ = ix_[t_]; ix_[t_] = ix_[b_]; ix_[b_] = tmp_; const int i_ = ix_[t_];
+                    fprintf(S->trace, " %d %d %.6g %.6g %.6g %d", i_, S->basic[i_], S->hkey[i_], infeas(S, i_), S->w[i_], S->wk ? S->wk[i_] : 1); }
+                fputc('\n', S->trace); free(ix_); }
+            /* (BRISK_SXTRACEVARS=v1,v2,...: those basic variables' rows on a "HV" line: variable position key infeasibility weight known,
+             * and the rank of the key among the heap) */
+            const char *vl_ = getenv("BRISK_SXTRACEVARS");
+            if (vl_) { fprintf(S->trace, "HV %ld :", S->iter); char buf_[2048]; snprintf(buf_, sizeof buf_, "%s", vl_);
+                for (char *t_ = strtok(buf_, ","); t_; t_ = strtok(NULL, ",")) { const int v_ = atoi(t_); const int i_ = v_ >= 0 && v_ < S->N ? S->pos[v_] : -1;
+                    if (i_ < 0) { fprintf(S->trace, " %d nonbasic", v_); continue; }
+                    int rk_ = 0; for (int p_ = 0; p_ < S->nheap; p_++) if (S->hkey[S->heap[p_]] > S->hkey[i_]) rk_++;
+                    fprintf(S->trace, " %d pos %d inheap %d key %.6g infeas %.6g w %.6g wk %d rank %d", v_, i_, S->hpos[i_], S->hkey[i_], infeas(S, i_), S->w[i_], S->wk ? S->wk[i_] : 1, rk_); }
+                fputc('\n', S->trace); } } }
     return S->nheap ? S->heap[0] : -1;
 }
 /* the row-wise copy keeps the entries of the nonbasic columns at the front of each row (HiGHS does the same): the
@@ -963,11 +1443,21 @@ static void rows_leave(Sx *S, int j) {
         if (k >= e) { rows_swap(S, k, e); S->Rnb[i]++; }
     }
 }
+/* the row copy's partition (each row's nonbasic entries first) brought to the basis in pos. (11 November 2026) Only the
+ * columns whose side changed are moved (rows_enter, rows_leave): every column's entries are always all on one side (the
+ * row copy starts all nonbasic, and only these two routines move entries), so the side its first entry is on is the
+ * column's. Before, every entry of every row was passed and swapped: on the mixed-integer solver's node LPs, where a new
+ * basis differs from the last in a few columns, that pass was 12 % of the time of a node (a multiple knapsack LP of 10 rows
+ * and 300 columns, about three iterations a node) */
 static void rows_partition(Sx *S) {
-    for (int i = 0; i < S->m; i++) {
-        int e = S->Rp[i];
-        for (int k = S->Rp[i]; k < S->Rp[i + 1]; k++) if (S->pos[S->Ri[k]] < 0) { rows_swap(S, k, e); e++; }
-        S->Rnb[i] = e - S->Rp[i];
+    const int n = S->n;
+    for (int j = 0; j < n; j++) {
+        const int p0 = S->Ap[j];
+        if (p0 == S->Ap[j + 1]) continue;
+        const int i = S->Ai[p0];
+        const int nb = S->Cr[p0] < S->Rp[i] + S->Rnb[i];
+        if (S->pos[j] >= 0) { if (nb) rows_enter(S, j); }
+        else if (!nb) rows_leave(S, j);
     }
 }
 
@@ -1093,9 +1583,79 @@ static void price(Sx *S, const SxVec *rho) {
     S->t_price += now() - t;
 }
 
+/* (7 November 2026, BRISK_SXINTPREF=gamma; only with integer flags given, sxm_set_integer) the entering variable of a final
+ * group cand[k0 .. k1) of the dual ratio test: q, the largest |alpha| (best), when it is a row logical or a continuous
+ * column; when it is an integer column, the member of largest |alpha| among the logicals and continuous columns whose
+ * |alpha| is at least gamma times best (the first such in the group's order among equal ones), if there is one. Every
+ * member of the group lies within the Harris bound, so the step of any of them keeps every reduced cost within the dual
+ * tolerance: the choice between them is free, and on a dual-degenerate LP (the relaxation of a mixed-integer program with
+ * a zero objective, where every ratio is zero) it decides which variable becomes basic. An integer column that enters
+ * becomes basic, usually at a fraction; a logical or a continuous column that enters leaves the integer columns at their
+ * bounds. A group of one member, or one with no integer column at its head, is not changed */
+/* (experiment, SXSLACKPREF=gamma; 13 November 2026: in both branches of the ratio test, before only in the unsorted one) among
+ * the final group's members with |alpha| >= gamma times the largest, a logical (length 1) or the shortest column enters, ties
+ * by the larger |alpha|: the choice within the group is free (every member keeps the reduced costs within the tolerance), and
+ * a short entering column keeps the basis sparse */
+static int short_pref_pick(Sx *S, int k0, int k1, int q, double best) {
+    if (!(S->env_slackpref > 0) || q < 0 || q >= S->n || k1 - k0 < 2) return q;
+    int q2 = -1; long l2 = 1L << 40; double b2 = 0;
+    for (int k = k0; k < k1; k++) {
+        if (S->ca[k] < S->env_slackpref * best) continue;
+        const int j = S->cand[k]; const long len = j >= S->n ? 1 : S->Ap[j + 1] - S->Ap[j];
+        if (len < l2 || (len == l2 && S->ca[k] > b2)) { l2 = len; b2 = S->ca[k]; q2 = j; }
+    }
+    return q2 >= 0 ? q2 : q;
+}
+static int int_pref_pick(Sx *S, int k0, int k1, int q, double best) {
+    if (!S->isint || !(S->env_intpref > 0) || q < 0 || q >= S->n || !S->isint[q] || k1 - k0 < 2) return q;
+    const double lim = S->env_intpref * best;
+    int q2 = -1, nalt = 0; double b2 = 0;
+    for (int k = k0; k < k1; k++) {
+        const int j = S->cand[k];
+        if (j < S->n && S->isint[j]) continue;
+        nalt++;
+        if (S->ca[k] >= lim && S->ca[k] > b2) { b2 = S->ca[k]; q2 = j; }
+    }
+    if (q2 < 0) { if (nalt) S->n_ip_small++; else S->n_ip_none++; return q; }
+    S->n_intpref++;
+    return q2;
+}
+
 /* the bound-flipping ratio test with Harris' tolerances. delta: the primal infeasibility of the leaving row (< 0 below its
  * lower bound). Returns the entering variable (-1: none: the leaving row cannot be made feasible: primal infeasible);
  * the variables to flip are returned in S->cand[0..*nflip-1] */
+/* (8 November 2026, a test: BRISK_SXNOBF=1) the ratio test without its long steps over bound flips: the first group only */
+static int sx_nobf(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXNOBF"); c = e && atoi(e) != 0; } return c; }
+
+/* (14 November 2026, an experiment in a scratch copy, bench/lp_r16/uccase7: BRISK_SXBFEARLY=gamma) the bound-flipping ratio test may
+ * stop at any breakpoint it passes: the dual objective rises up to the textbook stop. Among the candidates of all groups up to the
+ * final one whose |alpha| is at least gamma times the largest of them, the one with the fewest column entries enters (ties to the
+ * last), if it is strictly shorter than the final group's choice; the candidates of the groups before its group are flipped, the
+ * rest stay at their bounds. BRISK_SXBFEARLYM=1: the shortest only among the candidates of |alpha| at least gamma times the
+ * final group's choice's |alpha| */
+static _Thread_local int bfe_ng = 0, bfe_cap = 0; static _Thread_local int *bfe_gs = NULL;   /* (per thread: the ratio test runs on two threads in the race; the array is kept for the thread's life) */
+static int bfe_on_ = -1;   /* (the switch read once; with it off nothing is recorded and nothing allocated: the default path neither shares nor leaks this state) */
+static void bfe_push(int st) { if (bfe_on_ < 0) bfe_on_ = getenv("BRISK_SXBFEARLY") != NULL; if (!bfe_on_) return; if (bfe_ng >= bfe_cap) { bfe_cap = bfe_cap ? 2 * bfe_cap : 256; bfe_gs = realloc(bfe_gs, sizeof(int) * bfe_cap); } bfe_gs[bfe_ng++] = st; }
+static _Thread_local long bfe_n = 0, bfe_chg = 0;
+static int bfe_pick(Sx *S, int g, int q, int *nfl) {
+    static double gm = -2; static int md = 0;
+    if (gm == -2) { const char *e = getenv("BRISK_SXBFEARLY"); gm = e ? atof(e) : -1; const char *e2 = getenv("BRISK_SXBFEARLYM"); md = e2 ? atoi(e2) : 0; }
+    if (gm < 0 || q < 0 || bfe_ng < 2) return q;
+    bfe_n++;
+    double amx = 0, aq = 0; for (int k = 0; k < g; k++) { if (S->ca[k] > amx) amx = S->ca[k]; if (S->cand[k] == q) aq = S->ca[k]; }
+    const double thr = md == 1 ? gm * aq : gm * amx;
+    #define BFE_LEN(j) ((j) < S->n ? S->Ap[(j) + 1] - S->Ap[(j)] : 1)
+    const int lq = BFE_LEN(q); int bk = -1, bl = lq;
+    const int g0 = bfe_gs[bfe_ng - 1];
+    for (int k = 0; k < g0; k++) { const int j = S->cand[k]; if (S->move[j] == 0 || S->ca[k] < thr) continue; const int l = BFE_LEN(j); if (l < bl || (l == bl && bk >= 0)) { bl = l; bk = k; } }
+    #undef BFE_LEN
+    if (bk < 0 || bl >= lq) return q;
+    int gi = 0; while (gi + 1 < bfe_ng && bfe_gs[gi + 1] <= bk) gi++;
+    const int gs = bfe_gs[gi];
+    { int t = S->cand[bk]; S->cand[bk] = S->cand[gs]; S->cand[gs] = t; double u = S->ca[bk]; S->ca[bk] = S->ca[gs]; S->ca[gs] = u; u = S->cr[bk]; S->cr[bk] = S->cr[gs]; S->cr[gs] = u; }
+    *nfl = gs; S->fg_n = 1; bfe_chg++;
+    return S->cand[gs];
+}
 static int chuzc_dual(Sx *S, double delta, int *nflip) {
     const SxVec *row = &S->row;
     const double mo = delta < 0 ? -1.0 : 1.0;
@@ -1231,7 +1791,7 @@ static int chuzc_dual(Sx *S, double delta, int *nflip) {
      * (td <= s a for a > 0; the least (td + told) / a by cross products), and one division gives each bound. Three
      * divisions per candidate were most of the ratio test's time (lp_setcover_5k, LP: rows of 16,000 entries, 0.14 ms an
      * iteration) */
-    *nflip = 0;
+    *nflip = 0; bfe_ng = 0;
     if (nc == 0) return -1;
     double slope = fabs(delta);
     /* preselection (HiGHS): the candidates up to a step where the flips' total change exceeds the infeasibility, the
@@ -1357,12 +1917,16 @@ static int chuzc_dual(Sx *S, double delta, int *nflip) {
                 g++;
             }
             if (g == st) g = st + 1;   /* (rounding at the boundary: the candidate of the bound itself belongs to its group) */
+            bfe_push(st);
+            if (sx_nobf()) inf = 1;
             if (inf || slope - dsl <= 0 || (g == nc && slope - dsl <= S->tolp)) {
                 int q = -1; double best = 0;
                 for (int k = st; k < g; k++) if (S->ca[k] > best) { best = S->ca[k]; q = S->cand[k]; }
+                q = int_pref_pick(S, st, g, q, best);
+                q = short_pref_pick(S, st, g, q, best);
                 S->fg_n = g - st;
                 *nflip = st;
-                return q;
+                return bfe_pick(S, g, q, nflip);
             }
             slope -= dsl;
             st = g;
@@ -1396,26 +1960,48 @@ static int chuzc_dual(Sx *S, double delta, int *nflip) {
         if (g == start) {   /* numerical corner: nothing within the bound (cannot happen with th finite) */
             return -1;
         }
+        bfe_push(start);
         /* the final group: the slope turns negative, an unbounded candidate, or the last candidates (when their flips
          * leave the row feasible within the tolerance; otherwise the row cannot be made feasible) */
+        if (sx_nobf()) inf = 1;
         if (inf || slope - dsl <= 0 || (g == nc && slope - dsl <= S->tolp)) {
             /* the final group: the largest |alpha| enters */
             int q = -1; double best = 0;
             for (int k = start; k < g; k++) if (S->ca[k] > best) { best = S->ca[k]; q = S->cand[k]; }
+            {   /* (13 November 2026, an experiment: BRISK_SXTIEPICK=1 the highest index among the members of the largest |alpha|,
+                 * =2 one of them at random (a hash of the iteration and the index); by default the first met, the lowest index. Gurobi
+                 * on satellites4-25's copy (LP) breaks such exact ties otherwise: 63325, the 29th of 30, where ours takes 157) */
+                static int tp_ = -1; if (tp_ < 0) { const char *e_ = getenv("BRISK_SXTIEPICK"); tp_ = e_ ? atoi(e_) : 0; }
+                if (tp_ && q >= 0) { double bh = -1;
+                    for (int k = start; k < g; k++) if (S->ca[k] >= best * (1 - 1e-12)) {
+                        const double h = tp_ == 1 ? (double)S->cand[k] : col_rand(S->cand[k] * 7919 + (int)(S->iter % 100003));
+                        if (h > bh) { bh = h; q = S->cand[k]; } } } }
+            {   /* (13 November 2026, a diagnostic: BRISK_SXFORCEQ=<file> of lines "iteration variable") the entering variable forced to
+                 * the given one when it is in the final group (Gurobi's choices among exact ties on satellites4-25's copy, LP, so that
+                 * the next difference that is not a tie shows) */
+                static int nfq_ = -1; static long *fqi_ = NULL; static int *fqv_ = NULL;
+                if (nfq_ < 0) { nfq_ = 0; const char *e_ = getenv("BRISK_SXFORCEQ"); FILE *ff_ = e_ ? fopen(e_, "r") : NULL;
+                    if (ff_) { long a_; int b_; int cap_ = 0; while (fscanf(ff_, "%ld %d", &a_, &b_) == 2) { if (nfq_ >= cap_) { cap_ = cap_ ? 2 * cap_ : 1024; fqi_ = realloc(fqi_, sizeof(long) * cap_); fqv_ = realloc(fqv_, sizeof(int) * cap_); } fqi_[nfq_] = a_; fqv_[nfq_++] = b_; } fclose(ff_); } }
+                if (nfq_ > 0) { int lo_ = 0, hi_ = nfq_ - 1, f_ = -1; while (lo_ <= hi_) { const int md_ = (lo_ + hi_) / 2; if (fqi_[md_] == S->iter) { f_ = md_; break; } if (fqi_[md_] < S->iter) lo_ = md_ + 1; else hi_ = md_ - 1; }
+                    if (f_ >= 0) for (int k = start; k < g; k++) if (S->cand[k] == fqv_[f_]) { q = fqv_[f_]; best = S->ca[k]; break; } } }
+            q = int_pref_pick(S, start, g, q, best);
             S->fg_n = g - start;
-            if (S->env_slackpref > 0 && q >= 0 && q < S->n) {
-                /* (experiment) among candidates with |alpha| >= env_slackpref of the largest, a logical (or the shortest
-                 * column) enters: the basis stays sparser */
-                int q2 = -1; long l2 = 1L << 40; double b2 = 0;
-                for (int k = start; k < g; k++) {
-                    if (S->ca[k] < S->env_slackpref * best) continue;
-                    const int j = S->cand[k]; const long len = j >= S->n ? 1 : S->Ap[j + 1] - S->Ap[j];
-                    if (len < l2 || (len == l2 && S->ca[k] > b2)) { l2 = len; b2 = S->ca[k]; q2 = j; }
-                }
-                if (q2 >= 0) q = q2;
-            }
+            q = short_pref_pick(S, start, g, q, best);
+            {   /* (13 November 2026, a diagnostic: BRISK_SXTRACEGRP=1 with BRISK_SXTRACE) the final group's members on a line of their
+                 * own before the iteration's line: "G iteration chosen : variable |alpha| ratio reduced-cost ..." (the tie-breaks
+                 * against Gurobi's on satellites4-25's copy, LP) */
+                static int tg_ = -1; if (tg_ < 0) { const char *e_ = getenv("BRISK_SXTRACEGRP"); tg_ = e_ && atoi(e_) == 1; }
+                if (tg_ && S->trace) { fprintf(S->trace, "G %ld %d slope %.6g dsl %.6g inf %d nc %d start %d g %d :", S->iter, q, slope, dsl, inf, nc, start, g);
+                    for (int k = start; k < g && k < start + 200; k++) fprintf(S->trace, " %d %.6g %.6g %.6g", S->cand[k], S->ca[k], S->cr[k], S->d[S->cand[k]]);
+                    fputc('\n', S->trace);
+                    /* (13 November 2026, a diagnostic: BRISK_SXTRACEALL=1) every candidate of the ratio test (after the preselection) on an
+                     * "A" line: variable |alpha| reduced-cost-in-the-move's-sign range */
+                    static int ta_ = -1; if (ta_ < 0) { const char *e2_ = getenv("BRISK_SXTRACEALL"); ta_ = e2_ && atoi(e2_) == 1; }
+                    if (ta_) { fprintf(S->trace, "A %ld delta %.10g told %.3g :", S->iter, delta, told);
+                        for (int k = 0; k < nc; k++) fprintf(S->trace, " %d %.10g %.10g %.6g", S->cand[k], S->ca[k], S->cr[k], S->up[S->cand[k]] - S->lo[S->cand[k]]);
+                        fputc('\n', S->trace); } } }
             *nflip = start;
-            return q;
+            return bfe_pick(S, g, q, nflip);
         }
         slope -= dsl;
         start = g;
@@ -1423,60 +2009,138 @@ static int chuzc_dual(Sx *S, double delta, int *nflip) {
     }
 }
 
-/* (4 November 2026, an experiment: BRISK_SXGRP=1) the final group of the bound-flipping ratio test: which of its members
- * enters. The test flips the groups before the final one and lets the largest |alpha| of the final group (the candidates
- * whose ratios lie within the Harris bound) enter, the others staying. When that member is boxed, it moves by the
- * infeasibility left over |alpha_q|, which can be far more than its box: it becomes basic outside its bounds, a new
- * infeasibility of about the size of the one removed. When the group also holds members without a finite box (free columns,
- * one-sided columns, logicals of inequality rows) and the boxed members together cannot take the infeasibility, the slope of
- * the dual objective turns negative at an unbounded member, not at a boxed one: that member enters instead (the largest
- * |alpha| of those, when at least BRISK_SXGRPREL, default 0.1, of the group's largest: the pivot's size, as in a threshold
- * pivoting of an LU factorization). Any member of the group is a valid choice of the Harris test (the reduced costs left of
- * the wrong sign stay within the tolerance). Seen on ns1644855 (LP) with the free columns substituted through inequality rows
- * (BRISK_SXPRE_AGGI=3): the columns z in [0, 1] without cost became basic at 80 times their box and passed the
- * infeasibility from one to the next with steps of zero length, while 110 to 145 free columns of the same group (|alpha|
- * 0.02 to 0.05 against 1) stayed nonbasic. With BRISK_SXGRPFLIP=1 also: the boxed members are flipped (first those whose
- * reduced cost the step makes right at the other bound, then those left within the tolerance) while the infeasibility left
- * exceeds the entering variable's box, each flip only when it leaves the leaving variable on its infeasible side */
-static int final_group(Sx *S, int q, double delta, int *nflip) {
-    const int g0 = *nflip, g1 = g0 + S->fg_n;
-    int kq = -1;
-    for (int k = g0; k < g1; k++) if (S->cand[k] == q) { kq = k; break; }
-    #define FG_BOXED(j) (S->move[j] != 0 && S->up[j] - S->lo[j] < SX_INF)
-    if (kq < 0 || !FG_BOXED(q)) return q;
+/* (7 November 2026, ISSUES 831; BRISK_SXGRPBF=gamma, 0.1 by default, 0: off) the final group of the bound-
+ * flipping ratio test passed in the order of its ratios, as the test passes the groups before it. The Harris pass lumps
+ * the candidates whose ratios lie within the dual tolerance into one group, and the test lets the largest |alpha| of it
+ * enter while the others stay at their bounds. When the infeasibility left exceeds what that member's box can take
+ * (|alpha_q| (u_q - l_q)), the member becomes basic outside its box, a new primal infeasibility about as large as the one
+ * removed; on LPs whose costs are mostly zero (brazil3, mzzv11, ns1644855) the perturbed reduced costs lie within a few
+ * tolerances of each other, the groups hold tens of members, and this happened in up to two thirds of the iterations,
+ * half of them steps of length zero. Here the members are taken in increasing ratio td / |alpha| (ties to the larger
+ * |alpha|, then the earlier member): a boxed member is flipped while the infeasibility left exceeds its share
+ * |alpha_j| (u_j - l_j); the first member that can take the rest (or has no finite box) enters if its reduced cost has
+ * the right sign (a step of positive length) and its |alpha| is at least gamma times the group's largest (the pivot's
+ * size; HiGHS accepts a final group whose largest |alpha| reaches 0.1 of the row's largest), else it is passed over and
+ * stays at its bound. Every flipped member has a ratio at most the entering one's, so after the step its reduced cost
+ * has the right sign at its new bound; the members passed over and those after the entering one keep reduced costs
+ * within the tolerance (the Harris bound covers the whole group). A flip changes the objective by td (u_j - l_j): a
+ * member of the wrong sign within the tolerance (td < 0) lowers it. Such flips are made only while they take at most
+ * half of the iteration's rise (the step's td_q / |alpha_q| times the infeasibility left, and the other flips), so that
+ * the dual objective rises at every step that shifts no cost and the method cannot cycle; without that bound they
+ * cycled while this was built (grow22 and pilot87 of Netlib, LPs: 2.1 million and 126,000 iterations at 60 s), and
+ * without any of them ns1644855 (LP) took 24,000-40,000 iterations instead of 17,000-22,000. A member of reduced cost
+ * zero is not flipped (no change of the objective). When no member qualifies, the largest |alpha| enters as before. */
+static int g_dsws = 1;   /* (13 November 2026, BRISK_SXDEGWS=0: the sparsest-member rule's solves through the factor's own workspace, as first built) */
+/* (13 November 2026) the sparsest-member rule's count: the nonzeros of B^-1 a_j, solved in the second solve's workspace (wv) */
+static long ds_count(Sx *S, int j) {
+    SxVec *v = &S->wv; long nz = 0;
+    sxv_clear(v); col_scatter(S, j, v, 1.0);
+    /* (the factor's running statistics of the forward solve through U, which choose how the iteration's own solves run, saved and
+     * restored: without that the rule changed the path where it changed no choice, qap12, LP: 11,939 -> 6,940 iterations) */
+    const double hc = S->F.hy_canc; const int hp = S->F.hy_cp;
+    if (g_dsws) { SxWs *W = &S->ws2; W->nflops = W->nedges = 0; sxlu_ftran_ws(&S->F, W, v, S->dens_col, NULL); } else sxlu_ftran(&S->F, v, S->dens_col, NULL);
+    if (g_dsws) { S->F.hy_canc = hc; S->F.hy_cp = hp; }
+    if (v->cnt >= 0) nz = v->cnt; else for (int i = 0; i < S->m; i++) nz += v->val[i] != 0;
+    sxv_clear(v);
+    S->ds_solve++;
+    return nz;
+}
+/* (14 November 2026, BRISK_SXDEGBOUND=1; ISSUES 881) the count on the factor's patterns, stopped once past bound (sxlu_count_bounded):
+ * a member denser than the best so far is known as such for the work of reaching bound + 1 rows */
+static long ds_count_sym(Sx *S, int j, long bound) {
+    SxVec *v = &S->wv;
+    sxv_clear(v); col_scatter(S, j, v, 1.0); if (v->cnt < 0) sxv_reindex(v);
+    SxWs *W = &S->ws2; W->nflops = W->nedges = 0;
+    const long n = sxlu_count_bounded(&S->F, W, v->idx, v->cnt, bound);
+    sxv_clear(v);
+    S->ds_solve++;
+    return n;
+}
+static _Thread_local const Sx *bf_S; static _Thread_local int bf_pass;   /* (final_group_bf's sort) */
+static int bf_cmp(const void *pa, const void *pb) {
+    const Sx *S = bf_S; const int x = *(const int *)pa, y = *(const int *)pb, pass = bf_pass;
+    #define BF_LT2(x, y) (S->cr[x] * S->ca[y] < S->cr[y] * S->ca[x] || (S->cr[x] * S->ca[y] == S->cr[y] * S->ca[x] && (pass == 2 ? S->cand[x] < S->cand[y] : pass == 0 ? (S->ca[x] > S->ca[y] || (S->ca[x] == S->ca[y] && x < y)) : (S->ca[x] < S->ca[y] || (S->ca[x] == S->ca[y] && x < y)))))
+    if (BF_LT2(x, y)) return -1; if (BF_LT2(y, x)) return 1; return 0;
+    #undef BF_LT2
+}
+static int final_group_bf(Sx *S, int q, double delta, int *nflip) {
+    const int g0 = *nflip, g1 = g0 + S->fg_n, ng = g1 - g0;
+    if (ng < 2) return q;
     double sl = fabs(delta);   /* the infeasibility left after the earlier groups' flips */
     for (int k = 0; k < g0; k++) { const int j = S->cand[k]; sl -= S->ca[k] * (S->up[j] - S->lo[j]); }
-    if (sl <= S->ca[kq] * (S->up[q] - S->lo[q])) return q;
-    double cb = 0; int ku = -1;     /* the boxed members' total move; the largest |alpha| without a finite box */
-    for (int k = g0; k < g1; k++) {
-        const int j = S->cand[k];
-        if (FG_BOXED(j)) cb += S->ca[k] * (S->up[j] - S->lo[j]);
-        else if (ku < 0 || S->ca[k] > S->ca[ku]) ku = k;
-    }
-    int ke = kq;
-    if (sl > cb && ku >= 0 && S->ca[ku] >= S->env_grprel * S->ca[kq]) ke = ku;
-    const int qe = S->cand[ke];
-    if (!S->env_grpflip) return qe;
-    const double rq = S->cr[ke] > 0 ? S->cr[ke] / S->ca[ke] : 0;   /* the step as a ratio */
-    const double cap = FG_BOXED(qe) ? S->ca[ke] * (S->up[qe] - S->lo[qe]) : 0;
-    int nf = g0;
-    for (int pass = 0; pass < 2; pass++)
-        for (int k = g0; k < g1 && sl > cap; k++) {
-            const int j = S->cand[k];
-            if (k == ke || k < nf || !FG_BOXED(j)) continue;
-            const double over = S->cr[k] - rq * S->ca[k];          /* > 0: its reduced cost of the wrong sign after a flip */
-            if (pass == 0 ? over > 0 : (over <= 0 || over > S->told)) continue;
-            const double mv = S->ca[k] * (S->up[j] - S->lo[j]);
-            if (sl - mv <= 0) continue;
-            sl -= mv;
-            const int t1 = S->cand[nf]; const double t2 = S->ca[nf], t3 = S->cr[nf];   /* to the flip list */
-            S->cand[nf] = j; S->ca[nf] = S->ca[k]; S->cr[nf] = S->cr[k];
-            S->cand[k] = t1; S->ca[k] = t2; S->cr[k] = t3;
-            if (ke == nf) ke = k;
-            nf++;
+    int *od = S->cp; double amax = 0;
+    for (int k = 0; k < ng; k++) { od[k] = g0 + k; if (S->ca[g0 + k] > amax) amax = S->ca[g0 + k]; }
+    /* (the members by increasing ratio cr / ca, compared by cross products; an insertion sort: groups are small) */
+    /* (13 November 2026, an experiment: BRISK_SXGRPBFRETRY=1) when no member can enter in this order (the members left once the
+     * flips have taken the infeasibility are all below gamma times the largest |alpha|), the group passed again with the ties of
+     * ratio ordered by increasing |alpha|: the small members flipped first, a large one left to enter. Satellites4-25's copy (LP):
+     * a group of 42 at one ratio, 30 of |alpha| 1 and 12 of 1/32 (each box taking 1 of the infeasibility 41): the 30 large were
+     * flipped first, then 10 small, the two small left could not enter, and none was flipped (the largest |alpha| entered with a
+     * step of 41 across its box of 1); Gurobi flips 40 and enters a member of |alpha| 1 (bench/lp_r16/slack) */
+    static int bfretry = -1; if (bfretry < 0) { const char *e_ = getenv("BRISK_SXGRPBFRETRY"); bfretry = e_ ? atoi(e_) : 0; }
+    const double lim = S->env_grpbf * amax;
+    const double sl0 = sl;
+    int ke = -1, nf = 0;
+    /* (BRISK_SXGRPBFRETRY=2: one pass, the ties of ratio in the order of the variables' indices, as Gurobi's on that LP) */
+    for (int pass = bfretry == 2 ? 2 : 0; pass < (bfretry == 1 ? 2 : bfretry == 2 ? 3 : 1) && ke < 0; pass++) {
+    if (pass == 1) { sl = sl0; nf = 0; for (int k = 0; k < ng; k++) od[k] = g0 + k; }
+    #define BF_LT(x, y) (S->cr[x] * S->ca[y] < S->cr[y] * S->ca[x] || (S->cr[x] * S->ca[y] == S->cr[y] * S->ca[x] && (pass == 2 ? S->cand[x] < S->cand[y] : pass == 0 ? (S->ca[x] > S->ca[y] || (S->ca[x] == S->ca[y] && x < y)) : (S->ca[x] < S->ca[y] || (S->ca[x] == S->ca[y] && x < y)))))
+    /* (13 November 2026) groups of more than 32 members sorted by qsort with the same comparison (a strict total order: the same
+     * result as the insertion sort, which costs the square of the group's size: with the costs unperturbed a group can hold
+     * thousands of members; neos-578379, LP, all costs zero, 21 s of its 24 s here) */
+    if (ng > 32) { bf_S = S; bf_pass = pass; qsort(od, (size_t)ng, sizeof(int), bf_cmp); }
+    else
+    for (int a = 1; a < ng; a++) { const int t = od[a]; int b = a - 1; while (b >= 0 && BF_LT(t, od[b])) { od[b + 1] = od[b]; b--; } od[b + 1] = t; }
+    #undef BF_LT
+    for (int a = 0; a < ng; a++) {
+        const int k = od[a], j = S->cand[k];
+        const int boxed = S->move[j] != 0 && S->up[j] - S->lo[j] < SX_INF;
+        const double cap = boxed ? S->ca[k] * (S->up[j] - S->lo[j]) : SX_INF;
+        if (sl - cap > 0) { if (S->cr[k] != 0) { od[nf++] = k; sl -= cap; } continue; }   /* flipped (od[0 .. nf)) */
+        if (S->cr[k] > 0 && S->ca[k] >= lim) {
+            ke = k;
+            /* (BRISK_SXINTPREF, with integer flags) an integer column found to enter: the next member in the order of the
+             * ratios that is a logical or a continuous column and could enter as well (its box takes the rest, a step of
+             * positive length, |alpha| at least gamma times the group's largest and at least this test's own bound)
+             * enters instead; the members between stay at their bounds (within the Harris bound, as those passed over) */
+            if (S->isint && S->env_intpref > 0 && j < S->n && S->isint[j]) {
+                const double lim2 = fmax(lim, S->env_intpref * amax);
+                for (int a2 = a + 1; a2 < ng; a2++) {
+                    const int k2 = od[a2], j2 = S->cand[k2];
+                    if (j2 < S->n && S->isint[j2]) continue;
+                    const int bx2 = S->move[j2] != 0 && S->up[j2] - S->lo[j2] < SX_INF;
+                    const double cap2 = bx2 ? S->ca[k2] * (S->up[j2] - S->lo[j2]) : SX_INF;
+                    if (sl - cap2 > 0 || !(S->cr[k2] > 0) || S->ca[k2] < lim2) continue;
+                    ke = k2; S->n_intpref++; break;
+                }
+            }
+            break;
         }
-    #undef FG_BOXED
-    *nflip = nf;
+    }
+    }
+    if (ke < 0) return q;
+    {   /* the objective's change: the flips at the reduced costs before the step, sum td_j (u_j - l_j), and the step on
+         * the infeasibility left, (td_q / |alpha_q|) sl; the flips of members of the wrong sign (td_j < 0) lower it */
+        double gain = S->cr[ke] / S->ca[ke] * sl, loss = 0;
+        for (int a = 0; a < nf; a++) { const int k = od[a], j = S->cand[k]; const double v = S->cr[k] * (S->up[j] - S->lo[j]); if (v > 0) gain += v; else loss -= v; }
+        /* (BRISK_SXGRPBFLOSS: the share of the rise they may take, 0.5 by default; above 1 the objective can fall and
+         * the method cycle: grow22, pilot87 with no bound) */
+        static double lfr = -1; if (lfr < 0) { const char *e_ = getenv("BRISK_SXGRPBFLOSS"); lfr = e_ ? atof(e_) : 0.5; }
+        if (loss > lfr * gain) {   /* (they would take more than that share of the rise: left at their bounds) */
+            int w2 = 0;
+            for (int a = 0; a < nf; a++) if (S->cr[od[a]] > 0) od[w2++] = od[a];
+            nf = w2;
+        }
+    }
+    /* the flipped members to cand[g0 .. g0 + nf), the others after them in their order */
+    const int qe = S->cand[ke];
+    int *tc = S->cti; double *ta = S->ctd, *tr = S->ck, *isf = S->chm;
+    for (int k = g0; k < g1; k++) isf[k] = 0;
+    int w = 0;
+    for (int a = 0; a < nf; a++) { const int k = od[a]; isf[k] = 1; tc[w] = S->cand[k]; ta[w] = S->ca[k]; tr[w] = S->cr[k]; w++; }
+    for (int k = g0; k < g1; k++) if (!isf[k]) { tc[w] = S->cand[k]; ta[w] = S->ca[k]; tr[w] = S->cr[k]; w++; }
+    for (int k = 0; k < ng; k++) { S->cand[g0 + k] = tc[k]; S->ca[g0 + k] = ta[k]; S->cr[g0 + k] = tr[k]; }
+    *nflip = g0 + nf;
     return qe;
 }
 
@@ -1502,7 +2166,12 @@ static void update_ddevex(Sx *S, int r, const SxVec *alpha) {
     S->w[r] = nw > 1.0 ? nw : 1.0;
 }
 /* update the dual steepest-edge weights; alpha: B^{-1} a_q (by position), tau = B^{-1} rho_r, wr = |rho_r|^2 */
+/* (13 November 2026, an experiment: BRISK_SXWMONO=1) a row's steepest-edge weight never falls in the update: Gurobi passes over
+ * rows whose exact weight is small for tens of iterations (satellites4-25's copy, LP: a column infeasible by 1 with weight 1 left
+ * for 55 iterations), as if its weights only grew */
+static int g_wmono = -1;
 static void update_dse(Sx *S, int r, const SxVec *alpha, const SxVec *tau, double wr) {
+    if (g_wmono < 0) { const char *e_ = getenv("BRISK_SXWMONO"); g_wmono = e_ && atoi(e_) != 0; }
     const double ar = alpha->val[r];
     const double nw = wr / (ar * ar);
     if (alpha->cnt >= 0) {
@@ -1512,6 +2181,8 @@ static void update_dse(Sx *S, int r, const SxVec *alpha, const SxVec *tau, doubl
             const double ai = alpha->val[i];
             const double ratio = ai / ar;
             double wi = S->w[i] + ratio * (ratio * wr - 2 * tau->val[i]);
+            if (g_wlb > 0 && wi < ratio * ratio * wr) wi = ratio * ratio * wr;   /* (BRISK_SXWLB: Forrest and Goldfarb's lower bound) */
+            if (g_wmono > 0 && wi < S->w[i]) wi = S->w[i];   /* (BRISK_SXWMONO: a weight never falls) */
             S->w[i] = wi > 1e-4 ? wi : 1e-4;
         }
     } else {
@@ -1519,44 +2190,79 @@ static void update_dse(Sx *S, int r, const SxVec *alpha, const SxVec *tau, doubl
             if (i == r || alpha->val[i] == 0) continue;
             const double ratio = alpha->val[i] / ar;
             double wi = S->w[i] + ratio * (ratio * wr - 2 * tau->val[i]);
+            if (g_wlb > 0 && wi < ratio * ratio * wr) wi = ratio * ratio * wr;
+            if (g_wmono > 0 && wi < S->w[i]) wi = S->w[i];
             S->w[i] = wi > 1e-4 ? wi : 1e-4;
         }
     }
     S->w[r] = nw > 1e-4 ? nw : 1e-4; S->wk[r] = 1;     /* (from |rho_r|^2, computed in the iteration: known) */
+    {   /* (12 November 2026, an experiment: BRISK_SXWLOG1=1) the rows whose basic variable is a logical keep the weight 1 (the
+         * entering variable q at row r after the basis change: a logical there too) */
+        static int wl1_ = -1; if (wl1_ < 0) { const char *e_ = getenv("BRISK_SXWLOG1"); wl1_ = e_ && atoi(e_) != 0; }
+        if (wl1_) { if (alpha->cnt >= 0) { for (int k = 0; k < alpha->cnt; k++) { const int i = alpha->idx[k]; if (i != r && S->basic[i] >= S->n) S->w[i] = 1.0; } }
+                    else for (int i = 0; i < S->m; i++) if (i != r && S->basic[i] >= S->n) S->w[i] = 1.0; }
+    }
 }
 
 /* the dual method's starting bounds: with the basis of the logicals, a boxed column of cost zero is dual feasible at
  * either bound, so it is put at the one that leaves the smaller primal infeasibility (the sum over its rows of the
  * logicals' bound violations), one pass over the columns; the perturbation then keeps that bound. Returns the flips. */
-static long dual_start_bounds(Sx *S) {
+static long dual_start_bounds_(Sx *S, int anycost) {
     const int n = S->n, m = S->m;
     double *v = xcalloc((size_t)m, sizeof(double));      /* the logicals' values s = -A x */
     for (int j = 0; j < n; j++) {
         const double xj = S->x[j];
         if (xj != 0) for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) v[S->Ai[p]] -= S->Ax[p] * xj;
     }
-#define SX_VIOL(i, s) ((s) < S->lo[n + (i)] ? S->lo[n + (i)] - (s) : (s) > S->up[n + (i)] ? (s) - S->up[n + (i)] : 0.0)
+#define SX_VIOL(i, s) ((anycost >= 4 && S->lo[n + (i)] == S->up[n + (i)]) ? 0.0 : (s) < S->lo[n + (i)] ? S->lo[n + (i)] - (s) : (s) > S->up[n + (i)] ? (s) - S->up[n + (i)] : 0.0)   /* (4: inequality rows only, a test) */
     long nfl = 0;
-    for (int j = 0; j < n; j++) {
-        if (S->pos[j] >= 0 || S->cost[j] != 0 || !is_boxed(S, j) || S->lo[j] == S->up[j]) continue;
+    /* (11 November 2026, a test: anycost 3) the columns in the order of the objective a flip loses per unit of infeasibility it
+     * removes at the start, cheapest first (a greedy covering) */
+    int *ord = NULL; int nord = n;
+    if (anycost >= 3) {
+        ord = xmalloc(sizeof(int) * ((size_t)n + 1)); double *key = xmalloc(sizeof(double) * ((size_t)n + 1)); nord = 0;
+        for (int j = 0; j < n; j++) {
+            if (S->pos[j] >= 0 || !is_boxed(S, j) || S->lo[j] == S->up[j]) continue;
+            const double to = S->move[j] > 0 ? S->up[j] : S->lo[j], dx = to - S->x[j];
+            double g = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const int i = S->Ai[p]; g += SX_VIOL(i, v[i] - S->Ax[p] * dx) - SX_VIOL(i, v[i]); }
+            if (!(g < 0)) continue;
+            key[j] = S->cost[j] * dx / -g; ord[nord++] = j;
+        }
+        {   /* (by the key, ties by the column's index: the same order as the insertion sort it replaces, in n log n) */
+            struct SxBp *kb = xmalloc(sizeof(struct SxBp) * ((size_t)nord + 1));
+            for (int k = 0; k < nord; k++) { kb[k].t = key[ord[k]]; kb[k].e = ord[k]; }
+            qsort(kb, nord, sizeof *kb, cmp_bp);
+            for (int k = 0; k < nord; k++) ord[k] = kb[k].e;
+            free(kb);
+        }
+        free(key);
+    }
+    for (int jj = 0; jj < nord; jj++) {
+        const int j = ord ? ord[jj] : jj;
+        if (S->pos[j] >= 0 || (S->cost[j] != 0 && !anycost) || !is_boxed(S, j) || S->lo[j] == S->up[j]) continue;
         const double to = S->move[j] > 0 ? S->up[j] : S->lo[j], dx = to - S->x[j];
-        double g = 0, base = 0;
+        double g = 0, base = 0; int worse = 0;
         for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) {
             const int i = S->Ai[p];
             const double e0 = SX_VIOL(i, v[i]), e1 = SX_VIOL(i, v[i] - S->Ax[p] * dx);
-            g += e1 - e0; base += e0;
+            g += e1 - e0; base += e0; if (e1 > e0) worse = 1;
         }
         if (!(g < -1e-9 * (1 + base))) continue;
+        if (anycost >= 5 && worse) continue;   /* (11 November 2026, a test: 5, a flip that makes no row worse) */
         for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) v[S->Ai[p]] -= S->Ax[p] * dx;
         S->x[j] = to; S->move[j] = (signed char)-S->move[j]; nfl++;
+        if (anycost >= 2 && nfl <= 12 && getenv("BRISK_SXPSTARTDIAG")) printf("  flip %d: column %d, [%g, %g] to %g, cost %.3g, %d entries\n", (int)nfl, j, S->lo[j], S->up[j], to, S->cost[j], S->Ap[j + 1] - S->Ap[j]);
     }
 #undef SX_VIOL
-    free(v);
+    free(v); free(ord);
     return nfl;
 }
+static long dual_start_bounds(Sx *S) { return dual_start_bounds_(S, 0); }
 /* cost perturbation (against dual degeneracy): structurals by a relative random amount in the direction that keeps the
  * starting basis' reduced costs feasible */
 /* (the stall rule on trial: BRISK_SXSTALL=1; off until measured on the sets; read by sx_setup into env_nostall) */
+/* (13 November 2026, the LP developer) BRISK_SXLAZYSTALL: the stall rule serves the perturbation at the first stall (dual_loop, dual_simplex) */
+static int lazystall(void) { static int v = -1; if (v < 0) { const char *e_ = getenv("BRISK_SXLAZYSTALL"); v = e_ ? atoi(e_) : 0; if (v < 0) v = 0; } return v; }
 static int cmp_dbl_asc(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 static void perturb_costs(Sx *S) {
     const int n = S->n;
@@ -1613,6 +2319,37 @@ static void perturb_costs(Sx *S) {
      * infeasibilities where the rows that joined were 59 (round 1: 378 flips, 4,005 infeasible rows; the six rounds 1,500 to
      * 3,500 iterations each, now 435 to 780). BRISK_SXPERTMOVE=0: by the sign of the cost */
     static int pmove = -1; if (pmove < 0) { const char *e_ = getenv("BRISK_SXPERTMOVE"); pmove = !(e_ && atoi(e_) == 0); }
+    /* (12 November 2026, an experiment: BRISK_SXPERTLEN=w, a column's perturbation times (its entries / the mean entries)^w when longer than the mean) */
+    static double plen_w = -1; if (plen_w < 0) { const char *e_ = getenv("BRISK_SXPERTLEN"); plen_w = e_ ? atof(e_) : 0; }
+    const double plen_avg = n > 0 ? fmax(1.0, (double)S->Ap[n] / n) : 1.0;
+    /* (14 November 2026, an experiment: BRISK_SXPERTUNITS=1) the rule by the largest cost (mode 1) applied in the problem's own units,
+     * column by column: xp = 5e-7 bcu (|c_j| + 1) (1 + u) with c_j and bcu (the largest |c_j|, its fourth root above 100) in the units
+     * of the problem as given, converted to the scaled problem by cscale_j / costscale. The rule in the scaled problem gives a column
+     * (|c_j| + 1 / cscale_j) times the base in the problem's units: a column scaled down (long columns of large entries) gets less
+     * (satellites4-25's shuffled copies, LP: the 15-entry columns 0.64 times the 2-entry columns' perturbation, Gurobi's 2.6 times;
+     * bench/lp_r16/satcopy/REPORT.md). With BRISK_SXPERTLEN the length factor follows */
+    static int punits_ = -1; if (punits_ < 0) { const char *e_ = getenv("BRISK_SXPERTUNITS"); punits_ = e_ && atoi(e_) != 0; }
+    double bcu_ = 0;
+    if (punits_ && mode == 1) {
+        for (int j = 0; j < n; j++) { const double cj = fabs(S->cost0[j]) * S->costscale / (S->cscale ? S->cscale[j] : 1.0); if (cj > bcu_) bcu_ = cj; }
+        if (bcu_ > 100) bcu_ = sqrt(sqrt(bcu_));
+        if (bcu_ == 0) bcu_ = 1;
+        if ((double)nbox / S->N < 0.01 && bcu_ > 1) bcu_ = 1;
+        if (S->verbose >= 2) printf("  cost perturbation in the problem's units: largest cost (fourth root above 100) %.3g\n", bcu_);
+    }
+    /* (14 November 2026, an experiment: BRISK_SXPERTNORM=1) each column's perturbation times its 2-norm in the scaled problem over the mean
+     * of those norms. The ratio test compares d_j / |alpha_rj|, and alpha_rj = rho_r a_j sums more terms in a long column: an even
+     * perturbation breaks ties among columns of equal true reduced cost in favour of long columns (satellites4-25's shuffled copies, LP,
+     * bench/lp_r16/satcopy/REPORT.md); one proportional to the norm leaves them on an equal footing, whatever the optimum needs (qap15,
+     * LP: its 90 long columns all basic at the optimum, held back by a factor that favours short columns) */
+    static int pnorm_ = -1; if (pnorm_ < 0) { const char *e_ = getenv("BRISK_SXPERTNORM"); pnorm_ = e_ && atoi(e_) != 0; }
+    double *cnorm_ = NULL;
+    if (pnorm_ && n > 0) {
+        cnorm_ = malloc(sizeof(double) * n); double sn_ = 0; int nn_ = 0;
+        for (int j = 0; j < n; j++) { double q_ = 0; for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) q_ += S->Ax[p] * S->Ax[p]; cnorm_[j] = sqrt(q_); if (q_ > 0) { sn_ += cnorm_[j]; nn_++; } }
+        sn_ = nn_ > 0 ? sn_ / nn_ : 1.0;
+        for (int j = 0; j < n; j++) cnorm_[j] = cnorm_[j] > 0 ? cnorm_[j] / sn_ : 1.0;
+    }
     for (int j = 0; j < n; j++) {
         const double l = S->lo0[j], u = S->up0[j];
         double xp;
@@ -1626,18 +2363,53 @@ static void perturb_costs(Sx *S) {
         } else
             xp = mode == 1 ? (fabs(S->cost0[j]) * S->costscale + one) * base * (1 + urand(S))
                            : (fabs(S->cost0[j]) + one) * base * (1 + urand(S));
+        {   /* (13 November 2026, an experiment: SXPERT_UNSC=x) the perturbation set in the problem's own units: x (|c_j| + 1) (1 + u),
+             * converted to the scaled problem (times cscale_j / costscale); Gurobi's on sat4p1 (LP) is about 1e-6 in those units,
+             * ours 4e-4 there and varying with the columns' scale factors */
+            static double pun_ = -1; if (pun_ < 0) { const char *e_ = getenv("SXPERT_UNSC"); pun_ = e_ ? atof(e_) : 0; }
+            if (pun_ > 0 && mode != 2) xp = pun_ * (fabs(S->cost0[j]) * S->costscale / (S->cscale ? S->cscale[j] : 1.0) + 1.0) * (1 + urand(S)) * (S->cscale ? S->cscale[j] : 1.0) / S->costscale; }
+        if (punits_ && mode == 1) {   /* (the experiment BRISK_SXPERTUNITS above) */
+            const double cs_ = S->cscale ? S->cscale[j] : 1.0;
+            xp = 5e-7 * bcu_ * (getenv("SXPERT_BASE") ? atof(getenv("SXPERT_BASE")) : 1.0) * (fabs(S->cost0[j]) * S->costscale / cs_ + 1.0) * (1 + urand(S)) * cs_ / S->costscale;
+        }
+        {   /* (13 November 2026, an experiment: SXPERT_SPREAD=1; after SXPERT_UNSC, so that the two combine) the random factor uniform on (0, 2) instead of (1, 2): perturbations
+             * spread from near zero to twice the base, as Gurobi's are (sat4p1, LP: its perturbed costs give our method bases 30
+             * times sparser) */
+            static int spr_ = -1; if (spr_ < 0) { const char *e_ = getenv("SXPERT_SPREAD"); spr_ = e_ ? atoi(e_) : 0; }
+            if (spr_ == 1 && mode != 2) xp *= 2.0 * urand(S) / 1.5; }
+        if (cnorm_ && mode != 2) xp *= cnorm_[j];   /* (the experiment BRISK_SXPERTNORM above) */
+        if (plen_w > 0 && mode != 2) { const double r_ = (double)(S->Ap[j + 1] - S->Ap[j]) / plen_avg; if (r_ > 1) xp *= pow(r_, plen_w); }   /* (an experiment, BRISK_SXPERTLEN) */
         if (l <= -SX_INF && u >= SX_INF) continue;
         if (l == u) continue;
         /* (23 October 2026) the nonbasic columns only: from the slack basis that is every column; from a given basis
          * (the rounds of the row sifting) a basic column's perturbation moves the duals and leaves nonbasic reduced
          * costs infeasible by its size, and the round began with a dual phase 1 (comp21-2idx: 1,705 iterations) */
-        if (S->pos[j] >= 0) continue;
+        /* (13 November 2026, an experiment: BRISK_SXPERTBASIC=1) the basic columns perturbed too, the reduced costs it leaves of
+         * the wrong sign repaired by the flips and shifts that follow (sat4p1: a start with 15,000 structural columns basic left
+         * them, the rows' duals and the logicals' reduced costs exactly zero, and the method pivoted through that unperturbed part) */
+        static int pbas_ = -1; if (pbas_ < 0) { const char *e_ = getenv("BRISK_SXPERTBASIC"); pbas_ = e_ && atoi(e_) != 0; }
+        if (S->pos[j] >= 0) { if (pbas_ && S->cost[j] == 0) S->cost[j] += (urand(S) < 0.5 ? -xp : xp); continue; }
         if (u >= SX_INF) S->cost[j] += xp;
         else if (l <= -SX_INF) S->cost[j] -= xp;
         else if ((S->cost[j] == 0 || pmove) && S->pos[j] < 0) S->cost[j] += S->move[j] < 0 ? -xp : xp;   /* (the bound it is at) */
         else S->cost[j] += S->cost[j] >= 0 ? xp : -xp;
     }
-    for (int i = 0; i < S->m; i++) S->cost[n + i] += (0.5 - urand(S)) * 1e-12;
+    {   /* (13 November 2026, an experiment: BRISK_SXPERTLOG=1) the rows' logicals perturbed as a structural column of cost zero is,
+         * in the direction that keeps a nonbasic one at its bound, a basic one by a random sign; else the 1e-12 of HiGHS */
+        static int plog_ = -1; if (plog_ < 0) { const char *e_ = getenv("BRISK_SXPERTLOG"); plog_ = e_ && atoi(e_) != 0; }
+        for (int i = 0; i < S->m; i++) {
+            const int j = n + i;
+            if (!plog_ || S->lo0[j] == S->up0[j]) { S->cost[j] += (0.5 - urand(S)) * 1e-12; continue; }
+            const double xp = mode == 2 ? 0.5 * (100 * S->told) * (1 + urand(S)) : one * base * (1 + urand(S));
+            if (S->pos[j] >= 0) S->cost[j] += urand(S) < 0.5 ? -xp : xp;
+            else if (S->up0[j] >= SX_INF) S->cost[j] += xp;
+            else if (S->lo0[j] <= -SX_INF) S->cost[j] -= xp;
+            else S->cost[j] += S->move[j] < 0 ? -xp : xp;
+        }
+    }
+    {   const char *pd_ = getenv("BRISK_SXPERTDUMP");   /* (13 November 2026, a diagnostic: each column's perturbation in the problem's own units) */
+        if (pd_) { FILE *fp_ = fopen(pd_, "w"); if (fp_) { for (int j = 0; j < n; j++) fprintf(fp_, "%d %d %.6e %d\n", j, S->Ap[j + 1] - S->Ap[j], (S->cost[j] - S->cost0[j]) * S->costscale / (S->cscale ? S->cscale[j] : 1.0), S->pos[j] >= 0); fclose(fp_); } } }
+    free(cnorm_);
     S->perturbed = 1; S->pert_base = base; S->pert_level = 0; S->zw_it = S->zw_zero = 0;
 }
 /* the dual method stalls (half of the steps of a window are of zero length: the perturbation is too small for the
@@ -1674,7 +2446,9 @@ static void perturb_first(Sx *S) {
     double bigc = 0;
     if (!oldpert && S->pert_u_ok) bigc = S->pert_bigc;
     else for (int j = 0; j < S->n; j++) if (fabs(S->cost0[j]) > bigc) bigc = fabs(S->cost0[j]);
-    int nbox = 0; for (int j = 0; j < S->N; j++) nbox += is_boxed(S, j);
+    int nbox = 0;
+    if (S->nbox_given_ok) { nbox = S->nbox_given; S->nbox_given_ok = 0; }     /* (counted by sxm_solve on the same bounds) */
+    else for (int j = 0; j < S->N; j++) nbox += is_boxed(S, j);
     double bc = bigc * S->costscale; if (bc > 100) bc = sqrt(sqrt(bc));
     if (bc == 0) bc = 1;     /* (28 October 2026: no cost at all, as in perturb_costs) */
     if ((double)nbox / S->N < 0.01 && bc > 1) bc = 1;
@@ -1687,10 +2461,17 @@ static void perturb_first(Sx *S) {
             S->pert_bigc = bigc; S->pert_u_ok = 1;
         }
         S->pert_level = 0; S->nrepert++;
-        const double f = S->pert_base;
+        /* (13 November 2026, an experiment: BRISK_SXXOPERTTOL=1, ISSUES 881) the crossover's dual method, near the optimum: the perturbation
+         * a quarter of the dual tolerance times (|c_j| + 1)(1 + r_j), so that its removal leaves no dual infeasibility beyond the tolerance
+         * to the clean-up (neos-3214367-sovi's root LP: the perturbation of the usual size left 0.49, and the primal clean-up and the dual
+         * method from the restored bounds ended in numerical difficulties) */
+        const double f = S->xo_pert_tol ? 0.25 * S->told / (S->costscale > 0 ? 1.0 : 1.0) : S->pert_base;
         for (int j = 0; j < S->n; j++) {
             if (S->pos[j] >= 0 || S->lo0[j] == S->up0[j] || S->move[j] == 0) continue;
-            const double xp = S->pert_u[j] * f;
+            double xp = S->pert_u[j] * f;
+            if (S->xo_pert_tol == 2) xp = f * (1 + col_rand(j));   /* (14 November 2026, a test: =2 without the cost's factor (|c_j| + 1), so that every removal stays below half the tolerance) */
+            {   static double pun_ = -1; if (pun_ < 0) { const char *e_ = getenv("SXPERT_UNSC"); pun_ = e_ ? atof(e_) : 0; }   /* (the experiment SXPERT_UNSC here too) */
+                if (pun_ > 0) xp = pun_ * S->pert_u[j] * (S->cscale ? S->cscale[j] : 1.0) / S->costscale; }
             if (S->move[j] > 0) { S->cost[j] += xp; S->d[j] += xp; } else { S->cost[j] -= xp; S->d[j] -= xp; }
         }
     }
@@ -1750,14 +2531,33 @@ static int need_refactor(const Sx *S) {
     return F->nupd >= sqrt(2.0 * S->env_refac_w * F->factor_work / a);
 }
 static int check_stop(Sx *S) {
-    if (S->stop && *S->stop) return 6;
+    if (brisk_flag_get(S->stop)) return 6;
 #ifdef _OPENMP
     /* (28 October 2026) S->nthreads follows the count too: the parallel parts test it (> 1 only), and the dual simplex
      * method beside the interior-point method, set up on one thread, ran on one after it was given all of them */
     if (S->threads) { const int t = *S->threads; if (t > 0 && t != S->cur_threads) { omp_set_num_threads(t); S->cur_threads = t; S->nthreads = t; } }
 #endif
     if (S->maxit > 0 && S->iter >= S->maxit) return 3;
+    if (S->env_stopit > 0 && S->iter >= S->env_stopit) return 3;   /* (BRISK_SXSTOPIT: experiments) */
     if (S->tlim > 0 && (++S->nchk & 15) == 0 && now() - S->t0 > S->tlim) return 6;
+    {   /* (13 November 2026, an experiment: BRISK_LPAUTOPROG=1; ISSUES 880) the simplex method's progress weighed when its work budget
+         * (the automatic choice's: the interior-point method's predicted work) runs out: every 500 iterations the work and the count of
+         * primal infeasibilities are noted; at the budget, the remaining work projected from the count's fall since the last note; when it
+         * is under half the budget, the budget is raised by twice the projection (at most twice). neos-3654993-kolva's root LP (LP
+         * relaxation, all costs zero): stopped after 12,401 of the 13,428 iterations it needed, then the crossover failed */
+        static int pg_ = -1; if (pg_ < 0) { const char *e_ = getenv("BRISK_LPAUTOPROG"); pg_ = e_ && atoi(e_) == 1; }
+        if (pg_ && S->workbudget > 0) {
+            if (S->iter - S->pg_it >= 500 || S->pg_it == 0) {
+                if (S->work <= S->workbudget || S->pg_it == 0) { int n_ = 0; for (int i = 0; i < S->m; i++) n_ += infeas(S, i) > 0;
+                    if (S->pg_it > 0 && S->work > S->workbudget * 0.0) { } S->pg_it = S->iter ? S->iter : 1; S->pg_work = S->work; S->pg_ninf = n_; } }
+            if (S->work > S->workbudget && S->pg_ext < 2 && S->pg_it > 1) {
+                int n_ = 0; for (int i = 0; i < S->m; i++) n_ += infeas(S, i) > 0;
+                const double dw = S->work - S->pg_work; const int dn = S->pg_ninf - n_;
+                if (dw > 0 && dn > 0) { const double rem = (double)n_ * dw / dn;
+                    if (rem < 0.5 * S->workbudget) { S->workbudget = S->work + 2.0 * rem; S->pg_ext++;
+                        if (S->verbose >= 2) printf("  the work budget raised by the progress: %d primal infeasibilities, %d fewer over %.3g work, the rest projected %.3g\n", n_, dn, dw, rem);
+                        return 0; } } } }
+    }
     if (S->workbudget > 0 && S->work > S->workbudget) {
         /* the budget's owner may raise it (the automatic choice of the method: a second budget once the first is used) */
         if (S->budget_cb) { const double nb = S->budget_cb(S->budget_ctx, S->work); if (nb > S->work) { S->workbudget = nb; return 0; } }
@@ -1783,6 +2583,57 @@ static double dual_bound(const Sx *S) {
     }
     return s;
 }
+/* (7 November 2026, the MIP developer's finding on app1-1) the bound the duals that will be returned prove: y = B^-T c_B
+ * with the working costs, then every column's reduced cost cost0_j - [A I]_j'y, basic columns included (dual_bound takes
+ * theirs as zero; on an ill-conditioned basis they are not: app1-1's node LPs claimed -2.999994 where the returned duals
+ * proved -3.00025 to -3.00005, and the mixed-integer solver, which checks every claim, lost 7,047 nodes in 60 s). The cutoff
+ * stop is claimed only when this bound passes. BRISK_SXCUTEXACT=0: the earlier claim */
+static double dual_bound_exact(Sx *S) {
+    SxVec *v = &S->rho; sxv_clear(v);
+    for (int i = 0; i < S->m; i++) v->val[i] = S->cost[S->basic[i]];
+    sxv_reindex(v);
+    double dd = 1; btran(S, v, &dd, NULL);
+    const double *y = v->val;
+    double s = 0; int inf = 0;
+    for (int j = 0; j < S->N && !inf; j++) {
+        double dj = S->cost0[j];
+        if (j < S->n) { for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) dj -= S->Ax[p] * y[S->Ai[p]]; }
+        else dj -= y[j - S->n];
+        if (dj == 0) continue;
+        const double b = dj > 0 ? S->lo0[j] : S->up0[j];
+        if (fabs(b) >= SX_INF) { if (fabs(dj) > S->told) inf = 1; continue; }
+        s += dj * b;
+    }
+    sxv_clear(v);
+    return inf ? -SX_INF : s;
+}
+/* (12 November 2026) compute_dual and dual_bound_exact in one backward solve and one pass over the columns: both take the
+ * same y = B^-T c_B (the working costs) and the same products a_j'y, subtracted in the same order from the working cost
+ * (the reduced cost kept) and from the cost as given (the exact bound's term), so each result has the bits of the separate
+ * calls. The cutoff's confirmation computed both one after the other; on a multiple knapsack MILP's node LPs half the
+ * re-solves end at the cutoff, and the second solve and pass were 5 % of the instructions */
+static double compute_dual_exact(Sx *S) {
+    SxVec *v = &S->rho; sxv_clear(v);
+    for (int i = 0; i < S->m; i++) v->val[i] = S->cost[S->basic[i]];
+    sxv_reindex(v);
+    double dd = 1; btran(S, v, &dd, NULL);
+    const double *y = v->val;
+    double s = 0; int inf = 0;
+    for (int j = 0; j < S->N; j++) {
+        const int bas = S->pos[j] >= 0;
+        double dw = S->cost[j], dj = S->cost0[j];
+        if (j < S->n) { for (int p = S->Ap[j]; p < S->Ap[j + 1]; p++) { const double t = S->Ax[p] * y[S->Ai[p]]; dw -= t; dj -= t; } }
+        else { dw -= y[j - S->n]; dj -= y[j - S->n]; }
+        S->d[j] = bas ? 0 : dw;
+        if (inf || dj == 0) continue;
+        const double b = dj > 0 ? S->lo0[j] : S->up0[j];
+        if (fabs(b) >= SX_INF) { if (fabs(dj) > S->told) inf = 1; continue; }
+        s += dj * b;
+    }
+    sxv_clear(v);
+    return inf ? -SX_INF : s;
+}
+static int cutexact_on(void) { static int v = -1; if (v < 0) { const char *e_ = getenv("BRISK_SXCUTEXACT"); v = !(e_ && atoi(e_) == 0); } return v; }
 /* the same bound for the working costs (perturbed and shifted) and the working bounds' kind: the dual objective the
  * method itself sees */
 static double dual_bound_w(const Sx *S) {
@@ -1802,15 +2653,44 @@ static double sum_pinf(const Sx *S, int *cnt) {
     if (cnt) *cnt = c;
     return s;
 }
+/* (12 November 2026, a diagnostic: BRISK_SXENTDBG=1, the entering and leaving columns of 40 entries or more since the last log line) */
 static void log_line(Sx *S, const char *what) {
     if (S->verbose < 2) return;
     int c; const double s = sum_pinf(S, &c);
     printf("  %-8s %8ld  obj %+.10e  pinf %.2e (%d)  %.2fs\n", what, S->iter, objective(S) * S->costscale, s, c, now() - S->t0);
+    if (g_entdbg > 0) {   /* the infeasible rows whose basic column is long, and their pricing score (infeasibility^2 / weight) against the others' */
+        long nl = 0, nb = 0, no = 0; double sl = 0, so = 0, mx_l = 0, mx_o = 0;
+        for (int i = 0; i < S->m; i++) { const int j = S->basic[i]; if (j < S->n && S->Ap[j + 1] - S->Ap[j] >= 40) nb++;
+            const double f = infeas_merit(S, i); if (f <= 0) continue; const double sc = f * f / (S->w[i] > 0 ? S->w[i] : 1);
+            if (j < S->n && S->Ap[j + 1] - S->Ap[j] >= 40) { nl++; sl += sc; if (sc > mx_l) mx_l = sc; } else { no++; so += sc; if (sc > mx_o) mx_o = sc; } }
+        printf("           long basic %ld, of them infeasible %ld (mean score %.3g, largest %.3g); other infeasible rows %ld (mean score %.3g, largest %.3g)\n", nb, nl, nl ? sl / nl : 0, mx_l, no, no ? so / no : 0, mx_o); }
+    if (g_entdbg > 0) { printf("           entering %ld, of them long %ld (reduced cost within the tolerance %ld); long leaving %ld\n", g_ent_all, g_ent_long, g_ent_long_d0, g_leave_long); g_ent_all = g_ent_long = g_ent_long_d0 = g_leave_long = 0; }
 }
 
 /* rebuild: factorization, primal and dual values; corrections of the duals */
 static int rebuild(Sx *S) {
     refactor(S);
+    {   /* (12 November 2026, an experiment: BRISK_SXWRESET=1) the steepest-edge weights reset to 1 at every rebuild */
+        static int wrs_ = -1; if (wrs_ < 0) { const char *e_ = getenv("BRISK_SXWRESET"); wrs_ = e_ && atoi(e_) != 0; }
+        if (wrs_) { for (int i = 0; i < S->m; i++) S->w[i] = 1.0; if (S->wk) memset(S->wk, 1, (size_t)S->m); S->wlazy = 0; }
+    }
+    {   /* (8 November 2026, a test: BRISK_SXEXACTWREF=1) the exact dual steepest-edge weights at every rebuild (one backward
+         * solve a row): whether the updated weights' drift along the path costs iterations */
+        static int exr = -1; if (exr < 0) { const char *e = getenv("BRISK_SXEXACTWREF"); exr = e && atoi(e) != 0; }
+        if (exr) {
+            SxVec *rho = &S->rho;
+            for (int i = 0; i < S->m; i++) {
+                sxv_clear(rho); rho->val[i] = 1; rho->idx[0] = i; rho->cnt = 1;
+                double dd = S->dens_rho; btran(S, rho, &dd, NULL);
+                double w = 0;
+                if (rho->cnt >= 0) for (int t = 0; t < rho->cnt; t++) { const double v = rho->val[rho->idx[t]]; w += v * v; }
+                else for (int k = 0; k < S->m; k++) w += rho->val[k] * rho->val[k];
+                S->w[i] = w > 1e-4 ? w : 1e-4;
+            }
+            sxv_clear(rho);
+            if (S->wk) memset(S->wk, 1, (size_t)S->m);
+        }
+    }
     compute_dual(S);
     int ns = 0;
     correct_duals(S, &ns);
@@ -1826,18 +2706,85 @@ static int dual_loop(Sx *S) {
     int need_rebuild = 1, verified = 0;
     long last_log = -1000;
     S->heap_ok = 0; S->Ifull = 1;
+    {   static int vfp_ = -1; static double vfc_ = 0.5;   /* (BRISK_SXVFAC=P, BRISK_SXVFACC=c: the merit's factor, a test) */
+        if (vfp_ < 0) { const char *e_ = getenv("BRISK_SXVFAC"); vfp_ = e_ ? atoi(e_) : 0; const char *c_ = getenv("BRISK_SXVFACC"); if (c_) vfc_ = atof(c_); }
+        if (vfp_ > 0 && !S->vfac) {
+            S->vfac = xmalloc(sizeof(double) * ((size_t)S->N + 1)); S->vent = xmalloc(sizeof(long) * ((size_t)S->N + 1));
+            for (int j = 0; j <= S->N; j++) { S->vfac[j] = 1.0; S->vent[j] = -1; }
+            S->vf_last = S->iter; S->vf_p = vfp_; S->vf_c = vfc_;
+            { const char *d_ = getenv("BRISK_SXVFACD"); S->vf_d = d_ && atoi(d_) == 1; }
+            S->vden = xcalloc((size_t)S->N + 1, sizeof(int));
+            { const char *o_ = getenv("BRISK_SXVFACONCE"); S->vf_once = o_ && atoi(o_) == 1; } S->vonce = xcalloc((size_t)S->N + 1, 1);
+        }
+    }
+    if (g_dserows > 0 && !S->dsefull_init && S->rscale) {   /* (BRISK_SXDSEROWS) the starting weights r_i^2, exact for the logicals' basis */
+        S->dsefull_init = 1; S->wlazy = 0;
+        for (int i = 0; i < m; i++) { const int j_ = S->basic[i]; S->w[i] = j_ >= S->n ? S->rscale[i] * S->rscale[i] : 1.0; if (S->wk) S->wk[i] = 1; }
+    }
+    if (g_dsefull > 0 && !S->dsefull_init) {   /* (BRISK_SXDSEFULL) the starting weights 1 + the row's nonbasic structural entries squared (exact for the logicals' basis) */
+        S->dsefull_init = 1; S->wlazy = 0;
+        for (int i = 0; i < m; i++) { double w_ = 1; const int e_ = S->Rp[i] + S->Rnb[i]; for (int p_ = S->Rp[i]; p_ < e_; p_++) w_ += S->Rx[p_] * S->Rx[p_]; S->w[i] = w_; if (S->wk) S->wk[i] = 1; }
+    }
     const double tloop0 = S->tdiag ? now() : 0;
     for (;;) {
         int st = check_stop(S);
         if (st) { if (S->tdiag) S->t_loop += now() - tloop0; return st; }
         if (S->fresh) { S->fresh = 0; need_rebuild = 0; }
         if (need_rebuild || need_refactor(S)) { const double tr0 = S->tdiag ? now() : 0; rebuild(S); need_rebuild = 0; S->heap_ok = 0; S->Ifull = 1; if (S->tdiag) S->t_rebuild += now() - tr0; }
+        {   /* (13 November 2026, an experiment: BRISK_SXPERTAT=k with BRISK_SXLAZYPERT=1) the first perturbation at iteration k of this
+             * solve instead of at a stall: Gurobi's dual simplex method on sat4p1 (LP) perturbs between its iterations 1,000 and
+             * 4,000, and which column gets which value matters (its values shuffled within each length class: dense again) */
+            static long pat_ = -2; if (pat_ == -2) { const char *e_ = getenv("BRISK_SXPERTAT"); pat_ = e_ ? atol(e_) : -1; }
+            if (pat_ >= 0 && S->lazy_pert && !S->perturbed && S->iter == pat_) S->pert_pending = 1; }
         if (S->pert_pending) { if (S->perturbed) perturb_more(S); else perturb_first(S); S->pert_pending = 0; }
-        if (S->iter - last_log >= 1000) { log_line(S, S->phase == 1 ? "dual ph1" : "dual"); last_log = S->iter; }
+        {   /* (12 November 2026, a diagnostic: BRISK_SXROWDBG=<row>) at the first iteration: the ten rows of the largest pricing score
+             * (infeasibility squared over the steepest-edge weight) and the score and rank of the given row */
+            static int rdbg_ = -2; if (rdbg_ == -2) { const char *e_ = getenv("BRISK_SXROWDBG"); rdbg_ = e_ ? atoi(e_) : -1; }
+            static long rdit_ = -2; if (rdit_ == -2) { const char *e_ = getenv("BRISK_SXROWDBGIT"); rdit_ = e_ ? atol(e_) : 0; }
+            if (rdbg_ >= 0 && S->iter_rdbg0 >= 0 && S->iter >= rdit_) { S->iter_rdbg0 = -1;
+                double *sc_ = xmalloc(sizeof(double) * ((size_t)m + 1)); int ninf_ = 0;
+                for (int i = 0; i < m; i++) { const double f = infeas(S, i); sc_[i] = f > 0 ? f * f / (S->w[i] > 0 ? S->w[i] : 1) : 0; ninf_ += f > 0; }
+                int rank_ = 0; for (int i = 0; i < m; i++) if (sc_[i] > sc_[rdbg_ < m ? rdbg_ : 0]) rank_++;
+                fprintf(stderr, "[rowdbg] infeasible rows %d; row %d: basic %d (%s, %d entries), infeasibility %.3g, weight %.3g, score %.3g, rank %d\n", ninf_, rdbg_, S->basic[rdbg_],
+                        S->basic[rdbg_] < S->n ? "column" : "logical", S->basic[rdbg_] < S->n ? S->Ap[S->basic[rdbg_] + 1] - S->Ap[S->basic[rdbg_]] : 1, infeas(S, rdbg_), S->w[rdbg_], sc_[rdbg_], rank_);
+                for (int t = 0; t < 10; t++) { int b = -1; for (int i = 0; i < m; i++) if (sc_[i] > 0 && (b < 0 || sc_[i] > sc_[b])) b = i; if (b < 0) break;
+                    double we_ = 0, wf_ = 0; { SxVec *rh_ = &S->rho; sxv_clear(rh_); rh_->val[b] = 1; rh_->idx[0] = b; rh_->cnt = 1; double dd_ = S->dens_rho; btran(S, rh_, &dd_, NULL);
+                        if (rh_->cnt >= 0) for (int u = 0; u < rh_->cnt; u++) we_ += rh_->val[rh_->idx[u]] * rh_->val[rh_->idx[u]]; else for (int k = 0; k < m; k++) we_ += rh_->val[k] * rh_->val[k];
+                        /* (the tableau row's squared norm over the structural columns: the weight of the steepest edge in the space of all variables is we_ + this) */
+                        double *rv_ = xcalloc((size_t)m + 1, sizeof(double)); if (rh_->cnt >= 0) for (int u = 0; u < rh_->cnt; u++) rv_[rh_->idx[u]] = rh_->val[rh_->idx[u]]; else for (int k = 0; k < m; k++) rv_[k] = rh_->val[k];
+                        for (int jj = 0; jj < S->n; jj++) { if (S->pos[jj] >= 0) continue; double a_ = 0; for (int p_ = S->Ap[jj]; p_ < S->Ap[jj + 1]; p_++) a_ += rv_[S->Ai[p_]] * S->Ax[p_]; wf_ += a_ * a_; }
+                        free(rv_); sxv_clear(rh_); }
+                    fprintf(stderr, "[rowdbg]   top %d: row %d, basic %d (%s, %d entries), infeasibility %.3g, weight %.3g (exact %.3g, with the tableau row %.3g), score %.3g (with the tableau row %.3g)\n", t, b, S->basic[b], S->basic[b] < S->n ? "column" : "logical",
+                            S->basic[b] < S->n ? S->Ap[S->basic[b] + 1] - S->Ap[S->basic[b]] : 1, infeas(S, b), S->w[b], we_, we_ + wf_, sc_[b], infeas(S, b) * infeas(S, b) / (we_ + wf_)); sc_[b] = -1; }
+                /* (13 November 2026, BRISK_SXROWDBGVAR=<variable>: every infeasible row's exact weight, the ranking by the exact score
+                 * (infeasibility squared over |row of B^-1|^2), the top ten and the rank of the row whose basic variable is the given
+                 * one: a column index, or n + i for row i's logical) */
+                { static long rvar_ = -2; if (rvar_ == -2) { const char *e_ = getenv("BRISK_SXROWDBGVAR"); rvar_ = e_ ? atol(e_) : -1; }
+                  if (rvar_ >= 0) {
+                    for (int i = 0; i < m; i++) { const double f = infeas(S, i); sc_[i] = 0; if (f <= 0) continue;
+                        SxVec *rh_ = &S->rho; sxv_clear(rh_); rh_->val[i] = 1; rh_->idx[0] = i; rh_->cnt = 1; double dd_ = S->dens_rho; btran(S, rh_, &dd_, NULL);
+                        double we_ = 0; if (rh_->cnt >= 0) for (int u = 0; u < rh_->cnt; u++) we_ += rh_->val[rh_->idx[u]] * rh_->val[rh_->idx[u]]; else for (int k = 0; k < m; k++) we_ += rh_->val[k] * rh_->val[k];
+                        sxv_clear(rh_); sc_[i] = f * f / (we_ > 1e-12 ? we_ : 1e-12); }
+                    const int pv_ = rvar_ < S->N ? S->pos[rvar_] : -1;
+                    int rk_ = -1; if (pv_ >= 0) { rk_ = 0; for (int i = 0; i < m; i++) if (sc_[i] > sc_[pv_]) rk_++; }
+                    fprintf(stderr, "[rowdbg exact] variable %ld at row %d: infeasibility %.3g, exact score %.3g, rank %d of %d infeasible\n", rvar_, pv_, pv_ >= 0 ? infeas(S, pv_) : 0.0, pv_ >= 0 ? sc_[pv_] : 0.0, rk_, ninf_);
+                    for (int t = 0; t < 10; t++) { int b = -1; for (int i = 0; i < m; i++) if (sc_[i] > 0 && (b < 0 || sc_[i] > sc_[b])) b = i; if (b < 0) break;
+                        fprintf(stderr, "[rowdbg exact]   top %d: row %d, basic %d (%s, %d entries), infeasibility %.3g, exact score %.3g\n", t, b, S->basic[b], S->basic[b] < S->n ? "column" : "logical",
+                                S->basic[b] < S->n ? S->Ap[S->basic[b] + 1] - S->Ap[S->basic[b]] : 1, infeas(S, b), sc_[b]); sc_[b] = -1; } } }
+                free(sc_); } }
+        static long logint_ = -1; if (logint_ < 0) { const char *e_ = getenv("BRISK_SXLOGINT"); logint_ = e_ && atol(e_) > 0 ? atol(e_) : 1000; }   /* (12 November 2026, a diagnostic: the log's interval) */
+        if (S->iter - last_log >= logint_) {
+            log_line(S, S->phase == 1 ? "dual ph1" : "dual"); last_log = S->iter;
+            /* (10 November 2026) the infeasible rows for the race's retirement rule (main.c, BRISK_LPRACERETIRE): a pass over
+             * the rows every 1,000 iterations, in phase 2 only (phase 1's are of another problem) */
+            if (S->prog && S->phase != 1) { int c_; (void)sum_pinf(S, &c_); const double t_ = now();
+                if (S->prog->nsamp == 0) { S->prog->ninf0 = c_; S->prog->tpub0 = t_; }
+                S->prog->ninf = c_; S->prog->tpub = t_; S->prog->nsamp++; }
+        }
         if (brisk_stab_due(S->iter)) { int c_; const double s_ = sum_pinf(S, &c_); brisk_stab_row(S->iter, S->phase == 1 ? "dual, phase 1" : "dual", g_sx_tabsign * objective(S) * S->costscale + g_sx_taboff, s_, c_); }
         /* (22 October 2026) the objective cutoff (sxm_solve): the dual bound of the current duals with the problem's own
          * costs and bounds passes the cutoff: the optimum lies beyond it, and the node can be pruned */
-        if (S->cut_on && S->phase == 2 && (S->N <= 20000 || S->iter % 10 == 0)) {
+        if (S->cut_on && S->phase == 2 && S->iter >= S->cut_skip && (S->N <= 20000 || S->iter % 10 == 0)) {
             const double b = dual_bound(S);
             const double cv = S->cut_val + 1e-9 * (1 + fabs(S->cut_val));
             /* (27 October 2026) confirmed on reduced costs computed afresh from the basis before the stop is claimed: the
@@ -1845,9 +2792,13 @@ static int dual_loop(Sx *S) {
              * at the cutoff, the duals of this bound). sp150x300d with substitutions: 23 claims its check could not prove.
              * When the fresh bound does not pass, the loop goes on from the fresh reduced costs */
             if (b > cv) {
-                compute_dual(S);
+                static int fuse = -1; if (fuse < 0) { const char *e_ = getenv("BRISK_SXCUTFUSE"); fuse = !(e_ && atoi(e_) == 0); }
+                const int fz = fuse && cutexact_on();
+                double bxf = 0;
+                if (fz) bxf = compute_dual_exact(S); else compute_dual(S);
                 const double bf = dual_bound(S);
-                if (bf > cv) { S->cut_bound = bf; return 7; }
+                if (bf > cv && cutexact_on()) { const double be = fz ? bxf : dual_bound_exact(S); if (be > cv) { S->cut_bound = be; return 7; } S->cut_skip = S->iter + 50; }
+                else if (bf > cv) { S->cut_bound = bf; return 7; }
                 int ns = 0; if (correct_duals(S, &ns)) compute_primal(S);
                 S->nshift += ns; S->heap_ok = 0; S->Ifull = 1;
             }
@@ -1862,11 +2813,45 @@ static int dual_loop(Sx *S) {
                 int ns = 0; if (correct_duals(S, &ns)) compute_primal(S);
                 S->nshift += ns; S->heap_ok = 0; S->Ifull = 1;
                 const double b2 = dual_bound(S);
-                if (b2 > cv) { S->cut_bound = b2; return 7; }
+                if (b2 > cv && cutexact_on()) { const double be = dual_bound_exact(S); if (be > cv) { S->cut_bound = be; return 7; } S->cut_skip = S->iter + 50; }
+                else if (b2 > cv) { S->cut_bound = b2; return 7; }
             }
         }
         double tdg = S->tdiag ? now() : 0;
-        const int r = chuzr(S);
+        int r = chuzr(S);
+        {   /* (13 November 2026, a diagnostic: BRISK_SXFORCEVARS=<file> of lines "iteration variable", variables numbered as the
+             * trace numbers them, columns 0..n-1 and n + i for row i's logical) the leaving variable forced at those iterations of
+             * this solve, when it is basic and infeasible: to compare the entering choices with another solver's from its basis */
+            static int nfv_ = -1; static long *fit_ = NULL; static int *fvar_ = NULL;
+            if (nfv_ < 0) { nfv_ = 0; const char *e_ = getenv("BRISK_SXFORCEVARS"); FILE *ff_ = e_ ? fopen(e_, "r") : NULL;
+                if (ff_) { long a_; int b_; int cap_ = 0; while (fscanf(ff_, "%ld %d", &a_, &b_) == 2) { if (nfv_ >= cap_) { cap_ = cap_ ? 2 * cap_ : 256; fit_ = realloc(fit_, sizeof(long) * cap_); fvar_ = realloc(fvar_, sizeof(int) * cap_); } fit_[nfv_] = a_; fvar_[nfv_] = b_; nfv_++; } fclose(ff_); } }
+            for (int t_ = 0; t_ < nfv_; t_++) if (fit_[t_] == S->iter) {
+                const int v_ = fvar_[t_], p_ = v_ >= 0 && v_ < S->N ? S->pos[v_] : -1;
+                {   /* (13 November 2026, a diagnostic: BRISK_SXTRACEFORCED=1 with BRISK_SXTRACE) the forced row against ours on an "F" line:
+                     * iteration forced-variable its-rank key infeasibility weight | ours: variable key infeasibility weight */
+                    static int tf_ = -1; if (tf_ < 0) { const char *e2_ = getenv("BRISK_SXTRACEFORCED"); tf_ = e2_ ? atoi(e2_) : 0; }
+                    if (tf_ && S->trace && p_ >= 0 && r >= 0) { int rk_ = 0; const int inh_ = S->hpos[p_] >= 0;
+                        if (inh_) for (int q_ = 0; q_ < S->nheap; q_++) if (S->hkey[S->heap[q_]] > S->hkey[p_]) rk_++;
+                        fprintf(S->trace, "F %ld %d rank %d key %.6g inf %.6g w %.6g wk %d | %d key %.6g inf %.6g w %.6g wk %d nheap %d\n", S->iter, v_, inh_ ? rk_ : -1, inh_ ? S->hkey[p_] : 0.0, infeas(S, p_), S->w[p_], S->wk ? S->wk[p_] : 1,
+                                S->basic[r], S->hkey[r], infeas(S, r), S->w[r], S->wk ? S->wk[r] : 1, S->nheap);
+                        /* (BRISK_SXTRACEFORCED=2: and the forced row's rank by the exact steepest-edge score, every heap row's |row of B^-1|^2
+                         * computed: an "E" line: iteration forced-variable exact-rank exact-weight | the best by the exact score: variable
+                         * infeasibility exact-weight; ties within 1e-12 counted as ahead only if a smaller variable index) */
+                        if (tf_ >= 2 && inh_) { SxVec *v2_ = &S->wv; double fw_ = 0, fs_ = 0, bs_ = -1, bw_ = 0; int bi_ = -1, erk_ = 0;
+                            double *sc_ = xmalloc(sizeof(double) * (size_t)S->nheap);
+                            for (int q_ = 0; q_ < S->nheap; q_++) { const int i_ = S->heap[q_]; sxv_clear(v2_); v2_->val[i_] = 1; v2_->idx[0] = i_; v2_->cnt = 1;
+                                double dd_ = S->dens_rho; btran(S, v2_, &dd_, NULL); double w_ = 0;
+                                if (v2_->cnt >= 0) for (int t_ = 0; t_ < v2_->cnt; t_++) { const double a_ = v2_->val[v2_->idx[t_]]; w_ += a_ * a_; } else for (int k_ = 0; k_ < S->m; k_++) w_ += v2_->val[k_] * v2_->val[k_];
+                                sxv_clear(v2_); const double f_ = infeas_merit(S, i_); sc_[q_] = f_ * f_ / w_;
+                                if (i_ == p_) { fw_ = w_; fs_ = sc_[q_]; }
+                                if (sc_[q_] > bs_ * (1 + 1e-12) || (sc_[q_] >= bs_ * (1 - 1e-12) && bi_ >= 0 && S->basic[i_] < S->basic[bi_])) { bs_ = sc_[q_]; bi_ = i_; bw_ = w_; } }
+                            for (int q_ = 0; q_ < S->nheap; q_++) { const int i_ = S->heap[q_]; if (sc_[q_] > fs_ * (1 + 1e-12) || (sc_[q_] >= fs_ * (1 - 1e-12) && S->basic[i_] < v_)) erk_++; }
+                            free(sc_);
+                            fprintf(S->trace, "E %ld %d erank %d ew %.6g inf %.6g | %d inf %.6g ew %.6g\n", S->iter, v_, erk_, fw_, infeas(S, p_), S->basic[bi_], infeas(S, bi_), bw_); } } }
+                if (p_ >= 0 && infeas(S, p_) > 0) r = p_;
+                else fprintf(stderr, "   [force: iteration %ld, variable %d %s]\n", S->iter, v_, p_ < 0 ? "not basic" : "feasible");
+                break; }
+        }
         if (S->tdiag) { const double t1 = now(); S->t_chuzr += t1 - tdg; tdg = t1; }
         if (r < 0) {
             if (S->F.nupd > 0 && !verified && !S->noverify) { need_rebuild = 1; verified = 1; continue; }   /* confirm on fresh values */
@@ -1874,6 +2859,7 @@ static int dual_loop(Sx *S) {
             return 0;
         }
         verified = 0;
+        const double w_r = S->w[r];   /* (the trace) */
         const int jl = S->basic[r];
         const double xr = S->x[jl];
         const double delta = xr < S->lo[jl] ? xr - S->lo[jl] : xr - S->up[jl];
@@ -1885,6 +2871,17 @@ static int dual_loop(Sx *S) {
         if (S->tdiag) tdg = now();
         price(S, rho);
         if (S->tdiag) S->t_row += now() - tdg;
+        /* (12 November 2026, an experiment: BRISK_SXDSEFULL=1) the steepest edge in the space of all variables (Forrest and
+         * Goldfarb 1992): the weight of row r is the squared norm of its tableau row over every column, |rho_r|^2 (the
+         * logicals) + the pivot row's structural entries squared + 1 when the leaving variable is a structural column; the
+         * weights' solve then takes rho_r + A (A' rho_r) instead of rho_r. uccase7 (LP): at Gurobi's basis of iteration 800
+         * these weights rank the rows as Gurobi chooses them, ours by |rho_r|^2 do not (REPORT_lp_r16) */
+        /* (12 November 2026, an experiment: BRISK_SXDSEROWS=1) the steepest-edge weights measured in the problem's own units: the
+         * row of the unscaled basis's inverse is c_j (row of B^-1) R, so with the infeasibility unscaled the column's scale cancels
+         * and the weight is sum_k (rho_rk r_k)^2; the weights' solve takes r^2 rho_r. Gurobi's default pricing norms keep its bases
+         * sparse on uccase7 (LP), its NormAdjust 0 and 1 give bases as dense as ours (REPORT_lp_r16) */
+        if (g_dserows > 0 && S->rscale) { wr = 0; for (int k = 0; k < rho->cnt; k++) { const int i = rho->idx[k]; const double v = rho->val[i] * S->rscale[i]; wr += v * v; } }
+        if (g_dsefull > 0) { for (int k = 0; k < S->row.cnt; k++) { const int j = S->row.idx[k]; if (j < S->n) wr += S->row.val[j] * S->row.val[j]; } if (S->basic[r] < S->n) wr += 1; }
         int nflip;
         if (S->tdiag) tdg = now();
         int q = chuzc_dual(S, delta, &nflip);
@@ -1940,7 +2937,289 @@ static int dual_loop(Sx *S) {
             }
             return 1;
         }
-        if (S->env_grp && S->fg_n > 1) q = final_group(S, q, delta, &nflip);
+        const int nflip_pre_ = nflip;
+        if (S->env_grpbf > 0 && S->fg_n > 1) q = final_group_bf(S, q, delta, &nflip);
+        {   /* (13 November 2026, an experiment: BRISK_SXDEGSPARSE=1) a final group whose members all have a step of zero (reduced
+             * costs zero: any member keeps the duals' signs): the member whose column B^-1 a_q is the sparsest enters (its |alpha| at
+             * least gamma times the group's largest), not the largest |alpha|. Gurobi on satellites4-25's copy (LP), from the same
+             * bases: its entering variable is the sparsest member in 14 of 15 such groups (3 nonzeros against 226 to 2,056 for the
+             * others; ours took the largest |alpha|, columns of 1,420-2,056); bench/lp_r16/slack/grpfeat.py. One solve a member */
+            static int ds_ = -1; if (ds_ < 0) { const char *e_ = getenv("BRISK_SXDEGSPARSE"); ds_ = e_ ? atoi(e_) : 0; }   /* (=2: each member's count kept until the next factorization) */
+            { static int dw_ = -1; if (dw_ < 0) { const char *e_ = getenv("BRISK_SXDEGWS"); dw_ = !(e_ && atoi(e_) == 0); g_dsws = dw_; } }
+            if (ds_ >= 2 && !S->dsnz) { S->dsnz = xmalloc(sizeof(int) * ((size_t)S->N + 1)); S->dsst = xmalloc(sizeof(long) * ((size_t)S->N + 1)); for (int j = 0; j <= S->N; j++) S->dsst[j] = -1; }
+            S->ds_tq = -1;
+            /* (13 November 2026, agent X; BRISK_SXDEGALL=1: in every solve, as first built) the rule acts only in the dual simplex
+             * method of a solve from the logicals' basis. Its case is the fill-in of the basis along a long path from a sparse start
+             * (Gurobi's from the slack basis on the satellites LPs; the row sifting's rounds, solved as from that basis, included); a solve from a given basis (the crossover's clean-up, a re-solve
+             * of sxm_solve, the clean-up rounds after the perturbation is removed) is short, its fill is that of the basis given, and
+             * a member of larger dual step there gives up the dual feasibility of the duals given: neos-4531126-vouga (LP), the
+             * crossover's clean-up 620 -> 3,846 iterations with the rule (agent C) */
+            static int dal_ = -1; if (dal_ < 0) { const char *e_ = getenv("BRISK_SXDEGALL"); dal_ = e_ && atoi(e_) > 0; }
+            /* (14 November 2026, a test: BRISK_SXXODEG=1, ISSUES 881) in the crossover's dual method once its costs are perturbed (at a
+             * stall), and nowhere else: the perturbation spreads the ties of step zero and the ratio test's choice among them fills the
+             * basis (ns1904248, LP: the entering columns' solves 4,073 -> 11,062 entries on average with the perturbation; with the rule
+             * 2,165, 63,351 -> 25,789 iterations, 27.5 -> 8.4 s), while before the perturbation the path from the given basis is short and
+             * the rule's larger dual steps give up the given duals (neos-4531126-vouga, LP: the crossover's clean-up 620 -> 3,846
+             * iterations with the rule on throughout, agent C) */
+            const int xog_ = S->xo_deg && (S->perturbed || S->xo_deg == 2);   /* (=2: throughout the crossover's dual method) */
+            if (ds_ > 0 && S->fg_n > 1 && q >= 0 && ((S->ds_scratch && !S->xo_deg_only) || dal_ || xog_)) {
+                const int g0_ = nflip, g1_ = nflip + S->fg_n; int allz_ = 1; double amx_ = 0;
+                for (int k = g0_; k < g1_; k++) { if (S->cr[k] != 0) { allz_ = 0; break; } if (S->ca[k] > amx_) amx_ = S->ca[k]; }
+                /* (BRISK_SXDEGSPARSE=4: any final group the pass over it left whole, no member flipped: its members all lie within the
+                 * Harris bound, and the sparsest of those of the right sign and |alpha| at least gamma times the largest enters) */
+                if (ds_ >= 4 && ds_ != 5 && !allz_ && nflip == nflip_pre_) { allz_ = 1; amx_ = 0; for (int k = g0_; k < g1_; k++) if (S->ca[k] > amx_) amx_ = S->ca[k]; }
+                int qpos_ = -1; for (int k = g0_; k < g1_; k++) if (S->cand[k] == q) { qpos_ = k; break; }
+                /* (BRISK_SXDEGSPARSE=5, a cheap test: the last member of the candidate list of the right sign and |alpha| at least gamma
+                 * times the largest, no solve; Gurobi's choice was that member in 14 of 14 zero-step groups on satellites4-25's copy) */
+                if (ds_ == 5 && qpos_ >= 0) { if (!allz_ && nflip == nflip_pre_) { allz_ = 1; amx_ = 0; for (int k = g0_; k < g1_; k++) if (S->ca[k] > amx_) amx_ = S->ca[k]; }
+                    if (allz_) { for (int k = g1_ - 1; k >= g0_; k--) if (S->cr[k] >= 0 && S->ca[k] >= S->env_grpbf * amx_) { q = S->cand[k]; break; } }
+                    allz_ = 0; }
+                if (allz_ && qpos_ >= 0) {
+                    static int dst_ = -1; if (dst_ < 0) { const char *e_ = getenv("BRISK_SXDEGSTAT"); dst_ = e_ && atoi(e_) > 0; }
+                    const double dt0_ = S->tdiag || dst_ ? now() : 0; const int q0_ = q; const long ns0_ = S->ds_solve;
+                    S->ds_grp++;
+                    double sl_ = fabs(delta); for (int k = 0; k < g0_; k++) { const int j = S->cand[k]; sl_ -= S->ca[k] * (S->up[j] - S->lo[j]); }   /* (the infeasibility left after the earlier groups' flips) */
+                    SxVec *v_ = &S->wv; long bestnz_ = -1; int bq_ = q;
+                    const double sq0_ = fmax(S->cr[qpos_], 0) / S->ca[qpos_];   /* (the dual step of the member the ratio test chose) */
+                    static int dov_ = -1; if (dov_ < 0) { const char *e_ = getenv("BRISK_SXDEGOVER"); dov_ = e_ && atoi(e_) > 0; }
+                    double ov0_ = 0; { const int jj_ = q; const double rg_ = S->move[jj_] != 0 ? S->up[jj_] - S->lo[jj_] : SX_INF; if (rg_ < SX_INF) ov0_ = fmax(0, sl_ / S->ca[qpos_] - rg_); }   /* (how far the chosen member leaves its box) */
+                    /* (BRISK_SXDEGSPARSEK=k: at most k fresh solves a group, the members whose count is kept counted for free; with
+                     * the costs unperturbed the groups can hold thousands of members: roi5alpha10n8, LP, 10 ms an iteration) */
+                    static int dk_ = -1; if (dk_ < 0) { const char *e_ = getenv("BRISK_SXDEGSPARSEK"); dk_ = e_ ? atoi(e_) : 0; }
+                    int nsolve_ = 0;
+                    /* (13 November 2026, BRISK_SXDEGEST=K, K >= 1: a cheaper count) each member's count kept for good, not only until the next
+                     * factorization (a member never counted is solved); the K best members by their kept counts are solved afresh and the
+                     * sparsest of them enters. The rule as first built solves every member whose count is older than the factorization */
+                    static int de_ = -1; if (de_ < 0) { const char *e_ = getenv("BRISK_SXDEGEST"); de_ = e_ ? atoi(e_) : 0; if (de_ > 8) de_ = 8; }
+                    int tk_[8]; long te_[8]; int nt_ = 0;
+                    /* (13 November 2026) the members that qualify counted first: with one, it enters without a solve (it is the sparsest of
+                     * one); with none, the ratio test's choice stays; only with two or more are counts needed (BRISK_SXDEGONE=0: every
+                     * qualifying member solved, as first built) */
+                    static int d1_ = -1; if (d1_ < 0) { const char *e_ = getenv("BRISK_SXDEGONE"); d1_ = !(e_ && atoi(e_) == 0); }
+                    int nel_ = 0, kel_ = -1, q0q_ = 0; S->ds_nel = 0;
+                    /* (BRISK_SXDEGBOUND=1, with the second workspace) the ratio test's member counted first on the patterns, unbounded: the
+                     * members are then counted against it */
+                    static int dsb0_ = -1; if (dsb0_ < 0) { const char *e_ = getenv("BRISK_SXDEGBOUND"); dsb0_ = e_ && atoi(e_) == 1; }
+                    static int dinc0_ = -1; if (dinc0_ < 0) { const char *e_ = getenv("BRISK_SXDEGINC"); dinc0_ = e_ ? atoi(e_) : 0; }
+                    const int dsb_ = dsb0_ && g_dsws && de_ == 0;
+                    long n0b_ = -1, incb_ = -1;
+                    if (dsb_ && dinc0_ > 0) { n0b_ = ds_count_sym(S, q0_, 0x7fffffffffffffffL); incb_ = n0b_ - 1; }
+                    for (int ps_ = d1_ ? 0 : 1; ps_ < 2; ps_++) {
+                    if (ps_ == 1 && d1_ && nel_ < 2) { if (nel_ == 1) { bq_ = S->cand[kel_]; qpos_ = kel_; S->ds_memb++; } break; }
+                    for (int k = g0_; k < g1_; k++) {
+                        {   static double dg_ = -1; if (dg_ < 0) { const char *e_ = getenv("BRISK_SXDEGSPARSEG"); dg_ = e_ ? atof(e_) : 0; }   /* (the members considered: |alpha| at least this share of the group's largest, by default gamma) */
+                            if (S->ca[k] < fmax(dg_, S->env_grpbf) * amx_) continue; }
+                        /* (BRISK_SXDEGSPARSE=3: only members whose step, the leaving infeasibility over |alpha|, keeps them within their
+                         * box: no new primal infeasibility; the largest |alpha| as before when none) */
+                        if (ds_ >= 4 && S->cr[k] < 0) continue;   /* (a member of the wrong sign within the tolerance: not taken) */
+                        /* (BRISK_SXDEGSPARSE=7: mode 4 with only the members whose dual step, reduced cost over |alpha|, is at least the step of
+                         * the member the ratio test chose: the sparser member is taken only where the dual objective rises as much; =8: and
+                         * their box takes the infeasibility left, as mode 6) */
+                        if ((ds_ == 7 || ds_ == 8) && fmax(S->cr[k], 0) / S->ca[k] < sq0_ * (1 - 1e-9)) continue;
+                        /* (BRISK_SXDEGSPARSE=9: mode 4 with only the members whose dual step is at most the chosen member's: the ratio test's pass
+                         * over the group lets the member of the smallest ratio enter, so that no member's reduced cost takes the wrong sign; a
+                         * member of a larger ratio leaves those before it of the wrong sign within the tolerance, which the iterations after must
+                         * repair (supportcase12, LP: the rule's member had the larger step in 10,662 of 11,743 changed choices). Ties of the
+                         * step, the zero steps above all, are what the rule was found on (Gurobi on satellites4-25, LP); =10: and their box takes the
+                         * infeasibility left, as mode 6) */
+                        if ((ds_ == 9 || ds_ == 10 || ds_ == 11) && fmax(S->cr[k], 0) / S->ca[k] > sq0_ * (1 + 1e-9) + 1e-300) continue;
+                        /* (BRISK_SXDEGSPARSE=11: mode 10 with only the exact ties of the step: a member of a smaller step, a zero step where the
+                         * chosen member's is positive (vouga, LP: 29 such choices), gives up the dual objective's rise; the rule then acts only
+                         * where the ratio test cannot tell the members apart, the zero steps of a degenerate vertex above all) */
+                        if (ds_ == 11 && fmax(S->cr[k], 0) / S->ca[k] < sq0_ * (1 - 1e-9)) continue;
+                        /* (BRISK_SXDEGOVER=1, with modes 4, 6-8: only the members that leave their box by no more than the member the ratio test
+                         * chose, the step sl / |alpha| less the box: where no member's box takes the infeasibility left, pythago7825 (LP), a
+                         * member of smaller |alpha| enters further outside its box, a larger new primal infeasibility) */
+                        if (dov_) { const int jj_ = S->cand[k]; const double rg_ = S->move[jj_] != 0 ? S->up[jj_] - S->lo[jj_] : SX_INF;
+                            const double ov_ = rg_ < SX_INF ? fmax(0, sl_ / S->ca[k] - rg_) : 0; if (ov_ > ov0_ * (1 + 1e-9) + 1e-12) continue; }
+                        /* (BRISK_SXDEGSPARSE=6: mode 4 with only the members whose box takes the infeasibility left after the earlier groups'
+                         * flips, as the pass over the final group asks of the member it lets enter: no member becomes basic outside its box.
+                         * Mode 4 on pythago7825 (LP): in 17,622 of its 19,109 changed choices no member's box could take the rest, the ratio
+                         * test's member (the largest |alpha|) left its box least, and the sparsest (|alpha| 0.46 of the largest on average)
+                         * entered further outside it, a larger new primal infeasibility each time: 25,038 -> 91,231 iterations at the 60 s
+                         * limit. With this condition the rule leaves such groups to the ratio test: 28,474 iterations, 15.0 s (13.4 s)) */
+                        if (ds_ == 6 || ds_ == 8 || ds_ == 10 || ds_ == 11) { const int jj_ = S->cand[k]; if (S->move[jj_] != 0 && S->up[jj_] - S->lo[jj_] < SX_INF && S->ca[k] * (S->up[jj_] - S->lo[jj_]) < sl_ * (1 - 1e-9)) continue; }
+                        if (ds_ == 3) { const int jj_ = S->cand[k]; const double rg_ = S->up[jj_] - S->lo[jj_];
+                            if (rg_ < SX_INF && fabs(delta) / S->ca[k] > rg_ * (1 + 1e-9)) continue; }
+                        if (ps_ == (d1_ ? 0 : 1) && S->cand[k] == q0_) q0q_ = 1;   /* (the ratio test's member qualifies itself) */
+                        if (ps_ == (d1_ ? 0 : 1)) { if (S->ds_nel >= S->ds_elcap) { S->ds_elcap = S->ds_elcap ? 2 * S->ds_elcap : 256; S->ds_el = realloc(S->ds_el, sizeof(int) * (size_t)S->ds_elcap); } S->ds_el[S->ds_nel++] = k; }   /* (the qualifying members, for the check) */
+                        if (ps_ == 0) { nel_++; kel_ = k; continue; }
+                        const int jq_ = S->cand[k]; long nz_ = 0;
+                        S->ds_memb++;
+                        if (de_ > 0 && ds_ >= 2) {   /* (the kept count, or a fresh one; the K best kept in tk_ by count, then larger |alpha|) */
+                            if (S->dsst[jq_] >= 0) { nz_ = S->dsnz[jq_]; S->ds_hit++; } else { nz_ = ds_count(S, jq_); S->dsnz[jq_] = (int)nz_; S->dsst[jq_] = S->iter; }
+                            int a_ = nt_ < de_ ? nt_++ : de_;
+                            if (a_ == de_) { if (nz_ > te_[de_ - 1] || (nz_ == te_[de_ - 1] && S->ca[k] <= S->ca[tk_[de_ - 1]])) continue; a_ = de_ - 1; }
+                            while (a_ > 0 && (nz_ < te_[a_ - 1] || (nz_ == te_[a_ - 1] && S->ca[k] > S->ca[tk_[a_ - 1]]))) { tk_[a_] = tk_[a_ - 1]; te_[a_] = te_[a_ - 1]; a_--; }
+                            tk_[a_] = k; te_[a_] = nz_;
+                            continue;
+                        }
+                        if (dsb_) {   /* (BRISK_SXDEGBOUND=1: the count on the patterns, bounded by the best so far and, with BRISK_SXDEGINC,
+                                       * by one less than the ratio test's member's count) */
+                            long bd_ = incb_ >= 0 ? incb_ : 0x7fffffffffffffffL; if (bestnz_ >= 0 && bestnz_ < bd_) bd_ = bestnz_;
+                            nsolve_++; nz_ = ds_count_sym(S, jq_, bd_);
+                        }
+                        else if (ds_ >= 2 && S->dsst[jq_] == S->nfactor) { nz_ = S->dsnz[jq_]; S->ds_hit++; }
+                        else if (dk_ > 0 && nsolve_ >= dk_) continue;
+                        else { nsolve_++; S->ds_solve++;
+                            sxv_clear(v_); col_scatter(S, jq_, v_, 1.0);
+                            /* (13 November 2026) in the second solve's workspace: the factor's own statistics of its hypersparse solves (which
+                             * choose how the iteration's own solves run) are left as they are, so the rule changes the path only by its choice */
+                            {   const double hc_ = S->F.hy_canc; const int hp_ = S->F.hy_cp;
+                                if (g_dsws) { SxWs *W_ = &S->ws2; W_->nflops = W_->nedges = 0; sxlu_ftran_ws(&S->F, W_, v_, S->dens_col, NULL); S->F.hy_canc = hc_; S->F.hy_cp = hp_; } else sxlu_ftran(&S->F, v_, S->dens_col, NULL); }
+                            if (v_->cnt >= 0) nz_ = v_->cnt; else for (int i = 0; i < S->m; i++) nz_ += v_->val[i] != 0;
+                            sxv_clear(v_);
+                            if (ds_ >= 2) { S->dsnz[jq_] = (int)nz_; S->dsst[jq_] = S->nfactor; }
+                        }
+                        if (bestnz_ < 0 || nz_ < bestnz_ || (nz_ == bestnz_ && S->ca[k] > S->ca[qpos_])) { bestnz_ = nz_; bq_ = S->cand[k]; qpos_ = k; }
+                    }
+                    }
+                    for (int t_ = 0; t_ < nt_; t_++) {   /* (BRISK_SXDEGEST: the K best by kept counts solved afresh) */
+                        const int k = tk_[t_], jq_ = S->cand[k]; long nz_;
+                        if (S->dsst[jq_] == S->iter) nz_ = S->dsnz[jq_]; else { nz_ = ds_count(S, jq_); S->dsnz[jq_] = (int)nz_; S->dsst[jq_] = S->iter; }
+                        if (bestnz_ < 0 || nz_ < bestnz_ || (nz_ == bestnz_ && S->ca[k] > S->ca[qpos_])) { bestnz_ = nz_; bq_ = jq_; qpos_ = k; }
+                    }
+                    {   /* (13 November 2026, BRISK_SXDEGINC=1) the ratio test's member is the incumbent: another member enters only when its
+                         * B^-1 a_j is strictly sparser than the incumbent's (both counted afresh). Without it (agent X's diagnostic,
+                         * BRISK_SXDEGDIAG) a changed choice was no sparser in 2,737 of 8,977 changes on supportcase12 and 248 of 447 on ex9
+                         * (LPs): the best two by kept counts can be no better than the incumbent, which was not counted, and a member that
+                         * qualifies alone entered uncounted; such a change only takes a larger dual step, leaving the members of smaller
+                         * ratio with reduced costs of the wrong sign (within the tolerance) for no gain in sparsity */
+                        static int di_ = -1; if (di_ < 0) { const char *e_ = getenv("BRISK_SXDEGINC"); di_ = e_ ? atoi(e_) : 0; }
+                        /* (BRISK_SXDEGINC=2: only where the incumbent qualifies itself (its box takes the infeasibility left, a reduced cost of the
+                         * right sign); where it does not, it would become basic outside its box, and the member that qualifies enters as in mode 6) */
+                        if (di_ > 0 && bq_ != q0_ && (di_ != 2 || q0q_)) {
+                            long n0_; if (n0b_ >= 0) n0_ = n0b_; else if (de_ > 0 && ds_ >= 2 && S->dsst[q0_] == S->iter) n0_ = S->dsnz[q0_]; else { n0_ = ds_count(S, q0_); if (de_ > 0 && ds_ >= 2) { S->dsnz[q0_] = (int)n0_; S->dsst[q0_] = S->iter; } }
+                            long n1_ = bestnz_; if (n1_ < 0 && n0b_ >= 0) n1_ = ds_count_sym(S, bq_, incb_); if (n1_ < 0) { if (de_ > 0 && ds_ >= 2 && S->dsst[bq_] == S->iter) n1_ = S->dsnz[bq_]; else { n1_ = ds_count(S, bq_); if (de_ > 0 && ds_ >= 2) { S->dsnz[bq_] = (int)n1_; S->dsst[bq_] = S->iter; } } bestnz_ = n1_; }
+                            if (!(n1_ < n0_)) { bq_ = q0_; bestnz_ = n0_; S->ds_inc++; }
+                        }
+                    }
+                    {   /* (BRISK_SXDEGSHIFT=1) the shift the member needs to take the ratio test's dual step, td_q - s0 |alpha_q|, kept within
+                         * the dual tolerance: a larger one would change the problem's costs, not only the choice among ties (where the ratio
+                         * test's member has a reduced cost of the wrong sign, its step zero, or the tolerance was tightened in the rounds after
+                         * the solve); the ratio test's member then enters */
+                        static int dsh2_ = -1; if (dsh2_ < 0) { const char *e_ = getenv("BRISK_SXDEGSHIFT"); dsh2_ = e_ ? atoi(e_) : 0; }
+                        if (dsh2_ > 0 && bq_ != q0_) { int ka_ = -1, kb_ = -1; for (int k = g0_; k < g1_; k++) { if (S->cand[k] == bq_) ka_ = k; if (S->cand[k] == q0_) kb_ = k; }
+                            if (ka_ < 0 || kb_ < 0 || fabs(S->cr[ka_] - fmax(S->cr[kb_], 0) / S->ca[kb_] * S->ca[ka_]) > S->told) { bq_ = q0_; S->ds_shref++; } }
+                    }
+                    q = bq_;
+                    if (q != q0_) {   /* (BRISK_SXDEGSHIFT=1: the dual step of the ratio test's member, sb; see the step below) */
+                        int kb_ = -1; for (int k = g0_; k < g1_; k++) if (S->cand[k] == q0_) { kb_ = k; break; }
+                        if (kb_ >= 0) { S->ds_tq = q; S->ds_tst = fmax(S->cr[kb_], 0) / S->ca[kb_]; } }
+                    {   /* (13 November 2026, a diagnostic: BRISK_SXDEGDIAG=1) each changed choice on stderr: the iteration, the group's size,
+                         * both members' counts of B^-1 a_j, |alpha| over the largest, reduced cost over the tolerance, the dual steps, and the
+                         * reduced costs of the wrong sign each step leaves on the group's other members (how many, the largest and the sum,
+                         * over the tolerance) */
+                        static int dg2_ = -1; if (dg2_ < 0) { const char *e_ = getenv("BRISK_SXDEGDIAG"); dg2_ = e_ && atoi(e_) > 0; }
+                        if (dg2_ && q != q0_) { int ka_ = -1, kb_ = -1; for (int k = g0_; k < g1_; k++) { if (S->cand[k] == q) ka_ = k; if (S->cand[k] == q0_) kb_ = k; }
+                            if (ka_ >= 0 && kb_ >= 0) { const double sa_ = fmax(S->cr[ka_], 0) / S->ca[ka_], sb_ = fmax(S->cr[kb_], 0) / S->ca[kb_];
+                                int na_ = 0, nb_ = 0; double ma_ = 0, mb_ = 0, ua_ = 0, ub_ = 0;
+                                for (int k = g0_; k < g1_; k++) { const double va_ = sa_ * S->ca[k] - S->cr[k], vb_ = sb_ * S->ca[k] - S->cr[k];
+                                    if (k != ka_ && va_ > 0) { na_++; ma_ = fmax(ma_, va_); ua_ += va_; } if (k != kb_ && vb_ > 0) { nb_++; mb_ = fmax(mb_, vb_); ub_ += vb_; } }
+                                const long nb0_ = ds_count(S, q0_);
+                                const long na0_ = bestnz_ >= 0 ? bestnz_ : ds_count(S, q);
+                                fprintf(stderr, "[degdiag] %ld g %d nz %ld %ld ar %.3g %.3g cr %.3g %.3g st %.4g %.4g wa %d %.3g %.3g wb %d %.3g %.3g sl %.3g dcol %.4f pert %d nel %d nupd %d\n", S->iter, g1_ - g0_, na0_, nb0_,
+                                        S->ca[ka_] / amx_, S->ca[kb_] / amx_, S->cr[ka_] / S->told, S->cr[kb_] / S->told, sa_, sb_, na_, ma_ / S->told, ua_ / S->told, nb_, mb_ / S->told, ub_ / S->told, sl_, S->dens_col, S->perturbed, nel_, S->F.nupd); } } }
+                    if (q != q0_) { S->ds_chg++;
+                        for (int t_ = 0; t_ < 2; t_++) { const int jj_ = t_ ? q0_ : q; int kk_ = -1; for (int k = g0_; k < g1_; k++) if (S->cand[k] == jj_) kk_ = k;
+                            if (kk_ >= 0 && S->move[jj_] != 0 && S->up[jj_] - S->lo[jj_] < SX_INF && S->ca[kk_] * (S->up[jj_] - S->lo[jj_]) < sl_ * (1 - 1e-9)) { if (t_) S->ds_oob0++; else S->ds_oob++; }
+                            if (!t_ && kk_ >= 0) { S->ds_ar += S->ca[kk_] / amx_; if (S->cr[kk_] == 0) S->ds_cr0++; } }
+                        {   int ka_ = -1, kb_ = -1; for (int k = g0_; k < g1_; k++) { if (S->cand[k] == q) ka_ = k; if (S->cand[k] == q0_) kb_ = k; }
+                            if (ka_ >= 0 && kb_ >= 0) { const double sa_ = fmax(S->cr[ka_], 0) / S->ca[ka_], sb_ = fmax(S->cr[kb_], 0) / S->ca[kb_];
+                                if (sa_ < sb_ * (1 - 1e-9)) { S->ds_stsm++; S->ds_strat += sb_ > 0 ? sa_ / sb_ : 1; } else if (sa_ > sb_ * (1 + 1e-9)) S->ds_stlg++; } } }
+                    if (S->tdiag || dst_) S->ds_t += now() - dt0_;
+                    (void)ns0_;
+                    {   /* (13 November 2026, a diagnostic: BRISK_SXDEGCHECK=1) every eligible member solved afresh (its exact |B^-1 a_j|), and the
+                         * entering member that each estimate would choose compared with the sparsest: 0 the rule as it runs (counts kept until
+                         * the next factorization), 1 counts kept for good (only members never counted solved), 2 the same counts ranking and
+                         * the best two by them solved afresh, 3 only members of |alpha| at least half the largest, 4 the column's own length,
+                         * 5 counts kept 100 iterations, 6 the last member of the candidate list; their agreement printed at -v 2 */
+                        static int dch_ = -1; if (dch_ < 0) { const char *e_ = getenv("BRISK_SXDEGCHECK"); dch_ = e_ && atoi(e_) > 0; }
+                        if (dch_ && ds_ >= 4 && ds_ != 5) {
+                            for (int t_ = 0; t_ < 3; t_++) if (!S->dc_nz[t_]) { S->dc_nz[t_] = xmalloc(sizeof(int) * ((size_t)S->N + 1)); S->dc_it[t_] = xmalloc(sizeof(long) * ((size_t)S->N + 1)); for (int j = 0; j <= S->N; j++) S->dc_it[t_][j] = -1; }
+                            const int ng_ = g1_ - g0_; long *ex_ = xmalloc(sizeof(long) * (size_t)ng_);
+                            for (int k = g0_; k < g1_; k++) ex_[k - g0_] = -1;
+                            int nel_ = 0;
+                            for (int t_ = 0; t_ < S->ds_nel; t_++) { const int k = S->ds_el[t_];
+                                const int jq_ = S->cand[k]; long nz_ = 0; nel_++;
+                                sxv_clear(v_); col_scatter(S, jq_, v_, 1.0); { SxWs *W_ = &S->ws2; const double hc_ = S->F.hy_canc; const int hp_ = S->F.hy_cp; sxlu_ftran_ws(&S->F, W_, v_, S->dens_col, NULL); S->F.hy_canc = hc_; S->F.hy_cp = hp_; }
+                                if (v_->cnt >= 0) nz_ = v_->cnt; else for (int i = 0; i < S->m; i++) nz_ += v_->val[i] != 0;
+                                sxv_clear(v_); ex_[k - g0_] = nz_; }
+                            if (nel_ >= 2) {
+                                long mn_ = -1; for (int k = 0; k < ng_; k++) if (ex_[k] >= 0 && (mn_ < 0 || ex_[k] < mn_)) mn_ = ex_[k];
+                                int pk_[8]; for (int e = 0; e < 8; e++) pk_[e] = -1;
+                                #define DC_BETTER(a_, b_, ka_, kb_) ((b_) < 0 || (a_) < (b_) || ((a_) == (b_) && S->ca[ka_] > S->ca[kb_]))
+                                {   long b_ = -1; for (int k = g0_; k < g1_; k++) if (S->cand[k] == q) pk_[0] = k; (void)b_; }
+                                for (int e = 1; e <= 5; e++) { if (e == 2 || e == 3 || e == 4) continue;
+                                    const int c_ = e == 1 ? 0 : 2; long bb_ = -1; int bk_ = -1;
+                                    for (int k = g0_; k < g1_; k++) { if (ex_[k - g0_] < 0) continue; const int j = S->cand[k];
+                                        long es_; if (S->dc_it[c_][j] >= 0 && (e == 1 || S->iter - S->dc_it[c_][j] < 100)) es_ = S->dc_nz[c_][j];
+                                        else { es_ = ex_[k - g0_]; S->dc_nz[c_][j] = (int)es_; S->dc_it[c_][j] = S->iter; S->dc_sol[e]++; }
+                                        if (bk_ < 0 || DC_BETTER(es_, bb_, k, bk_)) { bb_ = es_; bk_ = k; } }
+                                    pk_[e] = bk_; }
+                                {   int k1_ = -1, k2_ = -1; long e1_ = -1, e2_ = -1;   /* (2: the best two by kept counts, solved afresh) */
+                                    for (int k = g0_; k < g1_; k++) { if (ex_[k - g0_] < 0) continue; const int j = S->cand[k]; long es_;
+                                        if (S->dc_it[1][j] >= 0) es_ = S->dc_nz[1][j]; else { es_ = ex_[k - g0_]; S->dc_nz[1][j] = (int)es_; S->dc_it[1][j] = S->iter; S->dc_sol[2]++; }
+                                        if (k1_ < 0 || DC_BETTER(es_, e1_, k, k1_)) { k2_ = k1_; e2_ = e1_; k1_ = k; e1_ = es_; } else if (k2_ < 0 || DC_BETTER(es_, e2_, k, k2_)) { k2_ = k; e2_ = es_; } }
+                                    int bk_ = -1; long bb_ = -1;
+                                    for (int t_ = 0; t_ < 2; t_++) { const int k = t_ ? k2_ : k1_; if (k < 0) continue; const int j = S->cand[k];
+                                        if (S->dc_it[1][j] != S->iter) S->dc_sol[2]++; S->dc_nz[1][j] = (int)ex_[k - g0_]; S->dc_it[1][j] = S->iter;
+                                        if (bk_ < 0 || DC_BETTER(ex_[k - g0_], bb_, k, bk_)) { bb_ = ex_[k - g0_]; bk_ = k; } }
+                                    pk_[2] = bk_; }
+                                {   long bb_ = -1; int bk_ = -1; for (int k = g0_; k < g1_; k++) { if (ex_[k - g0_] < 0 || S->ca[k] < 0.5 * amx_) continue; S->dc_sol[3]++;
+                                        if (bk_ < 0 || DC_BETTER(ex_[k - g0_], bb_, k, bk_)) { bb_ = ex_[k - g0_]; bk_ = k; } } pk_[3] = bk_; }
+                                {   long bb_ = -1; int bk_ = -1; for (int k = g0_; k < g1_; k++) { if (ex_[k - g0_] < 0) continue; const int j = S->cand[k]; const long ln_ = j < S->n ? S->Ap[j + 1] - S->Ap[j] : 1;
+                                        if (bk_ < 0 || DC_BETTER(ln_, bb_, k, bk_)) { bb_ = ln_; bk_ = k; } } pk_[4] = bk_; }
+                                for (int k = g1_ - 1; k >= g0_; k--) if (ex_[k - g0_] >= 0) { pk_[6] = k; break; }
+                                #undef DC_BETTER
+                                S->dc_n++;
+                                for (int e = 0; e < 7; e++) { if (pk_[e] < 0) continue; const long xe_ = ex_[pk_[e] - g0_]; if (xe_ < 0) continue;
+                                    if (xe_ == mn_) S->dc_ag[e]++; if (xe_ <= 1.25 * mn_ + 2) S->dc_near[e]++; S->dc_lr[e] += log((xe_ + 1.0) / (mn_ + 1.0)); }
+                            }
+                            free(ex_);
+                        }
+                    }
+                }
+            } }
+        {   /* (13 November 2026, a diagnostic: BRISK_SXFORCEENT=<file> of "iteration variable": another solver's entering variable at
+             * that iteration, printed beside ours: its pivot entry, reduced cost, ratio, bounds and position, as ours) */
+            static int nfe_ = -1; static long *eit_ = NULL; static int *evar_ = NULL;
+            if (nfe_ < 0) { nfe_ = 0; const char *e_ = getenv("BRISK_SXFORCEENT"); FILE *ff_ = e_ ? fopen(e_, "r") : NULL;
+                if (ff_) { long a_; int b_; int cap_ = 0; while (fscanf(ff_, "%ld %d", &a_, &b_) == 2) { if (nfe_ >= cap_) { cap_ = cap_ ? 2 * cap_ : 256; eit_ = realloc(eit_, sizeof(long) * cap_); evar_ = realloc(evar_, sizeof(int) * cap_); } eit_[nfe_] = a_; evar_[nfe_] = b_; nfe_++; } fclose(ff_); } }
+            for (int t_ = 0; t_ < nfe_; t_++) if (eit_[t_] == S->iter) {
+                const int g_ = evar_[t_];
+                for (int u_ = 0; u_ < 2; u_++) { const int v_ = u_ ? g_ : q; if (v_ < 0 || v_ >= S->N) continue;
+                    const double a_ = v_ < S->n ? S->row.val[v_] : S->rho.val[v_ - S->n] * -1.0;
+                    fprintf(stderr, "   [ent %ld %s var %d (%s, %d entries): alpha %.4g, d %.4g, ratio %.4g, bounds [%g, %g], move %d, basic %d]\n", S->iter, u_ ? "other" : "ours ", v_,
+                            v_ < S->n ? "column" : "logical", v_ < S->n ? S->Ap[v_ + 1] - S->Ap[v_] : 1, a_, S->d[v_], a_ != 0 ? fabs(S->d[v_] / a_) : -1.0, S->lo[v_], S->up[v_], S->move[v_], S->pos[v_] >= 0); }
+                fprintf(stderr, "   [ent %ld: leaving infeasibility %.4g, flips %d, final group %d]\n", S->iter, delta, nflip, S->fg_n);
+                break; }
+        }
+        {   /* (13 November 2026, a diagnostic: BRISK_SXFORCEPATH=<file> of lines "iteration leaving entering flip flip ...", gpath.py's
+             * lines) at those iterations the entering variable and the bound flips forced to the file's (with BRISK_SXFORCEVARS for the
+             * leaving one): our state follows another solver's path, so that its choices can be compared with ours at its own states */
+            static int nfp_ = -1; static long *fpi_ = NULL; static int *fpq_ = NULL, *fpo_ = NULL, *fpf_ = NULL;
+            if (nfp_ < 0) { nfp_ = 0; const char *e_ = getenv("BRISK_SXFORCEPATH"); FILE *ff_ = e_ ? fopen(e_, "r") : NULL;
+                if (ff_) { char ln_[1 << 16]; int cap_ = 0, capf_ = 0, nf_ = 0;
+                    while (fgets(ln_, sizeof ln_, ff_)) { char *sp_ = ln_; long k_ = strtol(sp_, &sp_, 10); char *tk_ = strtok(sp_, " \n"); if (!tk_ || tk_[0] == '[') continue;
+                        tk_ = strtok(NULL, " \n"); if (!tk_ || tk_[0] == '[') continue; const int q_ = atoi(tk_);
+                        if (nfp_ + 1 >= cap_) { cap_ = cap_ ? 2 * cap_ : 1024; fpi_ = realloc(fpi_, sizeof(long) * cap_); fpq_ = realloc(fpq_, sizeof(int) * cap_); fpo_ = realloc(fpo_, sizeof(int) * (cap_ + 1)); }
+                        fpi_[nfp_] = k_; fpq_[nfp_] = q_; fpo_[nfp_] = nf_;
+                        while ((tk_ = strtok(NULL, " \n"))) { if (nf_ >= capf_) { capf_ = capf_ ? 2 * capf_ : 4096; fpf_ = realloc(fpf_, sizeof(int) * capf_); } fpf_[nf_++] = atoi(tk_); }
+                        nfp_++; fpo_[nfp_] = nf_; }
+                    fclose(ff_); } }
+            if (nfp_ > 0) { int f_ = -1; for (int t_ = 0; t_ < nfp_; t_++) if (fpi_[t_] == S->iter) { f_ = t_; break; }
+                if (f_ >= 0) { const int gq_ = fpq_[f_];
+                    if (gq_ >= 0 && gq_ < S->N && S->pos[gq_] < 0 && fabs(S->row.val[gq_]) > 1e-9) {
+                        int ok_ = 1; for (int u_ = fpo_[f_]; u_ < fpo_[f_ + 1]; u_++) { const int j_ = fpf_[u_]; if (j_ < 0 || j_ >= S->N || S->pos[j_] >= 0 || S->move[j_] == 0 || !is_boxed(S, j_)) ok_ = 0; }
+                        if (ok_) { q = gq_; nflip = 0; for (int u_ = fpo_[f_]; u_ < fpo_[f_ + 1]; u_++) S->cand[nflip++] = fpf_[u_]; g_forcedit = S->iter; }
+                        else fprintf(stderr, "   [forcepath %ld: a flip not possible]\n", S->iter);
+                    } else fprintf(stderr, "   [forcepath %ld: entering %d not possible (basic %d, alpha %g)]\n", S->iter, gq_, gq_ >= 0 && gq_ < S->N ? S->pos[gq_] >= 0 : -1, gq_ >= 0 && gq_ < S->N ? S->row.val[gq_] : 0.0);
+                } }
+        }
+        if (S->isint) { if (q < S->n && S->isint[q]) S->n_ent_int++; else S->n_ent_oth++; }
+        if (g_entdbg) { const int lq = q < S->n ? S->Ap[q + 1] - S->Ap[q] : 1, jr = S->basic[r], lr = jr < S->n ? S->Ap[jr + 1] - S->Ap[jr] : 1;   /* (a diagnostic) */
+            if (lq >= 40) { g_ent_long++; if (fabs(S->d[q]) <= S->told) g_ent_long_d0++; } if (lr >= 40) g_leave_long++; g_ent_all++; }
         const double arow = S->row.val[q];
         S->sum_rowc += S->row.cnt;
         /* FTRAN the entering column, and rho for the weights */
@@ -1951,10 +3230,20 @@ static int dual_loop(Sx *S) {
             if (col->cnt >= 0) S->dens_col = 0.95 * S->dens_col + 0.05 * (double)col->cnt / S->m;
             S->work += (double)(S->F.nflops - f0) + (col->cnt >= 0 ? col->cnt : S->m);
             S->t_ftran += now() - t;
-        } else { sxv_copy(tau, rho); ftran2(S, col, tau); }
+        } else { sxv_copy(tau, rho);
+            if (g_dserows > 0 && S->rscale) for (int k = 0; k < tau->cnt; k++) { const int i = tau->idx[k]; tau->val[i] *= S->rscale[i] * S->rscale[i]; }
+            if (g_dsefull > 0) { for (int k = 0; k < S->row.cnt; k++) { const int j = S->row.idx[k]; if (j < S->n && S->row.val[j] != 0) col_scatter(S, j, tau, S->row.val[j]); }
+                if (S->basic[r] < S->n) col_scatter(S, S->basic[r], tau, 1.0); }
+            ftran2(S, col, tau); }
         const double acol = col->val[r];
+        {   static long itdbg_ = -1; if (itdbg_ < 0) { const char *e_ = getenv("BRISK_SXITERDBG"); itdbg_ = e_ ? atol(e_) : 0; }   /* (12 November 2026, a diagnostic: the first k iterations, the entering and leaving columns) */
+            if (itdbg_ > 0 && S->iter < itdbg_) { const int jl_ = S->basic[r];
+                fprintf(stderr, "[it] %ld enter %d (%d entries) leave %d (%d entries) |alpha_q| %d |rho| %d\n", S->iter, q, q < S->n ? S->Ap[q + 1] - S->Ap[q] : 1,
+                        jl_, jl_ < S->n ? S->Ap[jl_ + 1] - S->Ap[jl_] : 1, col->cnt >= 0 ? col->cnt : S->m, S->row.cnt); } }
         S->sum_col += col->cnt >= 0 ? col->cnt : m;
         if (fabs(acol - arow) > 1e-7 * (1 + fabs(acol)) || fabs(acol) < 1e-9) {
+            {   static int dd_ = -1; if (dd_ < 0) { const char *e_ = getenv("BRISK_SXDISAGREEDBG"); dd_ = e_ && atoi(e_) == 1; }   /* (13 November 2026, a diagnostic) */
+                if (dd_) { int pos_ = -1; for (int k_ = 0; k_ < S->ncand; k_++) if (S->cand[k_] == q) { pos_ = k_; break; } fprintf(stderr, "[disagree] it %ld r %d q %d acol %.6g arow %.6g nupd %d nflip %d ncand %d q at %d ca %.4g; flipped 0..nflip-1 includes q: %d\n", S->iter, r, q, acol, arow, S->F.nupd, nflip, S->ncand, pos_, pos_ >= 0 ? S->ca[pos_] : -1.0, pos_ >= 0 && pos_ < nflip); } }
             /* the row and the column disagree: refactorize and try again */
             if (S->F.nupd > 0) { need_rebuild = 1; continue; }
             if (fabs(acol) < 1e-9) { S->w[r] *= 10; S->heap_ok = 0; continue; }
@@ -1963,14 +3252,23 @@ static int dual_loop(Sx *S) {
          * is zero or of the wrong sign within the tolerance (its cost shifted to make it zero; no flips then) */
         const int mvq = S->move[q] ? S->move[q] : (arow * (delta < 0 ? -1.0 : 1.0) > 0 ? 1 : -1);
         double thd = 0;
-        if ((S->perturbed || S->lazy_pert) && S->phase == 2 && !S->env_nostall) {
+        /* (13 November 2026, the LP developer; BRISK_SXLAZYSTALL=1, off by default) a solve whose costs are perturbed at the first
+         * stall (lazy_pert: BRISK_SXLAZYPERT=1, and the re-solves of sxm_solve) relies on this stall rule for that perturbation, but
+         * the rule is gated by its own trial switch (BRISK_SXSTALL, off): without it the costs are never perturbed at all, and the
+         * runs said to perturb at the first stall ran unperturbed to the end (mzzv11, LP: the objective at -26,078.000 for 18,000
+         * iterations, 45,954 iterations against the default's 9,382). With the switch the rule arms the first perturbation of a
+         * solve with lazy_pert whatever BRISK_SXSTALL says; its escalations after it stay with BRISK_SXSTALL (=2: they too) */
+        const int lzst_ = lazystall();
+        const int stall_on_ = !S->env_nostall || (lzst_ && S->lazy_pert && (!S->perturbed || lzst_ >= 2));
+        if ((S->perturbed || S->lazy_pert) && S->phase == 2 && stall_on_) {
             /* (24 October 2026, the night) a step is degenerate when the entering reduced cost is within twice the
              * perturbation that column received (it moves only by the perturbation), not only when it is zero: mzzv11 (LP)
              * moved its objective by 5e-4 in 6,000 iterations of such steps, none of zero length, and the rule never fired */
             double zq = S->told;
             if (S->perturbed && q < S->n) { double sc = 1; for (int k = 0; k < S->pert_level; k++) sc *= 10; const double pq = 2.0 * (fabs(S->cost0[q]) * S->costscale + 1) * S->pert_base * sc; if (pq > zq) zq = pq; }
             S->zw_it++; if (!(mvq * S->d[q] > zq)) S->zw_zero++;
-            if (S->zw_it >= SX_STALL_WIN) {
+            static long swin_ = -1; if (swin_ < 0) { const char *e_ = getenv("BRISK_SXSTALLWIN"); swin_ = e_ ? atol(e_) : SX_STALL_WIN; if (swin_ < 10) swin_ = SX_STALL_WIN; }   /* (13 November 2026, an experiment: the stall rule's window) */
+            if (S->zw_it >= swin_) {
                 /* (experiment) a window in which the objective moved by less than 1e-7 of its size: a stall as well,
                  * whether the steps were zero or only tiny (savsched1: -20,657.078 over 20,000 iterations) */
                 int objstall = 0;
@@ -1987,15 +3285,29 @@ static int dual_loop(Sx *S) {
                 S->zw_it = S->zw_zero = 0;
             }
         }
+        {   /* (13 November 2026, BRISK_SXDEGSHIFT=1, agent X) the sparsest-member rule's member enters with the dual step of the member
+             * the ratio test chose: its cost is shifted so that its reduced cost over |alpha| is that step (the shift is removed when it
+             * leaves the basis, shift_back, or at the end). The other members' reduced costs then change exactly as under the ratio
+             * test's choice: a member of larger ratio no longer leaves those of smaller ratio with reduced costs of the wrong sign (the
+             * losses on supportcase12, nb10tb, ex9 and neos-5051588-culgoa, LPs: the rule's member had the larger step in 85-98 % of the
+             * changed choices). Only the entering column changes: the sparsity is kept, the dual path is the ratio test's. Within the
+             * Harris bound the shift is at most the tolerance times |alpha_q| / |alpha_q0| */
+            static int dsh_ = -1; if (dsh_ < 0) { const char *e_ = getenv("BRISK_SXDEGSHIFT"); dsh_ = e_ ? atoi(e_) : 0; }
+            if (dsh_ > 0 && S->ds_tq == q && S->move[q] != 0) {
+                const double tg_ = mvq * S->ds_tst * fabs(arow), df_ = S->d[q] - tg_;
+                if (df_ != 0) { S->cost[q] -= df_; S->shift[q] -= df_; S->d[q] = tg_; S->shifted = 1; S->ds_nsh++; if (fabs(df_) > S->ds_shmax) S->ds_shmax = fabs(df_); }
+            }
+        }
         if (mvq * S->d[q] > 0) thd = S->d[q] / acol;
-        else { shift_cost(S, q); if (!(S->env_grp && S->env_grpflip)) nflip = 0; }   /* (final_group's flips kept) */
+        else { shift_cost(S, q); nflip = 0; }
         /* flips: the candidates the ratio test passed, and the boxed variables of the row whose reduced cost has the
          * wrong sign beyond the tolerance after the step (entries below the pivot tolerance, which the ratio test does
          * not consider); the others with such a reduced cost get their cost shifted. One solve for all the flips. */
-        int nfl = 0;
+        int nfl = 0; S->trace_nf = 0;
         sxv_clear(bf);
         for (int k = 0; k < nflip; k++) {
             const int j = S->cand[k];
+            if (S->trace && S->trace_nf < 512) S->trace_fl[S->trace_nf++] = j;
             if (S->move[j] > 0) { col_scatter(S, j, bf, S->up[j] - S->lo[j]); S->x[j] = S->up[j]; S->move[j] = -1; }
             else { col_scatter(S, j, bf, S->lo[j] - S->up[j]); S->x[j] = S->lo[j]; S->move[j] = 1; }
             nfl++;
@@ -2044,13 +3356,27 @@ static int dual_loop(Sx *S) {
             }
         }
         S->d[q] = 0;
-        for (int t = 0; t < nbad; t++) {
+        {   static int fps_ = -1; if (fps_ < 0) { const char *e_ = getenv("BRISK_SXFORCEPATHSHIFT"); fps_ = e_ && atoi(e_) != 0; }
+            /* (a forced iteration: no flips but the other solver's; BRISK_SXFORCEPATHSHIFT=1: the reduced costs left of the wrong sign
+             * beyond the tolerance shifted to zero, else left as they are) */
+            if (g_forcedit == S->iter && fps_) for (int t = 0; t < nbad; t++) { const int j = S->cand[t];
+                if (j != q && S->move[j] != 0 && S->move[j] * S->d[j] < -S->told) { shift_cost(S, j); S->nsh_it++; } } }
+        for (int t = 0; t < nbad && g_forcedit != S->iter; t++) {   /* (a forced iteration: see above) */
             const int j = S->cand[t];
             if (j == q || S->move[j] == 0 || S->move[j] * S->d[j] >= -S->told) continue;
-            if (is_boxed(S, j)) {
+            /* (10 November 2026, ISSUES 862; on by default since 11 November, BRISK_SXSMALLSHIFT=0: off) an entry below the ratio test's pivot tolerance is
+             * zero for the ratio test, so it is zero here too: its reduced cost of the wrong sign is the step's rounding
+             * times it, and the cost is shifted (removed at the end) instead of the column flipped across its box, which
+             * moves the basic values by its range times its column (neos-5041822-cockle, LP: entries 2e-8, ranges 5e7, a
+             * cycle of four iterations) */
+            static int smsh = -1; if (smsh < 0) { const char *e_ = getenv("BRISK_SXSMALLSHIFT"); smsh = e_ ? atoi(e_) : 1; }
+            /* (13 November 2026, an experiment: BRISK_SXNOPOSTFLIP=1) such a reduced cost is shifted to zero, never flipped: Gurobi on
+             * satellites4-25's copy with perturbed costs (LP) flips no variable outside the ratio test's own flips (1,000 iterations) */
+            static int npf_ = -1; if (npf_ < 0) { const char *e_ = getenv("BRISK_SXNOPOSTFLIP"); npf_ = e_ && atoi(e_) != 0; }
+            if (!npf_ && is_boxed(S, j) && !(smsh && fabs(S->row.val[j]) < (S->cpiv > 0 ? S->cpiv : 1e-7))) {
                 if (S->move[j] > 0) { col_scatter(S, j, bf, S->up[j] - S->lo[j]); S->x[j] = S->up[j]; S->move[j] = -1; }
                 else { col_scatter(S, j, bf, S->lo[j] - S->up[j]); S->x[j] = S->lo[j]; S->move[j] = 1; }
-                nfl++; S->nflip_it++;
+                nfl++; S->nflip_it++; if (S->trace && S->trace_nf < 512) S->trace_fl[S->trace_nf++] = j;
             } else { shift_cost(S, j); S->nsh_it++; }
         }
         if (nfl) {
@@ -2070,11 +3396,28 @@ static int dual_loop(Sx *S) {
         S->x[jl] = bound;
         if (S->tdiag) { const double t1 = now(); S->t_pupd += t1 - tdg; tdg = t1; }
         /* weights */
-        if (S->env_ddevex) update_ddevex(S, r, col); else update_dse(S, r, col, tau, wr);
+        if (S->env_ddevex) {
+            /* (13 November 2026, an experiment: SXDUALDEVEX=2) the reference framework reset when the leaving row's Devex weight
+             * drifts more than threefold from its exact value |rho_r|^2, known in the iteration */
+            if (S->env_ddevex == 2 && (S->w[r] > 3 * wr || 3 * S->w[r] < wr)) { for (int i = 0; i < S->m; i++) S->w[i] = 1.0; S->heap_ok = 0; S->n_dvxreset++; }
+            update_ddevex(S, r, col);
+        } else update_dse(S, r, col, tau, wr);
         if (S->tdiag) S->t_dse += now() - tdg;
         /* the basis change */
         S->basic[r] = q; S->pos[q] = r; S->move[q] = 0;
         S->pos[jl] = -1;
+        if (S->vfac) { S->vfac[q] = 1.0; S->vent[q] = S->iter; S->vden[q] = col->cnt >= 0 ? col->cnt : m; }   /* (BRISK_SXVFAC) */
+        if (S->vfac && S->iter - S->vf_last >= S->vf_p) {   /* (BRISK_SXVFAC) the columns that became basic since and lie outside their bounds */
+            for (int i = 0; i < m; i++) {
+                const int j = S->basic[i];
+                if (j >= S->n || S->vent[j] <= S->vf_last || S->vfac[j] != 1.0 || !(infeas(S, i) > 0)) continue;
+                if (S->vf_d && !(S->vden[j] > S->dens_col * m)) continue;
+                if (S->vf_once && S->vonce[j]) continue;
+                const double F = fmax(1.0, S->vf_c * sqrt((double)(S->Ap[j + 1] - S->Ap[j])));
+                if (F > 1.0) { S->vfac[j] = F; S->vonce[j] = 1; if (S->heap_ok) heap_touch(S, i); }
+            }
+            S->vf_last = S->iter;
+        }
         rows_enter(S, q); rows_leave(S, jl);
         S->d[jl] = -thd;
         if (S->lo[jl] == S->up[jl]) S->move[jl] = 0; else S->move[jl] = delta < 0 ? 1 : -1;
@@ -2088,6 +3431,13 @@ static int dual_loop(Sx *S) {
         if (S->heap_ok) heap_touch(S, r);
         else if (!S->Ifull && !S->inI[r] && infeas(S, r) > 0) { S->inI[r] = 1; S->Ilist[S->nI++] = r; }
         if (S->tdiag) S->t_heap += now() - tdg;
+        if (S->trace) {
+            fprintf(S->trace, "%ld r %d jl %d q %d nzq %d delta %.4g w %.4g acol %.4g thd %.4g thp %.4g col %d tau %d grp %d nfl %d :", S->iter, r, jl, q,
+                    q < S->n ? S->Ap[q + 1] - S->Ap[q] : 1, delta, w_r, acol, thd, thp, col->cnt, tau->cnt, S->fg_n, nfl);
+            for (int k = 0; k < S->trace_nf; k++) fprintf(S->trace, " %d (%.3g)", S->trace_fl[k], S->row.val[S->trace_fl[k]]);
+            fprintf(S->trace, " | jl [%.4g, %.4g] q [%.4g, %.4g] dq %.4g", S->lo[jl], S->up[jl], S->lo[q], S->up[q], S->d[q]);
+            fputc('\n', S->trace);
+        }
         S->iter++; S->it_dual++; if (S->phase == 1) S->it_ph1++;
         if (S->prog) S->prog->it = S->prog_base + S->iter;   /* (the race's log: one store, nothing computed for it) */
     }
@@ -2256,14 +3606,9 @@ static int shift_bounds_primal(Sx *S, const SxVec *v) {
  * its duals are recomputed after every iteration (the costs change with the set of infeasible variables). Phase 2 updates
  * the duals by the pivotal row and recomputes them at each refactorization. */
 static void unscaled_violations(const Sx *S, double tp, double td, double *pv, double *dv, double *psv, double *dsv);
-/* (4 November 2026, ISSUES 839) the primal method's last good basis: saved at each refactorization whose recomputed values
- * agree with the updated ones; when a refactorization shows a jump (the infeasibility at least ten times larger, and of at
- * least ten more rows) at a pivot threshold already raised to 0.5, the basis itself is ill-conditioned and raising the
- * threshold cannot repair the values: the method goes back to the last good basis (its bounds and nonbasic values with it)
- * and goes on from there with the threshold at 0.5, at most five times a solve. momentum2 (LP): after 300 iterations of
- * pivots of 1e-4 to 1e-6 of their column's largest entry the recomputed values reached 9e10 and the solve failed (with
- * the Devex pricing on 2 of 13 random sequences, with the steepest-edge pricing at the default); with it, the two failing
- * sequences 60 s (the limit) -> 7.2 and 5.1 s */
+/* (4 November 2026, ISSUES 839) the primal method's last good basis (its bounds and nonbasic values with it): saved at each
+ * refactorization whose recomputed values agree with the updated ones, for the step back when a factorization shows that
+ * the basis has lost its conditioning (BRISK_SXPBACKREL, primal_loop) */
 static void pgood_save(Sx *S) {
     const int m = S->m, N = S->N;
     if (!S->gb_basic) {
@@ -2279,15 +3624,24 @@ static void pgood_restore(Sx *S) {
     memcpy(S->basic, S->gb_basic, sizeof(int) * (size_t)m); memcpy(S->pos, S->gb_pos, sizeof(int) * (size_t)N); memcpy(S->move, S->gb_move, (size_t)N);
     memcpy(S->x, S->gb_x, sizeof(double) * (size_t)N); memcpy(S->lo, S->gb_lo, sizeof(double) * (size_t)N); memcpy(S->up, S->gb_up, sizeof(double) * (size_t)N);
 }
-/* (off by default: on the 40 random LPs the jumps it reacts to are mostly small, and going back loses the work since the
- * last good basis: map16715-04 10.7 -> 14.0 s, mushroom-best 1.08 -> 1.93 s, cre-b 1.87 -> 2.87 s, neos-4763324-toguru 10.0
- * -> 13.5 s, neos-4360552-sangro 12.5 -> 16.1 s, momentum2 4.2 -> 4.8 s; two LPs faster. BRISK_SXPBACK=1: on) */
-static int pback_on(void) { static int v = -1; if (v < 0) { const char *e_ = getenv("BRISK_SXPBACK"); v = e_ && atoi(e_) != 0; } return v; }
+/* (BRISK_SXPRT) phase 1: a feasible variable of a small entry that the step took beyond its bound (by at most the larger
+ * tolerance of the ratio test's stability test) has the bound moved, as in phase 2, and stays feasible */
+static void prt_shift_ph1(Sx *S, int r) {
+    const double ptol = S->tolp;
+    for (int k = 0; k < S->prt_n; k++) {
+        const int i = S->prt_list[k], j = S->basic[i]; if (i == r) continue;
+        const double x_ = S->x[j];
+        if (x_ < S->lo[j] - ptol) { S->lo[j] = x_ - (1 + urand(S)) * ptol; S->nbshift++; S->n_prtshift++; }
+        else if (x_ > S->up[j] + ptol) { S->up[j] = x_ + (1 + urand(S)) * ptol; S->nbshift++; S->n_prtshift++; }
+    }
+}
 static int primal_loop(Sx *S) {
     SxVec *rho = &S->rho, *col = &S->col;
     int need_rebuild = 1, verified = 0, ph1 = 0;
     long last_log = -1000;
     S->ch_ok = 0;
+    S->vhash = 0;
+    S->gb_ok = 0;     /* (the last good basis of this call only: the bounds of an earlier call's are not this call's) */
     for (;;) {
         int st = check_stop(S);
         if (st) return st;
@@ -2297,19 +3651,35 @@ static int primal_loop(Sx *S) {
             else {
                 S->fresh = 0;
                 double sb = 0; int nb = 0; if (S->dbg >= 2 || S->pstab) for (int i = 0; i < S->m; i++) { const double f = infeas(S, i); if (f > 0) { sb += f; nb++; } }
+                /* (5 November 2026, BRISK_SXPBACKREL) the largest change of a basic value by the new factorization, relative to
+                 * the values' scale (1 + the largest |x_B| before) */
+                const int chk = (S->pback_rel > 0 && S->pse_route) || S->dbg >= 2;
+                double xs_old = 0;
+                if (chk) { if (!S->px_old) S->px_old = xmalloc(sizeof(double) * ((size_t)S->N + 1)); memcpy(S->px_old, S->x, sizeof(double) * (size_t)S->N);
+                    for (int i = 0; i < S->m; i++) { const double a_ = fabs(S->x[S->basic[i]]); if (a_ > xs_old) xs_old = a_; } }
                 refactor(S); compute_primal(S); devex_check(S);
+                double dxrel = 0; if (chk) { double dm = 0; for (int i = 0; i < S->m; i++) { const int j = S->basic[i]; const double a_ = fabs(S->x[j] - S->px_old[j]); if (a_ > dm) dm = a_; } dxrel = dm / (1 + xs_old); }
                 if (S->dbg >= 2 || S->pstab) {
                     double sa = 0; int na = 0; for (int i = 0; i < S->m; i++) { const double f = infeas(S, i); if (f > 0) { sa += f; na++; } }
-                    if (S->dbg >= 2) printf("  primal refactorization at %ld: infeasibility %.3e (%d) before, %.3e (%d) after\n", S->iter, sb, nb, sa, na);
+                    if (S->dbg >= 2) { double xm = 0; for (int i = 0; i < S->m; i++) { const double a_ = fabs(S->x[S->basic[i]]); if (a_ > xm) xm = a_; }
+                        printf("  primal refactorization at %ld: infeasibility %.3e (%d) before, %.3e (%d) after; max|xB| %.2e; pivots %d, rel<1e-3: %d, min rel %.1e, thr %.2g; change %.1e\n", S->iter, sb, nb, sa, na, xm, S->pv_n, S->pv_nsmall, S->pv_minrel, S->F.pivthr, dxrel); }
+                    S->pv_n = 0; S->pv_nsmall = 0; S->pv_minrel = 1;
                     /* (by default since 28 October 2026; BRISK_SXPSTAB=0: off) the values kept by the updates and those of the new factorization far
                      * apart (the infeasibility at least ten times, and of at least ten more rows): the threshold raised */
                     const int jump = S->pstab && sa > 10 * sb + 1e-6 && na > nb + 10;
-                    if (jump && S->F.pivthr < 0.5) { S->F.pivthr = 0.5; S->nptrouble++; }
-                    else if (jump && pback_on() && S->gb_ok && S->nback < 5) {
-                        S->nback++; S->nptrouble++;
-                        if (S->verbose >= 2) printf("  primal refactorization at %ld: the values jumped (infeasibility %.1e over %d rows, %.1e before): back to the last good basis\n", S->iter, sa, na, sb);
-                        pgood_restore(S); refactor(S); compute_primal(S); S->pse_on = 0; devex_reset(S);   /* (the steepest-edge weights belong to the abandoned basis: Devex from here) */
-                    } else if (!jump && pback_on()) pgood_save(S);
+                    /* (5 November 2026, BRISK_SXPBACKREL) the basis has lost its conditioning: the new factorization changes a basic
+                     * value by more than pback_rel times the values' scale; the drift of the updates changes them by far less (at
+                     * most 4e-3 on the 40 random LPs, while the infeasibility-jump rule above reacts to 1e-5 to 1e-2 over 15-80
+                     * rows; 4.3e4 at momentum2's failure, LP). Back to the last good basis at once, with the threshold at 0.5:
+                     * raising the threshold cannot repair the basis itself. A safety net only: without the stability test it does
+                     * not rescue momentum2 (the same failure comes back) */
+                    const int lost = S->pback_rel > 0 && S->pse_route && dxrel > S->pback_rel;
+                    if (lost && S->gb_ok && S->nback < 5) {
+                        S->nback++; S->nptrouble++; S->n_tr_lost++; S->F.pivthr = 0.5;
+                        if (S->verbose >= 2) printf("  primal refactorization at %ld: the basic values changed by %.1e of their scale: the basis has lost its conditioning, back to the last good basis\n", S->iter, dxrel);
+                        pgood_restore(S); refactor(S); compute_primal(S); S->pse_on = 0; devex_reset(S);
+                    } else if (jump && S->F.pivthr < 0.5) { S->F.pivthr = 0.5; S->nptrouble++; S->n_tr_jump++; }
+                    else if (!jump && !lost && S->pback_rel > 0 && S->pse_route) pgood_save(S);
                 }
             }
             if (was2) shift_bounds_primal(S, NULL);      /* the drift of the recomputation absorbed in phase 2 */
@@ -2331,7 +3701,20 @@ static int primal_loop(Sx *S) {
         if (brisk_stab_due(S->iter)) { int c_; const double s_ = sum_pinf(S, &c_); brisk_stab_row(S->iter, ph1 ? "primal, phase 1" : "primal", g_sx_tabsign * objective(S) * S->costscale + g_sx_taboff, s_, c_); }
         const int q = chuzc_primal(S);
         if (q < 0) {
-            if (S->F.nupd > 0 && !verified && !(S->noverify && !ph1)) { need_rebuild = 1; verified = 1; continue; }
+            if (S->F.nupd > 0 && !verified && !(S->noverify && !ph1)) {
+                if (S->pcyc_on && !ph1 && S->pse_route) {
+                    /* (5 November 2026, BRISK_SXPCYC) phase 2 ends at the same basis (a hash of the basic set) as at the last
+                     * verification: the factorization's new values and duals (on a basis whose recomputed values move by more
+                     * than the tolerances) sent the method round a cycle back to it (momentum2, LP, Devex pricing at random
+                     * sequence 1: a verification every 17 iterations, 11 rows off by 1e-2 at values of 1e6, until the time
+                     * limit). The loop ends; primal_simplex restores the bounds and its rounds (the dual method for the primal
+                     * infeasibilities, the primal method for the dual ones) finish from this basis */
+                    unsigned long long h = 0; for (int i = 0; i < S->m; i++) h += ((unsigned long long)S->basic[i] + 1) * 0x9E3779B97F4A7C15ULL ^ (((unsigned long long)S->basic[i] + 1) << 17);
+                    if (h == S->vhash) { S->n_pcyc++; if (S->verbose >= 2) printf("  the primal method at %ld: the same basis as at the last verification: the loop ends\n", S->iter); return 0; }
+                    S->vhash = h;
+                }
+                need_rebuild = 1; verified = 1; continue;
+            }
             if (!ph1) return 0;
             /* phase 1 ends with infeasibilities: the problem is infeasible only if they are not tiny (below the level
              * where the phase-1 reduced costs carry information); tiny ones get the bound moved to the value (removed
@@ -2355,10 +3738,24 @@ static int primal_loop(Sx *S) {
         const double ptol = S->tolp;
         const double atol = 1e-9;
         double thmax = SX_INF;
+        /* (5 November 2026, ISSUES 839, BRISK_SXPRT) a stability test in the ratio test (Harris's tolerance by the pivot's
+         * size, as SoPlex's fast ratio test does): when the pivot chosen is below prt times the column's largest entry,
+         * the two passes are repeated with prt_tol times the feasibility tolerance for every entry that small in the first
+         * pass, so that it blocks the step later and the second pass, which takes the
+         * largest entry among those that block first, can choose a larger pivot. The pivot's size against its column's
+         * largest bounds the growth of the factor's update (the eta column alpha / alpha_r). momentum2 (LP): 75 % of the
+         * pivots below 1e-3 of their column's largest, down to 1e-13; the basic values grew from 3e2 to 2e6 and a
+         * factorization then gave 9e10. The violation a relaxed entry may reach is at most prt_tol tolerances: phase 2's
+         * bound shifts absorb it, and in phase 1 prt_shift_ph1 moves the bound of a variable that was feasible */
+        double asmall = 0, amax = 0; S->prt_n = 0;
+        const double ptolb = ptol * S->prt_tol;
+    ratio_again:
+        thmax = SX_INF;
         for (int k = 0; k < col->cnt; k++) {
             const int i = col->idx[k];
             const double a = dir * col->val[i];
             if (fabs(a) < atol) continue;
+            if (fabs(a) > amax) amax = fabs(a);
             const int j = S->basic[i];
             const double v = S->x[j];
             double lo = S->lo[j], up = S->up[j];
@@ -2367,7 +3764,9 @@ static int primal_loop(Sx *S) {
                 else if (v > up + ptol) { if (a > 0) { lo = up; up = SX_INF; } else continue; }
             }
             if (a > 0 ? lo <= -SX_INF : up >= SX_INF) continue;
-            const double t = a > 0 ? (v - lo + ptol) / a : (up - v + ptol) / -a;
+            const double pt = fabs(a) < asmall ? ptolb : ptol;
+            if (pt != ptol && ph1 && v >= S->lo[j] - ptol && v <= S->up[j] + ptol) { if (!S->prt_list) S->prt_list = xmalloc(sizeof(int) * ((size_t)S->m + 1)); S->prt_list[S->prt_n++] = i; }
+            const double t = a > 0 ? (v - lo + pt) / a : (up - v + pt) / -a;
             if (t < thmax) thmax = t;
         }
         int r = -1; double best = 0, thp = 0;
@@ -2408,6 +3807,18 @@ static int primal_loop(Sx *S) {
                     if (g <= 0) break;
                 }
                 S->n_ph1pass += kk < nb ? kk : nb - 1;
+                /* (7 November 2026; BRISK_SXPH1FLAT, on by default since that day; 0: off) the sum of infeasibilities flat after the point where the step stops
+                 * (its slope zero: the infeasible variables that still improve balance those that get worse, typically none
+                 * of either), and the entering variable's other bound reached before the next breakpoint: the step goes to
+                 * that bound, a bound flip, instead of a basis change at the same phase-1 objective. A boxed column of a
+                 * big-M row (lectsched-1, MILP: -M b <= -2 - s with b in [0, 1]) otherwise enters the basis at the fraction
+                 * that just makes its row feasible, and the vertex reached has one basic structural column more for each
+                 * row repaired so */
+                int flatflip = 0;
+                if (S->ph1flat && S->ph1long == 1 && kk < nb && !(bi[bo[kk].e] & 2) && fabs(g) <= 1e-9 * (1 + fabs(S->d[q]))) {
+                    const double rq = S->up[q] - S->lo[q], tnext = kk + 1 < nb ? bR[bo[kk + 1].e] : SX_INF;
+                    if (rq < SX_INF && rq <= tnext) flatflip = 1;
+                }
                 double amax = 0;
                 for (int k = 0; k < nb; k++) if (fmin(bR[k], bT[k]) <= dmax) { const double aa = fabs(col->val[bi[k] >> 2]); if (aa > amax) amax = aa; }
                 double tbest = -SX_INF;
@@ -2417,6 +3828,7 @@ static int primal_loop(Sx *S) {
                     if (aa >= 0.1 * amax && (bT[k] > tbest || (bT[k] == tbest && aa > best))) { tbest = bT[k]; best = aa; r = i; lbound = (bi[k] & 1) ? S->up[S->basic[i]] : S->lo[S->basic[i]]; }
                 }
                 thmax = dmax; thp = tbest; lsel = 1;
+                if (flatflip) { thmax = thp = S->up[q] - S->lo[q]; r = -1; S->n_ph1flat++; }
             }
         } else if (thmax < SX_INF) {
             for (int k = 0; k < col->cnt; k++) {
@@ -2433,6 +3845,41 @@ static int primal_loop(Sx *S) {
                 if (a > 0 ? lo <= -SX_INF : up >= SX_INF) continue;
                 const double t = a > 0 ? (v - lo) / a : (up - v) / -a;
                 if (t <= thmax && fabs(a) > best) { best = fabs(a); r = i; thp = t; }
+            }
+            /* (the stability test: the passes again, with the larger tolerance for the small entries, only when the pivot
+             * chosen is small; most columns keep the plain ratio test's choice and cost nothing more) */
+            if (asmall == 0 && S->prt > 0 && S->pse_route && r >= 0 && best < S->prt * amax) { asmall = S->prt * amax; S->n_prt++; goto ratio_again; }
+            if (asmall > 0 && r >= 0 && best < asmall) S->n_prtfail++;
+            /* (7 November 2026; BRISK_SXPH1FLAT, on by default since that day; 0: off) the same rule as in the long ratio test above, for the plain one: the row
+             * chosen is an infeasible variable that becomes feasible there, the sum of infeasibilities is flat beyond it
+             * (|d_q| = |alpha_r|), and no other basic variable stops the step before the entering variable's other bound:
+             * a bound flip instead of the basis change */
+            if (S->ph1flat && ph1 && r >= 0) {
+                const int jr = S->basic[r]; const double vr = S->x[jr];
+                const int soft = vr < S->lo[jr] - ptol || vr > S->up[jr] + ptol;
+                const double rq = S->up[q] - S->lo[q];
+                if (soft && rq < SX_INF && fabs(fabs(S->d[q]) - fabs(col->val[r])) <= 1e-9 * (1 + fabs(S->d[q]))) {
+                    double tmin = SX_INF;
+                    for (int k = 0; k < col->cnt && tmin >= rq; k++) {
+                        const int i = col->idx[k];
+                        const double a = dir * col->val[i];
+                        if (fabs(a) < atol) continue;
+                        const int j = S->basic[i];
+                        const double v = S->x[j];
+                        double lo = S->lo[j], up = S->up[j];
+                        if (i == r) {       /* (the row's own other bound: an equation is infeasible again at once) */
+                            const double t = a < 0 ? (up < SX_INF ? (up - v + ptol) / -a : SX_INF) : (lo > -SX_INF ? (v - lo + ptol) / a : SX_INF);
+                            if (t < tmin) tmin = t;
+                            continue;
+                        }
+                        if (v < lo - ptol) { if (a < 0) { up = lo; lo = -SX_INF; } else continue; }
+                        else if (v > up + ptol) { if (a > 0) { lo = up; up = SX_INF; } else continue; }
+                        if (a > 0 ? lo <= -SX_INF : up >= SX_INF) continue;
+                        const double t = a > 0 ? (v - lo + ptol) / a : (up - v + ptol) / -a;
+                        if (t < tmin) tmin = t;
+                    }
+                    if (rq <= tmin) { thmax = thp = rq; r = -1; S->n_ph1flat++; }
+                }
             }
         }
         const double rangeq = S->up[q] - S->lo[q];
@@ -2455,12 +3902,16 @@ static int primal_loop(Sx *S) {
             S->x[q] = S->move[q] > 0 ? S->up[q] : S->lo[q];
             S->move[q] = -S->move[q];
             S->nflips++;
+            if (ph1 && S->prt_n) prt_shift_ph1(S, -1);
             pc_set_key(S, q, pmerit(S, q));
         } else {
             if (thp < 0) thp = 0;          /* a variable slightly beyond its bound: a step of zero */
             if (thp == 0) S->n_pdegen++;
             jl = S->basic[r];
             ar = col->val[r];
+            S->n_alpha += col->cnt;
+            if (S->dbg >= 2) { double am = 0; for (int k = 0; k < col->cnt; k++) { const double a_ = fabs(col->val[col->idx[k]]); if (a_ > am) am = a_; }
+                const double rel = fabs(ar) / am; S->pv_n++; if (rel < 1e-3) S->pv_nsmall++; if (rel < S->pv_minrel) S->pv_minrel = rel; }
             const double a = dir * ar;
             if (lsel) bound = lbound;
             else {
@@ -2495,6 +3946,7 @@ static int primal_loop(Sx *S) {
             if (!vdone) btran(S, rho, &S->dens_rho, &S->upart);
             if (rho->cnt < 0) sxv_reindex(rho);
             price(S, rho);
+            S->n_row += S->row.cnt;
             if (S->pstab) {
                 /* (27 October 2026; by default since 28 October, BRISK_SXPSTAB=0: off) the pivot from the row and from the column disagree:
                  * nothing is updated, the basis is factored again; when they disagree right after a factorization, the
@@ -2502,7 +3954,7 @@ static int primal_loop(Sx *S) {
                  * kMaxPivotThreshold); at 0.5 the pivot is taken */
                 const double arow = S->row.val[q];
                 if (fabs(ar - arow) > 1e-7 * (1 + fabs(ar)) && (S->F.nupd > 0 || S->F.pivthr < 0.5)) {
-                    S->nptrouble++;
+                    S->nptrouble++; S->n_tr_rowcol++;
                     if (S->F.nupd == 0) S->F.pivthr = 0.5;
                     need_rebuild = 1; continue;
                 }
@@ -2513,6 +3965,7 @@ static int primal_loop(Sx *S) {
             S->x[q] += step;
             S->x[jl] = bound;
             if (!ph1) shift_bounds_primal(S, col);
+            else if (S->prt_n) prt_shift_ph1(S, r);
             /* dual update (with the costs as they are: phase 1's change below) and Devex weights, (1 November 2026) with the
              * candidates' keys in one pass over the pivotal row (three passes before: facility, LP, rows of thousands of
              * entries; each entry's key reads only its own reduced cost and weight, so the same keys in the same order) */
@@ -2539,6 +3992,7 @@ static int primal_loop(Sx *S) {
                     if (v->cnt < 0) sxv_reindex(v);
                     /* a_j' v for the columns of the pivotal row only: column by column when their entries are fewer than
                      * those of v's rows, else by a pricing of v */
+                    const double tp0_ = now();
                     long wc = 0, wr = 0;
                     for (int k = 0; k < S->row.cnt; k++) { const int j = S->row.idx[k]; wc += j < S->n ? S->Ap[j + 1] - S->Ap[j] : 1; }
                     for (int k = 0; k < v->cnt; k++) wr += S->Rnb[v->idx[k]] + 1;
@@ -2568,6 +4022,7 @@ static int primal_loop(Sx *S) {
                         if (touch) pc_set_key(S, j, pmerit(S, j));
                     }
                     sxv_clear(&S->row2); sxv_clear(v);
+                    S->t_prod += now() - tp0_; S->fl_prod += wc < wr ? wc : wr;
                     S->d[q] = 0; S->d[jl] = -thd;
                     const double wl = gq / (ar * ar);
                     S->dvx[jl] = wl > 1 ? wl : 1;
@@ -2730,11 +4185,94 @@ static void unscaled_violations(const Sx *S, double tp, double td, double *pv, d
         const double e = S->move[j] == 0 ? fabs(dj) : S->move[j] * dj < 0 ? -S->move[j] * dj : 0;
         d = fmax(d, e);
         if (e > td) ds = fmin(ds, fabs(S->d[j]));
+        {   static int vdb = -1; if (vdb < 0) vdb = getenv("BRISK_SXVIOLDBG") != NULL;   /* (a diagnostic: every dual violation over the target) */
+            if (vdb && e > td) printf("  dual violation %.2e at %d (n %d, %s): move %d lo0 %g up0 %g lo %g up %g x %g d %.3e scaled, told %.1e, pos %d\n", e, j, S->n, j < S->n ? "column" : "logical", S->move[j], S->lo0[j], S->up0[j], S->lo[j], S->up[j], S->x[j], S->d[j], S->told, S->pos[j]); }
         if (d > dold && d > 1e-3 && getenv("SXDBG")) printf("  dual violation %g at %d (n %d): move %d lo0 %g up0 %g lo %g up %g x %g d %g\n", d, j, S->n, S->move[j], S->lo0[j], S->up0[j], S->lo[j], S->up[j], S->x[j], S->d[j]);
     }
     *pv = p; *dv = d; *psv = ps; *dsv = ds;
 }
 
+/* (7 November 2026; ISSUES 843, BRISK_LPGRBTOL=1) the largest violations of the current basic solution on the scaled problem
+ * the method works on, with the costs and bounds of the problem (no shifts or perturbations): the basic variables beyond
+ * their bounds, the reduced costs of the nonbasic ones of the wrong sign, absolute, as the method's tolerances measure them.
+ * A violation the dual method accepted by its own rule (unscaled_violations, ISSUES 629) is accepted here too */
+static void scaled_violations(const Sx *S, double *pv, double *dv) {
+    double p = 0, d = 0;
+    for (int i = 0; i < S->m; i++) {
+        const int j = S->basic[i]; const double v = S->x[j];
+        const int acc = S->tiny_on && S->tiny && j < S->tiny_n && S->tiny[j];
+        if (v < S->lo0[j] && !(acc && S->lo0[j] - v <= 1e-6 * (1 + fabs(S->lo0[j])))) p = fmax(p, S->lo0[j] - v);
+        if (v > S->up0[j] && !(acc && v - S->up0[j] <= 1e-6 * (1 + fabs(S->up0[j])))) p = fmax(p, v - S->up0[j]);
+    }
+    for (int j = 0; j < S->N; j++) {
+        if (S->pos[j] >= 0 || S->lo0[j] == S->up0[j]) continue;
+        const double dj = S->d[j];
+        d = fmax(d, S->move[j] == 0 ? fabs(dj) : S->move[j] * dj < 0 ? -S->move[j] * dj : 0);
+    }
+    *pv = p; *dv = d;
+}
+
+/* (8 November 2026, ISSUES 847; BRISK_SXPH1BIGM=<M>, on by default with M = 1e5) the dual phase 1 by artificial bounds: each column
+ * that leaves the starting basis dual infeasible (not boxed, its cost of the wrong sign for its one finite bound, or free
+ * with a cost) gets the bound its reduced cost asks for at the distance M from its finite bound (from zero when free),
+ * and the dual method's phase 2 runs at once on the problem so bounded; it is dual feasible from the start. At the end a
+ * column at an artificial bound gets that bound a thousand times further and the loop goes on (twice at most); when none
+ * is left at one, the artificial bounds are removed: the basis is optimal for the problem itself. Otherwise (or when the
+ * bounded problem is infeasible), the bounds are removed and the phase 1 by the auxiliary problem starts from the basis
+ * reached. Gurobi's dual simplex method starts so (its log's first line: objective and primal infeasibility of the order
+ * of the artificial bounds); ns1690781 (LP) 1,359 iterations in one phase against our 1,071 in phase 1 and 2,650 after.
+ * Returns the loop's status, or -1 for the phase 1 by the auxiliary problem. */
+static int dual_bigm(Sx *S, double M0) {
+    unsigned char *art = xcalloc((size_t)S->N, 1);
+    long nart = 0;
+    for (int j = 0; j < S->N; j++) {
+        if (S->pos[j] >= 0 || is_boxed(S, j) || S->lo[j] == S->up[j]) continue;
+        const double dj = S->d[j], l = S->lo[j], u = S->up[j];
+        if (l <= -SX_INF && u >= SX_INF) { if (fabs(dj) <= S->told) continue; if (dj > 0) S->lo[j] = -M0; else S->up[j] = M0; }
+        else if (l > -SX_INF) { if (dj >= -S->told) continue; S->up[j] = l + M0; }
+        else { if (dj <= S->told) continue; S->lo[j] = u - M0; }
+        art[j] = 1; nart++;
+        set_nonbasic(S, j, dj);
+    }
+    if (S->verbose >= 2) printf("  dual phase 1 by artificial bounds: %ld columns bounded at %.1e\n", nart, M0);
+    if (getenv("BRISK_SXDBGP1")) { long nf = 0, nl = 0, nu = 0, nlog = 0; for (int j = 0; j < S->N; j++) if (art[j]) { if (j >= S->n) nlog++; if (S->lo0[j] <= -SX_INF && S->up0[j] >= SX_INF) nf++; else if (S->lo0[j] > -SX_INF) nl++; else nu++; }
+        fprintf(stderr, "[p1] artificial: %ld free, %ld with a lower bound only, %ld with an upper bound only (%ld logicals)\n", nf, nl, nu, nlog); }
+    S->phase = 2;
+    int st = -1;
+    double M = M0;
+    for (int round = 0; ; round++) {
+        st = dual_loop(S);
+        if (st != 0) break;
+        long at = 0;
+        for (int j = 0; j < S->N; j++) {
+            if (!art[j] || S->pos[j] >= 0) continue;
+            if ((S->move[j] > 0 && S->lo[j] != S->lo0[j]) || (S->move[j] < 0 && S->up[j] != S->up0[j])) at++;
+        }
+        if (S->verbose >= 2) printf("  artificial bounds, round %d: %ld columns at one\n", round, at);
+        if (!at) break;
+        /* (12 November 2026) widened until M passes 1e11 (three rounds from M = 1e5, as before; more from a smaller start) */
+        if (M * 1e3 > 1e11 * (1 + 1e-12)) { st = -1; break; }
+        M *= 1e3;
+        for (int j = 0; j < S->N; j++) {
+            if (!art[j] || S->pos[j] >= 0) continue;
+            if (S->move[j] > 0 && S->lo[j] != S->lo0[j]) { S->lo[j] = S->up0[j] < SX_INF ? S->up0[j] - M : -M; S->x[j] = S->lo[j]; }
+            else if (S->move[j] < 0 && S->up[j] != S->up0[j]) { S->up[j] = S->lo0[j] > -SX_INF ? S->lo0[j] + M : M; S->x[j] = S->up[j]; }
+        }
+    }
+    for (int j = 0; j < S->N; j++) if (art[j]) { S->lo[j] = S->lo0[j]; S->up[j] = S->up0[j]; }
+    free(art);
+    normalize_nonbasic(S);
+    if (st == 0 || st == 3 || st == 6 || st == 7) return st;
+    compute_primal_dual(S);
+    return -1;
+}
+/* (on by default since 8 November 2026, M = 1e5; BRISK_SXPH1BIGM=0: the phase 1 by the auxiliary problem only). Judged on the
+ * default route, 4 threads, interleaved: 23 problem LPs 0.983, 40 development LPs 0.994, 55 tall LPs 0.984, 45 fresh LPs of the
+ * outside benchmark's families 1.001, 49 held-out relaxations 0.999, its 42 reproduced cases 0.995 (momentum1 0.82 -> 0.55 s,
+ * neos-3209462-rhin 1.07 -> 0.60 s; neos-799711 0.79 -> 1.18 s, neos-4984115-canche 1.59 -> 1.93 s); the dual simplex method alone,
+ * one thread, 74 LPs: the 24 it changes 0.895 of the time (ns1690781 0.64 -> 0.17 s) */
+static int ph1bigm(void) { static double v = -1; if (v < 0) { const char *e_ = getenv("BRISK_SXPH1BIGM"); v = e_ ? atof(e_) : 1e5; } return v > 0; }
+static double ph1bigm_m(void) { const char *e_ = getenv("BRISK_SXPH1BIGM"); return e_ ? atof(e_) : 1e5; }
 static int dual_simplex(Sx *S) {
     /* dual phase 1 when the starting basis has dual infeasibilities that a bound flip cannot remove */
     compute_dual(S);
@@ -2747,7 +4285,45 @@ static int dual_simplex(Sx *S) {
         else if (S->lo[j] > -SX_INF) { if (dj < -S->told) need1 = 1; }
         else if (dj > S->told) need1 = 1;
     }
+    if (getenv("BRISK_SXDBGP1")) { int c_ = 0; for (int j = 0; j < S->N; j++) { if (S->pos[j] >= 0 || is_boxed(S, j) || S->lo[j] == S->up[j]) continue; const double dj = S->d[j];
+        const int bad_ = (S->lo[j] <= -SX_INF && S->up[j] >= SX_INF) ? fabs(dj) > S->told : S->lo[j] > -SX_INF ? dj < -S->told : dj > S->told;
+        if (bad_ && c_++ < 5) fprintf(stderr, "[p1] j %d (%s) d %.3g cost %.3g lo %.3g up %.3g\n", j, j < S->n ? "column" : "logical", dj, S->cost[j], S->lo[j], S->up[j]); }
+        fprintf(stderr, "[p1] need1 %d, %d dual infeasible\n", need1, c_); }
+    /* (the artificial bounds put primal values of the order of M into the basis; when the start is primal feasible as it is,
+     * they would make phase 2 remove what the phase 1 by the auxiliary problem leaves alone: gfd-schedulen180f7d50m30k18 (LP),
+     * whose dual form has all right-hand sides zero, 5.0 -> 32.7 s. Then the auxiliary problem, as before) */
+    int pfeas0 = 1;
+    if (need1 && ph1bigm() && !S->it_given) {
+        for (int i = 0; i < S->m && pfeas0; i++) { const int j = S->basic[i]; const double v = S->x[j];
+            if (v < S->lo0[j] - S->tolp * (1 + fabs(S->lo0[j])) || v > S->up0[j] + S->tolp * (1 + fabs(S->up0[j]))) pfeas0 = 0; }
+        if (S->verbose >= 2 && pfeas0) printf("  dual phase 1: the start is primal feasible; by the auxiliary problem\n");
+    }
+    if (need1 && ph1bigm() && !S->it_given && !pfeas0) {
+        double M_ = ph1bigm_m();
+        {   /* (12 November 2026, an experiment: BRISK_SXPH1BIGMAUTO=k) the artificial bounds at the scale of the problem's own
+             * right-hand sides: k times the median of the rows' finite nonzero bounds (scaled), so that the infeasibilities they
+             * put into the basic values are of the size of the real ones (genus-sym-grafo5708-48, LP: M = 1e5 3,063 iterations on
+             * average, M = 1 2,576, M = 0.1 1,887; a fixed small M loses elsewhere, REPORT_lp_r16) */
+            static double ba_ = -1; if (ba_ < 0) { const char *e_ = getenv("BRISK_SXPH1BIGMAUTO"); ba_ = e_ ? atof(e_) : 0; }
+            if (ba_ > 0) {
+                double *v_ = xmalloc(sizeof(double) * (2 * (size_t)S->m + 1)); long nv_ = 0;
+                for (int i = 0; i < S->m; i++) { const int j = S->n + i; const double l = S->lo0[j], u = S->up0[j];
+                    if (l > -SX_INF && l != 0) v_[nv_++] = fabs(l); if (u < SX_INF && u != 0 && u != l) v_[nv_++] = fabs(u); }
+                if (nv_ > 0) { qsort(v_, (size_t)nv_, sizeof(double), cmp_dbl_asc); M_ = ba_ * v_[nv_ / 2]; }
+                free(v_);
+                if (S->verbose >= 2) printf("  dual phase 1: artificial bounds at %.3g (%ld finite nonzero row bounds)\n", M_, nv_);
+            }
+        }
+        const int stb = dual_bigm(S, M_);
+        if (stb >= 0) return stb;
+        need1 = 1;
+    }
     if (need1) {
+        /* (13 November 2026, the LP developer; with BRISK_SXLAZYSTALL) the stall rule counts phase 2 only, so a solve whose costs
+         * wait for the first stall ran the auxiliary problem unperturbed (ns1904248, LP: 83,718 iterations of it against the
+         * default's 4,171 on perturbed costs); the rule extended to phase 1 perturbs in the middle of it and was worse (past 60 s).
+         * The auxiliary problem gets the default's perturbation from its start instead, the late one being for phase 2 */
+        if (S->lazy_main && lazystall() && !S->perturbed && getenv("BRISK_SXLAZYPH1") == NULL) { perturb_costs(S); compute_dual(S); }
         S->phase = 1;
         for (int j = 0; j < S->N; j++) {
             const double l = S->lo0[j], u = S->up0[j];
@@ -2854,7 +4430,7 @@ static double basis_cond(Sx *S) {
 /* (27 October 2026) the crossover's pushes stop at the time limit or at a stop request (ISSUES 460): their loops looked at
  * neither, and savsched1's (LP, a basis of 288,983 rows) ran minutes past the limit; the simplex loop after them then
  * returns the limit's status */
-static int xo_stopped(const Sx *S) { return (S->stop && *S->stop) || (S->tlim > 0 && now() - S->t0 > S->tlim); }
+static int xo_stopped(const Sx *S) { return (brisk_flag_get(S->stop)) || (S->tlim > 0 && now() - S->t0 > S->tlim); }
 static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpush) {
     unsigned xo_chk = 0; int xo_stop = 0;
     const int n = S->n, m = S->m, N = S->N;
@@ -3019,7 +4595,7 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
             const int atl = fx || at[j] == 1 || (S->lo[j] > -SX_INF && fabs(xv - S->lo[j]) <= S->tolp), atu = fx || at[j] == 2 || (S->up[j] < SX_INF && fabs(xv - S->up[j]) <= S->tolp);
             if (!atl && !atu) continue;              /* (not complementary: left to the primal method) */
             if ((atl && !atu && dz[j] < 0) || (atu && !atl && dz[j] > 0)) continue;   /* (the wrong sign: likewise) */
-            if ((S->stop && *S->stop) || ((++xo_chk & 63) == 0 && xo_stopped(S))) { xo_stop = 1; break; }   /* (27 October 2026, the night: the caller's flag at every push; a push costs up to 0.1 ms, 64 of them delayed the default route's stop of the dual simplex method by up to 8 ms) */
+            if ((brisk_flag_get(S->stop)) || ((++xo_chk & 63) == 0 && xo_stopped(S))) { xo_stop = 1; break; }   /* (27 October 2026, the night: the caller's flag at every push; a push costs up to 0.1 ms, 64 of them delayed the default route's stop of the dual simplex method by up to 8 ms) */
             if (need_refactor(S)) { refactor(S); compute_primal(S); }
             const int r = S->pos[j];
             const double sgt = dz[j] > 0 ? 1.0 : -1.0, smax = fabs(dz[j]);
@@ -3101,7 +4677,39 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
     static int pord = -1; if (pord < 0) { const char *e = getenv("BRISK_SXXOPUSHORD"); pord = e ? atoi(e) : 0; }
     static int snapfix = -1; if (snapfix < 0) { const char *e = getenv("BRISK_SXXOSNAP"); snapfix = e && atoi(e) != 0; }   /* (off: measured worse, TRICKS 8) */
     long nsnap = 0;
+    /* (7 November 2026, BRISK_SXXOSHIFT, on by default since that day; 0: off) a leaving variable beyond its bound leaves at its value, not set onto the
+     * bound: the basic values stay the solution of the equations, and the variable, now nonbasic off its bound, is pushed
+     * onto it like any other superbasic one, through the ratio test (which pivots when a basic variable reaches a bound
+     * first). Set onto its bound without moving the basic values, as before, the basic values were no longer
+     * B^-1 (b - N x_N): the error, its distance beyond the bound, came back at the next factorization multiplied by the
+     * new B^-1 a of the leaving column, whose entry in its row is one over the pivot (neos-4264598-oueme, LP, from the
+     * classes' solution: one leaving variable 0.14 beyond its bound at a pivot of 2e-4; updated basic infeasibilities at
+     * most 0.14, recomputed 3.7e2, then 6,677 iterations of the dual method; with it 0.14 and 1,370). The basis itself
+     * was not ill-conditioned (condition estimate 4.8e6 in both, no pivot replaced). Those still off their bound after
+     * the passes are set onto it, the caller recomputing the basic values. */
+    static int xshift = -1; if (xshift < 0) { const char *e = getenv("BRISK_SXXOSHIFT"); xshift = !(e && atoi(e) == 0); }   /* (on by default since 7 November 2026: the default route, 4 threads, the three fixes of that day together: 23 problem LPs 0.848, 40 development LPs 0.943, 80 rescaled copies of 40 held-out LPs 0.972, no status changed); BRISK_SXXOSHIFT=0: off) */
+    long nsnapd = 0, nshift = 0; double snapmax = 0, snapamp = 0;   /* (the leaving variables beyond their bound: counts for SXDBG) */
+    char *shf = xcalloc((size_t)N + 1, 1);
     int *pperm = xmalloc(sizeof(int) * ((size_t)N + 1)); double *pkey = pord ? xmalloc(sizeof(double) * ((size_t)N + 1)) : NULL;
+    /* (14 November 2026, a test: BRISK_SXXOSNAPALL=1; ISSUES 884) every superbasic variable with a finite bound set onto its nearer bound
+     * at once, the basic values recomputed once, and the dual or the primal method after the pushes repairs what that leaves; only the
+     * free superbasic variables are pushed. The primal push solves with each superbasic column: highschool1-aigio (LP) 70,517 of them
+     * at about 1 ms (the forward solves on a basis of 72,004 rows) */
+    {   static int sall = -1; if (sall < 0) { const char *e_ = getenv("BRISK_SXXOSNAPALL"); sall = e_ && atoi(e_) == 1; }
+        if (sall) {
+            long nset = 0;
+            for (int q = 0; q < N; q++) {
+                if (S->pos[q] >= 0) continue;
+                const double l = S->lo[q], u = S->up[q], v = S->x[q];
+                if (v == l || v == u || (l <= -SX_INF && u >= SX_INF)) continue;
+                const double t = l <= -SX_INF ? u : u >= SX_INF ? l : (v - l <= u - v ? l : u);
+                S->x[q] = t; S->move[q] = t == l ? 1 : -1; nset++;
+            }
+            compute_primal(S);
+            if (S->verbose >= 2) { int ni = 0; double mi = 0; for (int i = 0; i < m; i++) { const double f = infeas(S, i); if (f > 0) { ni++; mi = fmax(mi, f); } }
+                printf("  crossover: %ld superbasic variables set onto their nearer bound at once: %d basic infeasible (largest %.1e)\n", nset, ni, mi); }
+        }
+    }
     for (int pass = 0, left = 1; pass < 5 && left && !xo_stop; pass++) {
     for (int j = 0; j < N; j++) pperm[j] = j;
     if (pord) {
@@ -3118,7 +4726,7 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
         const double l = S->lo[q], u = S->up[q], v = S->x[q];
         if (v == l || v == u || (l <= -SX_INF && u >= SX_INF && v == 0)) continue;
         left = 1;
-        if ((S->stop && *S->stop) || ((++xo_chk & 63) == 0 && xo_stopped(S))) { xo_stop = 1; break; }
+        if ((brisk_flag_get(S->stop)) || ((++xo_chk & 63) == 0 && xo_stopped(S))) { xo_stop = 1; break; }
         if (need_refactor(S)) {
             double mi0 = 0; if (S->dbg > 1) for (int i = 0; i < m; i++) mi0 = fmax(mi0, infeas(S, i));
             const int nout = refactor(S); compute_primal(S);
@@ -3226,7 +4834,9 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
         const int jl = S->basic[r]; const double ar = col->val[r];
         const double bound = dir * ar > 0 ? S->lo[jl] : S->up[jl];
         const double snap = bound - S->x[jl];      /* (the leaving variable's move onto its bound: nonzero when it was beyond it) */
-        S->x[q] += step; S->x[jl] = bound;
+        const int shifted = xshift && fabs(snap) > S->tolp;
+        if (fabs(snap) > S->tolp) { nsnapd++; snapmax = fmax(snapmax, fabs(snap)); snapamp = fmax(snapamp, fabs(snap) / fabs(ar)); }
+        S->x[q] += step; if (!shifted) S->x[jl] = bound; else nshift++;
         sxv_clear(rho); rho->val[r] = 1; rho->idx[0] = r; rho->cnt = 1;
         {   /* (23 October 2026) only the update's part of the solve: no pricing follows (qap15, LP: a whole solve of 0.47 ms
              * per pivoting push). (24 October 2026, the night) with its own density estimate: the dual pushes' full solves
@@ -3238,10 +4848,11 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
             S->work += (double)(S->F.nflops - f0); S->t_btran += now() - t;
         }
         S->basic[r] = q; S->pos[q] = r; S->move[q] = 0; S->pos[jl] = -1;
-        S->move[jl] = S->lo[jl] == S->up[jl] ? 0 : bound == S->lo[jl] ? 1 : -1;
+        S->move[jl] = shifted ? 0 : S->lo[jl] == S->up[jl] ? 0 : bound == S->lo[jl] ? 1 : -1;
+        if (shifted) shf[jl] = 1;
         rows_enter(S, q); rows_leave(S, jl);
         if (sxlu_update(&S->F, r, &S->spike, &S->upart, ar)) { refactor(S); compute_primal(S); }
-        else if (snapfix && fabs(snap) > S->tolp) {
+        else if (!shifted && snapfix && fabs(snap) > S->tolp) {
             /* (2 November 2026) the leaving variable was beyond its bound and is now nonbasic on it: the basic values follow,
              * x_B -= snap B^-1 a_jl on the new basis, so that they stay the solution of the equations. Without it the
              * difference waited for the next refactorization, which recomputed it multiplied by the basis's condition (zeil's
@@ -3256,6 +4867,16 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
     }
     }
     if (S->dbg && snapfix) printf("  crossover: %ld leaving variables beyond their bound corrected in the primal push\n", nsnap);
+    long nshleft = 0;
+    if (xshift) for (int j = 0; j < N; j++) {     /* (the ones still off their bound: onto the nearer one; the caller recomputes the basic values) */
+        if (!shf[j] || S->pos[j] >= 0) continue;
+        const double l = S->lo[j], u = S->up[j], v = S->x[j];
+        if (v == l || v == u || (l <= -SX_INF && u >= SX_INF && v == 0)) continue;
+        const double t = l <= -SX_INF && u >= SX_INF ? 0 : l <= -SX_INF ? u : u >= SX_INF ? l : (v - l <= u - v ? l : u);
+        S->x[j] = t; S->move[j] = l == u ? 0 : t == l && l > -SX_INF ? 1 : t == u && u < SX_INF ? -1 : 0; nshleft++;
+    }
+    if (S->dbg) printf("  crossover: %ld leaving variables beyond their bound (largest %.1e, largest over the pivot %.1e); %ld left at their value and pushed, %ld of them set onto their bound after the passes\n", nsnapd, snapmax, snapamp, nshift, nshleft);
+    free(shf);
     free(pperm); free(pkey);
     sxv_clear(col); sxv_clear(rho);
     free(bq); free(bt);
@@ -3267,16 +4888,34 @@ static long crossover_push(Sx *S, const double *x0, const double *y0, long *ndpu
     return npush;
 }
 
+/* (5 November 2026, a diagnostic: BRISK_SXDIAGEND=1) the density of the basis' inverse, by the entries of every seventh of
+ * its rows (split by rows whose basic variable is a column or a logical), and the columns basic (those strictly inside
+ * their bounds apart), at the upper and at the lower bound; printed at a given start basis, after the crossover's pushes and
+ * at the end of the solve */
+static void sx_diag_density(Sx *S, const char *lab) {
+    SxVec *rho = &S->rho; double sr = 0, srl = 0, srs = 0; int nl = 0, ns = 0, nup = 0, nlo = 0, nbs = 0, nfr = 0;
+    for (int i = 0; i < S->m; i += 7) {
+        sxv_clear(rho); rho->val[i] = 1; rho->idx[0] = i; rho->cnt = 1;
+        double dd = S->dens_rho; btran(S, rho, &dd, NULL);
+        if (rho->cnt < 0) sxv_reindex(rho);
+        const int c = rho->cnt; sr += c;
+        if (S->basic[i] < S->n) { srs += c; ns++; } else { srl += c; nl++; }
+    }
+    sxv_clear(rho);
+    for (int j = 0; j < S->n; j++) { if (S->pos[j] >= 0) { nbs++; if (S->x[j] > S->lo[j] + 1e-7 && S->x[j] < S->up[j] - 1e-7) nfr++; } else if (S->move[j] < 0) nup++; else nlo++; }
+    printf("    diag %s: |rho| %.1f (rows with a basic column %.1f, %d; with a basic logical %.1f, %d); columns basic %d (strictly inside %d), at upper %d, at lower %d\n",
+           lab, sr / (nl + ns), ns ? srs / ns : 0.0, ns, nl ? srl / nl : 0.0, nl, nbs, nfr, nup, nlo);
+}
 static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat,
                          SimplexInfo *info) {
     SimplexInfo dummy; if (!info) info = &dummy;
     memset(info, 0, sizeof *info);
-    if (o && o->stop && *o->stop) { info->status = 6; return 6; }    /* (the caller's flag set: no set-up) */
+    if (o && brisk_flag_get(o->stop)) { info->status = 6; return 6; }    /* (the caller's flag set: no set-up) */
     Sx S; memset(&S, 0, sizeof S);
     S.t0 = now();
     g_sx_taboff = L->c0; g_sx_tabsign = L->maxim ? -1.0 : 1.0;   /* (the default log's table: the objective as given) */
     S.rayout = o ? o->ray : NULL;
-    S.tlim = o ? o->timelimit : 0; S.maxit = o ? o->maxit : 0; S.verbose = o ? o->verbose : 0; S.stop = o ? o->stop : NULL; S.threads = o ? o->threads : NULL; S.dbg = getenv("SXDBG") ? atoi(getenv("SXDBG")) : 0; if (S.dbg < 0) S.dbg = 1; S.tdiag = S.verbose >= 2;
+    S.tlim = o ? o->timelimit : 0; S.maxit = o ? o->maxit : 0; S.verbose = o ? o->verbose : 0; S.stop = o ? o->stop : NULL; S.threads = o ? o->threads : NULL; S.dbg = getenv("SXDBG") ? atoi(getenv("SXDBG")) : 0; S.xo_deg_only = getenv("BRISK_SXXODEG") && atoi(getenv("BRISK_SXXODEG")) >= 1; if (S.dbg < 0) S.dbg = 1; S.tdiag = S.verbose >= 2;
     S.workbudget = o ? o->workbudget : 0; S.budget_cb = o ? o->budget_cb : NULL; S.budget_ctx = o ? o->budget_ctx : NULL;
     const int method = o ? o->method : 0;
     sx_setup(&S, L, o);
@@ -3293,7 +4932,9 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
          * lazily (a row's exact weight when it first comes to the top of the leaving rows), as the re-solves of the
          * mixed-integer solver do (sxm_set_basis), instead of the slack basis's 1. BRISK_SXRSLAZYW=0: the weights 1 */
         static int rslw = -1; if (rslw < 0) { const char *e_ = getenv("BRISK_SXRSLAZYW"); rslw = !(e_ && atoi(e_) == 0); }
-        if (rslw && o->given_perturb) {
+        /* (13 November 2026, an experiment: BRISK_SXGIVENLAZYW=1) the same for any given basis (BRISK_SXBASISFILE included) */
+        static int glw = -1; if (glw < 0) { const char *e_ = getenv("BRISK_SXGIVENLAZYW"); glw = e_ && atoi(e_) == 1; }
+        if (rslw && (o->given_perturb || glw)) {
             memset(S.wk, 0, (size_t)S.m); S.wlazy = 1;
             for (int i = 0; i < S.m; i++) {
                 const int j = S.basic[i];
@@ -3302,6 +4943,16 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
                 S.w[i] = c2 > 1 ? fmax(1.0 / c2, 1e-4) : 1.0;
             }
         }
+        /* (13 November 2026, an experiment: BRISK_SXGIVENEXACTW=1) the exact dual steepest-edge weights of the given basis, one
+         * backward solve a row, at once (=2: the weights 1 for every row) */
+        {   static int gew = -1; if (gew < 0) { const char *e_ = getenv("BRISK_SXGIVENEXACTW"); gew = e_ ? atoi(e_) : 0; }
+            if (gew == 1) { SxVec *rh_ = &S.rho;
+                for (int i = 0; i < S.m; i++) { sxv_clear(rh_); rh_->val[i] = 1; rh_->idx[0] = i; rh_->cnt = 1;
+                    double dd = S.dens_rho; btran(&S, rh_, &dd, NULL); double w = 0;
+                    if (rh_->cnt >= 0) for (int t = 0; t < rh_->cnt; t++) { const double v = rh_->val[rh_->idx[t]]; w += v * v; } else for (int k = 0; k < S.m; k++) w += rh_->val[k] * rh_->val[k];
+                    S.w[i] = w > 1e-4 ? w : 1e-4; }
+                sxv_clear(rh_); memset(S.wk, 1, (size_t)S.m); S.wlazy = 0; }
+            else if (gew == 2) { for (int i = 0; i < S.m; i++) S.w[i] = 1.0; memset(S.wk, 1, (size_t)S.m); S.wlazy = 0; } }
     } else slack_basis(&S);
     const int pert = !(o && o->noperturb);
     int given_route = 0;     /* with a starting basis: 1 optimal as it is, 2 primal feasible, 3 dual feasible */
@@ -3313,6 +4964,32 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
             else if (S.move[j] * S.d[j] < -S.told) dinf = 1;
         }
         given_route = !pinf && !dinf ? 1 : !pinf ? 2 : !dinf ? 3 : 0;
+        /* (14 November 2026, an experiment: BRISK_SXGIVENSHIFT=k; ISSUES 883) a given basis whose dual infeasibilities are all within k
+         * times the dual tolerance (a basis carried back by the postsolve from an optimal basis, off by its rounding): those costs
+         * shifted (shift_cost; the final rounds remove the shifts) and the dual method's phase 2 from it, where it was treated as a
+         * start neither primal nor dual feasible (the costs perturbed, the dual method's phase 1). neos-4264598-oueme's root LP (LP,
+         * the crossover's perturbation of BRISK_SXXOPERTTOL=2): 16 dual infeasibilities of at most 1.1e-7, 14 primal of at most 5.9e-7,
+         * then a phase 1 from 20,122 primal infeasibilities and 31,340 iterations (11.5 s) */
+        {   static double gsh_ = -1; if (gsh_ < 0) { const char *e_ = getenv("BRISK_SXGIVENSHIFT"); gsh_ = e_ ? atof(e_) : 0; }
+            if (gsh_ > 0 && given_route == 0 && !(o && o->given_perturb)) {
+                int big_ = 0;
+                for (int j = 0; j < S.N && !big_; j++) {
+                    if (S.pos[j] >= 0) continue;
+                    const double e_ = S.move[j] == 0 ? (S.lo[j] != S.up[j] ? fabs(S.d[j]) : 0) : -S.move[j] * S.d[j];
+                    if (e_ > gsh_ * S.told) big_ = 1;
+                }
+                if (!big_) {
+                    int nsh_ = 0;
+                    for (int j = 0; j < S.N; j++) {
+                        if (S.pos[j] >= 0) continue;
+                        const double e_ = S.move[j] == 0 ? (S.lo[j] != S.up[j] ? fabs(S.d[j]) : 0) : -S.move[j] * S.d[j];
+                        if (e_ > S.told) { shift_cost(&S, j); nsh_++; }
+                    }
+                    given_route = 3;
+                    if (S.verbose >= 2) printf("  starting basis: %d dual infeasibilities within %g times the tolerance, their costs shifted: dual feasible\n", nsh_, gsh_);
+                }
+            }
+        }
         if (S.dbg) {    /* (the given basis' defects: counts, the largest, the first few variables) */
             int np = 0, nd = 0, shown = 0; double mp = 0, md = 0;
             for (int i = 0; i < S.m; i++) { const double f = infeas(&S, i); if (f > 0) { np++; mp = fmax(mp, f); if (shown < 8) { shown++; printf("    primal infeasible: row %d, basic variable %d (%s), x %g in [%g, %g]\n", i, S.basic[i], S.basic[i] < S.n ? "column" : "logical", S.x[S.basic[i]], S.lo[S.basic[i]], S.up[S.basic[i]]); } } }
@@ -3326,14 +5003,22 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
         }
         if (S.verbose >= 2) printf("  starting basis: %s\n", given_route == 1 ? "optimal" : given_route == 2 ? "primal feasible" : given_route == 3 ? "dual feasible" : "neither primal nor dual feasible");
     }
+    if (getenv("BRISK_SXDIAGEND") && S.it_given) sx_diag_density(&S, "given start");
     const int xo = o && o->xstart && !S.it_given;
     int xo_dual = 0;
     if (xo) {
         long nd = 0;
+        /* (14 November 2026, ISSUES 884) the crossover's factorizations stop at the time limit or at a stop request (the
+         * columns left replaced by logicals): its pushes check them only between pushes, and one factorization of the start
+         * basis outlasted the limit by over 70 s (highschool1-aigio, LP) */
+        S.F.stopf = S.stop; S.F.deadline = S.tlim > 0 ? S.t0 + S.tlim : 0;
+        if (getenv("BRISK_SXXOTLDBG")) fprintf(stderr, "[xo] the crossover: time limit %.3f s, stop flag %s\n", S.tlim, S.stop ? "set" : "none");
         const long np = crossover_push(&S, o->xstart, o->ystart, &nd);
-        if (S.verbose >= 1) printf("  crossover: %ld primal and %ld dual pushes (%.2f s)\n", np, nd, now() - S.t0);
+        S.F.stopf = NULL; S.F.deadline = 0;
+        if (S.verbose >= 1) printf("  crossover: %ld primal and %ld dual pushes (%.2f s; %d factorizations, %.2f s)\n", np, nd, now() - S.t0, S.nfactor, S.t_factor);
         info->pushes = np + nd;
         refactor(&S); compute_primal(&S); compute_dual(&S);
+        if (getenv("BRISK_SXDIAGEND")) sx_diag_density(&S, "crossover start");
         int np1 = 0, nd1 = 0; double mp = 0, md = 0;
         for (int i = 0; i < S.m; i++) { const double e = infeas(&S, i); if (e > S.tolp) { np1++; mp = fmax(mp, e); } }
         for (int j = 0; j < S.N; j++) { if (S.pos[j] >= 0 || S.lo[j] == S.up[j]) continue; const double e = S.move[j] > 0 ? -S.d[j] : S.move[j] < 0 ? S.d[j] : fabs(S.d[j]); if (e > S.told) { nd1++; md = fmax(md, e); } }
@@ -3357,7 +5042,7 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
      * is dual feasible; the full dual simplex method perturbed the costs and began with its phase 1, which gave up the
      * crossover's basis (lp_beckmann_300: 26 primal infeasibilities of at most 1.2e-6 after the pushes, then a phase 1
      * from 70,105 infeasibilities and 88,000 iterations, 19 s) */
-    else if (xo_dual) { S.phase = 2; st = dual_loop(&S); }
+    else if (xo_dual && !(o && o->given_perturb)) { S.phase = 2; if (getenv("BRISK_SXXOLAZY")) S.lazy_pert = 1; if (getenv("BRISK_SXXOPERTTOL")) S.xo_pert_tol = atoi(getenv("BRISK_SXXOPERTTOL")); if (getenv("BRISK_SXXODEG") && atoi(getenv("BRISK_SXXODEG")) >= 1) S.xo_deg = atoi(getenv("BRISK_SXXODEG")); st = dual_loop(&S); S.xo_deg = 0; }   /* (10 November 2026, a test: BRISK_SXXOLAZY, the stall rule's perturbation for the crossover's dual method, ISSUES 862) */
     else if (given_route == 1) st = 0;
     else if (given_route == 2) st = primal_simplex(&S, pert);
     else if (given_route == 3 && !(o && o->given_perturb)) { S.phase = 2; st = dual_loop(&S); }
@@ -3369,14 +5054,36 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
              * neos-3065804-namu (LP): 2,555 columns in [0,1] with negative costs put at 1 violated 1,458 rows, a phase 1
              * of 39,998 iterations (62,554 in all), where x = 0 is feasible (Gurobi's primal method: 123 iterations).
              * BRISK_SXPSTART=0: by the cost */
-            static int pstart = -1; if (pstart < 0) { const char *e_ = getenv("BRISK_SXPSTART"); pstart = !(e_ && atoi(e_) == 0); }
+            static int pstart = -1; if (pstart < 0) { const char *e_ = getenv("BRISK_SXPSTART"); pstart = e_ ? atoi(e_) : 3; }
             if (pstart) {
                 for (int j = 0; j < S.n; j++) {
                     if (S.pos[j] >= 0) continue;
                     const double l = S.lo[j], u = S.up[j];
-                    if (l > -SX_INF && u < SX_INF && l != u) { if (fabs(l) <= fabs(u)) { S.move[j] = 1; S.x[j] = l; } else { S.move[j] = -1; S.x[j] = u; } }
+                    if (l > -SX_INF && u < SX_INF && l != u) {
+                        /* (11 November 2026; 3 by default since that day, BRISK_SXPSTART=1 the rule of 4 November, 2 a test) a tie
+                         * (|l| = |u|, as for a column in [-1, 1]) at the bound the cost favours (as set before this loop): the
+                         * reason for the bound nearer zero, that x = 0 is often feasible, says nothing between two bounds equally
+                         * far from zero, and the lower one was taken blindly. Hnear_parallel_3500 (LP, x in [-1, 1]): phase 1 ended
+                         * at an objective of about 0 and phase 2 took 39,000 iterations; by the cost it ends near -1,200 (Gurobi's
+                         * -1,367), 47,195 -> 19,909 iterations; the 67 LPs 0.962 (scaled 0.78, dense coupling 0.88; thin polytope
+                         * +5 %, triangular and degenerate +2-14 % iterations). 2: a bound at zero if there is one, else by the cost */
+                        if (pstart == 2) { if (l == 0) { S.move[j] = 1; S.x[j] = l; } else if (u == 0) { S.move[j] = -1; S.x[j] = u; } continue; }
+                        if (pstart == 3 && fabs(l) == fabs(u)) continue;
+                        if (fabs(l) <= fabs(u)) { S.move[j] = 1; S.x[j] = l; } else { S.move[j] = -1; S.x[j] = u; }
+                    }
                 }
                 compute_primal(&S);
+            }
+            /* (7 November 2026, on trial: BRISK_SXPSTARTFLIP=1) a boxed column of cost zero at the bound that leaves its rows
+             * the smaller sum of violations (the dual method's start rule, one greedy pass): the primal method's phase 1 then
+             * starts nearer feasibility with every structural column still at a bound */
+            if (getenv("BRISK_SXPSTARTFLIP") && atoi(getenv("BRISK_SXPSTARTFLIP")) > 0) {
+                const long nfl = dual_start_bounds_(&S, atoi(getenv("BRISK_SXPSTARTFLIP")) >= 2 ? atoi(getenv("BRISK_SXPSTARTFLIP")) : 0); compute_primal(&S);   /* (11 November 2026, a test: 2 any column, whatever its cost) */
+                if (S.verbose >= 2 && nfl) printf("  %ld columns of cost zero start at their other bound (less primal infeasibility)\n", nfl);
+            }
+            if (S.verbose >= 2 && getenv("BRISK_SXPSTARTDIAG")) {   /* (11 November 2026, a diagnostic) the start's violated rows */
+                int nv = 0, nr = 0; for (int i = 0; i < S.m; i++) { const int j = S.basic[i]; if (j < S.n) continue; nr++; if (infeas(&S, i) > 0) nv++; }
+                printf("  the start: %d of %d rows violated (%.3f)\n", nv, nr, nr ? (double)nv / nr : 0.0);
             }
             const int ncr = primal_crash(&S);
             if (S.verbose >= 2 && ncr) printf("  %d columns brought into the starting basis by the crash\n", ncr);
@@ -3390,9 +5097,32 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
         if (!S.it_given && !xo) {
             const int nfc = free_crash(&S);
             if (S.verbose >= 2 && nfc) printf("  %d free columns brought into the starting basis (each for the logical of a row of its largest entry)\n", nfc);
+            /* (12 November 2026) the start by columns of cost zero not on row sifting's sets: a set leaves most rows out, and the
+             * columns the start takes for its equations ignore the rows not yet in it (satellites2-60-fs, LP: its first set's basis
+             * then cost the later rounds 3,096 -> 3,808 iterations; nb10tb 47,900 -> 53,998). BRISK_SXEQCRASHNOSIFT=0: on them too */
+            static int ecns = -1; if (ecns < 0) { const char *e_ = getenv("BRISK_SXEQCRASHNOSIFT"); ecns = !(e_ && atoi(e_) == 0); }
+            const int nec = (ecns && o && o->in_rowsift) ? 0 : eq_crash(&S);
+            if (S.verbose >= 1 && nec) printf("  %d free or boxed columns brought into the starting basis for the logicals of equations\n", nec);
+            /* (11 November 2026, a test: BRISK_SXDCRASH=1 with BRISK_SXCRASH=1) the primal method's crash before the dual method */
+            if (getenv("BRISK_SXDCRASH")) { const int ncr = primal_crash(&S); if (S.verbose >= 1 && ncr) printf("  %d columns brought into the starting basis by the crash (before the dual method)\n", ncr); }
         }
-        if (pert) perturb_costs(&S);
+        /* (13 November 2026, an experiment: BRISK_SXLAZYPERT=1) the costs perturbed at the first stall (half of a window's steps of
+         * zero length), not at the start: Gurobi's dual simplex method on sat4p1 (LP) had no perturbed cost at its iteration
+         * 1,000 and 58,701 by 4,000, and its perturbed costs given to ours keep our bases 30 times sparser */
+        static int lzp_ = -1; if (lzp_ < 0) { const char *e_ = getenv("BRISK_SXLAZYPERT"); lzp_ = e_ && atoi(e_) != 0; }
+        if (pert && lzp_) S.lazy_pert = S.lazy_main = 1;
+        else if (pert) perturb_costs(&S);
+        S.ds_scratch = (!S.it_given && !xo) || (o && o->given_perturb);   /* (and the rounds of the row sifting and the other starts solved as from the logicals' basis: given_perturb) */
+        {   /* (14 November 2026, a diagnostic: BRISK_SXSTARTDUMP=<file>) the dual method's start, once a process: per row its scale factor
+             * and side, per column its entries, its scale factor, its cost in the problem's units, its bounds and the bound it starts at
+             * (satellites4-25's copies, LP: the paths part at the first iteration although the presolved problems are the same) */
+            static int sd_done_ = 0; const char *sd_ = getenv("BRISK_SXSTARTDUMP");
+            if (sd_ && !sd_done_) { sd_done_ = 1; FILE *fp_ = fopen(sd_, "w"); if (fp_) {
+                for (int i = 0; i < S.m; i++) fprintf(fp_, "R %d %.17g %.17g %.17g\n", i, S.rscale ? S.rscale[i] : 1.0, S.lo[S.n + i], S.up[S.n + i]);
+                for (int j = 0; j < S.n; j++) fprintf(fp_, "C %d %d %.17g %.17g %.17g %.17g %d %d\n", j, S.Ap[j + 1] - S.Ap[j], S.cscale ? S.cscale[j] : 1.0, S.cost0[j] * S.costscale / (S.cscale ? S.cscale[j] : 1.0), S.lo0[j], S.up0[j], S.move[j], S.pos[j] >= 0);
+                fclose(fp_); } } }
         st = dual_simplex(&S);
+        S.ds_scratch = 0;
         /* (25 October 2026) an infeasibility the dual method could not prove (dual_loop's status 4): the primal method
          * decides */
         if (st == 4) st = primal_simplex(&S, pert);
@@ -3418,6 +5148,7 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
      * tolerance, the scaled tolerances are tightened and the primal (dual violations) or the dual method (primal
      * violations) continues from the current basis */
     const double tfin0 = now();
+    if (getenv("BRISK_SXDIAGEND") && S.m > 0) sx_diag_density(&S, "end");
     /* (27 October 2026, the night; ISSUES 603) the rounds are a clean-up: at most as many iterations again as the solve
      * took (10,000 at least), and a result whose violations stay above the target after them is not reported optimal
      * (status 4, numerical difficulties): bley_xs2's dual violation of 7.1e6 against costs of 1e7 had been reported
@@ -3425,6 +5156,8 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
     const long fin_maxit0 = S.maxit, fin_cap = S.iter + (S.iter > 10000 ? S.iter : 10000);
     if (!(S.maxit > 0 && S.maxit < fin_cap)) S.maxit = fin_cap;
     S.tiny_on = 1; if (S.tiny) memset(S.tiny, 0, (size_t)S.tiny_n);
+    const int grbt = (brisk_lpgrbtol() & LPGRB_SXROUNDS) != 0;
+    int fin_tgt = 0;     /* (status 4 from these rounds alone: SimplexInfo.fin_target) */
     for (int round = 0; round < 5 && st == 0; round++) {
         /* the costs and bounds of the problem (shifts and perturbations gone), the nonbasic variables at them */
         memcpy(S.cost, S.cost0, sizeof(double) * S.N); memset(S.shift, 0, sizeof(double) * S.N);
@@ -3433,11 +5166,25 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
         if (S.F.nupd > 0 || S.nfactor == 0) refactor(&S);
         compute_primal(&S); compute_dual(&S);
         double pv, dv, psv, dsv;
+        if (grbt) {
+            /* (7 November 2026; ISSUES 843, BRISK_LPGRBTOL=1) Gurobi's rule: the method's own tolerances on the scaled
+             * problem, checked once the shifts and perturbations are gone; the method continues from the basis while they
+             * are not met (the primal method for reduced costs of the wrong sign, the dual method for values beyond their
+             * bounds), with the same tolerances */
+            scaled_violations(&S, &pv, &dv);
+            if (S.verbose >= 2) printf("  violations of the scaled problem: primal %.1e, dual %.1e (tolerances %.0e, %.0e)\n", pv, dv, S.tolp, S.told);
+            if (pv <= S.tolp && dv <= S.told) break;
+            if (round == 4) { st = 4; fin_tgt = 1; if (S.verbose >= 2) printf("  the violations of the scaled problem stay above the tolerances: numerical difficulties\n"); break; }
+            st = dv > S.told ? primal_simplex(&S, pert) : dual_loop(&S);
+            if (st == 3 && S.maxit == fin_cap && fin_maxit0 != fin_cap) st = 4;
+            continue;
+        }
         unscaled_violations(&S, S.env_target, S.env_target, &pv, &dv, &psv, &dsv);
+        if (S.verbose >= 2 && getenv("BRISK_SXSCVIOL")) { double a_, b_; scaled_violations(&S, &a_, &b_); printf("  violations of the scaled problem: primal %.1e, dual %.1e (tolerances %.0e, %.0e)\n", a_, b_, S.tolp, S.told); }
         if (S.verbose >= 2) printf("  violations of the unscaled problem: primal %.1e, dual %.1e\n", pv, dv);
         { int c_; const double s_ = sum_pinf(&S, &c_); brisk_stab_end(S.iter, "final", g_sx_tabsign * objective(&S) * S.costscale + g_sx_taboff, s_, c_); }
         if (pv <= S.env_target && dv <= S.env_target) break;
-        if (round == 4) { st = 4; if (S.verbose >= 2) printf("  the violations stay above the target %.0e: numerical difficulties\n", S.env_target); break; }
+        if (round == 4) { st = 4; fin_tgt = 1; if (S.verbose >= 2) printf("  the violations stay above the target %.0e: numerical difficulties\n", S.env_target); break; }
         if (dv > S.env_target) {
             S.told = fmax(fmin(S.told * 0.5 * S.env_target / dv, 0.5 * dsv), 1e-12);
             S.cl_target = S.env_target; st = primal_simplex(&S, pert); S.cl_target = 0;
@@ -3497,13 +5244,24 @@ static int sx_solve_core(const LpProb *L, const SimplexOpts *o, double *xout, do
     if (rstat) for (int i = 0; i < m; i++) { const int j = n + i; rstat[i] = S.pos[j] >= 0 ? SX_BASIC : S.lo0[j] == S.up0[j] ? SX_FIXED : S.move[j] > 0 ? SX_UPPER : S.move[j] < 0 ? SX_LOWER : SX_ZERO; }
     if (S.tdiag) printf("  the solve's set-up %.3f s (scaling, the row copy, the start basis), the final rounds on the unscaled problem and the output %.3f s\n", t_setup, now() - tfin0);
     if (S.tdiag) printf("  the dual iterations' other parts: leaving row %.3f s, pivot row %.3f, ratio test %.3f, dual update and flips %.3f, primal step %.3f, weights %.3f, candidates %.3f, refactorizations with their recomputations %.3f; the dual loop %.3f s; forward solves %.3f, backward solves %.3f\n", S.t_chuzr, S.t_row, S.t_chuzc, S.t_dupd, S.t_pupd, S.t_dse, S.t_heap, S.t_rebuild, S.t_loop, S.t_ftran, S.t_btran);
+    if (S.verbose >= 2 && bfe_n) printf("  [early stop of the long step] %ld ratio tests with earlier groups, %ld entering choices changed\n", bfe_n, bfe_chg);
     if (S.verbose >= 2) printf("  pricing: %ld by rows (%ld dense; average |rho| %.1f of %d rows), %ld by columns; average |row| %.1f; average |alpha_q| %.1f\n",
                                S.nprice_row, S.nprice_dense, S.nprice_row ? S.sum_rho / S.nprice_row : 0.0, S.m, S.nprice_col, S.iter ? S.sum_rowc / S.iter : 0.0, S.iter ? S.sum_col / S.iter : 0.0);
-    if (S.verbose >= 2 && S.it_primal > 0) printf("  the primal method: %ld iterations (%ld in phase 1), %ld of length zero, %ld bound flips, %d resets of the Devex weights, %ld full scans of the candidates, %d numerical troubles (pivot threshold %.2g)\n", S.it_primal, S.it_ph1, S.n_pdegen, (long)S.nflips, S.ndvxreset, S.n_prescan, S.nptrouble, S.F.pivthr > 0 ? S.F.pivthr : 0.1);
+    if (S.verbose >= 2 && S.it_primal > 0) printf("  the primal method: %ld iterations (%ld in phase 1), %ld of length zero, %ld bound flips, %d resets of the Devex weights, %ld full scans of the candidates, %d numerical troubles (pivot threshold %.2g; the pivot from the row against the column %ld, the infeasibility's jump at a refactorization %ld, steps back %ld)\n", S.it_primal, S.it_ph1, S.n_pdegen, (long)S.nflips, S.ndvxreset, S.n_prescan, S.nptrouble, S.F.pivthr > 0 ? S.F.pivthr : 0.1, S.n_tr_rowcol, S.n_tr_jump, S.n_tr_lost);
+    if (S.verbose >= 2 && S.ds_grp) printf("  the sparsest member among the final group's ties: %ld groups, %ld entering choices changed, %ld eligible members, %ld fresh solves (%.3f a dual iteration), %ld counts kept, %.3f s; of the changed choices %ld outside their box (the replaced %ld), %ld of reduced cost zero, |alpha| %.3f of the largest on average; dual step smaller than the replaced member's %ld times (%.3f of it on average), larger %ld\n",
+                               S.ds_grp, S.ds_chg, S.ds_memb, S.ds_solve, S.iter ? (double)S.ds_solve / S.iter : 0.0, S.ds_hit, S.ds_t, S.ds_oob, S.ds_oob0, S.ds_cr0, S.ds_chg ? S.ds_ar / S.ds_chg : 0.0,
+                               S.ds_stsm, S.ds_stsm ? S.ds_strat / S.ds_stsm : 0.0, S.ds_stlg);
+    if (S.verbose >= 2 && S.ds_nsh) printf("  the sparsest-member rule: %ld entering costs shifted to the ratio test's dual step, the largest shift %.2e (tolerance %.1e); %ld changes refused, the shift beyond the tolerance\n", S.ds_nsh, S.ds_shmax, S.told, S.ds_shref);
+    if (S.verbose >= 2 && S.ds_inc) printf("  the sparsest-member rule: %ld changes refused, the member no sparser than the ratio test's\n", S.ds_inc);
+    if (S.verbose >= 2 && S.dc_n) { printf("  the estimates against the exact counts over %ld groups (same member, within 1.25, mean log ratio, solves):", S.dc_n);
+        for (int e = 0; e < 7; e++) printf(" [%d] %.3f %.3f %.3f %ld", e, (double)S.dc_ag[e] / S.dc_n, (double)S.dc_near[e] / S.dc_n, S.dc_lr[e] / S.dc_n, e == 0 ? S.ds_solve : S.dc_sol[e]); printf("\n"); }
+    if (S.verbose >= 2 && S.n_prt) printf("  the stability test of the ratio test: %ld ratio tests repeated, %ld left with a small pivot, %ld bounds moved in phase 1\n", S.n_prt, S.n_prtfail, S.n_prtshift);
     if (S.verbose >= 2 && S.n_ph1pass > 0) printf("  phase 1's ratio test passed %ld points where variables became feasible\n", S.n_ph1pass);
+    if (S.verbose >= 2 && S.n_ph1flat > 0) printf("  phase 1: %ld bound flips where the sum of infeasibilities was flat up to the entering variable's other bound\n", S.n_ph1flat);
+    if (S.verbose >= 2 && S.it_primal > 0) printf("  the primal method's vectors: average |alpha_q| %.1f, |row| %.1f of %d rows, %d columns; steepest-edge work: solves %.3g, products %.3g (%.3f s); all solves %.3g\n", S.n_alpha / (double)S.it_primal, S.n_row / (double)S.it_primal, S.m, S.N, S.fl_pse, S.fl_prod, S.t_prod, (double)S.F.nflops + S.F.nedges);
     if (S.verbose >= 2 && S.t_pse > 0) printf("  the primal method's steepest-edge pricing: its solves %.3f s (density %.2f; %ld beside the row's solve)\n", S.t_pse, S.dens_pv, S.npar_pse);
     if (S.verbose >= 2 && S.n_taupart + S.n_taufull > 0) printf("  the weights' solve: %ld restricted, %ld full (work lately %.3g and %.3g)\n", S.n_taupart, S.n_taufull, S.tw_part, S.tw_full);
-    info->status = st;
+    info->status = st; info->fin_target = st == 4 && fin_tgt;
     info->have_ray = st == 1 && S.have_ray; info->ray_sign = (int)S.raymo;
     info->iters = S.iter; info->iters_dual = S.it_dual; info->iters_primal = S.it_primal; info->iters_phase1 = S.it_ph1;
     info->nfactor = S.nfactor; info->nflips = S.nflips; info->work = S.work;
@@ -3803,7 +5561,7 @@ static int rowsift_solve(const LpProb *L, const SimplexOpts *o, char *in, int ni
         S.Ap[n] = q;
         for (int k = 0; k < ms; k++) { S.rl[k] = L->rl[rows[k]]; S.ru[k] = L->ru[rows[k]]; rss[k] = rs[rows[k]]; }
         SimplexOpts o2; if (o) o2 = *o; else memset(&o2, 0, sizeof o2);
-        o2.nopresolve = 1; o2.ray = NULL;
+        o2.nopresolve = 1; o2.ray = NULL; o2.in_rowsift = 1;
         /* (26 October 2026) each round the time left, not the whole limit: highschool1-aigio (LP) with 60 s ran 107 s, the
          * last round on the whole problem given the full limit after 47 s of the others */
         if (o && o->timelimit > 0) { o2.timelimit = o->timelimit - (now() - t0); if (o2.timelimit <= 0) o2.timelimit = 1e-3; }
@@ -3822,6 +5580,16 @@ static int rowsift_solve(const LpProb *L, const SimplexOpts *o, char *in, int ni
         SimplexInfo is;
         st = sx_solve_core(&S, &o2, x, NULL, ys, NULL, cs, rss, &is);
         its += is.iters; work += is.work;
+        /* (12 November 2026) a set whose solve ended at a basis optimal by the method's own tolerances but was reported with
+         * numerical difficulties by the final check on the problem as given (violations above the target that the scaled
+         * method cannot see: neos-799716, LP, column scale factors of 6e-8, a scaled reduced cost of 1e-14 is 2e-7 as given)
+         * is an intermediate problem: the rows it violates join and the rounds go on from its basis. Only when it violates
+         * none, its result would be the final one, and the whole problem is solved from the start as before. Before, the
+         * rounds were given up: neos-799716's sixth round, after the set had reached the optimal value in its third, and the
+         * whole problem from the start, 1,091 iterations of the rounds lost. BRISK_SXROWSIFTFIN=0: as before */
+        int fin4 = 0;
+        {   static int rsf = -1; if (rsf < 0) { const char *e_ = getenv("BRISK_SXROWSIFTFIN"); rsf = !(e_ && atoi(e_) == 0); }
+            if (rsf && !all && st == 4 && is.fin_target) { st = 0; fin4 = 1; } }
         info->iters_dual += is.iters_dual; info->iters_primal += is.iters_primal; info->iters_phase1 += is.iters_phase1;
         info->nfactor += is.nfactor; info->nflips += is.nflips; info->t_factor += is.t_factor; info->t_ftran += is.t_ftran; info->t_btran += is.t_btran; info->t_price += is.t_price;
         for (int k = 0; k < ms; k++) rs[rows[k]] = rss[k];
@@ -3843,7 +5611,7 @@ static int rowsift_solve(const LpProb *L, const SimplexOpts *o, char *in, int ni
                 if (v > 1e-9) { vio[i] = -v; ord[nv++] = i; }
             }
             if (o && o->verbose >= 2) printf("    %d rows violated\n", nv);
-            if (nv == 0) break;
+            if (nv == 0) { if (!fin4) break; st = 4; goto sift_decide; }   /* (fin4: the set's result would be final: as before, the whole problem from the start) */
             /* the violated rows not falling (below 0.7 of their number three rounds before, from the fifth round): the
              * set does not settle, and every round costs a new start (netdiversion: 164 to 188 a round, 107 rounds,
              * 14.6 s against 5.3 s for the whole problem); the whole problem from the basis reached */
@@ -3878,6 +5646,7 @@ static int rowsift_solve(const LpProb *L, const SimplexOpts *o, char *in, int ni
          * dual feasible for the whole problem, and the dual simplex method from it pays for that; the whole problem from the
          * start then. ns1904248 (LP): its first set (2,786 of 38,262 rows) unbounded, the whole problem from that basis 20,483
          * iterations and 22.5 s, from the start 4,457 and 0.69 s. BRISK_SXROWSIFTUNB=0: from the basis reached */
+    sift_decide:;
         {   static int rsu = -1; if (rsu < 0) { const char *e_ = getenv("BRISK_SXROWSIFTUNB"); rsu = !(e_ && atoi(e_) == 0); }
             if (rsu && (st == 2 || st == 4)) { scratch = 1; unbset = 1; } }
         if (st != 0 || its >= cap) { for (int i = 0; i < m; i++) in[i] = 1; nin = m; all = 1; if (scratch) havebasis = 0; if (o && o->verbose >= 1) printf("  row sifting: %s after %d rounds: the whole problem %s\n", unbset ? "a solve on the set unbounded or with numerical difficulties" : objstall ? "the objective not moving and the violated rows not falling over two rounds," : scratch ? "most rows in the set" : st == 3 ? "a cap, or the violated rows not falling," : st != 0 ? "a solve on the set not optimal" : "the cap on the iterations", round + 1, scratch ? "from the start" : "from the basis reached"); }
@@ -3914,11 +5683,74 @@ static int reduced_solve(const LpProb *R, const SimplexOpts *o2, double *xr, dou
  * complementarity, and the problem solved from that basis (optimal as it is, or finished by a few iterations). Used
  * when the presolved dual has at most half the problem's rows; if the dual's solve does not end optimal, the problem
  * is solved directly (*done stays 0). */
+/* (experiments) a problem as a free MPS file: rows r<i>, columns x<j>, the objective minimized */
+static void write_free_mps(const LpProb *Rp, FILE *fw) {
+    const LpProb R = *Rp;
+    {
+            fprintf(fw, "NAME sxpre\nROWS\n N obj\n");
+            for (int i = 0; i < R.m; i++) fprintf(fw, " %c r%d\n", R.rl[i] == R.ru[i] ? 'E' : R.rl[i] <= -LP_INF / 2 ? 'L' : 'G', i);
+            fprintf(fw, "COLUMNS\n");
+            for (int j = 0; j < R.n; j++) {
+                if (R.c[j] != 0) fprintf(fw, " x%d obj %.17g\n", j, R.maxim ? -R.c[j] : R.c[j]);
+                for (int p = R.Ap[j]; p < R.Ap[j + 1]; p++) fprintf(fw, " x%d r%d %.17g\n", j, R.Ai[p], R.Ax[p]);
+            }
+            fprintf(fw, "RHS\n");
+            for (int i = 0; i < R.m; i++) { const double b = R.rl[i] > -LP_INF / 2 ? R.rl[i] : R.ru[i]; if (b != 0) fprintf(fw, " rhs r%d %.17g\n", i, b); }
+            fprintf(fw, "RANGES\n");
+            for (int i = 0; i < R.m; i++) if (R.rl[i] != R.ru[i] && R.rl[i] > -LP_INF / 2 && R.ru[i] < LP_INF / 2) fprintf(fw, " rng r%d %.17g\n", i, R.ru[i] - R.rl[i]);
+            fprintf(fw, "BOUNDS\n");
+            for (int j = 0; j < R.n; j++) {
+                const double l = R.l[j], u = R.u[j];
+                if (l <= -LP_INF / 2 && u >= LP_INF / 2) { fprintf(fw, " FR bnd x%d\n", j); continue; }
+                if (l <= -LP_INF / 2) fprintf(fw, " MI bnd x%d\n", j); else if (l != 0) fprintf(fw, " LO bnd x%d %.17g\n", j, l);
+                if (u < LP_INF / 2) fprintf(fw, " UP bnd x%d %.17g\n", j, u);
+            }
+            fprintf(fw, "ENDATA\n"); fclose(fw);
+        }
+}
 static int ipm_route(const LpProb *R, const SimplexOpts *o2, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done);
 static int dual_route_applies(const LpProb *R);
-static int dual_route(const LpProb *R, const SimplexOpts *o2, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done) {
+/* (8 November 2026, ISSUES 847) the columns that leave the logicals' basis dual infeasible: a column not fixed and not
+ * boxed whose cost has the wrong sign for the one bound it can rest at (a free column: any cost). The dual simplex
+ * method starts from that basis, and each such column calls for its dual phase 1 */
+static long slack_dual_infeas(const LpProb *P) {
+    const double sg = P->maxim ? -1.0 : 1.0;
+    double cmax = 0; for (int j = 0; j < P->n; j++) if (fabs(P->c[j]) > cmax) cmax = fabs(P->c[j]);
+    const double tol = 1e-9 * (1 + cmax);
+    long k = 0;
+    for (int j = 0; j < P->n; j++) {
+        const double l = P->l[j], u = P->u[j], c = sg * P->c[j];
+        if (l == u) continue;
+        const int lf = l > -HUGEB, uf = u < HUGEB;
+        if (lf && uf) continue;
+        if (!lf && !uf) { if (fabs(c) > tol) k++; }
+        else if (lf) { if (c < -tol) k++; }
+        else if (c > tol) k++;
+    }
+    return k;
+}
+/* (12 November 2026) a route's attempt that does not give the result: its counts added to the caller's (iterations, factorizations,
+ * the solves' and the pricing's times, the work), so that the Summary reports the work done; the route that follows overwrites
+ * the result's own counts */
+static void sxinfo_add(SimplexInfo *a, const SimplexInfo *b) {
+    a->iters += b->iters; a->iters_dual += b->iters_dual; a->iters_primal += b->iters_primal; a->iters_phase1 += b->iters_phase1;
+    a->nfactor += b->nfactor; a->nflips += b->nflips; a->work += b->work;
+    a->t_factor += b->t_factor; a->t_ftran += b->t_ftran; a->t_btran += b->t_btran; a->t_price += b->t_price;
+}
+/* (14 November 2026, ISSUES 880) the record of the method that gave a route's first solve (the automatic choice's switch to the
+ * interior-point method, the race, the interior-point method's iterations and time), carried into the route's result when the
+ * solve that follows (from the first solve's basis or point) has none of its own: the routes that solve a transformed problem
+ * first (its dual, the problem on the symmetry classes, the problem with the substitution) kept the counts of both solves and
+ * dropped this record, and the Summary named the dual simplex method where the interior-point method and the crossover gave the
+ * result (neos-1367061's root LP, LP, by the automatic choice) */
+static void sxinfo_method(SimplexInfo *a, const SimplexInfo *first) {
+    if (!a->auto_ipm && first->auto_ipm) { a->auto_ipm = 1; a->iters_first = first->iters_first; a->t_first = first->t_first; }
+    if (!a->raced && first->raced) a->raced = first->raced;
+    if (!a->ipm_iters && first->ipm_iters) { a->ipm_iters = first->ipm_iters; a->t_ipm = first->t_ipm; }
+}
+static int dual_route(const LpProb *R, const SimplexOpts *o2, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done, SimplexInfo *ifail) {
     *done = 0;
-    if (getenv("BRISK_SXNODUAL")) return 0;
+    if (getenv("BRISK_SXNODUAL")) { if (o2->dr_declined) *o2->dr_declined = 1; return 0; }
     int est = 0;
     for (int j = 0; j < R->n; j++) {
         if (R->l[j] == R->u[j]) continue;
@@ -3931,7 +5763,7 @@ static int dual_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
      * 1.219 -> 1.193 s, savsched1 276 -> 27.7 s, ns1644855 78.5 -> 23.5 s; alone the dual loses badly on some problems
      * with fewer rows, uccase9 1.5 -> 56 s at one thread). BRISK_SXDUALF: the factor (an experiment) */
     const double df = getenv("BRISK_SXDUALF") ? atof(getenv("BRISK_SXDUALF")) : o2->dual_race ? 1.0 : 2.0;
-    if (df * est > R->m && !force) return 0;
+    if (df * est > R->m && !force) { if (o2->dr_declined) *o2->dr_declined = 1; return 0; }
     const double t0 = now();
     const int verbose = o2->verbose;
     LpProb D, DR; SxDual *M = NULL; SxPre *PD = NULL; char why[160] = "";
@@ -3948,18 +5780,43 @@ static int dual_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
      * on the problem itself (Gurobi's time, 36.4 s); the duals that paid were 11 to 40 times smaller. The crossover's saving
      * grows with the ratio, the risk of the method on the other form does not) */
     const double dfi = o2->in_dual ? 8.0 : df;
-    if (ps || (dfi * DR.m > R->m && !force) || DR.m == 0 || DR.n == 0) {
+    /* (8 November 2026, ISSUES 847; BRISK_SXDRFEAS=1, off until judged) the simplex methods on the dual problem only when it
+     * does not cost the start the problem itself has: the dual simplex method starts from the logicals' basis, and on the
+     * problem itself that basis is dual feasible when every column that is not boxed has a cost of the sign of its one
+     * bound (no dual phase 1: the method has one phase). On the dual problem the same basis is then primal feasible and
+     * dual infeasible (the dual simplex method on the dual is the primal simplex method on the problem: a phase 1 to reach
+     * dual feasibility, which the problem itself had at the start, and a phase 2 that undoes it). The dual problem is
+     * declined when its logicals' basis has more dual infeasibilities than the problem's own. neos-1367061 (LP): 0 on the
+     * problem, 1,304 on its dual; the dual simplex method alone 28,421-33,732 iterations (21-25 s) through the dual,
+     * 6,268-7,003 (1.9-2.1 s) on the problem itself, Gurobi's dual simplex method 6,392. Not for the interior-point route
+     * (in_dual: no simplex start) */
+    long dr_nR = -1, dr_nD = -1;
+    static int drfeas = -1; if (drfeas < 0) { const char *e_ = getenv("BRISK_SXDRFEAS"); drfeas = e_ && atoi(e_) > 0; }
+    if (!ps && drfeas && !o2->in_dual && !force) { dr_nR = slack_dual_infeas(R); dr_nD = slack_dual_infeas(&DR); }
+    const int dr_feas_decl = dr_nD > dr_nR;
+    if (!ps && getenv("BRISK_SXDRDBG")) {   /* (8 November 2026, a diagnostic) each form's share of free (not fixed) columns without cost */
+        long zR = 0, nR_ = 0, zD = 0, nD_ = 0;
+        for (int j = 0; j < R->n; j++) if (R->l[j] < R->u[j]) { nR_++; if (R->c[j] == 0) zR++; }
+        for (int j = 0; j < DR.n; j++) if (DR.l[j] < DR.u[j]) { nD_++; if (DR.c[j] == 0) zD++; }
+        fprintf(stderr, "[drdbg] problem %d x %d zero-cost %.3f | dual %d x %d zero-cost %.3f | dinf %ld %ld\n", R->m, R->n,
+                nR_ ? (double)zR / nR_ : 0, DR.m, DR.n, nD_ ? (double)zD / nD_ : 0, slack_dual_infeas(R), slack_dual_infeas(&DR));
+    }
+    if (dr_feas_decl && verbose >= 1) printf("  the dual problem's start has %ld dual infeasibilities, the problem's own %ld: the problem itself is solved\n", dr_nD, dr_nR);
+    if (ps || (dfi * DR.m > R->m && !force) || DR.m == 0 || DR.n == 0 || dr_feas_decl) {
+        if (o2->dr_declined) *o2->dr_declined = 1;
         if (verbose >= 1) printf("  the dual (%d x %d, presolved %d x %d) is not used\n", D.m, D.n, ps ? -1 : DR.m, ps ? -1 : DR.n);
         if (!ps) lp_free(&DR);
         lp_free(&D); sxpre_free(PD); sxpre_dual_free(M);
         return 0;
     }
     if (verbose >= 1) printf("  the dual problem: %d x %d, presolved %d x %d (%.2f s)\n", D.m, D.n, DR.m, DR.n, now() - t0);
+    /* (5 November 2026, experiments on ISSUES 835) BRISK_SXWRITEDUAL=<file>: the presolved dual as a free MPS file */
+    if (getenv("BRISK_SXWRITEDUAL")) { FILE *fw = fopen(getenv("BRISK_SXWRITEDUAL"), "w"); if (fw) write_free_mps(&DR, fw); }
     const int md = D.m, nd = D.n, mdr = DR.m, ndr = DR.n;
     int *csdr = malloc(sizeof(int) * (ndr + 1)), *rsdr = malloc(sizeof(int) * (mdr + 1));
     double *xdr = malloc(sizeof(double) * (ndr + 1)), *ydr = malloc(sizeof(double) * (mdr + 1));
     SimplexInfo id; memset(&id, 0, sizeof id);
-    SimplexOpts od = *o2; if (getenv("BRISK_SXDUALMETHOD")) od.method = atoi(getenv("BRISK_SXDUALMETHOD"));   /* (experiments) */
+    SimplexOpts od = *o2; od.dr_declined = NULL; if (getenv("BRISK_SXDUALMETHOD")) od.method = atoi(getenv("BRISK_SXDUALMETHOD"));   /* (experiments) */
     int st, dn2 = 0;
     if (o2->in_dual) {
         /* (23 October 2026) the interior-point route on a tall problem: the interior-point method and the crossover on its
@@ -3971,13 +5828,40 @@ static int dual_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
     /* (26 October 2026) the time limit is what is left after the interior-point attempt: od kept the whole of it, and the
      * simplex method on the dual ran 9 s past a limit of 10 s (opm2-z12-s8, -lpmethod 4) */
     if (!dn2 && o2->timelimit > 0) { od.timelimit = o2->timelimit - (now() - t0); if (od.timelimit <= 0) { st = 6; dn2 = 1; } }
+    /* (5 November 2026, experiments on ISSUES 835) BRISK_SXDUALSTART=<file>: the presolved dual solved from the basis in the
+     * file (lines "c <column> <status>" and "r <row> <status>", the statuses of simplex.h), the costs perturbed as from the
+     * logicals' basis and the steepest-edge weights computed exactly when a row first comes to the top (given_perturb);
+     * BRISK_SXDUALBASIS=<file>: the dual's basis at the end of its solve, in that format. With BRISK_SXSTOPIT=<k> (the dual
+     * simplex method stopped after k iterations) the route ends there, status 3, instead of solving the problem itself */
+    int *cs_start = NULL, *rs_start = NULL;
+    if (getenv("BRISK_SXDUALSTART")) {
+        FILE *fs = fopen(getenv("BRISK_SXDUALSTART"), "r");
+        if (fs) {
+            cs_start = calloc((size_t)ndr + 1, sizeof(int)); rs_start = calloc((size_t)mdr + 1, sizeof(int));
+            char t[4]; int k, v;
+            while (fscanf(fs, "%3s %d %d", t, &k, &v) == 3) { if (t[0] == 'c' && k >= 0 && k < ndr) cs_start[k] = v; else if (t[0] == 'r' && k >= 0 && k < mdr) rs_start[k] = v; }
+            fclose(fs);
+            od.cstat0 = cs_start; od.rstat0 = rs_start; od.given_perturb = 1;
+        }
+    }
     if (!dn2) { od.method = o2->in_dual ? 0 : od.method; st = reduced_solve(&DR, &od, xdr, ydr, csdr, rsdr, &id); }
+    free(cs_start); free(rs_start);
+    if (getenv("BRISK_SXDUALBASIS")) {
+        FILE *fb = fopen(getenv("BRISK_SXDUALBASIS"), "w");
+        if (fb) { for (int j = 0; j < ndr; j++) fprintf(fb, "c %d %d\n", j, csdr[j]); for (int i = 0; i < mdr; i++) fprintf(fb, "r %d %d\n", i, rsdr[i]); fclose(fb); }
+    }
     lp_free(&DR);
+    if (st == 3 && getenv("BRISK_SXSTOPIT")) {
+        free(csdr); free(rsdr); free(xdr); free(ydr); lp_free(&D); sxpre_free(PD); sxpre_dual_free(M);
+        *ir = id; ir->time = now() - t0; ir->dualized = 1; *done = 1;
+        return 3;
+    }
     if (st != 0) {
         if (verbose >= 1) printf("  the dual ended with status %d: the problem itself is solved\n", st);
         /* (24 October 2026) its iterations and time kept for the caller's summary: stopped by the interior-point method
          * beside it, the route's work was reported as 0 iterations (irish-electricity, LP: 23,000 in 20 s) */
-        ir->iters += id.iters; ir->time += id.time; ir->iters_dual += id.iters_dual; ir->iters_primal += id.iters_primal;
+        if (ifail) sxinfo_add(ifail, &id);
+        else { ir->iters += id.iters; ir->time += id.time; ir->iters_dual += id.iters_dual; ir->iters_primal += id.iters_primal; }
         free(csdr); free(rsdr); free(xdr); free(ydr); lp_free(&D); sxpre_free(PD); sxpre_dual_free(M);
         return 0;
     }
@@ -3999,6 +5883,10 @@ static int dual_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
     ir->t_factor = id.t_factor + i3.t_factor; ir->t_ftran = id.t_ftran + i3.t_ftran; ir->t_btran = id.t_btran + i3.t_btran; ir->t_price = id.t_price + i3.t_price;
     ir->time = now() - t0; ir->dualized = 1; ir->work = id.work + i3.work;
     ir->ipm_iters = id.ipm_iters; ir->t_ipm = id.t_ipm; ir->pushes = id.pushes + i3.pushes;
+    /* (13 November 2026, ISSUES 880) the dual's solve's automatic choice passed on too: when its dual simplex method stopped at the
+     * interior-point method's predicted work, the Summary names the methods that ran (it read "dual simplex method, 2443 iterations
+     * (0 dual, 0 primal)" on neos-1367061's root LP, where the interior-point method and the crossover gave the result) */
+    sxinfo_method(ir, &id);
     *done = 1;
     return st;
 }
@@ -4029,7 +5917,7 @@ static int aggb_applies(const LpProb *R, const SimplexOpts *o2) {
     return cand >= fmax(10.0, 0.05 * R->n);
 }
 int simplex_aggb_possible(const LpProb *L) { SimplexOpts o; memset(&o, 0, sizeof o); return aggb_applies(L, &o); }
-static int aggb_route(const LpProb *R, const SimplexOpts *o2, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done) {
+static int aggb_route(const LpProb *R, const SimplexOpts *o2, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done, SimplexInfo *ifail) {
     *done = 0;
     if (!aggb_applies(R, o2)) return 0;
     const double t0 = now();
@@ -4041,6 +5929,17 @@ static int aggb_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
     }
     const int verbose = o2->verbose;
     if (verbose >= 1) printf("  the bounded substitution for the simplex method: %d x %d -> %d x %d (%.2f s)\n", R->m, R->n, R2.m, R2.n, now() - t0);
+    if (verbose >= 2) {     /* (5 November 2026) the two problems' entries and rows */
+        long lr = 0, lr2 = 0; int ranged = 0;
+        for (int i = 0; i < R2.m; i++) ranged += R2.rl[i] > -1e29 && R2.ru[i] < 1e29 && R2.rl[i] != R2.ru[i];
+        int *c1 = calloc(R->m + 1, sizeof(int)), *c2 = calloc(R2.m + 1, sizeof(int));
+        for (int p = 0; p < R->Ap[R->n]; p++) c1[R->Ai[p]]++;
+        for (int p = 0; p < R2.Ap[R2.n]; p++) c2[R2.Ai[p]]++;
+        for (int i = 0; i < R->m; i++) if (c1[i] > lr) lr = c1[i];
+        for (int i = 0; i < R2.m; i++) if (c2[i] > lr2) lr2 = c2[i];
+        printf("  the substitution: entries %d -> %d, longest row %ld -> %ld, %d ranged rows\n", R->Ap[R->n], R2.Ap[R2.n], lr, lr2, ranged);
+        free(c1); free(c2);
+    }
     const int m2 = R2.m, n2 = R2.n;
     int *cs2 = malloc(sizeof(int) * (n2 + 1)), *rs2 = malloc(sizeof(int) * (m2 + 1));
     double *x2 = malloc(sizeof(double) * (n2 + 1)), *y2 = malloc(sizeof(double) * (m2 + 1));
@@ -4048,7 +5947,10 @@ static int aggb_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
     int st = reduced_solve(&R2, o2, x2, y2, cs2, rs2, &i2);
     lp_free(&R2);
     if (st != 0) {
-        if (verbose >= 1 && !(o2->stop && *o2->stop)) printf("  the problem with the substitution ended with status %d: the problem itself is solved\n", st);
+        if (verbose >= 1 && !(brisk_flag_get(o2->stop))) printf("  the problem with the substitution ended with status %d: the problem itself is solved\n", st);
+        /* (12 November 2026) its counts kept for the Summary: stopped by a time limit or by the method beside it, ofi2 (LP) was
+         * reported with 0 iterations after 21 s of them */
+        if (ifail) sxinfo_add(ifail, &i2);
         free(cs2); free(rs2); free(x2); free(y2); sxpre_free(P2);
         return 0;
     }
@@ -4065,7 +5967,7 @@ static int aggb_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
     ir->iters = i2.iters + i3.iters; ir->iters_dual = i2.iters_dual + i3.iters_dual; ir->iters_primal = i2.iters_primal + i3.iters_primal;
     ir->iters_phase1 = i2.iters_phase1 + i3.iters_phase1; ir->nfactor = i2.nfactor + i3.nfactor; ir->nflips = i2.nflips + i3.nflips;
     ir->t_factor = i2.t_factor + i3.t_factor; ir->t_ftran = i2.t_ftran + i3.t_ftran; ir->t_btran = i2.t_btran + i3.t_btran; ir->t_price = i2.t_price + i3.t_price;
-    ir->time = now() - t0; ir->work = i2.work + i3.work;
+    ir->time = now() - t0; ir->work = i2.work + i3.work; sxinfo_method(ir, &i2);
     *done = 1;
     return st;
 }
@@ -4107,7 +6009,7 @@ static int sym_route(const LpProb *R, const SimplexOpts *o2, double *xr, double 
     ir->iters = iq.iters + i3.iters; ir->iters_dual = iq.iters_dual + i3.iters_dual; ir->iters_primal = iq.iters_primal + i3.iters_primal;
     ir->iters_phase1 = iq.iters_phase1 + i3.iters_phase1; ir->nfactor = iq.nfactor + i3.nfactor; ir->nflips = iq.nflips + i3.nflips;
     ir->t_factor = iq.t_factor + i3.t_factor; ir->t_ftran = iq.t_ftran + i3.t_ftran; ir->t_btran = iq.t_btran + i3.t_btran; ir->t_price = iq.t_price + i3.t_price;
-    ir->time = now() - t0; ir->sym_m = mq; ir->sym_n = nq; ir->work = iq.work + i3.work;
+    ir->time = now() - t0; ir->sym_m = mq; ir->sym_n = nq; ir->work = iq.work + i3.work; sxinfo_method(ir, &iq);
     *done = 1;
     return st;
 }
@@ -4183,7 +6085,7 @@ static int ipm_point(const LpProb *L, int pre, int pdreg, const SimplexOpts *o2,
     SedumiProb P; LpMap M; double *ub = NULL;
     *near = 0; memset(ii, 0, sizeof *ii);
     /* (26 October 2026) no attempt once the time limit has passed: the standard form and the analysis do not look at it */
-    if ((o2->timelimit > 0 && o2->timelimit - (now() - t0) <= 0) || (o2->stop && *o2->stop)) { snprintf(ii->why, sizeof ii->why, "the time limit"); ii->status = 6; return 6; }
+    if ((o2->timelimit > 0 && o2->timelimit - (now() - t0) <= 0) || (brisk_flag_get(o2->stop))) { snprintf(ii->why, sizeof ii->why, "the time limit"); ii->status = 6; return 6; }
     lp_to_std(&Rc, pre, 0, &P, &M, &ub);
     if (M.status) { sedumi_free(&P); lp_map_free(&M); free(ub); snprintf(ii->why, sizeof ii->why, "the standard form failed"); return 4; }
     LpIpmOpts io; memset(&io, 0, sizeof io);
@@ -4239,7 +6141,7 @@ static int ipm_route(const LpProb *R, const SimplexOpts *o2, double *xr, double 
          * own route from dualizing again) */
         SimplexOpts od = *o2; od.in_dual = 1;
         int dn = 0;
-        const int st = dual_route(R, &od, xr, yr, csr, rsr, ir, &dn);
+        const int st = dual_route(R, &od, xr, yr, csr, rsr, ir, &dn, NULL);
         if (dn) { *done = 1; return st; }
     }
     double *x = calloc((size_t)R->n + 1, sizeof(double)), *y = calloc((size_t)R->m + 1, sizeof(double));
@@ -4262,7 +6164,7 @@ static int ipm_route(const LpProb *R, const SimplexOpts *o2, double *xr, double 
     const int asread = ar.declined;
     if (asread) { ist = 4; ii.iters = 0; snprintf(ii.why, sizeof ii.why, "the problem as read is cheaper"); near = 0; }
     int iters = ii.iters;
-    const int stopped = ist == 6 || (o2->stop && *o2->stop);
+    const int stopped = ist == 6 || (brisk_flag_get(o2->stop));
     if (ist != 0 && !near && !asread && o2->verbose >= 1) printf("  the interior-point method did not end optimal: %s\n", ii.why);
     /* a second attempt on the problem as read, without a presolve (22 October 2026: on triptim1 the method stalls after
      * 53 iterations on the simplex method's presolved problem, and after the standard presolve as well, and converges in
@@ -4304,7 +6206,7 @@ static int ipm_route(const LpProb *R, const SimplexOpts *o2, double *xr, double 
         /* the SOCP solver's interior point instead, as the LP route takes it when this method gives up (22 October
          * 2026: lp_densecols_small, whose dense columns' correction lost its accuracy, went to the dual simplex method
          * for 108 s against 0.7 s of the SOCP solver) */
-        if (ist == 6 || (o2->stop && *o2->stop)) return 0;
+        if (ist == 6 || (brisk_flag_get(o2->stop))) return 0;
         LpProb Rc = *R;
         SedumiProb P2; LpMap M2;
         lp_to_sedumi(&Rc, 0, 0, &P2, &M2);
@@ -4359,11 +6261,12 @@ static int ipm_route(const LpProb *R, const SimplexOpts *o2, double *xr, double 
                                        LPs whose factorization takes milliseconds (ISSUES 409); without this term the
                                        method switched on 21 of 168 small MIPLIB relaxations that the simplex method
                                        solves in 0.06-0.7 s, and lost (shifted geometric mean 0.550 -> 0.586 s) */
+#define SX_AUTO_NDK 1000.0         /* (ISSUES 880) the count by the factorization's own ordering once the work reaches this many entries touched per AMD factor entry */
 #define SX_AUTO_PATCAP 5e7          /* the largest pattern (entries of M M') ordered for the prediction */
 /* one form's normal equations M M': M has nr rows and the columns Cp, Ci (nc), and ns singleton columns more (the
  * slacks: the diagonal only). The dense columns as lpsolve.c's ne_setup takes them: longer than max(50, 10 x the
  * average, nr / 10), when nr >= 500 and there are 1 to 400 of them and fewer than a quarter of the columns. */
-typedef struct { int nr, nc, ns, nd; int *Cp, *Ci; char *isd; double lb, pb, lnz, cost; } NeForm;   /* (pb: the bound on the pattern's entries) */
+typedef struct { int nr, nc, ns, nd; int *Cp, *Ci; char *isd; double lb, pb, lnz, cost, fl, nnz; } NeForm;   /* (pb: the bound on the pattern's entries; fl: the factorization's flops; nnz: the entries with the slacks) */
 static void neform_init(NeForm *F) {
     const int nc = F->nc, ntot = nc + F->ns; const double nz = (double)F->Cp[nc] + F->ns;
     F->isd = calloc((size_t)nc + 1, 1); F->nd = 0;
@@ -4409,7 +6312,7 @@ static void neform_cost(NeForm *F) {
     if (amd_order(nr, ps, pi, perm, Control, Info) >= 0) {
         const double lnz = Info[AMD_LNZ] + nr, fl = Info[AMD_NDIV] + 2.0 * Info[AMD_NMULTSUBS_LDL], nd = F->nd;
         const double nnz = (double)Cp[nc] + F->ns;
-        F->lnz = lnz;
+        F->lnz = lnz; F->fl = fl; F->nnz = nnz;
         F->cost = fl + nd * (4.0 * lnz + 2.0 * nd * nr) + 10.0 * (4.0 * lnz + 4.0 * nnz + 4.0 * nd * nr);
     }
     free(tp); free(tj); free(mark); free(ps); free(pi); free(perm);
@@ -4474,10 +6377,10 @@ static void *ipm_job(void *p) {
     IpmJob *J = p;
     omp_set_num_threads(J->nt);           /* (a new thread starts from the default count) */
     SimplexOpts ox = J->o; ox.method = 3; ox.verbose = 0; ox.stop = &J->stop;
-    J->st = ipm_route(J->R, &ox, J->x, J->y, J->cs, J->rs, &J->info, &J->done);
+    BRISK_THREAD_GUARD(J->st = ipm_route(J->R, &ox, J->x, J->y, J->cs, J->rs, &J->info, &J->done), J->st = 4);   /* (a fatal error in this thread: the job without a result) */
     if (!J->race) return NULL;
     pthread_mutex_lock(&J->mu);
-    if (J->done && J->st == 0 && !J->abandoned) { J->stop_s = 1; if (J->stop_other) *J->stop_other = 1; if (J->stop_other2) *J->stop_other2 = 1; }
+    if (J->done && J->st == 0 && !J->abandoned) { brisk_flag_set(&J->stop_s, 1); if (J->stop_other) brisk_flag_set(J->stop_other, 1); if (J->stop_other2) brisk_flag_set(J->stop_other2, 1); }
     else if (!J->abandoned && J->threads_other) *J->threads_other = J->nt_all;
     J->finished = 1;
     const int ab = J->abandoned;
@@ -4491,6 +6394,7 @@ static void *ipm_job(void *p) {
 #endif
 typedef struct {
     const LpProb *R; int stage, predicted, declined; double wpred; int verbose; NeForm P, D;
+    int nd_pending, nd_dual; double nd_c, nd_wp0;   /* (ISSUES 880) the count by the factorization's own ordering deferred: the form and its AMD cost */
     const SimplexOpts *o; int nt0, launched; IpmJob *job; double t0;
 #ifdef SX_RACE
     pthread_t th;
@@ -4552,15 +6456,66 @@ static double ipm_form_lb(const LpProb *P) {
     return c;
 }
 /* the interior-point method's predicted work (the forms' orderings), printed with the work so far; 0 when too large */
-static double auto_wp(AutoCtx *A, double work) {
-    A->predicted = 1;
-    /* the dual form first; the standard form's ordering only when its lower bound is below twice the dual's cost */
-    NeForm *P = &A->P, *D = &A->D;
-    if (D->nr < P->nr) neform_cost(D);      /* (the dual form only with fewer rows, as lpsolve.c takes it) */
-    if (!(D->cost > 0 && P->lb > 2.0 * D->cost)) neform_cost(P);
-    double c = 0; int dual = 0;
-    if (D->cost > 0 && (P->cost == 0 || D->cost <= 0.5 * P->cost)) { c = D->cost; dual = 1; }
-    else c = P->cost;
+/* (14 November 2026, ISSUES 880) the chosen form's factorization counted with the ordering the interior-point method's factorization
+ * uses (lpsolve.c's estimate, lp_ne_cost_nd: the nested dissection where it pays) instead of AMD's, which can be several times higher:
+ * triptim4's root LP (LP) 5.3e10 flops an iteration by AMD against the factorization's 7.1e9, the switch after 59 s of the simplex
+ * method for the interior-point method's 10 s. Returns the iteration's cost with that count (c when it is not lower). No time limit:
+ * the decision depends on the work counts only, the same at any thread count and on a busy machine (the pattern is at most
+ * SX_AUTO_PATCAP entries; METIS's order is the same at any thread count) */
+/* (14 November 2026, ISSUES 880; the default, BRISK_SXAUTONDFAST=0: lpsolve.c's whole analysis) the count by the nested dissection alone: the pattern of M M' (its
+ * dense columns left out), the order of nd_order (the dissection the factorization calls) and the factor's exact column counts by
+ * the elimination tree (schol_exact_counts), without the factorization's whole symbolic analysis (lp_ne_cost_nd: 2.1-2.2 s on
+ * neos-4763324-toguru and physiciansched3-3, LPs, where the count found the orderings equal; this count 1.42 and 1.28 s, triptim4
+ * 0.72 -> 0.41 s, the same decisions: when the dissection is worse than AMD the prediction keeps AMD's count). 1: done */
+int nd_order(int n, const int *xadj, const int *adjncy, int *perm);
+int schol_exact_counts(int m, const int *deg, int *const *nbr, const int *P, double *flops_out, double *nnz_out);
+static int auto_nd_fast(const NeForm *F, double *fl, double *lnz) {
+    const int nr = F->nr, nc = F->nc; const int *Cp = F->Cp, *Ci = F->Ci;
+    int *tp = calloc((size_t)nr + 2, sizeof(int)), *tj = malloc(sizeof(int) * ((size_t)Cp[nc] + 1));
+    for (int j = 0; j < nc; j++) if (!F->isd[j]) for (int p = Cp[j]; p < Cp[j + 1]; p++) tp[Ci[p] + 1]++;
+    for (int i = 0; i < nr; i++) tp[i + 1] += tp[i];
+    { int *f = malloc(sizeof(int) * ((size_t)nr + 1)); memcpy(f, tp, sizeof(int) * nr);
+      for (int j = 0; j < nc; j++) if (!F->isd[j]) for (int p = Cp[j]; p < Cp[j + 1]; p++) tj[f[Ci[p]]++] = j;
+      free(f); }
+    int *mark = malloc(sizeof(int) * ((size_t)nr + 1)), *xadj = malloc(sizeof(int) * ((size_t)nr + 1));
+    int *adj = malloc(sizeof(int) * ((size_t)(2.0 * F->pb) + 1)), *P = malloc(sizeof(int) * ((size_t)nr + 1));
+    for (int i = 0; i < nr; i++) mark[i] = -1;
+    long e = 0; xadj[0] = 0;
+    for (int i = 0; i < nr; i++) {
+        mark[i] = i;
+        for (int t = tp[i]; t < tp[i + 1]; t++) { const int j = tj[t]; for (int p = Cp[j]; p < Cp[j + 1]; p++) { const int k = Ci[p]; if (mark[k] != i) { mark[k] = i; adj[e++] = k; } } }
+        xadj[i + 1] = (int)e;
+    }
+    int ok = 0;
+    if (nd_order(nr, xadj, adj, P) == 0) {
+        int *deg = malloc(sizeof(int) * ((size_t)nr + 1)); int **nbr = malloc(sizeof(int *) * ((size_t)nr + 1));
+        for (int i = 0; i < nr; i++) { deg[i] = xadj[i + 1] - xadj[i]; nbr[i] = adj + xadj[i]; }
+        ok = schol_exact_counts(nr, deg, nbr, P, fl, lnz) == 0;
+        free(deg); free(nbr);
+    }
+    free(tp); free(tj); free(mark); free(xadj); free(adj); free(P);
+    return ok;
+}
+static double auto_nd_cost(AutoCtx *A, NeForm *F, double c, double work) {
+    int *mp = malloc(sizeof(int) * ((size_t)F->nc + 1)), *mi = malloc(sizeof(int) * ((size_t)F->Cp[F->nc] + 1)); int k = 0, q = 0;
+    mp[0] = 0;
+    for (int j = 0; j < F->nc; j++) { if (F->isd && F->isd[j]) continue; for (int p = F->Cp[j]; p < F->Cp[j + 1]; p++) mi[q++] = F->Ci[p]; mp[++k] = q; }
+    double fl2 = 0, lnz2 = 0; const double tq = now();
+    static int fast_ = -1; if (fast_ < 0) { const char *e_ = getenv("BRISK_SXAUTONDFAST"); fast_ = !(e_ && atoi(e_) == 0); }
+    const int ok = fast_ ? auto_nd_fast(F, &fl2, &lnz2) : lp_ne_cost_nd(F->nr, k, mp, mi, F->fl, 1e30, &fl2, &lnz2);
+    free(mp); free(mi);
+    if (!(ok && fl2 < F->fl)) {
+        if (A->verbose >= 2) printf("  the interior-point method's own ordering not counted (%d, %.3g flops against AMD's %.3g; %.2f s; work so far %.3g)\n", ok, fl2, F->fl, now() - tq, work);
+        return c;
+    }
+    const double nd = F->nd, nr = F->nr;
+    const double c2 = fl2 + nd * (4.0 * lnz2 + 2.0 * nd * nr) + 10.0 * (4.0 * lnz2 + 4.0 * F->nnz + 4.0 * nd * nr);
+    if (A->verbose >= 1) printf("  the interior-point method's factorization by its own ordering: %.3g flops, factor %.3g (AMD's %.3g, %.3g; %.2f s; work so far %.3g)\n", fl2, lnz2, F->fl, F->lnz, now() - tq, work);
+    F->lnz = lnz2; F->fl = fl2;
+    return c2;
+}
+static double auto_wp_print(AutoCtx *A, double work, double c, int dual) {
+    const NeForm *P = &A->P, *D = &A->D;
     const double wp = c > 0 ? SX_AUTO_IT * c / SX_AUTO_FLOPS + SX_AUTO_SETUP : 0;
     if (A->verbose >= 1) {
         if (c > 0) printf("  the work so far %.3g; the interior-point method's predicted %.3g (%s form: %d rows, factor %.3g, %d dense columns)\n",
@@ -4570,8 +6525,49 @@ static double auto_wp(AutoCtx *A, double work) {
     A->wpred = wp;
     return wp;
 }
+/* defer: the count may wait for the work (auto_budget, which makes it at the next call); 0 for the callers that take the prediction as
+ * final (wrace_budget, an experiment: the count at once) */
+static double auto_wp(AutoCtx *A, double work, int defer) {
+    A->predicted = 1;
+    /* the dual form first; the standard form's ordering only when its lower bound is below twice the dual's cost */
+    NeForm *P = &A->P, *D = &A->D;
+    if (D->nr < P->nr) neform_cost(D);      /* (the dual form only with fewer rows, as lpsolve.c takes it) */
+    if (!(D->cost > 0 && P->lb > 2.0 * D->cost)) neform_cost(P);
+    double c = 0; int dual = 0;
+    if (D->cost > 0 && (P->cost == 0 || D->cost <= 0.5 * P->cost)) { c = D->cost; dual = 1; }
+    else c = P->cost;
+    /* (14 November 2026, ISSUES 880) a large prediction (the factorization at least 1e9 flops by AMD, where the interior-point method
+     * orders by the nested dissection) that would keep the simplex method running: the count by that ordering (auto_nd_cost), once the
+     * simplex method's work reaches SX_AUTO_NDK times AMD's factor entries. The count's time follows AMD's factor: 16-175 ns an entry on
+     * the 42 development LPs where it acts (2.2 s on neos-4763324-toguru, 4.1 s on rail03, 1.2 s on satellites2-25, whose simplex method
+     * ends in a few seconds); at the simplex method's 2e8-1e9 entries touched a second, 1,000 entries a factor entry keep the count at
+     * most about a sixth of the time spent before it (a few percent typically), and a problem the simplex method ends sooner never pays
+     * for it. BRISK_SXAUTOND=0: AMD's count alone */
+    static int and_ = -1; if (and_ < 0) { const char *e_ = getenv("BRISK_SXAUTOND"); and_ = !(e_ && atoi(e_) == 0); }
+    static double ndk_ = -1; if (ndk_ < 0) { const char *e_ = getenv("BRISK_SXAUTONDK"); ndk_ = e_ ? atof(e_) : SX_AUTO_NDK; }
+    NeForm *F = dual ? D : P;
+    const double wp0 = c > 0 ? SX_AUTO_IT * c / SX_AUTO_FLOPS + SX_AUTO_SETUP : 0;
+    if (and_ && c > 0 && F->fl >= 1e9 && wp0 > work) {
+        const double wnd = ndk_ * F->lnz;
+        if (work >= wnd) c = auto_nd_cost(A, F, c, work);
+        else if (!defer) c = auto_nd_cost(A, F, c, work);
+        else if (wnd < wp0) {
+            A->nd_pending = 1; A->nd_dual = dual; A->nd_c = c; A->nd_wp0 = wp0;
+            auto_wp_print(A, work, c, dual);
+            if (A->verbose >= 2) printf("  the count by the interior-point method's own ordering deferred to the work %.3g\n", wnd);
+            return wnd;
+        }
+    }
+    return auto_wp_print(A, work, c, dual);
+}
 static double auto_budget(void *vctx, double work) {
     AutoCtx *A = vctx;
+    if (A->predicted && A->nd_pending) {     /* (ISSUES 880) the deferred count, now that the work has reached it */
+        A->nd_pending = 0;
+        const double c = auto_nd_cost(A, A->nd_dual ? &A->D : &A->P, A->nd_c, work);
+        const double wp = auto_wp_print(A, work, c, A->nd_dual);
+        if (wp > work) return wp;
+    }
     if (A->predicted) { A->declined = 1; return 0; }
     if (A->stage == 0) {
         /* a lower bound first, without an ordering */
@@ -4580,7 +6576,7 @@ static double auto_budget(void *vctx, double work) {
         const double w0 = SX_AUTO_IT * (A->D.nr < A->P.nr ? fmin(A->P.lb, A->D.lb) : A->P.lb) / SX_AUTO_FLOPS + SX_AUTO_SETUP;
         if (w0 > work) return w0;
     }
-    const double wp = auto_wp(A, work);
+    const double wp = auto_wp(A, work, 1);
     if (wp == 0) { A->declined = 0; return 1e300; }
     if (wp > work) {
 #ifdef SX_RACE
@@ -4663,11 +6659,11 @@ typedef struct RaceCtx_ { const LpProb *R; const SimplexOpts *o; int nf; IpmJob 
 static void *dir_job(void *p) {
     DirJob *D = p;
     omp_set_num_threads(1);
-    D->st = reduced_solve(D->R, &D->o, D->x, D->y, D->cs, D->rs, &D->info);
-    if (D->st == 0 && !D->stop) {
-        D->won = 1; *D->stop_main = 1;
+    BRISK_THREAD_GUARD(D->st = reduced_solve(D->R, &D->o, D->x, D->y, D->cs, D->rs, &D->info), D->st = 4);
+    if (D->st == 0 && !brisk_flag_get(&D->stop)) {
+        brisk_flag_set(&D->won, 1); brisk_flag_set(D->stop_main, 1);
         pthread_mutex_lock(&D->C->mu);
-        if (D->C->J) D->C->J->stop = 1;
+        if (D->C->J) brisk_flag_set(&D->C->J->stop, 1);
         pthread_mutex_unlock(&D->C->mu);
     }
     return NULL;
@@ -4701,14 +6697,14 @@ static void *aggb_job(void *p) {
     DirJob *D = p;
     omp_set_num_threads(1);
     int dn = 0;
-    D->st = aggb_route(D->R, &D->o, D->x, D->y, D->cs, D->rs, &D->info, &dn);
-    if (dn && D->st == 0 && !D->stop) {
-        D->won = 1; *D->stop_main = 1;
+    BRISK_THREAD_GUARD(D->st = aggb_route(D->R, &D->o, D->x, D->y, D->cs, D->rs, &D->info, &dn, &D->info), (D->st = 4, dn = 0));
+    if (dn && D->st == 0 && !brisk_flag_get(&D->stop)) {
+        brisk_flag_set(&D->won, 1); brisk_flag_set(D->stop_main, 1);
         pthread_mutex_lock(&D->C->mu);
-        if (D->C->J) D->C->J->stop = 1;
+        if (D->C->J) brisk_flag_set(&D->C->J->stop, 1);
         pthread_mutex_unlock(&D->C->mu);
     }
-    D->fin = 1;
+    brisk_flag_set(&D->fin, 1);
     return NULL;
 }
 static void race_start_aggb(RaceCtx *C) {
@@ -4733,7 +6729,7 @@ static double race_budget(void *vctx, double work) {
      * LP: 2 % of the time for the second route's presolve, set-up and thread on its small problems) */
     if (C->dj_want && C->in_dual && !C->DJ) race_start_dj(C, 0);
     C->dj_want = 0;
-    if (C->J || (C->DJ && C->DJ->won)) return 1e300;
+    if (C->J || (C->DJ && brisk_flag_get(&C->DJ->won))) return 1e300;
     const LpProb *R = C->R;
     IpmJob *J = calloc(1, sizeof *J);
     if (!J) return 1e300;
@@ -4750,8 +6746,8 @@ static double race_budget(void *vctx, double work) {
      * this budget and the interior-point method takes all but the job's: on the problems where it wins, it had 3 of 4
      * threads when the route ran first and alone, 2 when the main simplex method kept one beside the job (rail02, LP: 56 ->
      * 73 s, triptim1 6.4 -> 8.0 s); a small problem has ended before the budget */
-    const int aggb_wait = C->DJ && C->DJ->aggb && !C->DJ->fin && !C->DJ->won;
-    J->nt = aggb_wait ? C->nf - 1 : C->nf - ks - (C->DJ && !C->DJ->fin); if (J->nt < 1) J->nt = 1;
+    const int aggb_wait = C->DJ && C->DJ->aggb && !brisk_flag_get(&C->DJ->fin) && !brisk_flag_get(&C->DJ->won);
+    J->nt = aggb_wait ? C->nf - 1 : C->nf - ks - (C->DJ && !brisk_flag_get(&C->DJ->fin)); if (J->nt < 1) J->nt = 1;
     J->threads_other = &C->threads; J->nt_all = C->DJ ? 1 : C->nf;
     if (C->DJ) J->stop_other2 = &C->DJ->stop;
     if (J->o.timelimit > 0) J->o.timelimit = fmax(C->o->timelimit - (now() - C->t0), 1e-3);
@@ -4760,14 +6756,14 @@ static double race_budget(void *vctx, double work) {
     pthread_mutex_init(&J->mu, NULL);
     C->threads = C->DJ ? 1 : ks;    /* (before the job starts: the simplex method keeps one thread while it runs) */
     pthread_mutex_lock(&C->mu);
-    const int ok = !(C->DJ && C->DJ->won) && pthread_create(&C->th, NULL, ipm_job, J) == 0;
+    const int ok = !(C->DJ && brisk_flag_get(&C->DJ->won)) && pthread_create(&C->th, NULL, ipm_job, J) == 0;
     if (ok) C->J = J;
     pthread_mutex_unlock(&C->mu);
     if (!ok) { job_free(J); C->threads = C->DJ ? 1 : C->nf; return 1e300; }
     if (C->o->verbose >= 1) printf("  the interior-point method started on %d of %d threads, beside the simplex method (the first to end wins)\n", J->nt, C->nf);
     if (aggb_wait) {
         if (C->o->verbose >= 1) printf("  the simplex method on the problem itself gives its thread to the interior-point method; the problem with the bounded substitution goes on\n");
-        C->main_declined = 1; return 0;
+        brisk_flag_set(&C->main_declined, 1); return 0;
     }
     return 1e300;
 }
@@ -4817,17 +6813,17 @@ static int race_route(const LpProb *R, const SimplexOpts *o2, int nf, double *xr
      * at the factor 2 as without the race, its direct route's job only from the budget) */
     os.dual_race = C.DJ && !C.DJ->primal;
     C.in_dual = 1;
-    int dn = 0, st = dual_route(R, &os, xr, yr, csr, rsr, &is, &dn);
+    int dn = 0, st = dual_route(R, &os, xr, yr, csr, rsr, &is, &dn, NULL);
     C.in_dual = 0; C.dj_want = 0;
     DJ = C.DJ;
     os.dual_race = 0;
-    if (!dn && !C.stop_ind) {
+    if (!dn && !brisk_flag_get(&C.stop_ind)) {
         if (DJ && !DJ->primal) {   /* the dual problem was not used: the direct route's job is this route's solve */
             pthread_join(C.thd, NULL);
             st = DJ->st; is = DJ->info;
             memcpy(xr, DJ->x, sizeof(double) * R->n); memcpy(yr, DJ->y, sizeof(double) * R->m);
             memcpy(csr, DJ->cs, sizeof(int) * R->n); memcpy(rsr, DJ->rs, sizeof(int) * R->m);
-            if (DJ->won) C.stop_ind = 0;     /* (its own result: not a stop from outside) */
+            if (brisk_flag_get(&DJ->won)) brisk_flag_set(&C.stop_ind, 0);     /* (its own result: not a stop from outside) */
             free(DJ->x); free(DJ->y); free(DJ->cs); free(DJ->rs); free(DJ); DJ = C.DJ = NULL;
         } else {
             /* (26 October 2026) the time left after the route through the dual problem, not the race's whole limit */
@@ -4838,35 +6834,35 @@ static int race_route(const LpProb *R, const SimplexOpts *o2, int nf, double *xr
                 C.dj_o = os; race_start_aggb(&C); DJ = C.DJ;
                 omp_set_num_threads(C.threads);
             }
-            if (!DJ) { if (o2->timelimit > 0) os.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3); st = aggb_route(R, &os, xr, yr, csr, rsr, &is, &da); }
-            if (!da && !C.stop_ind) { if (o2->timelimit > 0) os.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3); st = reduced_solve(R, &os, xr, yr, csr, rsr, &is); }
+            if (!DJ) { if (o2->timelimit > 0) os.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3); st = aggb_route(R, &os, xr, yr, csr, rsr, &is, &da, NULL); }
+            if (!da && !brisk_flag_get(&C.stop_ind)) { if (o2->timelimit > 0) os.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3); st = reduced_solve(R, &os, xr, yr, csr, rsr, &is); }
         }
     }
     int dj_joined = 0, ipm_joined = 0;
-    if (C.main_declined) {
+    if (brisk_flag_get(&C.main_declined)) {
         /* (27 October 2026) the main simplex method yielded at the budget (race_budget): the first of the bounded
          * substitution's job and the interior-point method (each stops the other when it wins); if neither ends optimal,
          * the simplex method on the problem itself to the end */
         if (DJ) { pthread_join(C.thd, NULL); dj_joined = 1; }
-        if (!(DJ && DJ->won) && C.J && !C.stop_ind) { pthread_join(C.th, NULL); ipm_joined = 1; }
-        if (!(DJ && DJ->won) && !(ipm_joined ? C.J->done && C.J->st == 0 : C.stop_ind)) {
+        if (!(DJ && brisk_flag_get(&DJ->won)) && C.J && !brisk_flag_get(&C.stop_ind)) { pthread_join(C.th, NULL); ipm_joined = 1; }
+        if (!(DJ && brisk_flag_get(&DJ->won)) && !(ipm_joined ? C.J->done && C.J->st == 0 : brisk_flag_get(&C.stop_ind))) {
             SimplexOpts oc = os; oc.budget_cb = NULL; oc.budget_ctx = NULL; oc.workbudget = 0; oc.stop = NULL;
             C.threads = nf; oc.threads = &C.threads; omp_set_num_threads(nf);
             if (o2->timelimit > 0) oc.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3);
             st = reduced_solve(R, &oc, xr, yr, csr, rsr, &is);
-        } else if (ipm_joined && C.J->done && C.J->st == 0) C.stop_ind = 1;     /* (the interior-point method's result, below) */
+        } else if (ipm_joined && C.J->done && C.J->st == 0) brisk_flag_set(&C.stop_ind, 1);     /* (the interior-point method's result, below) */
     }
     omp_set_num_threads(nt0);
     if (DJ) {
         /* the two simplex routes: the direct one won (it stopped the other), or it is told to stop and waited for (it reads
          * its flag every iteration) */
-        DJ->stop = 1;
+        brisk_flag_set(&DJ->stop, 1);
         if (!dj_joined) pthread_join(C.thd, NULL);
-        if (DJ->won && C.stop_ind) {
+        if (brisk_flag_get(&DJ->won) && brisk_flag_get(&C.stop_ind)) {
             st = DJ->st; is = DJ->info;
             memcpy(xr, DJ->x, sizeof(double) * R->n); memcpy(yr, DJ->y, sizeof(double) * R->m);
             memcpy(csr, DJ->cs, sizeof(int) * R->n); memcpy(rsr, DJ->rs, sizeof(int) * R->m);
-            C.stop_ind = 0;
+            brisk_flag_set(&C.stop_ind, 0);
             if (o2->verbose >= 1) printf(DJ->primal ? "  the primal simplex method ended first\n" : DJ->aggb ? "  the problem with the bounded substitution ended first\n" : "  the direct route ended first\n");
         }
         free(DJ->x); free(DJ->y); free(DJ->cs); free(DJ->rs); free(DJ); DJ = C.DJ = NULL;
@@ -4874,7 +6870,7 @@ static int race_route(const LpProb *R, const SimplexOpts *o2, int nf, double *xr
     IpmJob *J = C.J;
     if (!J) { *ir = is; *done = 1; pthread_mutex_destroy(&C.mu); return st; }
     int use_ipm = 0;
-    if (C.stop_ind) {       /* (the interior-point method ended optimal first; the simplex method stopped, possibly inside
+    if (brisk_flag_get(&C.stop_ind)) {       /* (the interior-point method ended optimal first; the simplex method stopped, possibly inside
                                the route through the dual problem, which then returns as not done) */
         if (!ipm_joined) pthread_join(C.th, NULL);          /* (it has ended: it set the flag) */
         use_ipm = J->done && J->st == 0;
@@ -4891,7 +6887,7 @@ static int race_route(const LpProb *R, const SimplexOpts *o2, int nf, double *xr
         /* the interior-point method is told to stop. It looks at its flag once per iteration, not during its analysis, so
          * it is left to end by itself on its copy of the problem (where on_exit is not available, it is waited for) */
         const double tw = now();
-        J->stop = 1;
+        brisk_flag_set(&J->stop, 1);
         if (ipm_joined) job_free(J);
         else {
 #ifdef SX_LEAVE
@@ -4978,7 +6974,7 @@ static double wrace_budget(void *v, double work) {
                 if (!W->busy) {
                     W->busy = 1;
                     pthread_mutex_unlock(&W->mu);
-                    const double wp = auto_wp(A, work);
+                    const double wp = auto_wp(A, work, 0);
                     if (wp > 0 && W->nipm >= 1) wrace_launch(A, W->nipm);
                     pthread_mutex_lock(&W->mu);
                     W->wp = wp; W->have_wp = 1; W->busy = 0;
@@ -4998,14 +6994,14 @@ static void *wrace_arm(void *p) {
     WArm *a = p; WRace *W = a->W;
     omp_set_num_threads(1);
     int ended;
-    if (a->me == 0) { a->dn = 0; a->st = dual_route(a->R, &a->o, a->x, a->y, a->cs, a->rs, &a->info, &a->dn); ended = a->dn && a->st != 6; }
+    if (a->me == 0) { a->dn = 0; BRISK_THREAD_GUARD(a->st = dual_route(a->R, &a->o, a->x, a->y, a->cs, a->rs, &a->info, &a->dn, NULL), (a->st = 4, a->dn = 0)); ended = a->dn && a->st != 6; }
     else {
         pthread_mutex_lock(&W->mu);
         while (!W->go) pthread_cond_wait(&W->cv, &W->mu);
         const int skip = W->skip;
         pthread_mutex_unlock(&W->mu);
         if (skip) { a->st = 6; return NULL; }
-        a->st = reduced_solve(a->R, &a->o, a->x, a->y, a->cs, a->rs, &a->info); ended = a->st != 6;
+        BRISK_THREAD_GUARD(a->st = reduced_solve(a->R, &a->o, a->x, a->y, a->cs, a->rs, &a->info), a->st = 4); ended = a->st != 6;
     }
     pthread_mutex_lock(&W->mu);
     if (ended) { W->ended[a->me] = 1; W->wend[a->me] = a->info.work; }
@@ -5057,6 +7053,98 @@ static int wrace_run(const LpProb *R, const SimplexOpts *os, AutoCtx *A, double 
     pthread_mutex_destroy(&W.mu); pthread_cond_destroy(&W.cv);
     return st;
 }
+/* (8 November 2026, a test: BRISK_SXFORMRACE=1) the dual simplex method alone on a tall problem, with two free threads or
+ * more: the problem itself and its dual problem each on half the threads, from the start. The route through the dual problem
+ * alone took 1.152 of the time of the problem itself on 26 tall LPs (each form far the better on some: ns1904248 0.74 against
+ * 37.7 s, genus-sym-g62-2 over 60 s against 4.5 s; neither form's share of columns without cost nor its start's dual
+ * infeasibilities separate them), the better of the two 0.705. The result by counted work, as wrace_run's: a route that ends
+ * gives its count, the other stops once its own passes it, and of the routes that end the one with less work gives the
+ * result: the same every run */
+typedef struct { WRace *W; int me, nt; const LpProb *R; SimplexOpts o; double *x, *y; int *cs, *rs; SimplexInfo info; int st, dn; } FArm;
+/* (on one thread the two take turns, W->go set: a route runs until its count passes the other's by a step, then waits
+ * for its turn; a route that has finished (W->skip bit) no longer takes one) */
+static double frace_budget(void *v, double work) {
+    FArm *a = v; WRace *W = a->W; const int me = a->me, ot = 1 - me;
+    pthread_mutex_lock(&W->mu);
+    const double thr = !W->ended[ot] ? 1e300 : me ? W->wend[0] : W->wend[1] * (1 + 1e-12);
+    double nb = work >= thr ? 0 : fmin(thr, work + fmax(1e6, 0.05 * work));
+    if (W->go && nb > 0) {
+        W->w0 = me ? W->w0 : work; W->wp = me ? work : W->wp;          /* the running counts: w0 the dual problem's, wp the problem's */
+        const double other = me ? W->w0 : W->wp;
+        nb = fmin(thr, fmax(work, other) + fmax(1e6, 0.05 * work));
+        if (!(W->skip & (1 << ot))) {
+            W->busy = ot; pthread_cond_broadcast(&W->cv);
+            while (W->busy != me && !(W->skip & (1 << ot))) pthread_cond_wait(&W->cv, &W->mu);
+        }
+    }
+    pthread_mutex_unlock(&W->mu);
+    return nb;
+}
+static void *frace_arm(void *p) {
+    FArm *a = p; WRace *W = a->W;
+    omp_set_num_threads(a->nt);
+    if (W->go) {     /* (one thread: the route through the dual problem first) */
+        pthread_mutex_lock(&W->mu);
+        while (W->busy != a->me && !(W->skip & (1 << (1 - a->me)))) pthread_cond_wait(&W->cv, &W->mu);
+        pthread_mutex_unlock(&W->mu);
+    }
+    int ended;
+    if (a->me == 0) { a->dn = 0; BRISK_THREAD_GUARD(a->st = dual_route(a->R, &a->o, a->x, a->y, a->cs, a->rs, &a->info, &a->dn, NULL), (a->st = 4, a->dn = 0)); ended = a->dn && a->st != 6; }
+    else { BRISK_THREAD_GUARD(a->st = reduced_solve(a->R, &a->o, a->x, a->y, a->cs, a->rs, &a->info), a->st = 4); ended = a->st != 6; }
+    pthread_mutex_lock(&W->mu);
+    if (ended) { W->ended[a->me] = 1; W->wend[a->me] = a->info.work; }
+    W->skip |= 1 << a->me; W->busy = 1 - a->me; pthread_cond_broadcast(&W->cv);
+    pthread_mutex_unlock(&W->mu);
+    return NULL;
+}
+static int frace_on(const LpProb *R, const SimplexOpts *o) {
+    static int on = -1; if (on < 0) { const char *e_ = getenv("BRISK_SXFORMRACE"); on = e_ && atoi(e_) == 1; }
+    /* (at every thread count, so that the result does not depend on it: on one thread the two forms share it) */
+    return on && o && o->method == 1 && !o->direct_peer && !o->in_dual && !o->dual_race && dual_route_applies(R);
+}
+/* the two forms run; *done set when one ended (its result in xr.. and *ir) */
+static int frace_run(const LpProb *R, const SimplexOpts *os, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done) {
+    *done = 0;
+    const int nf = omp_get_max_threads();
+    WRace W; memset(&W, 0, sizeof W); pthread_mutex_init(&W.mu, NULL); pthread_cond_init(&W.cv, NULL);
+    W.go = nf < 2; W.busy = 0;
+    FArm a[2]; memset(a, 0, sizeof a);
+    pthread_t th[2]; int ok[2] = { 0, 0 };
+    for (int k = 0; k < 2; k++) {
+        a[k].W = &W; a[k].me = k; a[k].nt = nf < 2 ? 1 : k ? nf / 2 : nf - nf / 2; a[k].R = R; a[k].o = *os;
+        a[k].o.threads = &a[k].nt; a[k].o.budget_cb = frace_budget; a[k].o.budget_ctx = &a[k];
+        a[k].o.workbudget = 1e6; a[k].o.no_dual_route = 1; a[k].o.dr_declined = NULL;
+        if (k == 1) a[k].o.verbose = 0;
+        a[k].x = malloc(sizeof(double) * (R->n + 1)); a[k].y = malloc(sizeof(double) * (R->m + 1));
+        a[k].cs = malloc(sizeof(int) * (R->n + 1)); a[k].rs = malloc(sizeof(int) * (R->m + 1));
+        if (!a[k].x || !a[k].y || !a[k].cs || !a[k].rs) {
+            for (int q = 0; q <= k; q++) { free(a[q].x); free(a[q].y); free(a[q].cs); free(a[q].rs); }
+            pthread_mutex_destroy(&W.mu); return 0;
+        }
+    }
+    if (os->verbose >= 1) printf("  the problem itself and its dual problem side by side, on %d and %d threads (the result by counted work)\n", a[1].nt, a[0].nt);
+    for (int k = 0; k < 2; k++) ok[k] = pthread_create(&th[k], NULL, frace_arm, &a[k]) == 0;
+    for (int k = 0; k < 2; k++) if (!ok[k]) frace_arm(&a[k]);     /* (no thread: run here, after or beside the other) */
+    for (int k = 0; k < 2; k++) if (ok[k]) pthread_join(th[k], NULL);
+    omp_set_num_threads(nf);
+    int win = -1;
+    if (W.ended[0] && W.ended[1]) win = W.wend[1] < W.wend[0] ? 1 : 0;
+    else if (W.ended[0]) win = 0;
+    else if (W.ended[1]) win = 1;
+    int st = 0;
+    if (win >= 0) {
+        memcpy(xr, a[win].x, sizeof(double) * R->n); memcpy(yr, a[win].y, sizeof(double) * R->m);
+        memcpy(csr, a[win].cs, sizeof(int) * R->n); memcpy(rsr, a[win].rs, sizeof(int) * R->m);
+        *ir = a[win].info; st = a[win].st; *done = 1;
+        if (os->verbose >= 1) {
+            if (W.ended[1 - win]) printf("  the %s ended with less counted work (%.3g against %.3g)\n", win ? "problem itself" : "dual problem", W.wend[win], W.wend[1 - win]);
+            else printf("  the %s ended (counted work %.3g); the other did not\n", win ? "problem itself" : "dual problem", W.wend[win]);
+        }
+    } else if (a[1].st == 6 || a[0].st == 6) { *ir = a[1].info; ir->iters += a[0].info.iters; st = 6; *done = 1; }
+    for (int k = 0; k < 2; k++) { free(a[k].x); free(a[k].y); free(a[k].cs); free(a[k].rs); }
+    pthread_mutex_destroy(&W.mu); pthread_cond_destroy(&W.cv);
+    return st;
+}
 #endif
 static int auto_route(const LpProb *R, const SimplexOpts *o2, double *xr, double *yr, int *csr, int *rsr, SimplexInfo *ir, int *done) {
     *done = 0;
@@ -5081,8 +7169,18 @@ static int auto_route(const LpProb *R, const SimplexOpts *o2, double *xr, double
     else
 #endif
     {
-        st = dual_route(R, &os, xr, yr, csr, rsr, &is, &dn);
-        if (!dn) { if (o2->timelimit > 0) os.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3); st = reduced_solve(R, &os, xr, yr, csr, rsr, &is); }   /* (the time left, 26 October 2026) */
+        st = dual_route(R, &os, xr, yr, csr, rsr, &is, &dn, NULL);
+        /* (14 November 2026, ISSUES 880) the route through the dual stopped by the budget (the interior-point method's predicted
+         * work reached, A.declined): the interior-point method follows at once. The problem itself was solved by the simplex
+         * method again, up to the first budget, and that solve's record replaced the dual's (neos-1367061's root LP, LP: the
+         * Summary's first solve 2,443 iterations in 0.14 s, where the dual simplex method had run about 1.4 s before it) */
+        if (!dn && A.declined) st = 6;
+        else if (!dn) {
+            SimplexInfo i0_ = is;
+            if (o2->timelimit > 0) os.timelimit = fmax(o2->timelimit - (now() - t0), 1e-3);   /* (the time left, 26 October 2026) */
+            st = reduced_solve(R, &os, xr, yr, csr, rsr, &is);
+            sxinfo_add(&is, &i0_); is.time += i0_.time;
+        }
     }
     auto_free(&A);
 #ifdef SX_RACE
@@ -5147,7 +7245,8 @@ static int sym_first(const LpProb *L, const SimplexOpts *o, double size_pre, dou
     LpProb Q; SxSym *M = NULL;
     /* (at most ten passes over the matrix: on problems whose columns share costs and bounds the classes by the data are
      * few and the rounds run long for nothing; ex9's classes take five rounds) */
-    if (!sxpre_symmetry(L, &Q, &M, o && o->verbose >= 1, 10.0 * ((double)L->Ap[L->n] + L->m + L->n))) return 0;
+    if (!sxpre_symmetry_cap(L, &Q, &M, o && o->verbose >= 1, 10.0 * ((double)L->Ap[L->n] + L->m + L->n), 0.7 * size_pre)
+        && !sxpre_symmetry_canon(L, &Q, &M, o && o->verbose >= 1, 10.0 * ((double)L->Ap[L->n] + L->m + L->n), o ? o->canon : NULL)) return 0;
     /* (used when the classes are at most 0.7 of the presolved problem's rows and columns, the ratio of the presolved
      * problem's own symmetry test: the presolve alone may reduce more) */
     if ((double)Q.m + Q.n > 0.7 * size_pre) { lp_free(&Q); sxpre_sym_free(M); return 0; }
@@ -5186,7 +7285,7 @@ static int simplex_solve_in(const LpProb *L, const SimplexOpts *o, double *xout,
                             int *rstat, SimplexInfo *info);
 /* the problem without its entries too small to matter (tiny_keep), when it has any; the solution's row activities are
  * then those of that problem (within 1e-10 of the given one's) */
-int simplex_solve(const LpProb *L, const SimplexOpts *o, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat,
+static int simplex_solve_body(const LpProb *L, const SimplexOpts *o, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat,
                   SimplexInfo *info) {
     sx_env_refresh();     /* (the settings' table of each thread is built again: the environment may have changed) */
     const int n = L->n, nz = L->Ap[n];
@@ -5273,6 +7372,39 @@ int simplex_crossover_dual(const LpProb *L, const SimplexOpts *o, const double *
     free(csd); free(rsd); free(xd); free(yd); free(ymin); lp_free(&D); sxpre_dual_free(M);
     return st;
 }
+static int sx_direct(const LpProb *L, const double *x, const double *ymin, const int *cs, const int *rs, double tol,
+                     double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat, double *objp, double *pinfp, double *dinfp);
+/* (13 November 2026) the point with every column at the bound its cost prefers (minimization: the lower bound for a positive
+ * cost, the upper for a negative one; a cost of zero: the lower bound if finite, else the upper, else zero) minimizes the cost
+ * over the bounds alone; when it satisfies every row within 1e-9 relative it is optimal for the LP, and the basis of the rows'
+ * logicals with y = 0 certifies it (every reduced cost is the cost, of the sign its bound needs). One pass over the matrix,
+ * ending at the first row or column that fails. neos-3148108-pahi (LP, 154,774 rows; 9 columns of cost 1, every column in
+ * [0, 1], x = 0 feasible): the presolve, the symmetry reduction, two more presolves and six factorizations took 0.13 s for 0
+ * iterations, where Gurobi's presolve removes every row and column. Returns 1 and fills the outputs as sx_solve_core does
+ * (status 0, no iteration, no factorization), or 0 (nothing written). BRISK_SXBOUNDPT=0: off */
+int sx_bound_point(const LpProb *L, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat, SimplexInfo *info) {
+    static int on = -1; if (on < 0) { const char *e_ = getenv("BRISK_SXBOUNDPT"); on = !(e_ && atoi(e_) == 0); }
+    const int m = L->m, n = L->n;
+    if (!on || m <= 0 || n <= 0) return 0;
+    const double sg = L->maxim ? -1.0 : 1.0;
+    double *x = xmalloc(sizeof(double) * ((size_t)n + 1)), *ymin = xcalloc((size_t)m + 1, sizeof(double));
+    int *cs = xmalloc(sizeof(int) * ((size_t)n + 1)), *rs = xmalloc(sizeof(int) * ((size_t)m + 1)), ok = 1;
+    for (int j = 0; j < n && ok; j++) {
+        const double c = sg * L->c[j], lj = L->l[j], uj = L->u[j];
+        const int lf = lj > -HUGEB, uf = uj < HUGEB;
+        if (lf && uf && lj == uj) { x[j] = lj; cs[j] = SX_FIXED; }
+        else if (c > 0 || (c == 0 && lf)) { if (!lf) ok = 0; else { x[j] = lj; cs[j] = SX_LOWER; } }
+        else if (c < 0 || uf) { if (!uf) ok = 0; else { x[j] = uj; cs[j] = SX_UPPER; } }
+        else { x[j] = 0; cs[j] = SX_ZERO; }
+    }
+    for (int i = 0; i < m; i++) rs[i] = SX_BASIC;
+    double obj = 0, pinf = 0, dinf = 0;
+    if (ok) ok = sx_direct(L, x, ymin, cs, rs, 1e-9, xout, axout, yout, zout, cstat, rstat, &obj, &pinf, &dinf);
+    free(x); free(ymin); free(cs); free(rs);
+    if (!ok) return 0;
+    if (info) { memset(info, 0, sizeof *info); info->status = 0; info->obj = obj; info->pinf = pinf; info->dinf = dinf; }
+    return 1;
+}
 /* (27 October 2026) the postsolved solution as the result, without the factorization of the problem as read, when it is
  * optimal there within 1e-9 relative (below the method's 1e-7 on the problem as read, 27.6): every value within its
  * bounds, every row activity within the row's, every nonbasic variable at the bound its status names, and every reduced
@@ -5345,7 +7477,7 @@ int simplex_postsolved_check(const LpProb *L, const double *x, const double *ymi
 static int sx_asread_check(const LpProb *L, const SimplexOpts *o, double t0, int st0, double *xout, double *axout, double *yout,
                            double *zout, int *cstat, int *rstat, SimplexInfo *info) {
     static int off = -1; if (off < 0) off = getenv("BRISK_SXNOASREADCHECK") != NULL;
-    if (off || (o && o->stop && *o->stop)) return -1;
+    if (off || (o && brisk_flag_get(o->stop))) return -1;
     /* (28 October 2026) an unbounded verdict stands when a column of the problem as read is a ray by its signs alone */
     if (st0 == 2 && lp_ray_column(L) >= 0) return -1;
     SimplexOpts o3; if (o) o3 = *o; else memset(&o3, 0, sizeof o3);
@@ -5376,34 +7508,36 @@ static int simplex_solve_in2(const LpProb *L, const SimplexOpts *o, double *xout
     SimplexInfo dummy; if (!info) info = &dummy;
     if ((o && (o->nopresolve || o->cstat0)) || getenv("BRISK_SXNOPRESOLVE")) return sx_solve_core(L, o, xout, axout, yout, zout, cstat, rstat, info);
     const double t0 = now();
+    /* (13 November 2026) every column at the bound its cost prefers: when that point satisfies every row it is optimal (it
+     * minimizes the cost over the bounds alone), with every row's logical basic and y = 0 (sx_bound_point) */
+    if (sx_bound_point(L, xout, axout, yout, zout, cstat, rstat, info)) {
+        info->time = now() - t0;
+        if (o && o->verbose >= 1) printf("  every column at the bound its cost prefers satisfies every row: optimal, with every row's logical basic\n");
+        return 0;
+    }
     LpProb R; SxPre *P = NULL; char why[160] = "";
-    const int sfs_ = sxpre_set_for_simplex(1);
+    /* (5 November 2026, an experiment: BRISK_SXAGGBSX=1) the dual or the primal simplex method alone: their presolve makes
+     * the bounded substitution of columns without cost itself (simplex_pre.c, g_sxpre_simplex 2), instead of the route
+     * below. Better on the satellites (LP; satellites4-25 4,040-5,167 iterations against the route's 5,829-6,557) but it
+     * breaks the symmetry the symmetry route uses (chromaticindex512-7, LP: 0 -> 55,661 iterations), makes neos-799716
+     * (LP) tall enough for the route through the dual (1,830 -> 21,714) and costs msc98-ip (LP) 9,125 -> 30,495 */
+    static int agsx = -1; if (agsx < 0) { const char *e_ = getenv("BRISK_SXAGGBSX"); agsx = e_ && atoi(e_) == 1; }
+    const int sfs_ = sxpre_set_for_simplex(agsx && o && (o->method == 1 || o->method == 2) ? 2 : 1);
     const int ps = sxpre_presolve(L, &R, &P, o ? o->verbose >= 1 : 0, why, sizeof why);
     sxpre_set_for_simplex(sfs_);
     const double tpre = now() - t0;
     if (!ps && getenv("BRISK_SXWRITE")) {   /* (experiments: the simplex methods' presolved problem as a free MPS file) */
         FILE *fw = fopen(getenv("BRISK_SXWRITE"), "w");
-        if (fw) {
-            fprintf(fw, "NAME sxpre\nROWS\n N obj\n");
-            for (int i = 0; i < R.m; i++) fprintf(fw, " %c r%d\n", R.rl[i] == R.ru[i] ? 'E' : R.rl[i] <= -LP_INF / 2 ? 'L' : 'G', i);
-            fprintf(fw, "COLUMNS\n");
-            for (int j = 0; j < R.n; j++) {
-                if (R.c[j] != 0) fprintf(fw, " x%d obj %.17g\n", j, R.maxim ? -R.c[j] : R.c[j]);
-                for (int p = R.Ap[j]; p < R.Ap[j + 1]; p++) fprintf(fw, " x%d r%d %.17g\n", j, R.Ai[p], R.Ax[p]);
+        if (fw && getenv("BRISK_SXWRITEMAP")) {     /* (experiments) the names of the rows and columns kept, as read */
+            FILE *fm = fopen(getenv("BRISK_SXWRITEMAP"), "w");
+            const int *rm, *cm; sxpre_maps(P, &rm, &cm);
+            if (fm) {
+                for (int i = 0; i < R.m; i++) fprintf(fm, "r %d %s\n", i, L->rname && rm ? L->rname[rm[i]] : "?");
+                for (int j = 0; j < R.n; j++) fprintf(fm, "c %d %s\n", j, L->cname && cm ? L->cname[cm[j]] : "?");
+                fclose(fm);
             }
-            fprintf(fw, "RHS\n");
-            for (int i = 0; i < R.m; i++) { const double b = R.rl[i] > -LP_INF / 2 ? R.rl[i] : R.ru[i]; if (b != 0) fprintf(fw, " rhs r%d %.17g\n", i, b); }
-            fprintf(fw, "RANGES\n");
-            for (int i = 0; i < R.m; i++) if (R.rl[i] != R.ru[i] && R.rl[i] > -LP_INF / 2 && R.ru[i] < LP_INF / 2) fprintf(fw, " rng r%d %.17g\n", i, R.ru[i] - R.rl[i]);
-            fprintf(fw, "BOUNDS\n");
-            for (int j = 0; j < R.n; j++) {
-                const double l = R.l[j], u = R.u[j];
-                if (l <= -LP_INF / 2 && u >= LP_INF / 2) { fprintf(fw, " FR bnd x%d\n", j); continue; }
-                if (l <= -LP_INF / 2) fprintf(fw, " MI bnd x%d\n", j); else if (l != 0) fprintf(fw, " LO bnd x%d %.17g\n", j, l);
-                if (u < LP_INF / 2) fprintf(fw, " UP bnd x%d %.17g\n", j, u);
-            }
-            fprintf(fw, "ENDATA\n"); fclose(fw);
         }
+        if (fw) write_free_mps(&R, fw);
     }
     if (ps) {
         sxpre_free(P);
@@ -5425,7 +7559,7 @@ static int simplex_solve_in2(const LpProb *L, const SimplexOpts *o, double *xout
         int *csr = malloc(sizeof(int) * (nr + 1)), *rsr = malloc(sizeof(int) * (mr + 1));
         double *xr = malloc(sizeof(double) * (nr + 1)), *yr = malloc(sizeof(double) * (mr + 1));
         SimplexOpts o2; if (o) o2 = *o; else memset(&o2, 0, sizeof o2);
-        o2.nopresolve = 1;
+        o2.nopresolve = 1; o2.direct_peer = NULL; o2.dr_declined = NULL;
         struct SxOut out; sxout_init(&out, L);
         struct SxOrig orig = { L, &out }; o2.orig = &orig;
         int done = 0;
@@ -5433,18 +7567,30 @@ static int simplex_solve_in2(const LpProb *L, const SimplexOpts *o, double *xout
         /* (27 October 2026, the night) and none once the caller's flag is set: a route stopped by it (sym_route's
          * solve on the classes) reported "not done", and the next one began with a whole set-up of the problem (the
          * default route's join of the dual simplex method waited 25-45 ms on n_quantile_07, LP) */
-        #define SX_LEFT() (!(o && o->stop && *o->stop) && (o && o->timelimit > 0 ? (o2.timelimit = o->timelimit - (now() - t0)) > 0 : 1))
+        #define SX_LEFT() (!(o && brisk_flag_get(o->stop)) && (o && o->timelimit > 0 ? (o2.timelimit = o->timelimit - (now() - t0)) > 0 : 1))
         const int sym = !(o && (o->nosymmetry || o->xstart || o->aggb_only)) && !getenv("BRISK_SXNOSYM");
         int aggb_declined = 0;
+        SimplexInfo isymf; memset(&isymf, 0, sizeof isymf);   /* (the counts of a route's attempt that did not give the result) */
         if (o && o->aggb_only) {
             /* (28 October 2026) the bounded substitution's job beside other methods: its route alone, or nothing */
-            if (aggb_applies(&R, &o2)) st = aggb_route(&R, &o2, xr, yr, csr, rsr, &ir, &done);
+            if (aggb_applies(&R, &o2)) st = aggb_route(&R, &o2, xr, yr, csr, rsr, &ir, &done, &isymf);
             if (!done) aggb_declined = 1;
             done = 1;
         }
-        SimplexInfo isymf; memset(&isymf, 0, sizeof isymf);
         if (sym) st = sym_route(&R, &o2, xr, yr, csr, rsr, &ir, &done, &isymf);
-        if (!done && SX_LEFT() && sym && !getenv("BRISK_SXNOSYMREAD")) {
+        /* (11 November 2026) not when the presolve changed nothing: the problem as read is then the presolved one, whose
+         * symmetry sym_route has just found of no use, and the same test on the same data repeats it (Htransport_10000, LP:
+         * two passes of the detection, about a tenth of the solve; the canonical form's test that could see more is off
+         * unless BRISK_LPFOLDSCALE) */
+        int same = R.m == L->m && R.n == L->n && R.Ap[R.n] == L->Ap[L->n] && R.c0 == L->c0 && R.maxim == L->maxim;
+        if (same) {
+            const size_t n_ = (size_t)L->n, m_ = (size_t)L->m, z_ = (size_t)L->Ap[L->n];
+            same = !memcmp(R.Ap, L->Ap, sizeof(int) * (n_ + 1)) && !memcmp(R.Ai, L->Ai, sizeof(int) * z_) && !memcmp(R.Ax, L->Ax, sizeof(double) * z_)
+                && !memcmp(R.c, L->c, sizeof(double) * n_) && !memcmp(R.l, L->l, sizeof(double) * n_) && !memcmp(R.u, L->u, sizeof(double) * n_)
+                && !memcmp(R.rl, L->rl, sizeof(double) * m_) && !memcmp(R.ru, L->ru, sizeof(double) * m_);
+        }
+        if (same && getenv("BRISK_LPFOLDSCALE") && atoi(getenv("BRISK_LPFOLDSCALE")) > 0) same = 0;
+        if (!done && SX_LEFT() && sym && !same && !getenv("BRISK_SXNOSYMREAD")) {
             /* the presolved problem has no symmetry of use: that of the problem as read, which the presolve may have
              * broken (sym_first); its result is final */
             int d2 = 0;
@@ -5458,15 +7604,41 @@ static int simplex_solve_in2(const LpProb *L, const SimplexOpts *o, double *xout
         }
         if (!done && SX_LEFT() && o && o->method == 3) st = ipm_route(&R, &o2, xr, yr, csr, rsr, &ir, &done);
         if (!done && SX_LEFT() && (!o || o->method == 0)) st = auto_route(&R, &o2, xr, yr, csr, rsr, &ir, &done);
-        {   static int pdr = -1; if (pdr < 0) { const char *e_ = getenv("BRISK_SXPDUALROUTE"); pdr = e_ ? atoi(e_) : 0; }   /* (4 November 2026, on trial) the primal method's route through the dual too */
-            if (!done && SX_LEFT() && (!o || o->method != 2 || pdr) && !(o && o->no_dual_route)) st = dual_route(&R, &o2, xr, yr, csr, rsr, &ir, &done); }
+        if (!done && SX_LEFT() && (!o || o->method != 2) && !(o && o->no_dual_route)) {
+            /* (7 November 2026) a declined route tells the job beside it that solves the problem itself (main.c's
+             * second simplex job, started on a test of the problem as read): it would repeat this solve */
+            int decl = 0; o2.dr_declined = &decl;
+#ifdef SX_RACE
+            if (frace_on(&R, o)) { o2.dr_declined = NULL; st = frace_run(&R, &o2, xr, yr, csr, rsr, &ir, &done); }
+            else
+#endif
+            st = dual_route(&R, &o2, xr, yr, csr, rsr, &ir, &done, &isymf);
+            o2.dr_declined = NULL;
+            volatile int *const dp = o ? o->direct_peer : NULL;
+            if (decl && dp) *dp = 1;
+        }
+        /* (5 November 2026) the dual or the primal simplex method alone: the route of the bounded substitution (aggb_route:
+         * the problem presolved once more with columns without cost substituted through short equations whose bounds the rows
+         * do not imply, solved, and the problem solved from the basis carried back), as the automatic method's second
+         * simplex job does; after the symmetry route, which the substitution would break (chromaticindex512-7, LP: 0 ->
+         * 55,661 iterations when it is part of the presolve). It is the reduction behind Gurobi's aggregation on the
+         * satellites (Gurobi with Aggregate=0: 2,248 -> 15,741 iterations on satellites2-25, LP): one thread, iterations of
+         * the four satellites (LP) over three random sequences 6,183-9,002 -> 1,896-2,447 (2-25), 6,226-8,880 -> 1,651-2,338
+         * (2-40), 4,444-5,308 -> 2,408-2,834 (2-60-fs), 10,710-15,340 -> 5,829-6,557 (4-25, held out). The substitution's two
+         * limits of 5 November 2026 (simplex_pre.c: one bound implied, no long row) took ofi (LP) from over 150 s back to its
+         * time without the route (three random sequences: 82,017-82,156 iterations against 83,909-84,371, CPU 1.00-1.07);
+         * on 71 other LPs the route touches, iterations 0.876 and CPU time 0.993 of before (geometric means; neos-4971100-bodrog
+         * 0.06, modszk1, uct-subprob, b1c1s1 0.40-0.43 of the iterations; the largest loss neos-3572885-glina 38 -> 61
+         * iterations, 0.22 -> 0.25 s). It also serves the default command line's dual simplex method beside the
+         * interior-point method (satellites2-25 at two threads 1.95 -> 0.69 s). BRISK_SXAGGBDUAL=0: not */
+        {   static int agd = -1; if (agd < 0) { const char *e_ = getenv("BRISK_SXAGGBDUAL"); agd = !(e_ && atoi(e_) == 0); }
+            if (agd && !agsx && !done && SX_LEFT() && o && (o->method == 1 || o->method == 2) && aggb_applies(&R, &o2)) st = aggb_route(&R, &o2, xr, yr, csr, rsr, &ir, &done, &isymf); }
         if (!done && SX_LEFT()) st = reduced_solve(&R, &o2, xr, yr, csr, rsr, &ir);
         if (!done && o && o->timelimit > 0 && o2.timelimit <= 0) { st = 6; ir.status = 6; }
-        if (!done && o && o->stop && *o->stop) { st = 6; ir.status = 6; }
+        if (!done && o && brisk_flag_get(o->stop)) { st = 6; ir.status = 6; }
         #undef SX_LEFT
         /* (the classes' solve that did not end optimal: its iterations counted with those that followed) */
-        ir.iters += isymf.iters; ir.iters_dual += isymf.iters_dual; ir.iters_primal += isymf.iters_primal; ir.iters_phase1 += isymf.iters_phase1;
-        ir.nfactor += isymf.nfactor; ir.nflips += isymf.nflips; ir.work += isymf.work;
+        sxinfo_add(&ir, &isymf);   /* (12 November 2026: with the solves' and the pricing's times) */
         if (aggb_declined) {
             free(csr); free(rsr); free(xr); free(yr); sxout_free(&out); lp_free(&R); sxpre_free(P);
             free(cs); free(rs); free(x); free(y);
@@ -5503,7 +7675,7 @@ static int simplex_solve_in2(const LpProb *L, const SimplexOpts *o, double *xout
         double obj, pinf, dinf;
         double *dx = NULL, *dax = NULL, *dy = NULL, *dz = NULL; int *dcs = NULL, *drs = NULL;
         if (sxdirect == 2) { dx = xmalloc(sizeof(double) * (n + 1)); dax = xmalloc(sizeof(double) * (m + 1)); dy = xmalloc(sizeof(double) * (m + 1)); dz = xmalloc(sizeof(double) * (n + 1)); dcs = xmalloc(sizeof(int) * (n + 1)); drs = xmalloc(sizeof(int) * (m + 1)); }
-        const int dok = sx_direct(L, x, y, cs, rs, 1e-9, sxdirect == 2 ? dx : xout, sxdirect == 2 ? dax : axout, sxdirect == 2 ? dy : yout,
+        const int dok = sx_direct(L, x, y, cs, rs, brisk_lpgrbtol() & LPGRB_SXROUNDS ? SX_GRB_TOL : 1e-9, sxdirect == 2 ? dx : xout, sxdirect == 2 ? dax : axout, sxdirect == 2 ? dy : yout,
                                   sxdirect == 2 ? dz : zout, sxdirect == 2 ? dcs : cstat, sxdirect == 2 ? drs : rstat, &obj, &pinf, &dinf);
         if (o && o->verbose >= 2) printf("  the postsolved solution %s on the problem as read (violations %.1e, %.1e)\n", dok ? "optimal" : "not optimal within 1e-9", pinf, dinf);
         if (dok && sxdirect == 1) {
@@ -5546,6 +7718,215 @@ static int simplex_solve_in2(const LpProb *L, const SimplexOpts *o, double *xout
     info->m_reduced = mr; info->n_reduced = nr; info->dualized = ir.dualized; info->sym_m = ir.sym_m; info->sym_n = ir.sym_n; info->pushes = ir.pushes; info->ipm_iters = ir.ipm_iters; info->t_ipm = ir.t_ipm; info->auto_ipm = ir.auto_ipm; info->raced = ir.raced;
     info->iters_first = ir.iters_first; info->t_first = ir.t_first;
     free(cs); free(rs); free(x); free(y);
+    return st;
+}
+
+/* (7 November 2026; ISSUES 843) with BRISK_LPGRBTOL=1 the methods stop by Gurobi's tolerances on the scaled problem, and
+ * one check on the problem as read keeps a plainly wrong result from being reported optimal: a row violated by more than
+ * SX_SANITY (1e-3) of its size (1 + |side| + sum_j |a_ij x_j|), a bound by more than SX_SANITY (1 + |bound|), or a reduced
+ * cost of the wrong sign by more than SX_SANITY (1 + the largest |c_j|): numerical difficulties. Rounding cannot reach
+ * these (the method's tolerances are 1e-6 on the scaled problem); a wrong basis or a lost factorization can */
+static double sx_sanity(const LpProb *L, const double *x, double dinf) {
+    const int m = L->m, n = L->n;
+    double *ax = xcalloc((size_t)m + 1, sizeof(double)), *an = xcalloc((size_t)m + 1, sizeof(double)), e = 0, cmax = 0;
+    for (int j = 0; j < n; j++) {
+        cmax = fmax(cmax, fabs(L->c[j]));
+        if (L->l[j] > -HUGEB) e = fmax(e, (L->l[j] - x[j]) / (1 + fabs(L->l[j])));
+        if (L->u[j] < HUGEB) e = fmax(e, (x[j] - L->u[j]) / (1 + fabs(L->u[j])));
+        for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { ax[L->Ai[p]] += L->Ax[p] * x[j]; an[L->Ai[p]] += fabs(L->Ax[p] * x[j]); }
+    }
+    for (int i = 0; i < m; i++) {
+        if (L->rl[i] > -HUGEB) e = fmax(e, (L->rl[i] - ax[i]) / (1 + fabs(L->rl[i]) + an[i]));
+        if (L->ru[i] < HUGEB) e = fmax(e, (ax[i] - L->ru[i]) / (1 + fabs(L->ru[i]) + an[i]));
+    }
+    free(ax); free(an);
+    return fmax(e, dinf / (1 + cmax));
+}
+static double *xoutpresent(const double *out, int k) { return out ? xmalloc(sizeof(double) * ((size_t)k + 1)) : NULL; }
+/* (14 November 2026, an experiment: BRISK_SXCANON=1) the problem solved in an order of its rows and columns that does not depend on
+ * the order it was written in: the rows sorted by their sides, their length and their sorted coefficients, then the columns
+ * lexicographically by the positions of their rows in that order (a stable sort: columns alike keep their order). Satellites4-25 (LP)
+ * is highly symmetric, and the method's choices among equal candidates follow the index: in the file the interchangeable columns come
+ * in a structured order and the bases stay sparse, in a shuffled copy they fill (the dual simplex method 37-41 s against 4 s; the copy
+ * so ordered 9.3 s, with the norm perturbation 4.5 s, Gurobi 4.4 s; bench/lp_r16/pertunits/micro15.txt). Not when a basis, a point or
+ * the presolve's maps are given (they are by the order as given) */
+static _Thread_local const LpProb *cn_L; static _Thread_local const int *cn_rp, *cn_rlen; static _Thread_local const double *cn_rv;
+static _Thread_local const int *cn_cp, *cn_cv;
+static int cn_rcmp(const void *a_, const void *b_) {
+    const int a = *(const int *)a_, b = *(const int *)b_; const LpProb *L = cn_L;
+    if (L->rl[a] != L->rl[b]) return L->rl[a] < L->rl[b] ? -1 : 1;
+    if (L->ru[a] != L->ru[b]) return L->ru[a] < L->ru[b] ? -1 : 1;
+    if (cn_rlen[a] != cn_rlen[b]) return cn_rlen[a] < cn_rlen[b] ? -1 : 1;
+    for (int k = 0; k < cn_rlen[a]; k++) { const double x = cn_rv[cn_rp[a] + k], y = cn_rv[cn_rp[b] + k]; if (x != y) return x < y ? -1 : 1; }
+    return a < b ? -1 : a > b;
+}
+static int cn_ccmp(const void *a_, const void *b_) {
+    const int a = *(const int *)a_, b = *(const int *)b_;
+    const int la = cn_cp[a + 1] - cn_cp[a], lb = cn_cp[b + 1] - cn_cp[b];
+    for (int k = 0; k < la && k < lb; k++) { const int x = cn_cv[cn_cp[a] + k], y = cn_cv[cn_cp[b] + k]; if (x != y) return x < y ? -1 : 1; }
+    if (la != lb) return la < lb ? -1 : 1;
+    return a < b ? -1 : a > b;
+}
+/* (the refinement rounds) rows by their signature's group, then lexicographically by their columns' positions, ties by the row's
+ * position before; columns by their rows' positions, ties by the column's position before */
+static _Thread_local const int *cn_gid, *cn_qpos, *cn_rcp, *cn_rcv, *cn_ppos;
+static int cn_rcmp2(const void *a_, const void *b_) {
+    const int a = *(const int *)a_, b = *(const int *)b_;
+    if (cn_gid[a] != cn_gid[b]) return cn_gid[a] < cn_gid[b] ? -1 : 1;
+    const int la = cn_rcp[a + 1] - cn_rcp[a], lb = cn_rcp[b + 1] - cn_rcp[b];
+    for (int k = 0; k < la && k < lb; k++) { const int x = cn_rcv[cn_rcp[a] + k], y = cn_rcv[cn_rcp[b] + k]; if (x != y) return x < y ? -1 : 1; }
+    if (la != lb) return la < lb ? -1 : 1;
+    return cn_qpos[a] < cn_qpos[b] ? -1 : cn_qpos[a] > cn_qpos[b];
+}
+static int cn_ccmp2(const void *a_, const void *b_) {
+    const int a = *(const int *)a_, b = *(const int *)b_;
+    const int la = cn_cp[a + 1] - cn_cp[a], lb = cn_cp[b + 1] - cn_cp[b];
+    for (int k = 0; k < la && k < lb; k++) { const int x = cn_cv[cn_cp[a] + k], y = cn_cv[cn_cp[b] + k]; if (x != y) return x < y ? -1 : 1; }
+    if (la != lb) return la < lb ? -1 : 1;
+    return cn_ppos[a] < cn_ppos[b] ? -1 : cn_ppos[a] > cn_ppos[b];
+}
+static int cn_icmp(const void *a_, const void *b_) { const int a = *(const int *)a_, b = *(const int *)b_; return a < b ? -1 : a > b; }
+static int cn_dcmp(const void *a_, const void *b_) { const double a = *(const double *)a_, b = *(const double *)b_; return a < b ? -1 : a > b; }
+/* (14 November 2026, an experiment: BRISK_SXRCM=1 with BRISK_SXCANON=1) the rows in reverse Cuthill-McKee order on the pattern of
+ * A A' (rows that share a column are neighbours): a breadth-first search from a row of the lowest degree in each connected part, each
+ * row's unvisited neighbours taken in increasing degree (ties by index), the order reversed at the end. The search scans each column
+ * once (all its rows are reached then), so its cost is that of the entries whatever the dense columns. The degree of a row is the
+ * count of entries of its columns less its own length (an upper bound of its degree in A A'). Satellites4-25 (LP) and its shuffled
+ * copies so ordered by scipy, then the columns lexicographically by the rows: 0.9-4.5 s against 36-44 s as shuffled, 3.6 s as written
+ * (bench/lp_r16/pertunits/micro18, micro19): rows that are near in the problem's structure come together, as in the file's own order */
+static _Thread_local const long *cn_deg;
+static int cn_degcmp(const void *a_, const void *b_) { const int a = *(const int *)a_, b = *(const int *)b_; if (cn_deg[a] != cn_deg[b]) return cn_deg[a] < cn_deg[b] ? -1 : 1; return a < b ? -1 : a > b; }
+static void cn_rcm_rows(const LpProb *L, int *q) {
+    const int m = L->m, n = L->n, nz = L->Ap[n];
+    int *rp = xcalloc((size_t)m + 2, sizeof(int)), *rj = xmalloc(sizeof(int) * ((size_t)nz + 1)), *f = xmalloc(sizeof(int) * ((size_t)m + 1));
+    for (int p = 0; p < nz; p++) rp[L->Ai[p] + 1]++;
+    for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
+    memcpy(f, rp, sizeof(int) * (size_t)m);
+    for (int j = 0; j < n; j++) for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) rj[f[L->Ai[p]]++] = j;   /* (each row's columns in increasing order) */
+    long *deg = xmalloc(sizeof(long) * ((size_t)m + 1));
+    for (int i = 0; i < m; i++) { long d = 0; for (int t = rp[i]; t < rp[i + 1]; t++) d += L->Ap[rj[t] + 1] - L->Ap[rj[t]]; deg[i] = d - (rp[i + 1] - rp[i]); }
+    int *byd = xmalloc(sizeof(int) * ((size_t)m + 1)); for (int i = 0; i < m; i++) byd[i] = i;
+    cn_deg = deg; qsort(byd, (size_t)m, sizeof(int), cn_degcmp);
+    unsigned char *vis = xcalloc((size_t)m + 1, 1), *cscan = xcalloc((size_t)n + 1, 1);
+    int nq = 0;
+    for (int s0 = 0; s0 < m; s0++) {
+        const int st = byd[s0]; if (vis[st]) continue;
+        vis[st] = 1; int head = nq; q[nq++] = st;
+        while (head < nq) {
+            const int i = q[head++]; const int k0 = nq;
+            for (int t = rp[i]; t < rp[i + 1]; t++) { const int j = rj[t]; if (cscan[j]) continue; cscan[j] = 1;
+                for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { const int r = L->Ai[p]; if (!vis[r]) { vis[r] = 1; q[nq++] = r; } } }
+            if (nq - k0 > 1) qsort(q + k0, (size_t)(nq - k0), sizeof(int), cn_degcmp);
+        }
+    }
+    for (int a = 0, b = m - 1; a < b; a++, b--) { const int t = q[a]; q[a] = q[b]; q[b] = t; }
+    free(rp); free(rj); free(f); free(deg); free(byd); free(vis); free(cscan);
+}
+static int simplex_solve_body(const LpProb *L, const SimplexOpts *o, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat,
+                              SimplexInfo *info);
+static int simplex_solve_canon(const LpProb *L, const SimplexOpts *o, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat,
+                               SimplexInfo *info) {
+    const int m = L->m, n = L->n, nz = L->Ap[n];
+    const double t0_ = now();
+    /* the rows' sorted coefficients */
+    int *rp = xcalloc((size_t)m + 2, sizeof(int)); double *rv = xmalloc(sizeof(double) * ((size_t)nz + 1));
+    for (int p = 0; p < nz; p++) rp[L->Ai[p] + 1]++;
+    for (int i = 0; i < m; i++) rp[i + 1] += rp[i];
+    int *fill = xmalloc(sizeof(int) * ((size_t)m + 1)); memcpy(fill, rp, sizeof(int) * (size_t)m);
+    for (int j = 0; j < n; j++) for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) rv[fill[L->Ai[p]]++] = L->Ax[p];
+    int *rlen = xmalloc(sizeof(int) * ((size_t)m + 1));
+    for (int i = 0; i < m; i++) { rlen[i] = rp[i + 1] - rp[i]; qsort(rv + rp[i], (size_t)rlen[i], sizeof(double), cn_dcmp); }
+    int *q = xmalloc(sizeof(int) * ((size_t)m + 1)), *qi = xmalloc(sizeof(int) * ((size_t)m + 1));
+    for (int i = 0; i < m; i++) q[i] = i;
+    cn_L = L; cn_rp = rp; cn_rv = rv; cn_rlen = rlen;
+    static int rcm_ = -1; if (rcm_ < 0) { const char *e_ = getenv("BRISK_SXRCM"); rcm_ = e_ ? atoi(e_) : 0; }
+    if (rcm_) cn_rcm_rows(L, q);    /* (BRISK_SXRCM=1: the rows in reverse Cuthill-McKee order) */
+    else qsort(q, (size_t)m, sizeof(int), cn_rcmp);
+    for (int k = 0; k < m; k++) qi[q[k]] = k;
+    /* the columns by their rows' new positions */
+    int *cv = xmalloc(sizeof(int) * ((size_t)nz + 1));
+    for (int j = 0; j < n; j++) { for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) cv[p] = qi[L->Ai[p]]; qsort(cv + L->Ap[j], (size_t)(L->Ap[j + 1] - L->Ap[j]), sizeof(int), cn_icmp); }
+    int *pc = xmalloc(sizeof(int) * ((size_t)n + 1));
+    for (int j = 0; j < n; j++) pc[j] = j;
+    cn_cp = L->Ap; cn_cv = cv;
+    if (rcm_ != 2) qsort(pc, (size_t)n, sizeof(int), cn_ccmp);   /* (BRISK_SXRCM=2: the rows reordered, the columns kept in their order) */
+    {   /* (BRISK_SXCANON=k, k >= 2) k - 1 refinement rounds: the rows of one signature reordered by their columns' positions, then the
+         * columns by the rows' new positions (as the symmetry detection refines its classes); what stays tied is interchangeable */
+        static int rounds_ = -1; if (rounds_ < 0) { const char *e_ = getenv("BRISK_SXCANON"); rounds_ = e_ ? atoi(e_) : 1; }
+        if (rounds_ >= 2) {
+            int *gid = xmalloc(sizeof(int) * ((size_t)m + 1)), *ppos = xmalloc(sizeof(int) * ((size_t)n + 1));
+            int g_ = 0;
+            for (int k = 0; k < m; k++) {
+                if (k > 0) { const int a = q[k - 1], b = q[k]; int same = L->rl[a] == L->rl[b] && L->ru[a] == L->ru[b] && rlen[a] == rlen[b];
+                    for (int t = 0; same && t < rlen[a]; t++) same = rv[rp[a] + t] == rv[rp[b] + t];
+                    if (!same) g_++; }
+                gid[q[k]] = g_;
+            }
+            /* the rows' columns (row-wise pattern) */
+            int *rcp = xcalloc((size_t)m + 2, sizeof(int)), *rcv = xmalloc(sizeof(int) * ((size_t)nz + 1)), *rf = xmalloc(sizeof(int) * ((size_t)m + 1));
+            for (int p = 0; p < nz; p++) rcp[L->Ai[p] + 1]++;
+            for (int i = 0; i < m; i++) rcp[i + 1] += rcp[i];
+            for (int r_ = 1; r_ < rounds_; r_++) {
+                for (int k = 0; k < n; k++) ppos[pc[k]] = k;
+                memcpy(rf, rcp, sizeof(int) * (size_t)m);
+                for (int j = 0; j < n; j++) for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) rcv[rf[L->Ai[p]]++] = ppos[j];
+                for (int i = 0; i < m; i++) qsort(rcv + rcp[i], (size_t)(rcp[i + 1] - rcp[i]), sizeof(int), cn_icmp);
+                cn_gid = gid; cn_qpos = qi; cn_rcp = rcp; cn_rcv = rcv;
+                qsort(q, (size_t)m, sizeof(int), cn_rcmp2);
+                for (int k = 0; k < m; k++) qi[q[k]] = k;
+                for (int j = 0; j < n; j++) { for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) cv[p] = qi[L->Ai[p]]; qsort(cv + L->Ap[j], (size_t)(L->Ap[j + 1] - L->Ap[j]), sizeof(int), cn_icmp); }
+                cn_ppos = ppos;
+                qsort(pc, (size_t)n, sizeof(int), cn_ccmp2);
+            }
+            free(gid); free(ppos); free(rcp); free(rcv); free(rf);
+        }
+    }
+    free(cv); free(fill); free(rlen); free(rv); free(rp);
+    /* the problem in that order */
+    LpProb P = *L;
+    P.Ap = xmalloc(sizeof(int) * ((size_t)n + 1)); P.Ai = xmalloc(sizeof(int) * ((size_t)nz + 1)); P.Ax = xmalloc(sizeof(double) * ((size_t)nz + 1));
+    P.c = xmalloc(sizeof(double) * ((size_t)n + 1)); P.l = xmalloc(sizeof(double) * ((size_t)n + 1)); P.u = xmalloc(sizeof(double) * ((size_t)n + 1));
+    P.rl = xmalloc(sizeof(double) * ((size_t)m + 1)); P.ru = xmalloc(sizeof(double) * ((size_t)m + 1));
+    P.rname = L->rname ? xmalloc(sizeof(char *) * ((size_t)m + 1)) : NULL; P.cname = L->cname ? xmalloc(sizeof(char *) * ((size_t)n + 1)) : NULL;
+    int e = 0;
+    for (int k = 0; k < n; k++) {
+        const int j = pc[k]; P.Ap[k] = e;
+        for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { P.Ai[e] = qi[L->Ai[p]]; P.Ax[e] = L->Ax[p]; e++; }
+        P.c[k] = L->c[j]; P.l[k] = L->l[j]; P.u[k] = L->u[j]; if (P.cname) P.cname[k] = L->cname[j];
+    }
+    P.Ap[n] = e;
+    for (int k = 0; k < m; k++) { P.rl[k] = L->rl[q[k]]; P.ru[k] = L->ru[q[k]]; if (P.rname) P.rname[k] = L->rname[q[k]]; }
+    /* the rows' entries in increasing order within each column (the solvers expect sorted columns) */
+    for (int k = 0; k < n; k++) for (int a = P.Ap[k] + 1; a < P.Ap[k + 1]; a++) { const int ti = P.Ai[a]; const double tx = P.Ax[a]; int b = a - 1;
+        while (b >= P.Ap[k] && P.Ai[b] > ti) { P.Ai[b + 1] = P.Ai[b]; P.Ax[b + 1] = P.Ax[b]; b--; } P.Ai[b + 1] = ti; P.Ax[b + 1] = tx; }
+    const double tcanon_ = now() - t0_;
+    SimplexOpts o2; if (o) o2 = *o; else memset(&o2, 0, sizeof o2);
+    double *ray2 = o && o->ray ? xcalloc((size_t)m + 1, sizeof(double)) : NULL; o2.ray = ray2;
+    o2.canon = NULL;
+    double *x2 = xoutpresent(xout, n), *ax2 = xoutpresent(axout, m), *y2 = xoutpresent(yout, m), *z2 = xoutpresent(zout, n);
+    int *cs2 = cstat ? xmalloc(sizeof(int) * ((size_t)n + 1)) : NULL, *rs2 = rstat ? xmalloc(sizeof(int) * ((size_t)m + 1)) : NULL;
+    const int st = simplex_solve_body(&P, &o2, x2, ax2, y2, z2, cs2, rs2, info);
+    for (int k = 0; k < n; k++) { const int j = pc[k]; if (xout) xout[j] = x2[k]; if (zout) zout[j] = z2[k]; if (cstat) cstat[j] = cs2[k]; }
+    for (int k = 0; k < m; k++) { const int i = q[k]; if (axout) axout[i] = ax2[k]; if (yout) yout[i] = y2[k]; if (rstat) rstat[i] = rs2[k]; if (ray2) o->ray[i] = ray2[k]; }
+    free(x2); free(ax2); free(y2); free(z2); free(cs2); free(rs2); free(ray2);
+    free(P.Ap); free(P.Ai); free(P.Ax); free(P.c); free(P.l); free(P.u); free(P.rl); free(P.ru); free(P.rname); free(P.cname);
+    free(q); free(qi); free(pc);
+    if (o && o->verbose >= 1) printf("  the problem solved in the order of its rows and columns by their entries (BRISK_SXCANON; the order %.3f s)\n", tcanon_);
+    return st;
+}
+int simplex_solve(const LpProb *L, const SimplexOpts *o, double *xout, double *axout, double *yout, double *zout, int *cstat, int *rstat,
+                  SimplexInfo *info) {
+    static int canon_ = -1; if (canon_ < 0) { const char *e_ = getenv("BRISK_SXCANON"); canon_ = e_ && atoi(e_) > 0; }
+    const int use_canon = canon_ && !(o && (o->cstat0 || o->rstat0 || o->xstart || o->ystart || o->orig));
+    const int st = use_canon ? simplex_solve_canon(L, o, xout, axout, yout, zout, cstat, rstat, info)
+                             : simplex_solve_body(L, o, xout, axout, yout, zout, cstat, rstat, info);
+    if (st != 0 || !xout || !(brisk_lpgrbtol() & LPGRB_SXROUNDS)) return st;
+    const double e = sx_sanity(L, xout, info->dinf);
+    if (!(e <= SX_SANITY)) {
+        info->status = 4; snprintf(info->why, sizeof info->why, "the result violates the problem as read by %.1e", e);
+        if (o && o->verbose >= 1) printf("  the result violates the problem as read by %.1e (beyond any rounding): numerical difficulties\n", e);
+        return 4;
+    }
     return st;
 }
 
@@ -5608,9 +7989,14 @@ struct SxModel {
     int xok, dok;                      /* the basic values and the reduced costs are those of the current basis, bounds and
                                           costs (an optimal solve leaves them so; a change of the bounds, the costs or the
                                           basis clears them): the next solve need not compute them again */
+    int xinc;                          /* (11 November 2026) the values in S->x are those of the last optimal solve's final check, for
+                                          the current basis and factorization: a change of bounds alone leaves them so (the nonbasic
+                                          values move only in the next solve, which then updates the basic values by the moves); a
+                                          given basis, a new factorization outside a solve or a trial undone clears it */
     double *ray, *pray;                /* the Farkas multipliers (m, as given) and the unbounded direction (N, scaled) */
     int have_farkas, have_pray, raysign;
     int cutoff;                        /* the last solve stopped at the cutoff (sxm_objective gives the bound then) */
+    signed char *isint;                /* (7 November 2026) the integer columns given by sxm_set_integer (n), NULL: none */
     signed char *hint;                 /* (27 October 2026) the side a basis given by sxm_set_basis put a variable at that was
                                           fixed then (+1 its lower bound, -1 its upper, 0 none): taken when a later bound
                                           change frees it (the MIP developer's ISSUES 542) */
@@ -5631,7 +8017,17 @@ SxModel *sxm_new(const LpProb *L, const double *cscale, const double *rscale, in
 }
 void sxm_free(SxModel *M) {
     if (!M) return;
-    sx_free(&M->S); free(M->ray); free(M->pray); free(M->hint); free(M);
+    sx_free(&M->S); free(M->ray); free(M->pray); free(M->hint); free(M->isint); free(M);
+}
+void sxm_set_integer(SxModel *M, const signed char *isint) {
+    Sx *S = &M->S;
+    free(M->isint); M->isint = NULL; S->isint = NULL;
+    if (!isint) return;
+    int any = 0; for (int j = 0; j < S->n; j++) if (isint[j]) { any = 1; break; }
+    if (!any) return;
+    M->isint = xmalloc((size_t)S->n + 1);
+    for (int j = 0; j < S->n; j++) M->isint[j] = isint[j] ? 1 : 0;
+    S->isint = M->isint;
 }
 void sxm_scaling(const SxModel *M, double *cscale, double *rscale, double *costscale) {
     const Sx *S = &M->S;
@@ -5685,7 +8081,7 @@ int sxm_set_basis_w(SxModel *M, const int *cstat, const int *rstat, int wmode) {
         M->hint[j] = (signed char)want;
     }
     const int nrep = refactor(S);
-    M->factored = 1; M->xok = M->dok = 0;
+    M->factored = 1; M->xok = M->dok = 0; M->xinc = 0;
     /* (27 October 2026, an experiment: BRISK_SXMEXACTW=1) the exact dual steepest-edge weights of the given basis, the
      * squared norms of the rows of its inverse (one backward solve a row), instead of the slack basis's 1 that
      * given_basis sets: the MIP developer's node LP of csched008 (LP) took 550 iterations from its parent's basis in a new
@@ -5730,6 +8126,146 @@ int sxm_set_basis_w(SxModel *M, const int *cstat, const int *rstat, int wmode) {
     }
     return nrep;
 }
+/* (7 November 2026; BRISK_SXPOLISH=1, off by default; only with integer flags given, sxm_set_integer) the LP solution
+ * polishing of SoPlex (Gleixner and others): at an optimal basis, pivots that keep it optimal and take integer columns out of
+ * the basis. A nonbasic row logical or continuous column of reduced cost within the dual tolerance enters by a primal step
+ * (an exact ratio test, the step of the least ratio; among exact ties an integer column leaves, then the largest |alpha|)
+ * when the variable that leaves is an integer column (it goes to a bound, integral); a pivot that would put another
+ * reduced cost beyond the tolerance, one whose pivot is below 1e-7 or a hundredth of its column's largest entry, a bound
+ * flip of the entering variable and an unbounded step are not made. The objective does not change (the reduced cost of
+ * the entering variable is zero up to the tolerance), every value stays within its bounds, and the basis has one integer
+ * column fewer. Passes over the candidates in the order of their indices (BRISK_SXPOLISH=k: at most k passes, until one
+ * makes no pivot); then a new factorization and the values. On
+ * a relaxation with a zero objective every candidate has reduced cost zero. Returns the pivots made */
+/* one polishing attempt: q enters by a primal step when the variable that leaves is an integer column and every reduced cost
+ * stays within the tolerance (see polish_int); returns 1 when the pivot was made */
+static int polish_try(Sx *S, int q) {
+    const int n = S->n;
+    SxVec *col = &S->col, *rho = &S->rho, *tau = &S->tau;
+    const double dir = (double)S->move[q];
+    sxv_clear(col); col_scatter(S, q, col, 1.0);
+    ftran(S, col, &S->dens_col, &S->spike);
+    if (col->cnt < 0) sxv_reindex(col);
+    double tmin = SX_INF, amax = 0; int r = -1, rint = 0; double ar_ = 0, bnd = 0;
+    for (int k = 0; k < col->cnt; k++) { const double a = fabs(col->val[col->idx[k]]); if (a > amax) amax = a; }
+    for (int k = 0; k < col->cnt; k++) {
+        const int i = col->idx[k];
+        const double a = dir * col->val[i];
+        if (fabs(a) < 1e-9) continue;
+        const int j = S->basic[i];
+        const double v = S->x[j];
+        double t; double b;
+        if (a > 0) { if (S->lo[j] <= -SX_INF) continue; t = (v - S->lo[j]) / a; b = S->lo[j]; }
+        else { if (S->up[j] >= SX_INF) continue; t = (S->up[j] - v) / -a; b = S->up[j]; }
+        if (t < 0) t = 0;
+        const int isi = j < n && S->isint[j];
+        const int better = t < tmin * (1 - 1e-12) - 1e-15 ||
+            (!(t > tmin * (1 + 1e-12) + 1e-15) && (isi > rint || (isi == rint && fabs(a) > fabs(ar_))));
+        if (r < 0 || better) { tmin = t; r = i; rint = isi; ar_ = a; bnd = b; }
+    }
+    if (r < 0 || !rint) { sxv_clear(col); return 0; }
+    if (S->up[q] - S->lo[q] <= tmin) { sxv_clear(col); return 0; }            /* (a bound flip of q first) */
+    const double ar = col->val[r];
+    if (fabs(ar) < 1e-7 || fabs(ar) < 1e-2 * amax) { sxv_clear(col); return 0; }
+    /* the pivotal row: the reduced costs after the pivot must stay within the tolerance */
+    sxv_clear(rho); rho->val[r] = 1; rho->idx[0] = r; rho->cnt = 1;
+    btran(S, rho, &S->dens_rho, &S->upart);
+    if (rho->cnt < 0) sxv_reindex(rho);
+    price(S, rho);
+    const double thd = S->d[q] / ar;
+    int ok = 1;
+    if (thd != 0) for (int k = 0; k < S->row.cnt && ok; k++) {
+        const int j = S->row.idx[k]; if (j == q || S->lo[j] == S->up[j]) continue;
+        const double dn = S->d[j] - thd * S->row.val[j];
+        if (S->move[j] == 0 ? fabs(dn) > S->told : S->move[j] * dn < -S->told) ok = 0;
+    }
+    const int jl = S->basic[r];
+    if (ok && thd != 0) { const double dl = -thd; const int mvl = S->lo[jl] == S->up[jl] ? 0 : bnd == S->lo[jl] ? 1 : -1; if (mvl * dl < -S->told) ok = 0; }
+    if (!ok) { sxv_clear(col); sxv_clear(rho); return 0; }
+    double wr = 0; for (int k = 0; k < rho->cnt; k++) wr += rho->val[rho->idx[k]] * rho->val[rho->idx[k]];
+    sxv_copy(tau, rho);
+    { double dd = S->dens_tau; ftran(S, tau, &dd, NULL); if (tau->cnt < 0) sxv_reindex(tau); }
+    update_dse(S, r, col, tau, wr);
+    if (S->wlazy) S->wk[r] = 1;
+    for (int k = 0; k < S->row.cnt; k++) { const int j = S->row.idx[k]; S->d[j] -= thd * S->row.val[j]; }
+    S->d[q] = 0; S->d[jl] = -thd;
+    const double step = tmin * dir;
+    for (int k = 0; k < col->cnt; k++) { const int i = col->idx[k]; S->x[S->basic[i]] -= step * col->val[i]; }
+    S->x[q] += step;
+    S->x[jl] = bnd;
+    S->basic[r] = q; S->pos[q] = r; S->move[q] = 0; S->pos[jl] = -1;
+    rows_enter(S, q); rows_leave(S, jl);
+    S->move[jl] = S->lo[jl] == S->up[jl] ? 0 : bnd == S->lo[jl] ? 1 : -1;
+    const int bad = sxlu_update(&S->F, r, &S->spike, &S->upart, ar);
+    sxv_clear(col); sxv_clear(rho); sxv_clear(tau); sxv_clear(&S->row);
+    if (bad || need_refactor(S)) { refactor(S); compute_primal_dual(S); }
+    return 1;
+}
+static long polish_int(Sx *S) {
+    if (!S->isint) return 0;
+    const int n = S->n, N = S->N;
+    long npiv = 0, ntry = 0;
+    static int npass = -1; if (npass < 0) { const char *e = getenv("BRISK_SXPOLISH"); npass = e ? atoi(e) : 1; if (npass < 1) npass = 1; }
+    /* (8 November 2026, BRISK_SXPOLISHCOST=bits, off: 0; the MIP developer's measurement: polishing on every node LP doubled
+     * a node's cost on neos-3734794-moppy, MILP, where most nonbasic variables have reduced cost zero and each costs a
+     * forward solve while few pivots are made) 1: a budget, the attempts at most the solve's own iterations (and 50);
+     * 2: from the integer side when the basic integer columns are fewer than the candidates: for each basic integer column
+     * its row of the tableau (one backward solve and a priced row), and only the candidates with an entry in that row tried,
+     * the largest entries first, at most four a row; either side makes the same kind of pivot */
+    static int pcost = -1; if (pcost < 0) { const char *e = getenv("BRISK_SXPOLISHCOST"); pcost = e ? atoi(e) : 0; }
+    const long budget = pcost & 1 ? (S->iter > 50 ? S->iter : 50) : LONG_MAX;
+    #define POLISH_CAND(q) (S->pos[q] < 0 && S->lo[q] != S->up[q] && S->move[q] != 0 && !((q) < n && S->isint[q]) && fabs(S->d[q]) <= S->told)
+    int byrow = 0;
+    if (pcost & 2) {
+        long nbint = 0, ncand = 0;
+        for (int i = 0; i < S->m; i++) { const int j = S->basic[i]; if (j < n && S->isint[j] && (fabs(S->x[j] - S->lo[j]) <= S->tolp * (1 + fabs(S->lo[j])) || fabs(S->x[j] - S->up[j]) <= S->tolp * (1 + fabs(S->up[j])))) nbint++; }
+        for (int q = 0; q < N; q++) if (POLISH_CAND(q)) ncand++;
+        byrow = nbint < ncand;
+    }
+    if (byrow) {
+        const int m = S->m;
+        int *rows = xmalloc(sizeof(int) * ((size_t)m + 1)), *cq = xmalloc(sizeof(int) * ((size_t)N + 1)); double *ca = xmalloc(sizeof(double) * ((size_t)N + 1));
+        /* (only the rows whose integer column sits at a bound: on a degenerate vertex the step is zero, and the integer row wins
+         * the ties of the ratio test; a column inside its bounds leaves only when its ratio is the least of all, which a
+         * degenerate vertex's other rows at zero steps prevent) */
+        int nr = 0; for (int i = 0; i < m; i++) { const int j = S->basic[i];
+            if (j < n && S->isint[j] && (fabs(S->x[j] - S->lo[j]) <= S->tolp * (1 + fabs(S->lo[j])) || fabs(S->x[j] - S->up[j]) <= S->tolp * (1 + fabs(S->up[j])))) rows[nr++] = i; }
+        SxVec *rho = &S->rho;
+        for (int t = 0; t < nr && ntry < budget; t++) {
+            const int r = rows[t], jb = S->basic[r];
+            if (!(jb < n && S->isint[jb])) continue;           /* (an earlier pivot changed this row's basic variable) */
+            sxv_clear(rho); rho->val[r] = 1; rho->idx[0] = r; rho->cnt = 1;
+            { double dd = S->dens_rho; btran(S, rho, &dd, NULL); }
+            if (rho->cnt < 0) sxv_reindex(rho);
+            price(S, rho);
+            int nc = 0;
+            for (int k = 0; k < S->row.cnt; k++) { const int q = S->row.idx[k]; const double a = fabs(S->row.val[q]); if (a >= 1e-7 && POLISH_CAND(q)) { cq[nc] = q; ca[nc] = a; nc++; } }
+            sxv_clear(rho); sxv_clear(&S->row);
+            ntry++;
+            for (int z = 0; z < 4 && z < nc && ntry < budget; z++) {
+                int b = z; for (int y = z + 1; y < nc; y++) if (ca[y] > ca[b] || (ca[y] == ca[b] && cq[y] < cq[b])) b = y;
+                { const int tq = cq[z]; cq[z] = cq[b]; cq[b] = tq; const double ta = ca[z]; ca[z] = ca[b]; ca[b] = ta; }
+                ntry++;
+                if (polish_try(S, cq[z])) { npiv++; break; }
+            }
+        }
+        free(rows); free(cq); free(ca);
+    } else
+    for (int pass = 0; pass < npass; pass++) {
+    const long np0 = npiv;
+    for (int q = 0; q < N && ntry < budget; q++) {
+        if (!POLISH_CAND(q)) continue;
+        ntry++;
+        if (polish_try(S, q)) npiv++;
+    }
+    if (npiv == np0) break;
+    }
+    #undef POLISH_CAND
+    if (npiv) { refactor(S); compute_primal_dual(S); S->heap_ok = 0; S->ch_ok = 0; }
+    {   static int ipd = -1; if (ipd < 0) ipd = getenv("BRISK_SXINTPREFDBG") != NULL;
+        if (ipd) fprintf(stderr, "polish: %ld candidates, %ld pivots\n", ntry, npiv); }
+    return npiv;
+}
 int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
     Sx *S = &M->S;
     const int N = S->N;
@@ -5745,9 +8281,15 @@ int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
     S->tolp = o && o->tol_primal > 0 ? o->tol_primal : 1e-7;
     S->told = o && o->tol_dual > 0 ? o->tol_dual : 1e-7;
     M->have_farkas = M->have_pray = 0; S->have_ray = 0; S->have_pray = 0; M->cutoff = 0;
-    for (int j = 0; j < N; j++) if (S->lo0[j] > S->up0[j] + 1e-9 * (1 + fabs(S->lo0[j]))) { res->status = 1; return 1; }
+    /* (11 November 2026) the same pass counts the boxed variables for the perturbation at the start (perturb_first's own pass
+     * over all variables, on the working bounds, which are these after sxm_reset_work) */
+    int nbox0 = 0;
+    for (int j = 0; j < N; j++) {
+        if (S->lo0[j] > S->up0[j] + 1e-9 * (1 + fabs(S->lo0[j]))) { res->status = 1; return 1; }
+        nbox0 += S->lo0[j] > -SX_INF && S->up0[j] < SX_INF;
+    }
     sxm_reset_work(S);
-    if (!M->factored) { refactor(S); M->factored = 1; M->xok = M->dok = 0; }
+    if (!M->factored) { refactor(S); M->factored = 1; M->xok = M->dok = 0; M->xinc = 0; }
     /* (the values of the last optimal solve kept when nothing they depend on changed: a re-solve with nothing changed,
      * or after a cost change only, skips one or both passes over the matrix) */
     /* (27 October 2026) the reduced costs before the nonbasic variables are placed: they depend on the basis and the
@@ -5756,26 +8298,45 @@ int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
     /* the nonbasic variables at their bounds again: a bound that moved takes the variable with it; one that was fixed
      * goes to the side a given basis named for it (M->hint), else, like one that lost the bound it was at, to the bound
      * its reduced cost asks for */
+    /* (11 November 2026) and in the same pass the dual infeasibilities after the placement (they depend on the reduced costs
+     * and the sides only, which nothing below changes before they are used): of variables a bound flip cannot help, of boxed
+     * ones. Two passes over all variables before */
+    int dnb = 0, dbox = 0;
+    /* (11 November 2026) the basic values updated by the moves of the nonbasic values when they are those of the last optimal
+     * solve's final check (M->xinc): x_B -= B^-1 sum_j a_j (x_j new - x_j old), one forward solve, none when nothing moved (a
+     * branch on a basic variable), instead of the whole computation (compute_primal: a pass over every nonbasic column and a
+     * forward solve); 6 % of the mixed-integer solver's time on a multiple knapsack MILP. BRISK_SXMXINC=0: as before */
+    static int xinc_on = -1; if (xinc_on < 0) { const char *e_ = getenv("BRISK_SXMXINC"); xinc_on = !(e_ && atoi(e_) == 0); }
+    const int useinc = !M->xok && M->xinc && xinc_on;
+    SxVec *dv = &S->col; int nmoved = 0;
+    if (useinc) sxv_clear(dv);
     for (int j = 0; j < N; j++) {
         if (S->pos[j] >= 0) continue;
         const double l = S->lo[j], u = S->up[j]; const int mv = S->move[j];
-        if (l == u) { S->move[j] = 0; S->x[j] = l; }
+        const double xo = S->x[j];
+        if (l == u) { S->move[j] = 0; S->x[j] = l; if (useinc && S->x[j] != xo) { col_scatter(S, j, dv, -(S->x[j] - xo)); nmoved++; } continue; }
         else if (mv == 0 && M->hint[j] > 0 && l > -SX_INF) { S->move[j] = 1; S->x[j] = l; M->hint[j] = 0; }
         else if (mv == 0 && M->hint[j] < 0 && u < SX_INF) { S->move[j] = -1; S->x[j] = u; M->hint[j] = 0; }
         else if (mv == 0 || (mv > 0 && l <= -SX_INF) || (mv < 0 && u >= SX_INF)) set_nonbasic(S, j, S->d[j]);
         else S->x[j] = mv > 0 ? l : u;
-    }
-    if (!M->xok) compute_primal(S);
-    int fresh0 = 0;      /* (optimal as it stands: the values computed above are those to check at the end) */
-    S->cut_on = o && o->cutoff_on; S->cut_val = S->cut_on ? (S->maxim ? -o->cutoff : o->cutoff) / S->costscale : 0;
-    const int pinf = primal_infeasible(S);
-    int dnb = 0, dbox = 0;      /* dual infeasibilities: of variables a bound flip cannot help, of boxed ones */
-    for (int j = 0; j < N; j++) {
-        if (S->pos[j] >= 0 || S->lo[j] == S->up[j]) continue;
+        if (useinc && S->x[j] != xo) { col_scatter(S, j, dv, -(S->x[j] - xo)); nmoved++; }
         const double dj = S->d[j];
         const int bad = S->move[j] == 0 ? fabs(dj) > S->told : S->move[j] * dj < -S->told;
-        if (bad) { if (is_boxed(S, j)) dbox++; else dnb++; }
+        if (bad) { if (l > -SX_INF && u < SX_INF) dbox++; else dnb++; }
     }
+    if (useinc) {
+        if (nmoved) {
+            double dd = 0; ftran(S, dv, &dd, NULL);     /* (a local density: the entering columns' estimate stays theirs) */
+            if (dv->cnt < 0) { for (int i = 0; i < S->m; i++) S->x[S->basic[i]] += dv->val[i]; }
+            else for (int k = 0; k < dv->cnt; k++) { const int i = dv->idx[k]; S->x[S->basic[i]] += dv->val[i]; }
+        }
+        sxv_clear(dv);
+    } else if (!M->xok) compute_primal(S);
+    M->xinc = 0;
+    int fresh0 = 0;      /* (optimal as it stands: the values computed above are those to check at the end) */
+    S->cut_skip = 0;   /* (a pause from an earlier solve does not carry over) */
+    S->cut_on = o && o->cutoff_on; S->cut_val = S->cut_on ? (S->maxim ? -o->cutoff : o->cutoff) / S->costscale : 0;
+    const int pinf = primal_infeasible(S);
     int st;
     S->noverify = 1;
     /* (23 October 2026) the costs perturbed at the start of a solve by the dual method, as the first solve's are (the end
@@ -5784,18 +8345,18 @@ int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
      * over 600 s -> 38 s; air05, binkar10_1, mas76, 30n20b8 about the same */
     static int sxmpert = -1; if (sxmpert < 0) sxmpert = !(getenv("BRISK_SXMPERT") && atoi(getenv("BRISK_SXMPERT")) == 0);
     /* (fresh: the loop entered directly uses the factorization and the values computed above) */
-    if (!pinf && !dnb && !dbox) { st = 0; fresh0 = 1; }
+    if (!pinf && !dnb && !dbox) { st = 0; fresh0 = !useinc; }     /* (updated values are checked on a fresh computation) */
     else if (M->cost_changed && !pinf) { S->fresh = 1; st = primal_simplex(S, 1); }
     else if (!dnb) {
         if (dbox) { for (int j = 0; j < N; j++) if (S->pos[j] < 0 && is_boxed(S, j)) set_nonbasic(S, j, S->d[j]); compute_primal(S); }
         S->phase = 2; S->fresh = 1;
-        if (sxmpert) perturb_first(S);
+        if (sxmpert) { S->nbox_given = nbox0; S->nbox_given_ok = 1; perturb_first(S); }
         st = dual_loop(S);
     } else if (!pinf) { S->fresh = 1; st = primal_simplex(S, 1); }
-    else { if (sxmpert) perturb_first(S); st = dual_simplex(S); if (st == 2) st = primal_simplex(S, 1); }
+    else { if (sxmpert) { S->nbox_given = nbox0; S->nbox_given_ok = 1; perturb_first(S); } st = dual_simplex(S); if (st == 2) st = primal_simplex(S, 1); }
     /* (25 October 2026) an infeasibility the dual method could not prove (dual_loop's status 4): the primal method
      * decides */
-    if (st == 4) { sxm_reset_work(S); normalize_nonbasic(S); compute_primal(S); compute_dual(S); S->fresh = 1; st = primal_simplex(S, 1); }
+    if (st == 4) { sxm_reset_work(S); normalize_nonbasic(S); compute_primal_dual(S); S->fresh = 1; st = primal_simplex(S, 1); }
     /* an infeasibility found by the primal method's phase 1: the dual method from there, for the proof */
     if (st == 1 && !S->have_ray) { sxm_reset_work(S); normalize_nonbasic(S); compute_primal(S); const int s2 = dual_simplex(S); if (s2 == 1 || s2 == 3 || s2 == 6) st = s2; }
     /* the problem's own costs and bounds; the violations on the problem as given (as sx_solve_core), the updated
@@ -5808,7 +8369,7 @@ int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
     S->tiny_on = 1; if (S->tiny) memset(S->tiny, 0, (size_t)S->tiny_n);
     for (int round = 0; round < 5 && st == 0; round++) {
         sxm_reset_work(S); normalize_nonbasic(S);
-        if (!(round == 0 && fresh0)) { compute_primal(S); compute_dual(S); }
+        if (!(round == 0 && fresh0)) { compute_primal_dual(S); }
         double pv, dv, psv, dsv; unscaled_violations(S, tgp, tgd, &pv, &dv, &psv, &dsv);
         /* (1 November 2026) the violations over the target come from the updated factorization's error or are the basis's
          * own (basic values outside their bounds by about the tolerance, which the method's scaled tolerance accepted): one
@@ -5827,7 +8388,7 @@ int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
             unscaled_violations(S, tgp, tgd, &pv, &dv, &psv, &dsv);
             facterr = (pv0 > tgp && pv < 0.9 * pv0) || (dv0 > tgd && dv < 0.9 * dv0);
         }
-        if ((pv > tgp || dv > tgd) && S->F.nupd > 0 && facterr) { refactor(S); compute_primal(S); compute_dual(S); unscaled_violations(S, tgp, tgd, &pv, &dv, &psv, &dsv); }
+        if ((pv > tgp || dv > tgd) && S->F.nupd > 0 && facterr) { refactor(S); compute_primal_dual(S); unscaled_violations(S, tgp, tgd, &pv, &dv, &psv, &dsv); }
         if (pv <= tgp && dv <= tgd) break;
         /* (27 October 2026, the night; ISSUES 603) violations above the target after the rounds: not optimal */
         if (round == 4) { st = 4; break; }
@@ -5839,13 +8400,33 @@ int sxm_solve(SxModel *M, const SxmOpts *o, SxmRes *res) {
         else { S->tolp = fmax(fmin(S->tolp * 0.5 * tgp / pv, 0.5 * psv), 1e-12); st = dual_loop(S); }
     }
     S->tiny_on = 0;
+    /* (SxmOpts.polish = LmOpts.polish, or BRISK_SXPOLISH=1 everywhere, with integer flags) the optimal basis polished: integer columns out of it (polish_int) */
+    {   static int pol = -1; if (pol < 0) pol = getenv("BRISK_SXPOLISH") && atoi(getenv("BRISK_SXPOLISH")) > 0;
+        if ((pol || (o && o->polish)) && st == 0 && S->isint) {
+            /* (8 November 2026, the MIP developer: up to 3.4e-7 left on csched008, MILP) when the pivots leave a violation
+             * above the target, the same final rounds as above repair it from the polished basis (the dual method for
+             * values beyond their bounds, the primal for reduced costs of the wrong sign), so that an optimal status still
+             * means within the targets; at most three rounds, the status from the last */
+            if (polish_int(S) > 0) {
+                for (int rr = 0; rr < 3 && st == 0; rr++) {
+                    double pv, dv, psv, dsv; unscaled_violations(S, tgp, tgd, &pv, &dv, &psv, &dsv);
+                    if (pv <= tgp && dv <= tgd) break;
+                    if (getenv("BRISK_SXINTPREFDBG")) fprintf(stderr, "polish: violations %.2e %.2e after the pivots, repaired\n", pv, dv);
+                    st = dv > tgd ? primal_simplex(S, 1) : dual_loop(S);
+                }
+            }
+        } }
     S->fresh = 0; S->noverify = 0;
     M->cost_changed = 0;
     M->xok = M->dok = st == 0;
+    M->xinc = st == 0;
     M->cutoff = st == 7;
     M->have_farkas = st == 1 && S->have_ray; M->raysign = S->raymo < 0 ? -1 : 1;
     M->have_pray = st == 2 && S->have_pray;
     res->status = st; res->iters = S->iter; res->iters_dual = S->it_dual; res->iters_primal = S->it_primal;
+    {   static int ipd = -1; if (ipd < 0) ipd = getenv("BRISK_SXINTPREFDBG") != NULL;   /* (a diagnostic: the choices the integer preference changed) */
+        if (ipd) { fprintf(stderr, "intpref: %ld choices changed in %ld iterations; entering: %ld integer, %ld other; integer heads kept: %ld with an alternative below the |alpha| test, %ld with none\n", S->n_intpref, S->iter, S->n_ent_int, S->n_ent_oth, S->n_ip_small, S->n_ip_none); }
+        S->n_intpref = S->n_ent_int = S->n_ent_oth = S->n_ip_small = S->n_ip_none = 0; }
     res->nfactor = S->nfactor - nf0; res->work = S->work - w0;
     return st;
 }
@@ -5914,7 +8495,7 @@ void sxm_binva_row(SxModel *M, int i, double *out) {
     sxv_clear(rho);
 }
 struct SxmSaved {
-    int m, N, factored;
+    int m, N, factored, xinc;
     int *basic, *pos; signed char *move; double *x, *d, *w, *lo0, *up0;
     char *wk; int wlazy;
     SxLU F;
@@ -5922,7 +8503,7 @@ struct SxmSaved {
 SxmSaved *sxm_save(const SxModel *M) {
     const Sx *S = &M->S; const int m = S->m, N = S->N;
     SxmSaved *V = xcalloc(1, sizeof *V);
-    V->m = m; V->N = N; V->factored = M->factored;
+    V->m = m; V->N = N; V->factored = M->factored; V->xinc = M->xinc;
     V->basic = xmalloc(sizeof(int) * (m + 1)); memcpy(V->basic, S->basic, sizeof(int) * m);
     V->pos = xmalloc(sizeof(int) * N); memcpy(V->pos, S->pos, sizeof(int) * N);
     V->move = xmalloc(N + 8); memcpy(V->move, S->move, N);
@@ -5943,7 +8524,7 @@ void sxm_restore(SxModel *M, const SxmSaved *V) {
     memcpy(S->wk, V->wk, (size_t)m); S->wlazy = V->wlazy;
     memcpy(S->lo0, V->lo0, sizeof(double) * N); memcpy(S->up0, V->up0, sizeof(double) * N);
     if (V->factored) sxlu_copy(&S->F, &V->F);
-    M->factored = V->factored; M->xok = M->dok = 0;
+    M->factored = V->factored; M->xok = M->dok = 0; M->xinc = V->xinc;
     rows_partition(S);
     sxm_reset_work(S);
 }

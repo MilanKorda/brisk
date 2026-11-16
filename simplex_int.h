@@ -75,8 +75,12 @@ typedef struct {
                                        measured by the depth-first solves) and the solves until the next such measure */
     double hy_e[2]; int hy_p[2];    /* the depth-first searches' edges per hypersparse solve (a running mean), forward and
                                        backward, and the solves until the next trial (sxlu_ftran, sxlu_btran; 24 October 2026) */
+    struct SxFws *fws;              /* (5 November 2026) the factorization's work arrays, kept between factorizations (simplex_lu.c) */
     long nedges;                    /* the edges the solves' depth-first searches examined (not in nflops: a separate count for the
                                        choice of the steepest-edge weights' solve, ftran2) */
+    const volatile int *stopf; double deadline;   /* (14 November 2026, ISSUES 884) a stop request and a deadline (CLOCK_MONOTONIC
+                                       seconds, 0: none) for sxlu_factor: past them it pivots no more, and the columns left are
+                                       replaced by logicals as the columns it cannot pivot are, so the factorization stays valid */
 } SxLU;
 
 /* the scratch space of a solve: one per solve that runs at the same time as another (the factorization's own, F->stack
@@ -101,6 +105,7 @@ void sxlu_ftran(SxLU *F, SxVec *x, double expdens, SxVec *spike);
 void sxlu_ftran_pair(SxLU *F, SxVec *x1, double d1, SxVec *spike1, SxVec *x2, double d2);
 /* the same with the scratch space W (W->m == m): solves with different W may run at the same time */
 void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike);
+long sxlu_count_bounded(SxLU *F, SxWs *W, const int *seed, int ns, long bound);   /* (ISSUES 881) */
 /* B x = rhs wanted at the positions pat[0..npat-1] only: those entries are exact; the others may be zero or computed;
  * the list holds the computed positions. W2: a second scratch space (W2->m == m). Returns the nonzeros after L and R
  * (-1: not counted) */

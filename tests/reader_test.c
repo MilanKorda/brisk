@@ -50,7 +50,28 @@ int main(void) {
         f = fopen(path("cut.cbf.gz"), "wb"); if (f) { fwrite(gz, 1, ng > 4 ? ng - 4 : 0, f); fclose(f); }       /* its last four bytes (the length) cut */
         { int rc = cbf_read(path("cut.cbf.gz"), &S, &c0, &maxim, &nint, msg, sizeof msg); CHECK(rc != 0, "the archive without its end is refused (%s)", rc ? msg : "read"); if (rc == 0) sedumi_free(&S); }
     } else printf("  (no gzip on this host: the archive checks skipped)\n");
-    const char *names[] = {"full.mps", "cut.mps", "full.qps", "cut.qps", "dollar.mps", "dollar.qps", "full.cbf", "cut.cbf", "full.cbf.gz", "cut.cbf.gz"};
+    /* (10 November 2026, the outside LP benchmark's audit) a token that is not a number, or a NaN, is an error naming the line;
+     * a matrix entry must be finite; "inf" is an infinite bound or right-hand side */
+    printf("3. MPS: the numbers (malformed, NaN, infinite)\n");
+    {   const char *bad[] = { "abc", "nan", "1.5x", "1e", "--1", "inf" };
+        for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+            snprintf(buf, sizeof buf, "NAME T\nROWS\n N obj\n G c1\nCOLUMNS\n x obj 1 c1 %s\nRHS\n rhs c1 1\nBOUNDS\n UP bnd x 2\nENDATA\n", bad[k]);
+            put("num.mps", buf);
+            LpProb L; int rc = lp_read_mps(path("num.mps"), &L, msg, sizeof msg);
+            CHECK(rc != 0 && strstr(msg, "line 6"), "the matrix entry '%s' is refused (%s)", bad[k], rc ? msg : "read"); if (rc == 0) lp_free(&L);
+        }
+        const char *rhsbad[] = { "abc", "nan" };
+        for (size_t k = 0; k < sizeof rhsbad / sizeof *rhsbad; k++) {
+            snprintf(buf, sizeof buf, "NAME T\nROWS\n N obj\n G c1\nCOLUMNS\n x obj 1 c1 1\nRHS\n rhs c1 %s\nENDATA\n", rhsbad[k]);
+            put("num.mps", buf);
+            LpProb L; int rc = lp_read_mps(path("num.mps"), &L, msg, sizeof msg);
+            CHECK(rc != 0 && strstr(msg, "line 8"), "the right-hand side '%s' is refused (%s)", rhsbad[k], rc ? msg : "read"); if (rc == 0) lp_free(&L);
+        }
+        snprintf(buf, sizeof buf, "NAME T\nROWS\n N obj\n G c1\nCOLUMNS\n x obj 1 c1 1\nRHS\n rhs c1 1\nBOUNDS\n UP bnd x Infinity\n LO bnd x -1.5e0\nENDATA\n");
+        put("num.mps", buf);
+        { LpProb L; int rc = lp_read_mps(path("num.mps"), &L, msg, sizeof msg); CHECK(rc == 0 && L.u[0] >= 1e30 && L.l[0] == -1.5, "an infinite bound is read as no bound (%s)", rc ? msg : "read"); if (rc == 0) lp_free(&L); }
+    }
+    const char *names[] = {"full.mps", "cut.mps", "full.qps", "cut.qps", "dollar.mps", "dollar.qps", "full.cbf", "cut.cbf", "full.cbf.gz", "cut.cbf.gz", "num.mps"};
     for (size_t k = 0; k < sizeof names / sizeof *names; k++) remove(path(names[k]));
     remove(dir);
     printf(fails ? "reader_test: %d failures\n" : "reader_test: all checks passed\n", fails);

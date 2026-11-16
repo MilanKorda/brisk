@@ -71,9 +71,24 @@ typedef struct {
                                    basis, 1; 1 each row's exact weight computed the first time it is a candidate to leave
                                    (fewer iterations from a parent's basis, the cost spread over the solve); 2 all exact
                                    weights at once (a backward solve a row) */
+    int polish;                 /* (7 November 2026, the MIP developer's request) 1: after an optimal solve, pivots that keep
+                                   the basis optimal and take integer columns out of it (SoPlex's LP solution polishing;
+                                   one factorization more), when integer columns are given by lm_set_integer; 0 (default):
+                                   not. Set per solve with lm_set_opts (the MIP solver: not in the cut loop, where it slows
+                                   the bound's progress) */
 } LmOpts;
 void lm_default_opts(LmOpts *o);
 int lm_set_opts(LpModel *M, const LmOpts *o);
+
+/* ---- (7 November 2026) the integer columns of a mixed-integer program: isint (n), nonzero for an integer column; copied
+ * (NULL clears them). They do not change the problem and, by default, nothing else: with BRISK_SXINTPREF=gamma in the
+ * environment (0 < gamma <= 1; an experiment, off by default) the dual simplex method of the re-solves, when the candidates
+ * of its ratio test tie (the final group of its bound-flipping ratio test, the candidates within the Harris bound, each of
+ * which keeps every reduced cost within the tolerance), lets a row activity or a continuous column enter rather than an
+ * integer column, among those whose pivot |alpha| is at least gamma times the group's largest. On a dual-degenerate
+ * relaxation (a zero objective) every ratio is zero, and an integer column that enters becomes basic, usually at a
+ * fraction. The first solve with the presolve (first_presolve) does not use them. Kept across row changes and trials. */
+int lm_set_integer(LpModel *M, const signed char *isint);
 
 /* ---- changes between solves (values as given). They keep the basis; the results of the last solve are no longer
  * available after any change. Bounds may be infinite (+-LP_INF); a lower bound above the upper bound makes the next

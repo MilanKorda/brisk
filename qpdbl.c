@@ -171,9 +171,23 @@ done:
 
 /* the reduced problem P2 (its own arrays; qp_prob_free frees them) and the record for the postsolve; NULL when no row was
  * eliminated (or on a failure) */
+/* 1 when some equality row has exactly two entries (or the count cannot be made) */
+static int dbl_any(const QpProb *P) {
+    const int n = P->n, m = P->m;
+    int *rc0 = calloc((size_t)m + 1, sizeof(int)); if (!rc0) return 1;
+    for (int j = 0; j < n; j++) for (int p = P->Ap[j]; p < P->Ap[j + 1]; p++) if (P->Ax[p] != 0) rc0[P->Ai[p]]++;
+    int any = 0; for (int i = 0; i < m && !any; i++) any = rc0[i] == 2 && fin_(P->rl[i]) && P->rl[i] == P->ru[i];
+    free(rc0);
+    return any;
+}
 QpDbl *qpdbl_presolve(const QpProb *P, QpProb *P2, int *nelim) {
     *nelim = 0;
     if (P->nqc > 0 || P->m <= 0 || P->n <= 0) return NULL;
+    /* (15 November 2026, the QP developer) first whether any row can be substituted at all: an equality row with exactly
+     * two entries (the first test of pass below). Without one nothing is copied: the working copy of the problem was
+     * made at every call, 17 ms of a 150 ms re-solve of a model predictive control QP with 1.9 million entries and no
+     * such row. */
+    if (!dbl_any(P)) return NULL;
     W w; memset(&w, 0, sizeof w);
     const int n = P->n, m = P->m; const long nz = P->Ap[n], hz = P->Hp ? P->Hp[n] : 0;
     w.n = n; w.m = m; w.c0 = P->c0;

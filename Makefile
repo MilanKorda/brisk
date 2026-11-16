@@ -49,7 +49,7 @@ endif
 # an FMA follows the inlining, so an edit of one function moved the last bits of others (the ill-posed files of the
 # regression sets moved with every switch of a change off); the time per iteration is the same within the noise
 CFLAGS  ?= -O3 $(ARCHFLAG) -funroll-loops -ffp-contract=off $(OMPFLAG) -std=gnu11 -Wall -Wextra -Wno-unused-parameter
-SRC      = problem.c weylpd.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c momaff.c blkscale.c fom.c mfipm.c lralm.c bm.c bmip.c symred.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c simplex.c simplex_lu.c simplex_pre.c qp.c qpio.c qpipm.c qpas.c qcqp.c qpdbl.c socpmodel.c
+SRC      = problem.c weylpd.c presolve.c postsolve.c dictroute.c chordal.c freeelim.c dualize.c momaff.c blkscale.c fom.c mfipm.c lralm.c bm.c bmip.c symred.c rowspace.c symalg.c sparsechol.c dualscale.c ddend.c crossover.c solver.c bound.c boundcert.c main.c $(OMPSRC) hpmp.c hpsolve.c socp.c sedumi.c lpio.c lpsolve.c nd.c simplex.c simplex_lu.c simplex_pre.c qp.c qpio.c qpipm.c qpas.c qcqp.c qpdbl.c qpstage.c qpldl.c socpmodel.c
 BLAS    ?= system
 
 ifeq ($(BLAS),scipy)
@@ -83,20 +83,27 @@ ifeq ($(CHOLMOD),1)
   DEFS += -DHAVE_CHOLMOD
   CHOLMODLIB = -l:libcholmod.a -l:libcamd.a -l:libcolamd.a -l:libccolamd.a
 endif
-# optional: METIS nested dissection for large Schur patterns (make METIS=1; off: AMD won on every AC-OPF pattern)
-METIS ?= 0
+# METIS (its nested dissection, METIS_NodeND) is bundled: metis/ (METIS 5.2.1 with GKlib, George Karypis and the University of
+# Minnesota, used under the Apache License 2.0, metis/LICENSE and metis/GKlib/LICENSE.txt; metis/README.md). Its sources join AMD's
+# objects, so every target that links AMD links it. (13 November 2026, the SOCP developer: on db-joint-soerensen, SOCP, its order makes
+# the normal equations' factor 6.6 times cheaper than AMD's.) make METIS=0: without it
+METIS ?= 1
+METISFLAGS = -DNDEBUG -DNDEBUG2 -DUSE_GKRAND -D_GNU_SOURCE -DIDXTYPEWIDTH=32 -DREALTYPEWIDTH=32 -Imetis/GKlib -Imetis/include -Imetis/libmetis -w
 ifeq ($(METIS),1)
-  DEFS += -DHAVE_METIS
-  METISLIB = -lmetis
+  DEFS += -DHAVE_METIS -DIDXTYPEWIDTH=32 -DREALTYPEWIDTH=32 -Imetis/include
+  AMDSRC += $(wildcard metis/GKlib/*.c) $(wildcard metis/libmetis/*.c)
+  AMDOBJ = $(AMDSRC:.c=.o)
 endif
 brisk: $(OBJ) $(AMDOBJ)
 	sh tools/link_check.sh $@ -- $(CC) $(CFLAGS) $(DEFS) $(LINKFIX) -o $@ $(OBJ) $(AMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lm
 
 # the QP solver's command line (the SOCP developer, 22 October 2026): qp.h, qp.c, qpio.c, qpipm.c, qpas.c, qpmain.c
-QPOBJ    = qp.o qpio.o qpipm.o qpas.o qcqp.o qpdbl.o
+QPOBJ    = qp.o qpio.o qpipm.o qpas.o qcqp.o qpdbl.o qpstage.o qpldl.o
 brisk_qp: qpmain.o $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ)
 	$(CC) $(CFLAGS) $(DEFS) $(LINKFIX) -o $@ qpmain.o $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
 qp.o qpio.o qpipm.o qpas.o qpmain.o: qp.h
+qpipm.o qpstage.o: qpstage.h
+qpipm.o qpldl.o: qpldl.h
 lpio.o qpio.o: fastnum.h
 tests/qp_test: tests/qp_test.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) qp.h
 	$(CC) $(CFLAGS) $(DEFS) -o $@ tests/qp_test.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
@@ -105,6 +112,8 @@ qptest: tests/qp_test
 
 amd/%.o: amd/%.c
 	$(CC) $(CFLAGS) -DNDEBUG -Wno-all -Wno-extra -c -o $@ $<
+metis/%.o: metis/%.c
+	$(CC) $(CFLAGS) $(METISFLAGS) -c -o $@ $<
 
 # (23 October 2026) every object on every header of the tree: a changed structure in qp.h left the library's capi.o
 # with the old size of QpRes, and brisk_qp_resolve wrote past it (stack smashing in the QP model's test)
@@ -154,6 +163,9 @@ $(LIBBRISK): $(LIBOBJ) $(LIBAMDOBJ) libbrisk.map libbrisk.exp
 libobj/amd/%.o: amd/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fPIC -DNDEBUG -Wno-all -Wno-extra -c -o $@ $<
+libobj/metis/%.o: metis/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC $(METISFLAGS) -c -o $@ $<
 
 libobj/%.o: %.c $(HDRS)
 	@mkdir -p $(dir $@)
@@ -174,6 +186,7 @@ asantest:
 threadtest: $(LIBBRISK) tools/thread_test.c
 	$(CC) -O1 -std=gnu11 -Wall -o tools/thread_test tools/thread_test.c -L. -lbrisk -Wl,-rpath,$(CURDIR) -lm
 	env -u OMP_NUM_THREADS -u BRISK_TINYMT BRISK_NOBUSY=1 ./tools/thread_test examples
+	env -u OMP_NUM_THREADS -u BRISK_TINYMT BRISK_NOBUSY=1 BRISK_CPUQUOTA=2 ./tools/thread_test examples quota
 reprotest: brisk $(LIBBRISK)
 	tools/repro_suite.sh
 reprotest-mkl: brisk $(LIBBRISK)
@@ -231,10 +244,11 @@ sxprecheck: $(LIBOBJ) $(LIBAMDOBJ) tools/sxpre_restrict_check.c
 # the tableau, the basis, trials, the cutoff, threads (tools/lpmodel_test.c), and the example branch and bound
 # (tools/lpmodel_bb.c) on the small mixed-integer problems of benchmarks/mip_small; linked with the library's objects
 LPMODEL_FILES = $(addprefix benchmarks/mip_small/,flugpl.mps gr4x6.mps gt2.mps khb05250.mps p0201.mps dcmulti.mps fiber.mps)
-lpmodeltest: $(LIBOBJ) $(LIBAMDOBJ) lpmodel.c lpmodel.h sxmodel.h tools/lpmodel_test.c tools/lpmodel_bb.c
+lpmodeltest: $(LIBOBJ) $(LIBAMDOBJ) lpmodel.c lpmodel.h sxmodel.h tools/lpmodel_test.c tools/lpmodel_bb.c tools/lpmodel_intpref.c
 	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_test tools/lpmodel_test.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
 	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_bb tools/lpmodel_bb.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
 	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_replay tools/lpmodel_replay.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
+	$(CC) $(CFLAGS) $(DEFS) -I. -o tools/lpmodel_intpref tools/lpmodel_intpref.c lpmodel.c $(LIBOBJ) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
 	./tools/lpmodel_test $(LPMODEL_FILES)
 	./tools/lpmodel_bb $(addprefix benchmarks/mip_small/,flugpl.mps gr4x6.mps khb05250.mps)
 	./tools/lpmodel_bb -weights 1 $(addprefix benchmarks/mip_small/,gr4x6.mps khb05250.mps)
@@ -257,5 +271,15 @@ tests/reader_test: tests/reader_test.c tests/main_nomain.o $(filter-out main.o,$
 readertest: tests/reader_test
 	./tests/reader_test
 
-bench/qp/small/qp_rep: bench/qp/small/qp_rep.c $(QPOBJ) sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) qp.h
-	$(CC) $(CFLAGS) $(DEFS) -I. -o $@ bench/qp/small/qp_rep.c $(QPOBJ) sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
+bench/qp/small/qp_rep: bench/qp/small/qp_rep.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) qp.h
+	$(CC) $(CFLAGS) $(DEFS) -I. -o $@ bench/qp/small/qp_rep.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
+# a receding-horizon stream on one persistent QP model (the QP developer, 14 November 2026)
+bench/qp_1114/qp_replay: bench/qp_1114/qp_replay.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) qp.h
+	$(CC) $(CFLAGS) $(DEFS) -I. -o $@ bench/qp_1114/qp_replay.c $(QPOBJ) qpstub.o sparsechol.o nd.o $(OMPSRC:.c=.o) $(AMDOBJ) $(BLASLIB) $(OMPLD) -lm
+
+# (7 November 2026) the outside LP benchmark's in-memory call rebuilt (tools/lp_memcall.c): the problem read first, then
+# brisk_solve_file on a name main.c's reader hands the problem over for; prints the reader calls and whether the solve came
+# back on the calling thread. BRISK_FAULT=lpjoboom injects an allocation failure in the LP race's simplex job thread.
+lpmemcall: $(LIBOBJ) $(LIBAMDOBJ) tools/lp_memcall.c main.c
+	$(CC) $(CFLAGS) -fPIC $(DEFS) -DBRISK_LIBRARY -I. -o tools/lp_memcall tools/lp_memcall.c $(filter-out libobj/main.o,$(LIBOBJ)) $(LIBAMDOBJ) $(CHOLMODLIB) $(METISLIB) $(BLASLIB) $(OMPLD) -lpthread -lm
+	BRISK_FAULT=lpjoboom,lpjoboomlate ./tools/lp_memcall benchmarks/lp_miplib2017_bench/mzzv11.mps -threads 4 -q

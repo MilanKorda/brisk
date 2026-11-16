@@ -111,6 +111,12 @@ def load_library(path=None):
         L.brisk_result_sn.argtypes, L.brisk_result_sn.restype = [P], I
         L.brisk_result_sx.argtypes, L.brisk_result_sx.restype = [P], pd
         L.brisk_result_sz.argtypes, L.brisk_result_sz.restype = [P], pd
+    if hasattr(L, "brisk_solve_socp"):       # SOCPs in general form
+        L.brisk_solve_socp.argtypes = [I, I, pi, pi, pd, pd, D, pd, pd, pd, pd, I, pi, pi, I, pi, pi, I, ppc, P]
+        L.brisk_solve_socp.restype = I
+    if hasattr(L, "brisk_solve_lp"):         # LPs in general form (the path of an MPS file)
+        L.brisk_solve_lp.argtypes = [I, I, pi, pi, pd, pd, D, pd, pd, pd, pd, I, ppc, P]
+        L.brisk_solve_lp.restype = I
     if hasattr(L, "brisk_solve_qp"):         # convex QPs (and QCQPs through files)
         L.brisk_solve_qp.argtypes = [I, I, pi, pi, pd, pd, D, pi, pi, pd, pd, pd, pd, pd, I, ppc, P]
         L.brisk_solve_qp.restype = I
@@ -849,8 +855,12 @@ def _qp_ptrs(d):
 
 
 class QpModel:
-    """A QP kept for re-solves after changes of bounds, row bounds or the cost, each solve warm-started from the
-    previous active set (BRISK's dual active-set method; active_set=False: the interior-point method, every solve cold).
+    """A QP kept for re-solves after changes of bounds, row bounds or the cost (a receding horizon, branch and bound).
+    BRISK chooses the method for the model (active_set=None, the default): the dual active-set method, each solve
+    warm-started from the previous active set, when the QP is small or when eliminating its equality rows leaves a
+    problem that a stream of solves pays for (a model predictive control QP written with its states); the
+    interior-point method otherwise, which keeps its setup between solves and starts from the last solution.
+    active_set=True: the active-set method; active_set=False: the interior-point method.
     The data as solve_qp's. For branch and bound on a mixed-integer QP:
 
         mdl = brisk.QpModel(P, q, A, l, u, lb, ub)
@@ -861,7 +871,7 @@ class QpModel:
 
     options: -tol, -maxit, -timelimit (as on the command line, a list or a dict). Results are QpResult."""
 
-    def __init__(self, P=None, q=None, A=None, l=None, u=None, lb=None, ub=None, c0=0.0, active_set=True, options=None,
+    def __init__(self, P=None, q=None, A=None, l=None, u=None, lb=None, ub=None, c0=0.0, active_set=None, options=None,
                  verbose=False):
         self._d = _qp_data(P, q, A, l, u, lb, ub, c0)
         for k in ("q", "l", "u", "lb", "ub"):
@@ -869,7 +879,7 @@ class QpModel:
         L = load_library()
         if not hasattr(L, "brisk_qp_create"):
             raise RuntimeError("this libbrisk has no QP solver object (brisk_qp_create): rebuild it")
-        av = options_to_argv(options) + ["-qpas" if active_set else "-qpipm"] + ([] if verbose else ["-q"])
+        av = options_to_argv(options) + ["-qpauto" if active_set is None else "-qpas" if active_set else "-qpipm"] + ([] if verbose else ["-q"])
         arr = (ctypes.c_char_p * len(av))(*[a.encode() for a in av])
         self._h = L.brisk_qp_create(self._d["n"], self._d["m"], *_qp_ptrs(self._d), len(av), arr)
         if not self._h:
@@ -1042,7 +1052,7 @@ def solve_sedumi(A, b, c, K, options=None, verbose=True, _caller="python:solve_s
     object with these attributes) with f (free variables), l (nonnegative variables), q (list:
     second-order cones x0 >= |x(1:)|), r (list: rotated cones 2 x0 x1 >= |x(2:)|^2), s (list:
     semidefinite blocks, each as its d*d entries by columns), in this order. Without
-    semidefinite blocks the problem is solved by BRISK's second-order cone solver, with them by
+    semidefinite blocks the problem is solved by BRISK's SOCP solver, with them by
     the semidefinite solver. Returns a ConeResult."""
     import scipy.sparse as sp
     b = np.ascontiguousarray(np.asarray(b, dtype=np.float64).ravel())
@@ -1070,6 +1080,140 @@ def solve_sedumi(A, b, c, K, options=None, verbose=True, _caller="python:solve_s
         int(b.size), int(c.size), P(Ap, pi), P(Ai, pi), P(Ax, pd), P(b, pd), P(c, pd), nf, nl,
         int(q.size), P(q, pi), int(rr.size), P(rr, pi), int(ss.size), P(ss, pi), n, a, r),
         options, verbose, _collect_sedumi, caller=_caller)
+
+
+def solve_socp(c, A=None, l=None, u=None, lb=None, ub=None, q=None, r=None, c0=0.0, options=None, verbose=True,
+               _caller="python:solve_socp"):
+    """Solve an SOCP in general form:
+
+        min c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub,  x[q_k] in a second-order cone,  x[r_k] in a rotated cone
+
+    by BRISK's SOCP solver. q: a list of cones, each a list of variable indices whose first is the cone's head
+    (x0 >= |x_rest|); r: a list of rotated cones, each a list whose first two are its heads (2 x0 x1 >= |x_rest|^2, x0, x1 >= 0).
+    A variable is in at most one cone. A: m x n (scipy sparse or dense; None: no rows); l, u, lb, ub: arrays, None or +-inf
+    for an absent bound (an equality row has l = u). Options as for solve_sedumi. Returns a ConeResult: x (n), y (the rows'
+    multipliers, m: > 0 at l, < 0 at u, 0 on a row with no bound), z = c - A'y (n), pobj and dobj including c0; for a dual
+    infeasible problem x is a direction of unbounded descent, for a primal infeasible one y a certificate."""
+    import scipy.sparse as sp
+    c = np.ascontiguousarray(np.asarray(c, dtype=np.float64).ravel())
+    n = c.size
+    if A is None:
+        A = sp.csc_matrix((0, n))
+    A = sp.csc_matrix(A)
+    if A.shape[1] != n:
+        raise ValueError(f"A is {A.shape[0]} x {A.shape[1]}, c has {n} entries")
+    A.sum_duplicates()
+    A.sort_indices()
+    m = A.shape[0]
+
+    def vec(v, k, fill):
+        if v is None:
+            return np.full(k, fill, dtype=np.float64)
+        v = np.ascontiguousarray(np.asarray(v, dtype=np.float64).ravel())
+        if v.size != k:
+            raise ValueError(f"a bound array has {v.size} entries, {k} expected")
+        return v
+
+    lr, ur, lx, ux = vec(l, m, -np.inf), vec(u, m, np.inf), vec(lb, n, -np.inf), vec(ub, n, np.inf)
+
+    def lists(cs):
+        cs = [list(map(int, k)) for k in (cs or [])]
+        ptr = np.zeros(len(cs) + 1, dtype=np.intc)
+        for k, v in enumerate(cs):
+            ptr[k + 1] = ptr[k] + len(v)
+        idx = np.ascontiguousarray(np.array([j for v in cs for j in v], dtype=np.intc)) if cs else np.zeros(1, dtype=np.intc)
+        return len(cs), ptr, idx
+
+    nq, qp, qi = lists(q)
+    nr, rp, ri = lists(r)
+    Ap = np.ascontiguousarray(A.indptr, dtype=np.intc)
+    Ai = np.ascontiguousarray(A.indices if A.nnz else np.zeros(1), dtype=np.intc)
+    Ax = np.ascontiguousarray(A.data if A.nnz else np.zeros(1), dtype=np.float64)
+    pi = ctypes.POINTER(ctypes.c_int)
+    pd = ctypes.POINTER(ctypes.c_double)
+    P = lambda a, t: a.ctypes.data_as(t)   # noqa: E731
+    if not hasattr(load_library(), "brisk_solve_socp"):
+        raise RuntimeError("this libbrisk has no general-form SOCP call (brisk_solve_socp): rebuild it")
+    res = _run(lambda L, k, a, rr: L.brisk_solve_socp(
+        n, m, P(Ap, pi), P(Ai, pi), P(Ax, pd), P(c, pd), float(c0), P(lr, pd), P(ur, pd), P(lx, pd), P(ux, pd),
+        nq, P(qp, pi), P(qi, pi), nr, P(rp, pi), P(ri, pi), k, a, rr), options, verbose, _collect_sedumi, caller=_caller)
+    return res
+
+
+class LpResult:
+    """The result of solve_lp: status (0 optimal, 1 primal infeasible, 2 dual infeasible, 3 the iteration limit, 4 numerical
+    difficulties, 5 reduced accuracy, 6 the time limit), status_str, obj (the objective value c'x + c0), x (n; None when no point
+    is returned, e.g. for an infeasible LP), y (the rows' multipliers, m: >= 0 at l, <= 0 at u) and z = c - A'y (n: >= 0 at lb,
+    <= 0 at ub), iterations, time; as the command line's result for an MPS file of the same LP. y and z are None where the
+    route gives no exact duals: the interior-point method's point when the standard presolve removed rows (options
+    ["-lpmethod", "4"], the interior-point method with the crossover, or a simplex method always give them)."""
+    def __init__(self, **kw):
+        self.x = self.y = self.z = None
+        self.__dict__.update(kw)
+
+    def __repr__(self):
+        return f"brisk.LpResult(status {self.status_str}, objective {self.obj:.10g}, {self.iterations} iterations)"
+
+
+def _collect_lp(L, r, rc):
+    status = L.brisk_result_status(r)
+    if rc < 0 or rc in (1, 2) or (status == -1 and rc not in (0, 20)):
+        raise RuntimeError(f"BRISK did not solve the problem (exit code {rc}: "
+                           + {1: "bad options", 2: "invalid problem data"}.get(rc, "aborted") + ")")
+    res = LpResult(status=status, status_str=L.brisk_result_status_str(r).decode(), exit_code=rc,
+                   iterations=L.brisk_result_iterations(r), obj=L.brisk_result_pobj(r), time=L.brisk_result_time(r))
+    n, m = L.brisk_result_sn(r), L.brisk_result_m(r)
+    ptr = L.brisk_result_sx(r)
+    if ptr and n > 0 and L.brisk_result_have_x(r):
+        res.x = np.ctypeslib.as_array(ptr, shape=(n,)).copy()
+        py, pz = L.brisk_result_y(r), L.brisk_result_sz(r)
+        if py and pz:
+            res.y = np.ctypeslib.as_array(py, shape=(m,)).copy() if m > 0 else np.zeros(0)
+            res.z = np.ctypeslib.as_array(pz, shape=(n,)).copy()
+    return res
+
+
+def solve_lp(c, A=None, l=None, u=None, lb=None, ub=None, c0=0.0, options=None, verbose=True, _caller="python:solve_lp"):
+    """Solve an LP in general form:
+
+        min c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub
+
+    by BRISK's LP solver, as an MPS file of the same LP (the default race of the interior-point method and the dual simplex
+    method; options as on the command line, e.g. ["-lpmethod", "2"], ["-threads", "1"]). A: m x n (scipy sparse or dense; None:
+    no rows); l, u, lb, ub: arrays, None or +-inf for an absent bound (an equality row has l = u). Note: a variable without lb
+    is free (an MPS file's default lower bound 0 is not assumed). Returns an LpResult."""
+    import scipy.sparse as sp
+    c = np.ascontiguousarray(np.asarray(c, dtype=np.float64).ravel())
+    n = c.size
+    if A is None:
+        A = sp.csc_matrix((0, n))
+    A = sp.csc_matrix(A)
+    if A.shape[1] != n:
+        raise ValueError(f"A is {A.shape[0]} x {A.shape[1]}, c has {n} entries")
+    A.sum_duplicates()
+    A.sort_indices()
+    m = A.shape[0]
+
+    def vec(v, k, fill):
+        if v is None:
+            return np.full(max(k, 1), fill, dtype=np.float64)
+        v = np.ascontiguousarray(np.asarray(v, dtype=np.float64).ravel())
+        if v.size != k:
+            raise ValueError(f"a bound array has {v.size} entries, {k} expected")
+        return v if k > 0 else np.full(1, fill, dtype=np.float64)
+
+    lr, ur, lx, ux = vec(l, m, -np.inf), vec(u, m, np.inf), vec(lb, n, -np.inf), vec(ub, n, np.inf)
+    Ap = np.ascontiguousarray(A.indptr, dtype=np.intc)
+    Ai = np.ascontiguousarray(A.indices if A.nnz else np.zeros(1), dtype=np.intc)
+    Ax = np.ascontiguousarray(A.data if A.nnz else np.zeros(1), dtype=np.float64)
+    pi = ctypes.POINTER(ctypes.c_int)
+    pd = ctypes.POINTER(ctypes.c_double)
+    P = lambda a, t: a.ctypes.data_as(t)   # noqa: E731
+    if not hasattr(load_library(), "brisk_solve_lp"):
+        raise RuntimeError("this libbrisk has no general-form LP call (brisk_solve_lp): rebuild it")
+    return _run(lambda L, k, a, rr: L.brisk_solve_lp(
+        n, m, P(Ap, pi), P(Ai, pi), P(Ax, pd), P(c, pd), float(c0), P(lr, pd), P(ur, pd), P(lx, pd), P(ux, pd), k, a, rr),
+        options, verbose, _collect_lp, caller=_caller)
 
 
 def _collect_socpm(L, r, rc):

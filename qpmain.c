@@ -1,3 +1,4 @@
+#define _GNU_SOURCE          /* sched_getaffinity, CPU_COUNT (cpus.h) */
 #include <unistd.h>
 /* qpmain.c - the command line of the QP solver (the SOCP developer, 22 October 2026):
  *     brisk_qp file.qps [-ipm | -as | -auto] [-tol t] [-maxit k] [-v | -vv | -q] [-threads k] [-timelimit s] [-x file]
@@ -11,6 +12,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "cpus.h"
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 int main(int argc, char **argv) {
 #ifdef __linux__
@@ -33,7 +35,7 @@ int main(int argc, char **argv) {
                "  -tol t          relative tolerance of the residuals and the gap (1e-8)\n"
                "  -maxit k        iterations\n"
                "  -v, -vv, -q     the iteration log, details, quiet (-vvv: each step's blocking variables and products)\n"
-               "  -threads k      threads of the factorization\n"
+               "  -threads k      at most k threads (and at most the CPUs available)\n"
                "  -timelimit s    seconds\n"
                "  -x file         write the solution (one value per line)\n"
                "  -w file         write the problem as read as a free-format QPS file with plain names, and stop\n"
@@ -61,7 +63,18 @@ int main(int argc, char **argv) {
         else fname = argv[a];
     }
 #ifdef _OPENMP
-    if (o.threads > 0) omp_set_num_threads(o.threads);
+    /* (8 November 2026, the owner: "the user-defined count is only an upper bound, not an exact number. This should be
+     * solver-wide") -threads k is at most the CPUs the process can keep busy (cpus.h: the affinity mask, or the container's
+     * quota when lower), as main.c's -threads; within it the QP solver's own rules put a step on the threads only when its
+     * work is large. BRISK_NOTHREADCAP=1 keeps k as given */
+    if (o.threads > 0) {
+        const int k = o.threads, a = cpus_avail();
+        if (a > 0 && k > a && !getenv("BRISK_NOTHREADCAP")) o.threads = a;
+        omp_set_num_threads(o.threads);
+        if (o.verbose > 1 || (o.verbose && o.threads < k))
+            { if (o.threads < k) printf("Number of threads: %d (at most %d as set by the user; %d CPUs available)\n", o.threads, k, a);
+              else printf("Number of threads: %d (at most %d as set by the user)\n", o.threads, k); }
+    }
 #endif
     QpProb P; char msg[512];
     const double tr = now();

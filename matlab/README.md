@@ -61,7 +61,7 @@ system libraries and crashed on the first BLAS call.)
 cones `x(1) >= norm(x(2:end))`), `K.r` (rotated cones `2*x(1)*x(2) >= norm(x(3:end))^2`) and
 `K.s` (PSD blocks, `vec(X)` column-major, the symmetric part of the data is used — as in
 SeDuMi). A problem without `K.s` is solved by BRISK's SOCP solver for linear and second-order
-cone programs (`opts.conesolver = 0` forces the semidefinite solver, which takes the cones as
+cone programs (`opts.socpsolver = 0` forces the semidefinite solver, which takes the cones as
 arrow blocks). Complex data are not supported. `info` has SeDuMi's
 `pinf`, `dinf`, `numerr` (0 solved, 1 reduced accuracy, 2 failure), `iter`, `cpusec`, plus
 `pobj`, `dobj`, `dimacs` (the six DIMACS errors, measured on your data; with `prec`, in the working precision), `status`.
@@ -82,6 +82,21 @@ The SDPA pair: `min c'x s.t. X = sum_i F_i x_i - F_0 psd` and `max F_0.Y s.t. F_
 Y psd`. `F` is the SDPA-M cell array `F{k, i+1}` (block `k` of `F_i`; LP blocks as vectors),
 `T` an `nnz x 5` array `[i k r s value]` (the body of a `.dat-s` file). Outputs follow SDPA-M:
 `objVal = [c'x, F_0.Y]`, `X`, `Y` cell arrays (LP blocks as column vectors).
+
+### Linear programs
+
+```matlab
+% min f'x  s.t.  l <= A x <= u,  lb <= x <= ub
+[x, info] = brisk_lp(f, A, l, u, lb, ub)
+[x, info] = brisk_lp(f, A, l, u, lb, ub, struct('lpmethod', 2))
+```
+
+The LP takes the path of an MPS file of the same LP (the default choice of method, the presolves, the crossover;
+`opts.lpmethod = 1`-`5` as on the command line). An absent bound is `-Inf` or `Inf`, `[]` means none of that kind (no
+default lower bound 0). `info`: `status`, `statuscode`, `obj`, `y` (the rows' multipliers: >= 0 at a row's lower side,
+<= 0 at its upper side), `z = f - A'y`, `iter`, `time`; `y` and `z` are `[]` when the route gives no exact duals (the
+simplex methods and the crossover always give them; the interior-point method's point when its duals, carried through
+the presolves, pass the measure of optimality), `x` is `[]` when no point is returned.
 
 ### Quadratic programs
 
@@ -104,8 +119,10 @@ dual infeasible, 3 iteration limit, 4 numerical difficulties, 5 reduced accuracy
 rows' multipliers), `z` (the bounds' multipliers; `H x + f - A'y - z = 0`), `iter`, `time`, `errors`. By default a
 small QP with `H` positive definite is solved by the dual active-set method, any other by the interior-point method
 for QPs; `opts.qpas = true` or `opts.qpipm = true` chooses. A QP that is not convex is refused with an error. A
-`BriskQpModel` uses the active-set method (with `opts.qpipm = true`: the interior-point method, each solve from the
-start).
+`BriskQpModel` chooses its method for the stream of solves: the active-set method, each solve from the previous active
+set, for a small QP and where eliminating the equality rows leaves a problem that the stream pays for; the
+interior-point method otherwise, which keeps its setup between the solves and starts from the last solution
+(`opts.qpas = true` or `opts.qpipm = true`: that method).
 
 ### Options
 

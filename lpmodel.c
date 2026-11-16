@@ -39,6 +39,7 @@ struct LpModel {
     int trial, trial_status, trial_have; double trial_obj;
     SxmSaved *saved;
     double *sl, *su, *srl, *sru, *sc;
+    signed char *isint;             /* (7 November 2026) the integer columns given by lm_set_integer (n), NULL: none */
 };
 
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (lpmodel)\n"); exit(1); } return p; }
@@ -87,7 +88,7 @@ void lm_free(LpModel *M) {
     if (!M) return;
     trial_free(M);
     sxm_free(M->E);
-    free(M->cst); free(M->rst); free(M->csc); free(M->rsc);
+    free(M->cst); free(M->rst); free(M->csc); free(M->rsc); free(M->isint);
     lp_free(&M->P);
     free(M);
 }
@@ -100,10 +101,24 @@ int lm_set_opts(LpModel *M, const LmOpts *o) {
     return 0;
 }
 
+int lm_set_integer(LpModel *M, const signed char *isint) {
+    if (!M) return -1;
+    free(M->isint); M->isint = NULL;
+    if (isint) { M->isint = xmalloc((size_t)M->P.n + 1); for (int j = 0; j < M->P.n; j++) M->isint[j] = isint[j] ? 1 : 0; }
+    if (M->E) sxm_set_integer(M->E, M->isint);
+    return 0;
+}
+/* a new simplex state: the problem's scaling as given, the integer flags of the object */
+static SxModel *new_state(LpModel *M, const double *cs, const double *rs, int msc, double costsc) {
+    SxModel *E = sxm_new(&M->P, cs, rs, msc, costsc);
+    if (M->isint) sxm_set_integer(E, M->isint);
+    return E;
+}
+
 /* ---- the state built again after row changes: same column scaling, the old rows' factors, the statuses carried */
 static void ensure_state(LpModel *M) {
     if (!M->E || !M->rebuild) return;
-    SxModel *E = sxm_new(&M->P, M->csc, M->rsc, M->msc, M->costsc);
+    SxModel *E = new_state(M, M->csc, M->rsc, M->msc, M->costsc);
     sxm_set_basis_w(E, M->cst, M->rst, M->opt.basis_weights);
     sxm_free(M->E);
     M->E = E;
@@ -249,6 +264,7 @@ static void sxm_opts_of(const LpModel *M, SxmOpts *so, double t0, long itdone) {
     so->stop = M->opt.stop;
     so->tol_primal = M->opt.tol_primal; so->tol_dual = M->opt.tol_dual;
     so->cutoff_on = M->opt.cutoff_on; so->cutoff = M->opt.cutoff - M->P.c0;
+    so->polish = M->opt.polish;
 }
 int lm_solve(LpModel *M, LmInfo *info) {
     if (!M) return -1;
@@ -278,7 +294,7 @@ int lm_solve(LpModel *M, LmInfo *info) {
 #endif
             pthread_mutex_unlock(&g_first_mu);
             it0 = si.iters; itd0 = si.iters_dual; itp0 = si.iters_primal; nf0 = si.nfactor; wk0 = si.work;
-            M->E = sxm_new(&M->P, NULL, NULL, 0, 0);
+            M->E = new_state(M, NULL, NULL, 0, 0);
             if (st != 3 && st != 6) sxm_set_basis_w(M->E, cs, rs, M->opt.basis_weights);
             free(cs); free(rs);
             if (st == 3 || st == 6) {
@@ -288,7 +304,7 @@ int lm_solve(LpModel *M, LmInfo *info) {
                 info->time = now() - t0;
                 return M->status;
             }
-        } else M->E = sxm_new(&M->P, NULL, NULL, 0, 0);
+        } else M->E = new_state(M, NULL, NULL, 0, 0);
     }
     ensure_state(M);
     SxmOpts so; sxm_opts_of(M, &so, t0, it0);
@@ -345,7 +361,7 @@ int lm_set_basis(LpModel *M, const int *cstat, const int *rstat) {
     if (!M || !cstat || !rstat) return -1;
     for (int j = 0; j < M->P.n; j++) if (cstat[j] < SX_BASIC || cstat[j] > SX_FIXED) return -1;
     for (int i = 0; i < M->P.m; i++) if (rstat[i] < SX_BASIC || rstat[i] > SX_FIXED) return -1;
-    if (!M->E) M->E = sxm_new(&M->P, NULL, NULL, 0, 0);
+    if (!M->E) M->E = new_state(M, NULL, NULL, 0, 0);
     ensure_state(M);
     changed(M);
     return sxm_set_basis_w(M->E, cstat, rstat, M->opt.basis_weights);

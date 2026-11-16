@@ -31,9 +31,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <ctype.h>
+#include <time.h>
 #include "lpio.h"
 #include "fastnum.h"
+#include "lpsolve.h"
 #ifndef _WIN32
 #include <spawn.h>
 #include <sys/wait.h>
@@ -100,26 +103,36 @@ static void h_free(Hash *H) { free(H->t); }
  * 53 bits and the power of ten is at most 22 (Clinger's fast path: the product or quotient of two exact doubles, rounded
  * once, is the correctly rounded value strtod returns); anything else by atof, as before. The same bits as atof on every
  * file of the LP sets (BRISK_READSUM) */
-static double mps_num(const char *s) {
+/* (10 November 2026, the outside LP benchmark's audit) the numbers the fast path does not take: strtod, and the whole token must
+ * be the number (atof read "abc" as 0 and took "nan"): *bad set otherwise; "inf" and "infinity" are read as infinite values
+ * as the reader's LP_INF (their use is checked by the caller: bounds, right-hand sides and ranges may be infinite, the matrix and the
+ * objective not) */
+static double mps_num_slow(const char *s, int *bad) {
+    char *e = NULL;
+    const double v = strtod(s, &e);
+    if (e == s || *e || isnan(v)) { *bad = 1; return 0.0; }
+    return isinf(v) ? (v > 0 ? LP_INF : -LP_INF) : v;     /* (the reader's infinity, LP_INF) */
+}
+static double mps_num(const char *s, int *bad) {
     static const double p10[23] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
     const char *p = s; int neg = 0;
     if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
     unsigned long long mant = 0; int nd = 0, e10 = 0, any = 0;
-    while (*p >= '0' && *p <= '9') { any = 1; if (mant || *p != '0') { if (nd >= 19) return atof(s); mant = mant * 10 + (unsigned)(*p - '0'); nd++; } p++; }
+    while (*p >= '0' && *p <= '9') { any = 1; if (mant || *p != '0') { if (nd >= 19) return mps_num_slow(s, bad); mant = mant * 10 + (unsigned)(*p - '0'); nd++; } p++; }
     if (*p == '.') {
         p++;
-        while (*p >= '0' && *p <= '9') { any = 1; if (mant || *p != '0') { if (nd >= 19) return atof(s); mant = mant * 10 + (unsigned)(*p - '0'); nd++; } e10--; p++; }
+        while (*p >= '0' && *p <= '9') { any = 1; if (mant || *p != '0') { if (nd >= 19) return mps_num_slow(s, bad); mant = mant * 10 + (unsigned)(*p - '0'); nd++; } e10--; p++; }
     }
-    if (!any) return atof(s);
+    if (!any) return mps_num_slow(s, bad);
     if (*p == 'e' || *p == 'E') {
         p++; int eneg = 0, ex = 0, ed = 0;
         if (*p == '-') { eneg = 1; p++; } else if (*p == '+') p++;
         while (*p >= '0' && *p <= '9') { if (ex < 10000) ex = ex * 10 + (*p - '0'); ed++; p++; }
-        if (!ed) return atof(s);
+        if (!ed) return mps_num_slow(s, bad);
         e10 += eneg ? -ex : ex;
     }
-    if (*p) return atof(s);
-    if (mant > (1ULL << 53) || e10 < -22 || e10 > 22) return atof(s);
+    if (*p) return mps_num_slow(s, bad);
+    if (mant > (1ULL << 53) || e10 < -22 || e10 > 22) return mps_num_slow(s, bad);
     double v = (double)mant;
     v = e10 >= 0 ? v * p10[e10] : v / p10[-e10];
     return neg ? -v : v;
@@ -468,7 +481,8 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             for (int t = 1; t + 1 < nt; t += 2) {
                 const int r = h_get(&HR, tok[t]);
                 if (r < 0) { snprintf(msg, nmsg, "%s, line %ld: unknown row %s", fname, lineno, tok[t]); rc = 1; break; }
-                const double v = mps_num(tok[t + 1]);
+                int bad = 0; const double v = mps_num(tok[t + 1], &bad);
+                if (bad || !(fabs(v) < LP_INF)) { snprintf(msg, nmsg, "%s, line %ld: %s is not a finite number (column %s, row %s)", fname, lineno, tok[t + 1], tok[0], tok[t]); rc = 1; break; }
                 if (v == 0.0) continue;
                 if (nz == zcap) { zcap *= 2; zi = realloc(zi, sizeof(int) * zcap); zv = realloc(zv, sizeof(double) * zcap); }
                 zi[nz] = r; zv[nz] = v; nz++;
@@ -479,7 +493,9 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             for (int t = (nt % 2); t + 1 < nt; t += 2) {
                 const int r = h_get(&HR, tok[t]);
                 if (r < 0) { snprintf(msg, nmsg, "%s, line %ld: unknown row %s", fname, lineno, tok[t]); rc = 1; break; }
-                if (sec == S_RHS) rhs[r] = mps_num(tok[t + 1]); else { rng[r] = mps_num(tok[t + 1]); hasrng[r] = 1; }
+                int bad = 0; const double v = mps_num(tok[t + 1], &bad);
+                if (bad) { snprintf(msg, nmsg, "%s, line %ld: %s is not a number (%s of row %s)", fname, lineno, tok[t + 1], sec == S_RHS ? "the right-hand side" : "the range", tok[t]); rc = 1; break; }
+                if (sec == S_RHS) rhs[r] = v; else { rng[r] = v; hasrng[r] = 1; }
             }
             if (rc) break;
         } else if (sec == S_BOUNDS) {
@@ -491,7 +507,8 @@ static int lp_read_mps_(const char *fname, LpProb *L, char *msg, size_t nmsg, in
             if (ic >= nt || (!noval && ic + 1 >= nt)) { snprintf(msg, nmsg, "%s, line %ld: incomplete bound", fname, lineno); rc = 1; break; }
             const int j = h_get(&HC, tok[ic]);
             if (j < 0) { snprintf(msg, nmsg, "%s, line %ld: unknown column %s", fname, lineno, tok[ic]); rc = 1; break; }
-            const double v = noval ? 0.0 : mps_num(tok[ic + 1]);
+            int bad = 0; const double v = noval ? 0.0 : mps_num(tok[ic + 1], &bad);
+            if (bad) { snprintf(msg, nmsg, "%s, line %ld: %s is not a number (the bound of column %s)", fname, lineno, tok[ic + 1], tok[ic]); rc = 1; break; }
             if (ci && (!strcmp(ty, "BV") || !strcmp(ty, "LI") || !strcmp(ty, "UI"))) ci[j] = 1;
             if (!strcmp(ty, "UP") || !strcmp(ty, "UI")) { up[j] = v; if (v < 0 && !(bset[j] & 1) && lo[j] == 0.0) lo[j] = -LP_INF; bset[j] |= 2; }
             else if (!strcmp(ty, "LO") || !strcmp(ty, "LI")) { lo[j] = v; bset[j] |= 1; }
@@ -567,6 +584,7 @@ struct LpPs { PsOp *op; int nop, cap; int *rows, nrows, rcap, vcap; double *vals
 void lp_map_free(LpMap *M) { free(M->ckind); free(M->cpos); free(M->cval); free(M->rpos); free(M->rsgn); memset(M, 0, sizeof(*M)); }
 
 static _Thread_local struct LpPs g_ps;   /* the operations of the last presolve (per thread: LPs may be solved on several threads at once, ISSUES 526) */
+int lp_presolve_nops(void) { return g_ps.nop; }
 static void ps_push(int kind, int j, int i, double v) {
     if (g_ps.nop == g_ps.cap) { g_ps.cap = 2 * g_ps.cap + 256; g_ps.op = realloc(g_ps.op, sizeof(PsOp) * g_ps.cap); }
     g_ps.op[g_ps.nop].kind = kind; g_ps.op[g_ps.nop].j = j; g_ps.op[g_ps.nop].i = i; g_ps.op[g_ps.nop].v = v; g_ps.nop++;
@@ -575,6 +593,324 @@ static void ps_push(int kind, int j, int i, double v) {
 int lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M) { return lp_to_std(L, presolve, verbose, S, M, NULL); }
 /* ub != NULL: the bounded form - upper bounds stay bounds (*ub, one per column of the standard
  * form, LP_INF: none) and a range row gets one slack with the bound ru - rl: no bound rows */
+/* (5 November 2026, ISSUES 836) the same search by Markowitz pivoting, as in a sparse LU factorization (Markowitz 1957;
+ * the search of Suhl and Suhl 1990): the pivot row and column are chosen together, at each step an entry (i, j) of the
+ * active rows with the least product (row length - 1) x (column count - 1) among the entries within a tenth of their
+ * row's largest (the threshold of the search below); column j is then eliminated from the other active rows that hold it.
+ * The search below takes the rows in a fixed order (shortest first, each reduced by every earlier pivot), which makes the
+ * fill, and with it whether the work cap is reached, depend on the order of the input: brazil3, neos-2746589-doon,
+ * neos-4409277-trave, neos-5076235-embley and genus-sym-g62-2 (LPs) reach it as read or on copies with rows and columns
+ * permuted, and find 0 to 75 % of their dependent equations, different numbers on each copy (neos-4409277-trave: 4 of 80
+ * as read, 0 on the copies, 80 million units of work without the cap). The choice by counts keeps the fill low whatever
+ * the order: all of them on every copy, within 2 to 10 units of work per entry.
+ * Dense rows (more entries than max(16, 10 sqrt(c)), c the columns of the equations: the rule of COLAMD, Davis, Gilbert,
+ * Larimore and Ng 2004) are left out of the elimination, as in sparse LU codes: every pivot would update them (rows of
+ * 8,000 entries in neos-2746589-doon, each updated by 3,000 pivots); they are reduced at the end, one at a time, by the
+ * pivot rows as they were when chosen (the method of the search below), the shortest first.
+ * An entry is zero when it is at most 1e-11 of the largest entry its row has had on the way (the tolerance below); a row
+ * whose entries are all zero is a combination of the pivot rows, which stay, and with its side zero within 1e-9 it is
+ * dependent (dep[t] = 1), otherwise it stays, as below. Stops at the stop flag and at a work cap (the entries of the pivot
+ * rows applied, the fill and the entries the search reads; 32 per entry of the equations + 100,000, BRISK_LPDEPMKWCAP the
+ * units per entry; the most needed on 113 LPs with dependent equations, as read and on three permuted copies each, was 20
+ * per entry, but for the quadratic assignment relaxations qap8 to qap15 and neos-4382714-ruvuma, LPs, whose symmetric
+ * structure leaves most choices tied, so that the order of the input still decides the fill: 21 to 28 per entry as read,
+ * 44 to 215 on the copies, where the cap stops the search). */
+/* each active row is a small hash table of its entries (open addressing, linear probing, at most half full) in a segment
+ * of a pool: an entry is found, changed, added or removed at a cost that does not grow with the row's length */
+static inline unsigned mkh(int j, unsigned mask) { unsigned h = (unsigned)j * 0x9E3779B1u; h ^= h >> 15; return h & mask; }
+typedef struct { int *tj; double *tv; long *rb; int *rcap, *rl; long pu, psz; } MkRows;
+static long mkr_find(const MkRows *R, int i, int j) {
+    const unsigned mask = (unsigned)R->rcap[i] - 1; const int *tj = R->tj + R->rb[i];
+    for (unsigned s = mkh(j, mask);; s = (s + 1) & mask) { if (tj[s] == j) return R->rb[i] + s; if (tj[s] < 0) return -1; }
+}
+static void mkr_del(MkRows *R, int i, long at) {
+    const unsigned mask = (unsigned)R->rcap[i] - 1; int *tj = R->tj + R->rb[i]; double *tv = R->tv + R->rb[i];
+    unsigned h0 = (unsigned)(at - R->rb[i]); tj[h0] = -1; R->rl[i]--;
+    for (unsigned k = (h0 + 1) & mask; tj[k] >= 0; k = (k + 1) & mask) {
+        const unsigned home = mkh(tj[k], mask);
+        if (((k - home) & mask) >= ((k - h0) & mask)) { tj[h0] = tj[k]; tv[h0] = tv[k]; tj[k] = -1; h0 = k; }
+    }
+}
+static void mkr_place(MkRows *R, int i, int j, double v) {     /* j not in row i, room checked */
+    const unsigned mask = (unsigned)R->rcap[i] - 1; int *tj = R->tj + R->rb[i];
+    unsigned s = mkh(j, mask); while (tj[s] >= 0) s = (s + 1) & mask;
+    tj[s] = j; R->tv[R->rb[i] + s] = v; R->rl[i]++;
+}
+static void mkr_room(MkRows *R, int i, int need) {              /* room for need more entries: the row moves, twice as large */
+    if (2 * (R->rl[i] + need) <= R->rcap[i]) return;
+    int nc = R->rcap[i] < 4 ? 4 : R->rcap[i]; while (nc < 2 * (R->rl[i] + need)) nc *= 2;
+    if (R->pu + nc > R->psz) { R->psz = 2 * (R->pu + nc); R->tj = realloc(R->tj, sizeof(int) * (size_t)R->psz); R->tv = realloc(R->tv, sizeof(double) * (size_t)R->psz); if (!R->tj || !R->tv) { fprintf(stderr, "brisk: out of memory (LP presolve)\n"); exit(1); } }
+    const long ob = R->rb[i]; const int oc = R->rcap[i];
+    R->rb[i] = R->pu; R->rcap[i] = nc; R->pu += nc; R->rl[i] = 0;
+    for (int s = 0; s < nc; s++) R->tj[R->rb[i] + s] = -1;
+    for (int s = 0; s < oc; s++) if (R->tj[ob + s] >= 0) mkr_place(R, i, R->tj[ob + s], R->tv[ob + s]);
+}
+static int lp_dependent_rows_mkw(int me, int n, const long *ep, const int *ej, const double *ev, const double *eb, char *dep, const volatile int *stop) {
+    /* rows: entries in a pool, each row a segment; columns: the rows that hold them (a superset: entries that became zero
+     * and rows that left are skipped where read); counts exact (over the sparse rows) */
+    long cpsz = 0, cpu = 0;
+    MkRows R; R.psz = 1024; R.pu = 0;
+    for (int t = 0; t < me; t++) { int nc = 2; while (nc < 2 * (ep[t + 1] - ep[t])) nc *= 2; R.psz += nc; }
+    R.psz += R.psz / 4;           /* (room for rows that grow) */
+    R.tj = xm(sizeof(int) * (size_t)R.psz); R.tv = xm(sizeof(double) * (size_t)R.psz);
+    R.rb = xm(sizeof(long) * (size_t)me); R.rl = xz(sizeof(int) * (size_t)me); R.rcap = xz(sizeof(int) * (size_t)me);
+    int *rl = R.rl;
+    long *cb = xm(sizeof(long) * ((size_t)n + 1)); int *cl = xz(sizeof(int) * ((size_t)n + 1)), *ccp = xz(sizeof(int) * ((size_t)n + 1)), *cr = NULL;
+    int *cc = xz(sizeof(int) * ((size_t)n + 1)), *cnt0 = xz(sizeof(int) * ((size_t)n + 1));
+    double *rhs = xm(sizeof(double) * (size_t)me), *bmag = xm(sizeof(double) * (size_t)me), *mag = xm(sizeof(double) * (size_t)me), *rmx = xm(sizeof(double) * (size_t)me);
+    char *ract = xz((size_t)me), *rdense = xz((size_t)me), *cinb = xz((size_t)n + 1);
+    int *rst = xz(sizeof(int) * (size_t)me);
+    int sstamp = 0;
+    /* the pivot rows as they were when chosen (for the dense rows): column, value, side, largest entry, entries */
+    int *pk = xm(sizeof(int) * ((size_t)n + 1)); for (int j = 0; j < n; j++) pk[j] = -1;
+    int *pc = xm(sizeof(int) * (size_t)me); long *ps = xm(sizeof(long) * ((size_t)me + 1));
+    double *pval = xm(sizeof(double) * (size_t)me), *pb = xm(sizeof(double) * (size_t)me), *pmx = xm(sizeof(double) * (size_t)me);
+    long ucap = ep[me] + 1024, used = 0; int *pi = xm(sizeof(int) * (size_t)ucap); double *pv = xm(sizeof(double) * (size_t)ucap);
+    /* the count lists (doubly linked; rows by length 1..n, columns by count 1..me) */
+    int *rh = xm(sizeof(int) * ((size_t)n + 2)), *rn = xm(sizeof(int) * (size_t)me), *rp = xm(sizeof(int) * (size_t)me);
+    int *ch = xm(sizeof(int) * ((size_t)me + 2)), *cn = xm(sizeof(int) * ((size_t)n + 1)), *cpv = xm(sizeof(int) * ((size_t)n + 1));
+    for (int k = 0; k <= n + 1; k++) rh[k] = -1;
+    for (int k = 0; k <= me + 1; k++) ch[k] = -1;
+#define MK_RIN(i_) do { const int i0 = (i_), k0 = rl[i0]; rp[i0] = -1; rn[i0] = rh[k0]; if (rh[k0] >= 0) rp[rh[k0]] = i0; rh[k0] = i0; } while (0)
+#define MK_ROUT(i_) do { const int i0 = (i_); if (rp[i0] >= 0) rn[rp[i0]] = rn[i0]; else rh[rl[i0]] = rn[i0]; if (rn[i0] >= 0) rp[rn[i0]] = rp[i0]; } while (0)
+#define MK_CIN(j_) do { const int j0 = (j_), k0 = cc[j0]; cinb[j0] = 1; cpv[j0] = -1; cn[j0] = ch[k0]; if (ch[k0] >= 0) cpv[ch[k0]] = j0; ch[k0] = j0; } while (0)
+#define MK_COUT(j_) do { const int j0 = (j_); cinb[j0] = 0; if (cpv[j0] >= 0) cn[cpv[j0]] = cn[j0]; else ch[cc[j0]] = cn[j0]; if (cn[j0] >= 0) cpv[cn[j0]] = cpv[j0]; } while (0)
+    /* a column's count changes by d: its place in the lists follows (a column the search left out comes back) */
+#define MK_CADD(j_, d_) do { const int j1 = (j_); if (cinb[j1]) MK_COUT(j1); cc[j1] += (d_); if (cc[j1] > 0 && pk[j1] < 0) MK_CIN(j1); } while (0)
+    /* load: duplicates within a row summed, zeros left out (odd[t]: the row had either, its table is read below instead
+     * of the input) */
+    int ncol = 0; char *odd = xz((size_t)me);
+    for (int t = 0; t < me; t++) {
+        const long len = ep[t + 1] - ep[t]; int nc = 2; while (nc < 2 * len) nc *= 2;
+        if (R.pu + nc > R.psz) { R.psz = 2 * (R.pu + nc); R.tj = realloc(R.tj, sizeof(int) * (size_t)R.psz); R.tv = realloc(R.tv, sizeof(double) * (size_t)R.psz); if (!R.tj || !R.tv) { fprintf(stderr, "brisk: out of memory (LP presolve)\n"); exit(1); } }
+        R.rb[t] = R.pu; R.rcap[t] = nc; R.pu += nc;
+        int *tj = R.tj + R.rb[t]; double *tv = R.tv + R.rb[t]; const unsigned mask = (unsigned)nc - 1;
+        for (int s = 0; s < nc; s++) tj[s] = -1;
+        double mx = 0; int l = 0;
+        for (long q = ep[t]; q < ep[t + 1]; q++) {
+            const int j = ej[q]; const double v = ev[q];
+            if (v == 0) { odd[t] = 1; continue; }
+            unsigned h = mkh(j, mask); while (tj[h] >= 0 && tj[h] != j) h = (h + 1) & mask;
+            if (tj[h] == j) { tv[h] += v; odd[t] = 1; continue; }
+            tj[h] = j; tv[h] = v; l++;
+            if (fabs(v) > mx) mx = fabs(v);
+        }
+        rl[t] = l;
+        if (odd[t]) {
+            for (int s = 0; s < nc; s++) { const long at = R.rb[t] + s; if (R.tj[at] >= 0 && R.tv[at] == 0) { mkr_del(&R, t, at); s = -1; } }
+            mx = 0; for (int s = 0; s < nc; s++) if (tj[s] >= 0) { if (fabs(tv[s]) > mx) mx = fabs(tv[s]); if (cnt0[tj[s]]++ == 0) ncol++; }
+        } else for (long q = ep[t]; q < ep[t + 1]; q++) if (cnt0[ej[q]]++ == 0) ncol++;
+        rhs[t] = eb[t]; bmag[t] = fabs(eb[t]); mag[t] = mx; rmx[t] = mx;
+    }
+    const double dlen = fmax(16.0, 10.0 * sqrt((double)ncol));
+    int ndense = 0;
+    for (int t = 0; t < me; t++) if (rl[t] > dlen) { rdense[t] = 1; ndense++; } else if (!odd[t]) { for (long q = ep[t]; q < ep[t + 1]; q++) cc[ej[q]]++; } else for (int s = 0; s < R.rcap[t]; s++) if (R.tj[R.rb[t] + s] >= 0) cc[R.tj[R.rb[t] + s]]++;
+    for (int j = 0; j < n; j++) { cb[j] = cpu; ccp[j] = cc[j] + 2; cpu += ccp[j]; }
+    cpsz = cpu + 1024; cr = xm(sizeof(int) * (size_t)cpsz);
+    for (int t = 0; t < me; t++) if (!rdense[t]) { if (!odd[t]) { for (long q = ep[t]; q < ep[t + 1]; q++) { const int j = ej[q]; cr[cb[j] + cl[j]++] = t; } } else for (int s = 0; s < R.rcap[t]; s++) { const int j = R.tj[R.rb[t] + s]; if (j >= 0) cr[cb[j] + cl[j]++] = t; } }
+    free(odd);
+    int ndep = 0, npiv = 0, aborted = 0, nact = 0;
+    for (int t = 0; t < me; t++) {
+        if (rl[t] == 0) { if (fabs(rhs[t]) <= 1e-9 * (1.0 + bmag[t])) { dep[t] = 1; ndep++; } continue; }
+        if (rdense[t]) continue;
+        ract[t] = 1; nact++; MK_RIN(t);
+    }
+    for (int j = 0; j < n; j++) if (cc[j] > 0) MK_CIN(j);
+    const long nze = ep[me];
+    const long wcap = (getenv("BRISK_LPDEPMKWCAP") ? (long)(atof(getenv("BRISK_LPDEPMKWCAP")) * (double)nze) : 32 * nze) + 100000;
+    const int slim = 4;           /* the lines looked at once a pivot is found (Suhl and Suhl's search limit) */
+    long work = 0, swork = 0;
+    while (nact > 0) {
+        if ((npiv & 255) == 0 && brisk_flag_get(stop)) { aborted = 1; break; }
+        if (work + swork > wcap) { aborted = 1; break; }
+        /* the search: columns of count k, then rows of length k, k = 1, 2, ...; at stage k every entry not yet looked at
+         * has a row of length >= k and a column of count >= k, so the search ends when the best product is <= (k-1)^2,
+         * or when slim lines have been looked at since a pivot was found */
+        int br = -1, bc = -1; long bcost = -1; double bratio = 0; int seenl = 0;
+        const int kmax = me > n ? me : n;
+        for (int k = 1; k <= kmax; k++) {
+            if (br >= 0 && bcost <= (long)(k - 1) * (k - 1)) break;
+            if (k <= me) for (int j = ch[k]; j >= 0; ) {
+                const int jn = cn[j];
+                /* the column's rows (its list compacted: rows that left, repeats); the rows of the least product are read
+                 * first, a row read only while its product can beat the best */
+                ++sstamp; int keep = 0;
+                for (int a = 0; a < cl[j]; a++) { const int i = cr[cb[j] + a]; if (!ract[i] || rst[i] == sstamp) continue; rst[i] = sstamp; cr[cb[j] + keep++] = i; }
+                cl[j] = keep; swork += keep;
+                int found = 0, nread = 0, nhas = 0; long lo = -1;
+                for (;;) {
+                    long mc = -1;
+                    for (int a = 0; a < keep; a++) { const int i = cr[cb[j] + a]; if (rst[i] != sstamp) continue; const long cost = (long)(k - 1) * (rl[i] - 1); if (cost > lo && (mc < 0 || cost < mc)) mc = cost; }
+                    if (mc < 0 || (br >= 0 && mc > bcost)) break;
+                    for (int a = 0; a < keep; a++) {
+                        const int i = cr[cb[j] + a]; if (rst[i] != sstamp || (long)(k - 1) * (rl[i] - 1) != mc) continue;
+                        const long at = mkr_find(&R, i, j); const int has = at >= 0; const double v = has ? R.tv[at] : 0;
+                        swork++; nread++; rst[i] = sstamp - 1;
+                        if (!has) continue;       /* the entry became zero */
+                        nhas++;
+                        if (fabs(v) >= 0.1 * rmx[i]) {
+                            found = 1; const double ratio = fabs(v) / rmx[i];
+                            if (br < 0 || mc < bcost || (mc == bcost && ratio > bratio)) { br = i; bc = j; bcost = mc; bratio = ratio; }
+                        }
+                    }
+                    if (found) break;
+                    lo = mc;
+                }
+                if (!found && nread == keep) MK_COUT(j);   /* no entry passes the threshold: left to the rows' search (Suhl and Suhl) */
+                if (br >= 0 && (bcost <= (long)(k - 1) * (k - 1) || ++seenl >= slim)) break;
+                j = jn;
+            }
+            if (br >= 0 && (bcost <= (long)(k - 1) * (k - 1) || seenl >= slim)) break;
+            if (k <= n) for (int i = rh[k]; i >= 0; i = rn[i]) {
+                const int *tj = R.tj + R.rb[i]; const double *tv = R.tv + R.rb[i]; const int ncap = R.rcap[i];
+                double mx = 0; for (int b = 0; b < ncap; b++) if (tj[b] >= 0 && fabs(tv[b]) > mx) mx = fabs(tv[b]);
+                rmx[i] = mx;
+                for (int b = 0; b < ncap; b++) {
+                    if (tj[b] < 0) continue;
+                    const double v = tv[b]; if (fabs(v) < 0.1 * mx) continue;
+                    const int j = tj[b];
+                    const long cost = (long)(k - 1) * (cc[j] - 1); const double ratio = fabs(v) / mx;
+                    if (br < 0 || cost < bcost || (cost == bcost && ratio > bratio)) { br = i; bc = j; bcost = cost; bratio = ratio; }
+                }
+                swork += ncap;
+                if (br >= 0 && (bcost <= (long)(k - 1) * (k - 1) || ++seenl >= slim)) break;
+            }
+            if (br >= 0 && (bcost <= (long)(k - 1) * (k - 1) || seenl >= slim)) break;
+        }
+        if (br < 0) break;
+        /* the pivot (br, bc): row br leaves, kept as pivot row kp */
+        const int r = br, c = bc, kp = npiv++;
+        MK_ROUT(r); ract[r] = 0; nact--;
+        double a = 0;
+        const int lr = rl[r];
+        if (used + lr > ucap) { ucap = 2 * (used + lr) + 1024; pi = realloc(pi, sizeof(int) * (size_t)ucap); pv = realloc(pv, sizeof(double) * (size_t)ucap); if (!pi || !pv) { fprintf(stderr, "brisk: out of memory (LP presolve)\n"); exit(1); } }
+        ps[kp] = used;
+        double rmex = 0;
+        for (int b = 0; b < R.rcap[r]; b++) { const int j = R.tj[R.rb[r] + b]; if (j < 0) continue; const double v = R.tv[R.rb[r] + b]; if (fabs(v) > rmex) rmex = fabs(v); if (j == c) { a = v; continue; } pi[used] = j; pv[used++] = v; MK_CADD(j, -1); }
+        rmx[r] = rmex;
+        ps[kp + 1] = used; pc[kp] = c; pval[kp] = a; pb[kp] = rhs[r]; pmx[kp] = rmx[r];
+        if (cinb[c]) MK_COUT(c);
+        pk[c] = kp;
+        const double rr = rhs[r], rm = rmx[r];
+        for (int a2 = 0; a2 < cl[c]; a2++) {
+            const int i = cr[cb[c] + a2];
+            if (!ract[i]) continue;
+            /* the pivot column's entry out; the entries in the pivot row's columns updated, then the fill (the row's largest
+             * entry kept as a bound: exact at the row search and at its pivot) */
+            const long atc = mkr_find(&R, i, c);
+            if (atc < 0) continue;
+            const double f = R.tv[atc] / a;
+            MK_ROUT(i);
+            mkr_del(&R, i, atc);
+            rhs[i] -= f * rr; if (fabs(f * rr) > bmag[i]) bmag[i] = fabs(f * rr);
+            if (fabs(f) * rm > mag[i]) mag[i] = fabs(f) * rm;
+            const double ztol = 1e-11 * mag[i];
+            double mx = rmx[i];
+            for (long q = ps[kp]; q < ps[kp + 1]; q++) {
+                const int j = pi[q];
+                const long at = mkr_find(&R, i, j);
+                if (at >= 0) {
+                    const double nv = R.tv[at] - f * pv[q];
+                    if (fabs(nv) <= ztol) { mkr_del(&R, i, at); MK_CADD(j, -1); }
+                    else { R.tv[at] = nv; if (fabs(nv) > mx) mx = fabs(nv); }
+                } else {
+                    const double nv = -f * pv[q];
+                    if (fabs(nv) <= ztol) continue;
+                    if (fabs(nv) > mx) mx = fabs(nv);
+                    mkr_room(&R, i, 1); mkr_place(&R, i, j, nv);
+                    if (cl[j] == ccp[j]) {          /* the column's list moves to the end of its pool, twice as long */
+                        const int nc_ = 2 * ccp[j] + 4;
+                        if (cpu + nc_ > cpsz) { cpsz = 2 * (cpu + nc_); cr = realloc(cr, sizeof(int) * (size_t)cpsz); if (!cr) { fprintf(stderr, "brisk: out of memory (LP presolve)\n"); exit(1); } }
+                        memcpy(cr + cpu, cr + cb[j], sizeof(int) * (size_t)cl[j]); cb[j] = cpu; ccp[j] = nc_; cpu += nc_;
+                    }
+                    cr[cb[j] + cl[j]++] = i;
+                    MK_CADD(j, 1);
+                    work++;
+                }
+            }
+            work += lr;
+            rmx[i] = mx;
+            if (rl[i] == 0) {                   /* reduced to zero: a combination of the pivot rows */
+                if (fabs(rhs[i]) <= 1e-9 * (1.0 + bmag[i])) { dep[i] = 1; ndep++; }
+                ract[i] = 0; nact--;
+                continue;
+            }
+            MK_RIN(i);
+        }
+        cl[c] = 0;
+    }
+#undef MK_RIN
+#undef MK_ROUT
+#undef MK_CIN
+#undef MK_COUT
+#undef MK_CADD
+    const int npiv1 = npiv;
+    if (ndense > 0 && !aborted) {
+        /* the dense rows, the shortest first, each reduced by the pivot rows in their order (the method above); a row that
+         * does not reduce to zero becomes a pivot row for the dense rows after it */
+        int *dr = xm(sizeof(int) * (size_t)ndense), nd_ = 0;
+        for (int t = 0; t < me; t++) if (rdense[t]) dr[nd_++] = t;
+        for (int x = 1; x < nd_; x++) { const int t = dr[x]; int y = x; while (y > 0 && rl[dr[y - 1]] > rl[t]) { dr[y] = dr[y - 1]; y--; } dr[y] = t; }
+        double *acc = xz(sizeof(double) * ((size_t)n + 1));
+        int *lst = xm(sizeof(int) * ((size_t)n + 1)); char *inl = xz((size_t)n + 1);
+        int *heap = xm(sizeof(int) * ((size_t)me + 1)); int *hst = xm(sizeof(int) * ((size_t)me + 1)); for (int k = 0; k < me; k++) hst[k] = -1;
+        for (int x = 0; x < nd_ && !aborted; x++) {
+            if (brisk_flag_get(stop)) { aborted = 1; break; }
+            const int t = dr[x];
+            int nl = 0, nh = 0; double rhs_ = rhs[t], bm = bmag[t], mg = mag[t];
+            for (int b = 0; b < R.rcap[t]; b++) {
+                const int j = R.tj[R.rb[t] + b]; if (j < 0) continue;
+                if (!inl[j]) { inl[j] = 1; lst[nl++] = j; }
+                acc[j] += R.tv[R.rb[t] + b];
+                const int k = pk[j];
+                if (k >= 0 && hst[k] != x) { hst[k] = x; int q = nh++; while (q > 0 && heap[(q - 1) / 2] > k) { heap[q] = heap[(q - 1) / 2]; q = (q - 1) / 2; } heap[q] = k; }
+            }
+            work += rl[t];
+            while (nh > 0) {
+                const int k = heap[0];
+                { const int last = heap[--nh]; int q = 0; for (;;) { int c2 = 2 * q + 1; if (c2 >= nh) break; if (c2 + 1 < nh && heap[c2 + 1] < heap[c2]) c2++; if (heap[c2] >= last) break; heap[q] = heap[c2]; q = c2; } if (nh > 0) heap[q] = last; }
+                const int jp = pc[k];
+                const double f = acc[jp] / pval[k];
+                if (f == 0) continue;
+                rhs_ -= f * pb[k]; if (fabs(f * pb[k]) > bm) bm = fabs(f * pb[k]);
+                if (fabs(f) * pmx[k] > mg) mg = fabs(f) * pmx[k];
+                for (long q = ps[k]; q < ps[k + 1]; q++) {
+                    const int j = pi[q];
+                    if (!inl[j]) { inl[j] = 1; lst[nl++] = j; }
+                    acc[j] -= f * pv[q];
+                    const int k2 = pk[j];
+                    if (k2 > k && hst[k2] != x) { hst[k2] = x; int q2 = nh++; while (q2 > 0 && heap[(q2 - 1) / 2] > k2) { heap[q2] = heap[(q2 - 1) / 2]; q2 = (q2 - 1) / 2; } heap[q2] = k2; }
+                }
+                acc[jp] = 0;
+                work += ps[k + 1] - ps[k];
+            }
+            double rmax = 0;
+            for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] >= 0) acc[j] = 0; else if (fabs(acc[j]) > rmax) rmax = fabs(acc[j]); }
+            if (rmax <= 1e-11 * mg) {
+                if (fabs(rhs_) <= 1e-9 * (1.0 + bm)) { dep[t] = 1; ndep++; }
+            } else {
+                /* a new pivot row: the entry within a tenth of the largest in the column of the fewest equations */
+                int jb = -1;
+                for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] < 0 && fabs(acc[j]) >= 0.1 * rmax && (jb < 0 || cnt0[j] < cnt0[jb] || (cnt0[j] == cnt0[jb] && fabs(acc[j]) > fabs(acc[jb])))) jb = j; }
+                long need = 0; for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] < 0 && j != jb && fabs(acc[j]) > 1e-14 * rmax) need++; }
+                if (used + need + 1 > ucap) { ucap = 2 * (used + need + 1); pi = realloc(pi, sizeof(int) * (size_t)ucap); pv = realloc(pv, sizeof(double) * (size_t)ucap); if (!pi || !pv) { fprintf(stderr, "brisk: out of memory (LP presolve)\n"); exit(1); } }
+                const int k = npiv++;
+                pc[k] = jb; pval[k] = acc[jb]; pb[k] = rhs_; pmx[k] = rmax; ps[k] = used;
+                for (int q = 0; q < nl; q++) { const int j = lst[q]; if (pk[j] < 0 && j != jb && fabs(acc[j]) > 1e-14 * rmax) { pi[used] = j; pv[used++] = acc[j]; } }
+                ps[k + 1] = used; pk[jb] = k;
+                work += need;
+            }
+            for (int q = 0; q < nl; q++) { acc[lst[q]] = 0; inl[lst[q]] = 0; }
+            if (work + swork > wcap) aborted = 1;
+        }
+        free(dr); free(acc); free(lst); free(inl); free(heap); free(hst);
+    }
+    if (getenv("BRISK_LPDEPDBG")) fprintf(stderr, "  [dependent rows by Markowitz pivoting: %d equations (%d dense), %d pivots (%d of them dense rows), %d dependent%s; work %ld + search %ld of %ld]\n", me, ndense, npiv, npiv - npiv1, ndep, aborted ? ", stopped at the work cap or the stop flag" : "", work, swork, wcap);
+    free(R.tj); free(R.tv); free(R.rb); free(R.rl); free(R.rcap); free(cr); free(cb); free(cl); free(ccp); free(cc); free(cnt0); free(rhs); free(bmag); free(mag); free(rmx);
+    free(ract); free(rdense); free(cinb); free(rst); free(rh); free(rn); free(rp); free(ch); free(cn); free(cpv);
+    free(pk); free(pc); free(ps); free(pval); free(pb); free(pmx); free(pi); free(pv);
+    return ndep;
+}
 /* (28 October 2026, the night; ISSUES 626) linearly dependent equality rows (Andersen and Andersen 1995, section 4.7; Gurobi's
  * and HiGHS's presolves remove them), for both presolves (lpio.c's and simplex_pre.c's): the caller's equality rows, by rows
  * (ep, ej, ev: the active entries; eb: the sides; columns in [0, n)). Each row, the shortest first, is reduced by Gaussian
@@ -591,14 +927,23 @@ int lp_to_sedumi(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M) 
  * rows are taken shortest first, so a column whose equations are long is needed by later rows only, and a pivot row
  * applied late spreads its fill into fewer rows still to come. BRISK_LPDEPTIE=0: the first column of the fewest
  * equations, as before). Stops at a work cap (the pivot rows'
- * fill; what was found stands: each row found is a combination of pivot rows, which stay) and at the stop flag. Returns the
- * number found. The robustness copies of an independent tester's LPs with a tenth more rows each the sum of two equations
+ * fill; what was found stands: each row found is a combination of pivot rows, which stay; *capped = 1) and at the stop
+ * flag. Returns the number found. The robustness copies of an independent tester's LPs with a tenth more rows each the sum of two equations
  * took 5 to 12 times the original's time (the quantile regressions: the dual form's 899 free variables; the coupled
  * networks: the dependent rows joined the network's parts in the factorization, the solves 10 times dearer), where
  * Gurobi's time hardly changed */
+/* (8 November 2026; BRISK_LPELIMFAST, on by default) a row of the presolve's eliminator kept with a map of its columns
+ * (map[k] = the position of column k in the row + 1, 0 when absent): an entry that leaves the row is marked by column -1
+ * and stays in place; compacting drops the marked entries and keeps the order of the others, so the row reads as the
+ * row compacted at every change would */
+static void elim_row_compact(int *rc, double *rv, int *rn, int *map) {
+    int w = 0;
+    for (int e = 0; e < *rn; e++) { const int k = rc[e]; if (k < 0) continue; rc[w] = k; rv[w] = rv[e]; map[k] = ++w; }
+    *rn = w;
+}
 static _Thread_local int g_lp_nodep = 0;
 void lp_set_nodeprows(int v) { g_lp_nodep = v; }
-int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double *ev, const double *eb, char *dep, const volatile int *stop) {
+static int lp_dependent_rows_order(int me, int n, const long *ep, const int *ej, const double *ev, const double *eb, char *dep, const volatile int *stop, int *capped) {
     memset(dep, 0, (size_t)me);
     if (me < 2) return 0;
     const long nze = ep[me];
@@ -631,7 +976,7 @@ int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double
     const long wcap = (getenv("BRISK_LPDEPCAP") ? (long)(atof(getenv("BRISK_LPDEPCAP")) * (double)nze) : 4 * nze) + 50000;   /* (BRISK_LPDEPCAP: the cap's units per entry, experiments) */
     long work = 0; int npiv = 0, ndep = 0, aborted = 0;
     for (int tt = 0; tt < me && !aborted; tt++) {
-        if ((tt & 255) == 0 && stop && *stop) { aborted = 1; break; }
+        if ((tt & 255) == 0 && brisk_flag_get(stop)) { aborted = 1; break; }
         const int t = rows[tt];
         int nl = 0, nh = 0; double smax = 0, rhs = eb[t], bmag = fabs(rhs);
         for (long q = ep[t]; q < ep[t + 1]; q++) {
@@ -679,17 +1024,39 @@ int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double
             work += need;
         }
         for (int q = 0; q < nl; q++) { acc[lst[q]] = 0; inl[lst[q]] = 0; }
-        if (work > wcap) aborted = 1;
+        if (work > wcap) { aborted = 1; *capped = 1; }
     }
     if (getenv("BRISK_LPDEPDBG")) fprintf(stderr, "  [dependent rows: %d equations, %d pivots, %d dependent%s; work %ld of %ld]\n", me, npiv, ndep, aborted ? ", stopped at the work cap or the stop flag" : "", work, wcap);
     free(colw); free(rows); free(cnt); free(pk); free(pc); free(ps); free(pval); free(pb); free(pmx); free(pi); free(pv); free(acc); free(lst); free(inl); free(heap); free(hst);
     return ndep;
 }
+/* (5 November 2026, ISSUES 836) BRISK_LPDEPMKW: 0 (the default) the search in the fixed order above; 1 the search by
+ * Markowitz pivoting (lp_dependent_rows_mkw) alone; 2 the search in the fixed order, and the search by Markowitz pivoting
+ * in its place when it reaches its work cap. The search in the fixed order costs least when its fill stays small, which it
+ * does on 97 of 113 LPs with dependent equations (the shifted geometric mean of its time 0.6 ms, the search by Markowitz
+ * pivoting 1.7 ms: its row tables and column lists cost a few times the entries); on the other 16 it reaches its cap, and
+ * its result depends on the order of the input. With 2, every one of them (as read and on three copies with rows and
+ * columns permuted) has all its dependent equations found, but for the quadratic assignment relaxations' copies (see
+ * lp_dependent_rows_mkw), in 0.8 ms (shifted geometric mean, all 113 LPs) */
+int lp_dependent_rows(int me, int n, const long *ep, const int *ej, const double *ev, const double *eb, char *dep, const volatile int *stop) {
+    static int mkw = -1; if (mkw < 0) { const char *e_ = getenv("BRISK_LPDEPMKW"); mkw = e_ ? atoi(e_) : 0; }
+    if (mkw == 1) { memset(dep, 0, (size_t)me); return me < 2 ? 0 : lp_dependent_rows_mkw(me, n, ep, ej, ev, eb, dep, stop); }
+    int capped = 0;
+    const int nd = lp_dependent_rows_order(me, n, ep, ej, ev, eb, dep, stop, &capped);
+    if (mkw != 2 || !capped) return nd;
+    memset(dep, 0, (size_t)me);
+    return lp_dependent_rows_mkw(me, n, ep, ej, ev, eb, dep, stop);
+}
 int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, double **ub) {
     const int bform = ub != NULL;
+    /* (11 November 2026) the switches of the experiments and diagnostics read once here, not in the loops over rows and columns:
+     * each getenv passes the whole environment (about 1,100 instructions in this container), and a test inside the row and
+     * column loops made 30,000 calls on a triangular LP of 10,000 rows, 11 % of the instructions of its whole solve */
+    const int e_dbgred = getenv("BRISK_LPDBGRED") != NULL, e_noforcing = getenv("BRISK_LPNOFORCING") != NULL,
+              e_nodualfix = getenv("BRISK_LPNODUALFIX") != NULL, e_lpdbg = getenv("BRISK_LPDBG") != NULL;
     /* (4 November 2026) stopped before it starts (the dual simplex method beside it has its result): the standard form without
      * the presolve, which is all the caller then needs (ns1111636, LP: 0.27 s of presolve after the race was decided) */
-    if (presolve > 0 && g_lp_stopf && *g_lp_stopf && !getenv("BRISK_LPFOLDNOSTOP")) presolve = 0;
+    if (presolve > 0 && brisk_flag_get(g_lp_stopf) && !getenv("BRISK_LPFOLDNOSTOP")) presolve = 0;
     const int m = L->m, n = L->n;
     memset(S, 0, sizeof(*S)); memset(M, 0, sizeof(*M));
     g_ps.nop = 0; g_ps.nrows = 0;
@@ -717,7 +1084,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
         for (int p_ = L->Ap[jj]; p_ < L->Ap[jj + 1]; p_++) { const int ii = L->Ai[p_]; if (!ra[ii]) continue; rcnt[ii]--; \
             if (vv != 0.0) { if (rl[ii] > -LP_INF) rl[ii] -= L->Ax[p_] * vv; if (ru[ii] < LP_INF) ru[ii] -= L->Ax[p_] * vv; } } } while (0)
 #define DROPROW(i_) do { const int ii = (i_); ra[ii] = 0; nrowrm++; for (int q_ = Rp[ii]; q_ < Rp[ii + 1]; q_++) if (ca[Rj[q_]]) ccnt[Rj[q_]]--; } while (0)
-    for (int pass = 0; presolve > 0 && pass < 50 && status == 0 && !(g_lp_stopf && *g_lp_stopf && !getenv("BRISK_LPFOLDNOSTOP")); pass++) {   /* (4 November 2026: and stopped, the passes made so far kept) */
+    for (int pass = 0; presolve > 0 && pass < 50 && status == 0 && !(brisk_flag_get(g_lp_stopf) && !getenv("BRISK_LPFOLDNOSTOP")); pass++) {   /* (4 November 2026: and stopped, the passes made so far kept) */
         int changed = 0;
         int act0 = 0; for (int i = 0; i < m; i++) act0 += ra[i] != 0; for (int j = 0; j < n; j++) act0 += ca[j] != 0;
         /* (4 November 2026) the stop flag read every 4,096 rows and columns as well: a pass of a large problem takes a tenth
@@ -725,7 +1092,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
         const int stopok = !getenv("BRISK_LPFOLDNOSTOP"); int pstop = 0;
         /* rows */
         for (int i = 0; i < m && status == 0 && !pstop; i++) {
-            if ((i & 4095) == 4095 && stopok && g_lp_stopf && *g_lp_stopf) { pstop = 1; break; }
+            if ((i & 4095) == 4095 && stopok && brisk_flag_get(g_lp_stopf)) { pstop = 1; break; }
             if (!ra[i]) continue;
             if (rl[i] > ru[i] + ftol * (1.0 + fabs(rl[i]))) { status = 1; break; }
             if (rcnt[i] == 0) {
@@ -742,27 +1109,41 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 if (hi < u[j]) u[j] = hi;
                 if (l[j] > u[j] + ftol * (1.0 + fabs(l[j]))) { status = 1; break; }
                 if (l[j] > u[j]) l[j] = u[j] = 0.5 * (l[j] + u[j]);
+                ps_push(9, j, i, a);     /* (11 November 2026) for the dual postsolve: row i's dual lives in x_j's bound multiplier */
                 DROPROW(i); changed = 1; continue;
             }
             /* activity bounds */
-            double amin = 0, amax = 0; int imin = 0, imax = 0;
+            double amin = 0, amax = 0, smin = 0, smax = 0; int imin = 0, imax = 0;
             for (int q = Rp[i]; q < Rp[i + 1]; q++) {
                 const int j = Rj[q]; if (!ca[j]) continue;
                 const double a = Rx[q];
-                if (a > 0) { if (l[j] > -LP_INF) amin += a * l[j]; else imin++; if (u[j] < LP_INF) amax += a * u[j]; else imax++; }
-                else { if (u[j] < LP_INF) amin += a * u[j]; else imin++; if (l[j] > -LP_INF) amax += a * l[j]; else imax++; }
+                if (a > 0) { if (l[j] > -LP_INF) { amin += a * l[j]; smin += fabs(a * l[j]); } else imin++; if (u[j] < LP_INF) { amax += a * u[j]; smax += fabs(a * u[j]); } else imax++; }
+                else { if (u[j] < LP_INF) { amin += a * u[j]; smin += fabs(a * u[j]); } else imin++; if (l[j] > -LP_INF) { amax += a * l[j]; smax += fabs(a * l[j]); } else imax++; }
             }
-            const double sc = 1.0 + fmax(fabs(amin), fabs(amax));
-            if (!imax && rl[i] > -LP_INF && amax < rl[i] - 1e-7 * (sc + fabs(rl[i]))) { status = 1; break; }
-            if (!imin && ru[i] < LP_INF && amin > ru[i] + 1e-7 * (sc + fabs(ru[i]))) { status = 1; break; }
-            if (!imin && rl[i] > -LP_INF && amin >= rl[i] - ftol * (sc + fabs(rl[i])) && rl[i] != ru[i]) { rl[i] = -LP_INF; changed = 1; }
-            if (!imax && ru[i] < LP_INF && amax <= ru[i] + ftol * (sc + fabs(ru[i])) && rl[i] != ru[i]) { ru[i] = LP_INF; changed = 1; }
+            /* (5 November 2026) each test's tolerance from the scale of the terms it compares: a test of the least activity
+             * against a side from the least activity's terms, of the most activity from the most's (the rounding of each sum
+             * is relative to its own terms). The scale was the larger of the two for every test, so a far bound on the
+             * other side widened the tolerance and binding rows were dropped as redundant: shs1014 (LP; 207,618 upper bounds
+             * of 1e9 in the file, placeholders) lost 422 rows, among them x_a + 31.2 x_b >= 31.25 (x_a, x_b >= 0, x_b with a
+             * far upper bound) dropped at a least activity of 0, and the interior-point method's point violated it by 0.97 of
+             * its activity (the crossover then took 149 s); atlanta-ip (LP) lost 236 rows and msc98-ip (LP) 177, rows such
+             * as "activity <= 0" whose most activity is 3, dropped with a tolerance of 1e-9 times a least activity of
+             * -2e10 (-2e15 in msc98-ip). BRISK_LPREDSCALE=0: the larger scale for every test, as before; BRISK_LPDBGRED=1:
+             * the rows the per-side scale keeps, printed */
+            static int rsc = -1; if (rsc < 0) { const char *e_ = getenv("BRISK_LPREDSCALE"); rsc = !(e_ && atoi(e_) == 0); }   /* (on since 7 November 2026, judged with the far-bound rule; BRISK_LPREDSCALE=0: the old tolerance) */
+            const double sc0 = 1.0 + fmax(fabs(amin), fabs(amax)), scn = rsc ? 1.0 + smin : sc0, scx = rsc ? 1.0 + smax : sc0;
+            if (!imax && rl[i] > -LP_INF && amax < rl[i] - 1e-7 * (scx + fabs(rl[i]))) { status = 1; break; }
+            if (!imin && ru[i] < LP_INF && amin > ru[i] + 1e-7 * (scn + fabs(ru[i]))) { status = 1; break; }
+            if (e_dbgred && !imin && rl[i] > -LP_INF && rl[i] != ru[i] && amin >= rl[i] - ftol * (sc0 + fabs(rl[i])) && !(amin >= rl[i] - ftol * (1.0 + smin + fabs(rl[i])))) printf("   [row %d: lower side kept by the per-side scale: amin %.9g rl %.9g smin %.3g amax %.3g (%d inf)]\n", i, amin, rl[i], smin, amax, imax);
+            if (!imin && rl[i] > -LP_INF && amin >= rl[i] - ftol * (scn + fabs(rl[i])) && rl[i] != ru[i]) { rl[i] = -LP_INF; changed = 1; }
+            if (e_dbgred && !imax && ru[i] < LP_INF && rl[i] != ru[i] && amax <= ru[i] + ftol * (sc0 + fabs(ru[i])) && !(amax <= ru[i] + ftol * (1.0 + smax + fabs(ru[i])))) printf("   [row %d: upper side kept by the per-side scale: amax %.9g ru %.9g smax %.3g amin %.3g (%d inf)]\n", i, amax, ru[i], smax, amin, imin);
+            if (!imax && ru[i] < LP_INF && amax <= ru[i] + ftol * (scx + fabs(ru[i])) && rl[i] != ru[i]) { ru[i] = LP_INF; changed = 1; }
             if (rl[i] <= -LP_INF && ru[i] >= LP_INF) { DROPROW(i); changed = 1; continue; }
             /* forcing: the row can only be met with every variable at the bound of that side */
             int force = 0;
-            if (!imax && rl[i] > -LP_INF && fabs(amax - rl[i]) <= ftol * (sc + fabs(rl[i]))) force = 1;       /* at amax */
-            else if (!imin && ru[i] < LP_INF && fabs(amin - ru[i]) <= ftol * (sc + fabs(ru[i]))) force = -1;   /* at amin */
-            if (force && getenv("BRISK_LPNOFORCING")) force = 0;     /* (experiments) */
+            if (!imax && rl[i] > -LP_INF && fabs(amax - rl[i]) <= ftol * (scx + fabs(rl[i]))) force = 1;       /* at amax */
+            else if (!imin && ru[i] < LP_INF && fabs(amin - ru[i]) <= ftol * (scn + fabs(ru[i]))) force = -1;   /* at amin */
+            if (force && e_noforcing) force = 0;     /* (experiments) */
             /* (27 October 2026, the night) only when the points the fixing removes lie within each column's tolerance of
              * its bound: they have activities between the side and the extreme one (gap apart), column j at most
              * gap / |a_ij| from its bound. The gap's test against the row's tolerance alone depends on the row's scale (a
@@ -776,18 +1157,20 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                     if (fgap > fabs(Rx[q]) * ftol * (1.0 + fabs(v))) { force = 0; break; }
                 }
             if (force) {
+                int nfc = 0;
                 for (int q = Rp[i]; q < Rp[i + 1]; q++) {
                     const int j = Rj[q]; if (!ca[j]) continue;
                     const double v = ((Rx[q] > 0) == (force > 0)) ? u[j] : l[j];
-                    FIXCOL(j, v);
+                    FIXCOL(j, v); nfc++;
                 }
+                ps_push(10, nfc, i, (double)force);    /* (11 November 2026) a forcing row, for the dual postsolve (its columns: the kind-0 records just before) */
                 DROPROW(i); changed = 1; continue;
             }
         }
         if (status) break;
         /* columns */
         for (int j = 0; j < n && status == 0 && !pstop; j++) {
-            if ((j & 4095) == 4095 && stopok && g_lp_stopf && *g_lp_stopf) { pstop = 1; break; }
+            if ((j & 4095) == 4095 && stopok && brisk_flag_get(g_lp_stopf)) { pstop = 1; break; }
             if (!ca[j]) continue;
             if (l[j] > u[j] + ftol * (1.0 + fabs(l[j]))) { status = 1; break; }
             if (l[j] > -LP_INF && u[j] < LP_INF && u[j] - l[j] <= 1e-13 * (1.0 + fabs(l[j]))) { FIXCOL(j, l[j]); changed = 1; continue; }
@@ -807,7 +1190,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 if (a > 0) { if (rl[i] > -LP_INF) down_ok = 0; if (ru[i] < LP_INF) up_ok = 0; }
                 else { if (ru[i] < LP_INF) down_ok = 0; if (rl[i] > -LP_INF) up_ok = 0; }
             }
-            if (getenv("BRISK_LPNODUALFIX")) down_ok = up_ok = 0;      /* (experiments) */
+            if (e_nodualfix) down_ok = up_ok = 0;      /* (experiments) */
             if (down_ok && c[j] > 0) { if (l[j] <= -LP_INF) continue; FIXCOL(j, l[j]); changed = 1; continue; }
             if (up_ok && c[j] < 0) { if (u[j] >= LP_INF) continue; FIXCOL(j, u[j]); changed = 1; continue; }
             if (down_ok && c[j] == 0 && l[j] > -LP_INF) { FIXCOL(j, l[j]); changed = 1; continue; }
@@ -1012,6 +1395,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
     const int *A2p = L->Ap, *A2i = L->Ai; const double *A2x = L->Ax;
     int *E_p = NULL, *E_i = NULL; double *E_x = NULL; int nelim = 0;
     if (bform && presolve > 1 && status == 0 && !getenv("BRISK_LPNOELIM")) {
+        struct timespec el_t0_; clock_gettime(CLOCK_MONOTONIC, &el_t0_); double el_op_ = 0;   /* (the eliminator's time, for BRISK_LPDBG) */
         int **rc = xz(sizeof(int *) * (m + 1)), *rn = xz(sizeof(int) * (m + 1)), *rcap = xz(sizeof(int) * (m + 1)); double **rv = xz(sizeof(double *) * (m + 1));
         int **cr = xz(sizeof(int *) * (n + 1)), *cn = xz(sizeof(int) * (n + 1)), *ccap = xz(sizeof(int) * (n + 1)), *cl = xz(sizeof(int) * (n + 1));
         for (int i = 0; i < m; i++) if (ra[i]) { rcap[i] = rcnt[i] + 4; rc[i] = xm(sizeof(int) * rcap[i]); rv[i] = xm(sizeof(double) * rcap[i]); }
@@ -1023,11 +1407,45 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
         const int maxlc = getenv("BRISK_LPELIMLC") ? atoi(getenv("BRISK_LPELIMLC")) : 12;
         const int xfill = getenv("BRISK_LPELIMFILL") ? atoi(getenv("BRISK_LPELIMFILL")) : 40;
         const int dbl2 = getenv("BRISK_LPELIM2") ? atoi(getenv("BRISK_LPELIM2")) : 1;
+        /* (7 November 2026, BRISK_LPELIMSCALE=1, off) the eliminator's tests made independent of the scaling of the rows and
+         * the columns: (1) the pivot's two size tests (not below 1e-2 of the row's largest entry, nor of the column's) compare
+         * entries of different columns (rows), which a column (row) scaling changes: they are made on the matrix scaled by the
+         * least-squares scaling of its entries (lpsolve.c, lp_canon_scale; the matrix alone: a component's free shift
+         * cancels in both tests), whose scaled entries do not depend on the input's scaling; (2) the tolerance of the implied
+         * bounds 1e-9 (1 + |b| + |rmin| + |rmax|) loses its 1, an absolute part; (3) an entry that cancels in a substitution
+         * is dropped when it is below the rounding of the two terms it came from, not below 1e-13 absolute. On
+         * neos-1420546's (LP) column-rescaled copy the eliminator took 4 of the original's 9 */
+        static int esc = -1; if (esc < 0) esc = getenv("BRISK_LPELIMSCALE") && atoi(getenv("BRISK_LPELIMSCALE")) > 0;
+        double *ers = NULL, *ecs = NULL; int ecr = 0;   /* (the factors computed when a candidate first reaches the size tests) */
+#define ESC_NEED() do { if (esc && !ecr) { ecr = 1; ers = xm(sizeof(double) * (m + 1)); ecs = xm(sizeof(double) * (n + 1)); \
+            int its_ = 0; double rr_ = 0; const double te_ = (double)clock() / CLOCKS_PER_SEC; \
+            /* (the tests compare a scaled entry with 1e-2 of another: factors to about a percent decide them alike, and the \
+             * matrix alone converges slowly, map14860-20 (LP) 681 steps to 1e-14: a residual of 1e-6, at most 100 steps) */ \
+            const int ok_ = lp_canon_scale_tol(m, n, L->Ap, L->Ai, L->Ax, NULL, NULL, NULL, NULL, NULL, ers, ecs, &its_, &rr_, 1e-6, 100); \
+            if (getenv("BRISK_LPDBG")) printf("   [eliminator on the scaled data: the scaling %d conjugate gradient steps, relative residual %.1e (%.3fs of the processor)]\n", its_, rr_, (double)clock() / CLOCKS_PER_SEC - te_); \
+            if (!ok_) { free(ers); free(ecs); ers = ecs = NULL; } } } while (0)
+#define ESC_R(i_) (ers ? ers[i_] : 1.0)
+#define ESC_C(j_) (ecs ? ecs[j_] : 1.0)
+        /* (8 November 2026; on by default, BRISK_LPELIMFAST=0: off) a substitution through row i updates every other row r of the column:
+         * found by a scan of row r, a substitution cost the length of r, and a long row in the columns of thousands of short
+         * pivot rows cost its length thousands of times (neos-2669500-cust, LP: 29,400 substitutions, rows of up to 37,633
+         * entries, 0.55 s). A row whose scans have cost as much as a map of all the columns (n + 1 entries) gets one, and
+         * a substitution then costs the length of the pivot row: the entries that leave the row are marked (column -1)
+         * and the row is compacted, in order, when half of it is marked and before it is read as a candidate pivot row,
+         * so that every reader sees the row as before and the same pivots come in the same order, with the same bits.
+         * The maps take at most 64 MB. Judged (an agent's study, bench/lp_1108/elimfast_agent36/): neos-2669500-cust 1.25 -> 0.55 s
+         * (Gurobi 0.39 s), neos-520729 0.40 -> 0.24 s, neos-4984115-canche at one thread 43.6 -> 6.2 s; the same bits on 93 of 99
+         * LPs at 4 threads (the other 6 the race's timing) and on all 14 checked at one thread */
+        int **rmap = NULL, *rdead = NULL; char *rswept = NULL; long *rscan = NULL, mbud = 0;
+        {   const char *e_ = getenv("BRISK_LPELIMFAST");
+            if (!(e_ && atoi(e_) == 0)) { rmap = xz(sizeof(int *) * (m + 1)); rdead = xz(sizeof(int) * (m + 1)); rswept = xz(m + 1); rscan = xz(sizeof(long) * (m + 1)); mbud = (64L << 20) / (long)sizeof(int); } }
         for (int round = 0; round < 6; round++) {
             int did = 0;
             for (int i = 0; i < m; i++) {
-                if (g_lp_stopf && *g_lp_stopf) break;
-                if (!ra[i] || rl[i] != ru[i] || rn[i] < 2) continue;
+                if (brisk_flag_get(g_lp_stopf)) break;
+                if (!ra[i] || rl[i] != ru[i]) continue;
+                if (rmap && rmap[i] && rdead[i]) { elim_row_compact(rc[i], rv[i], &rn[i], rmap[i]); rdead[i] = 0; }
+                if (rn[i] < 2) continue;
                 const int lr = rn[i];
                 /* the activity of the row without one column: the sums over the finite bounds and the counts of infinite ones */
                 double smin = 0, smax = 0, amax = 0; int imin = 0, imax = 0;
@@ -1037,14 +1455,15 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                     if (a > 0) { if (l[k] > -LP_INF) smin += a * l[k]; else imin++; if (u[k] < LP_INF) smax += a * u[k]; else imax++; }
                     else { if (u[k] < LP_INF) smin += a * u[k]; else imin++; if (l[k] > -LP_INF) smax += a * l[k]; else imax++; }
                 }
-                int bj = -1, bq = -1, blc = 1 << 30;
+                int bj = -1, bq = -1, blc = 1 << 30, amsc = 0;   /* (amsc: the row's largest scaled entry taken) */
                 for (int q = 0; q < lr; q++) {
                     const int j = rc[i][q]; const double a = rv[i][q];
                     const int lc = cl[j];
                     if (lc > maxlc && (lr != 2 || dbl2 == 0)) { dbg[0]++; if (lr == 2) d2[0]++; continue; }
                     if (lc >= blc) continue;
                     if ((long)(lr - 1) * (lc - 1) > (long)lr + lc - 1 + xfill) { dbg[1]++; continue; }
-                    if (fabs(a) < 1e-2 * amax) { if (lr == 2) d2[1]++; continue; }
+                    if (esc && !amsc) { ESC_NEED(); amsc = 1; if (ecs) { amax = 0; for (int q2 = 0; q2 < lr; q2++) amax = fmax(amax, fabs(rv[i][q2]) * ecs[rc[i][q2]]); } }
+                    if (fabs(a) * ESC_C(j) < 1e-2 * amax) { if (lr == 2) d2[1]++; continue; }
                     /* the rest of the row: [rmin, rmax] */
                     double rmin, rmax; int fmin_ = 1, fmax_ = 1;       /* finite */
                     { double cmin, cmax; int nmin = imin, nmax = imax;
@@ -1052,7 +1471,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                       else { cmin = u[j] < LP_INF ? a * u[j] : 0.0; if (u[j] >= LP_INF) nmin--; cmax = l[j] > -LP_INF ? a * l[j] : 0.0; if (l[j] <= -LP_INF) nmax--; }
                       rmin = smin - cmin; rmax = smax - cmax; fmin_ = nmin == 0; fmax_ = nmax == 0; }
                     /* x_j = (b - rest) / a in [lo, hi] */
-                    const double b = rl[i], tl = 1e-9 * (1.0 + fabs(b) + fabs(rmin) + fabs(rmax));
+                    const double b = rl[i], tl = 1e-9 * ((esc ? 0.0 : 1.0) + fabs(b) + fabs(rmin) + fabs(rmax));
                     int lo_ok, hi_ok;
                     if (a > 0) { lo_ok = l[j] <= -LP_INF || (fmax_ && (b - rmax) >= a * l[j] - tl); hi_ok = u[j] >= LP_INF || (fmin_ && (b - rmin) <= a * u[j] + tl); }
                     else { lo_ok = l[j] <= -LP_INF || (fmin_ && (b - rmin) <= a * l[j] + tl); hi_ok = u[j] >= LP_INF || (fmax_ && (b - rmax) >= a * u[j] - tl); }
@@ -1074,8 +1493,10 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                      * of its 46 s presolve here. The same substitutions */
                     if (lr != 2 || dbl2 == 0) {
                         double cmaxa = 0;
-                        for (int t = 0; t < cn[j]; t++) { const int r = cr[j][t]; if (!ra[r]) continue; for (int e = 0; e < rn[r]; e++) if (rc[r][e] == j) { cmaxa = fmax(cmaxa, fabs(rv[r][e])); break; } }
-                        if (fabs(a) < 1e-2 * cmaxa) { if (lr == 2) d2[3]++; continue; }
+                        for (int t = 0; t < cn[j]; t++) { const int r = cr[j][t]; if (!ra[r]) continue;
+                            if (rmap && rmap[r]) { const int e = rmap[r][j]; if (e) cmaxa = fmax(cmaxa, fabs(rv[r][e - 1]) * ESC_R(r)); continue; }
+                            for (int e = 0; e < rn[r]; e++) if (rc[r][e] == j) { cmaxa = fmax(cmaxa, fabs(rv[r][e]) * ESC_R(r)); break; } }
+                        if (fabs(a) * ESC_R(i) < 1e-2 * cmaxa) { if (lr == 2) d2[3]++; continue; }
                     }
                     bj = j; bq = q; blc = lc;
                 }
@@ -1097,12 +1518,13 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                     if (l[k] > u[k] + 1e-9 * (1.0 + fabs(l[k]))) { status = 1; break; }
                     if (l[k] > u[k]) l[k] = u[k] = 0.5 * (l[k] + u[k]);
                 }
+                struct timespec op_t0_; clock_gettime(CLOCK_MONOTONIC, &op_t0_);
                 /* the operation: the row (without j) and b, for lp_recover */
                 if (g_ps.nrows + lr + 1 > g_ps.rcap) { g_ps.rcap = 2 * g_ps.rcap + lr + 256; g_ps.rows = realloc(g_ps.rows, sizeof(int) * g_ps.rcap); }
                 if (g_ps.vcap < g_ps.rcap) { g_ps.vcap = g_ps.rcap; g_ps.vals = realloc(g_ps.vals, sizeof(double) * g_ps.vcap); }
                 const int r0 = g_ps.nrows;
                 for (int q = 0; q < lr; q++) if (q != bq) { g_ps.rows[g_ps.nrows] = rc[i][q]; g_ps.vals[g_ps.nrows++] = rv[i][q]; }
-                g_ps.rows[g_ps.nrows] = -1; g_ps.vals[g_ps.nrows++] = b;
+                g_ps.rows[g_ps.nrows] = -1 - i; g_ps.vals[g_ps.nrows++] = b;     /* (the row, for the dual postsolve: -1 - i) */
                 ps_push(8, j, r0, a);
                 /* the cost */
                 if (c[j] != 0.0) { const double f = c[j] / a; for (int q = 0; q < lr; q++) if (q != bq) c[rc[i][q]] -= f * rv[i][q]; c0 += f * b; }
@@ -1110,6 +1532,45 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 for (int q = 0; q < lr; q++) pos[rc[i][q]] = 0;
                 for (int t = 0; t < cn[j]; t++) {
                     const int r = cr[j][t]; if (!ra[r] || r == i) continue;
+                    if (rmap && !rmap[r]) {         /* (the map once the scans of the row have cost as much) */
+                        rscan[r] += rn[r];
+                        if (rn[r] >= 64 && rscan[r] > n && mbud >= (long)n + 1) {
+                            rmap[r] = xz(sizeof(int) * (n + 1)); mbud -= (long)n + 1;
+                            for (int e = 0; e < rn[r]; e++) rmap[r][rc[r][e]] = e + 1;
+                        }
+                    }
+                    if (rmap && rmap[r]) {
+                        int *mp = rmap[r]; const int ej = mp[j] - 1;
+                        if (ej < 0) continue;
+                        const double f = rv[r][ej] / a;
+                        for (int q = 0; q < lr; q++) {
+                            if (q == bq) continue;
+                            const int k = rc[i][q]; const double dv = -f * rv[i][q]; int e = mp[k] - 1;
+                            if (e >= 0) { const double o_ = rv[r][e]; rv[r][e] += dv; if (esc && fabs(rv[r][e]) <= 64 * DBL_EPSILON * (fabs(o_) + fabs(dv))) rv[r][e] = 0.0; }
+                            else {
+                                if (rn[r] == rcap[r]) { rcap[r] = 2 * rcap[r] + 4; rc[r] = realloc(rc[r], sizeof(int) * rcap[r]); rv[r] = realloc(rv[r], sizeof(double) * rcap[r]); }
+                                e = rn[r]; rc[r][e] = k; rv[r][e] = dv; mp[k] = ++rn[r];
+                                if (cn[k] == ccap[k]) { ccap[k] = 2 * ccap[k] + 4; cr[k] = realloc(cr[k], sizeof(int) * ccap[k]); }
+                                cr[k][cn[k]++] = r; cl[k]++;
+                            }
+                            /* an entry that cancelled leaves the row (once the row is swept: before, the sweep below) */
+                            if (rswept[r] && (esc ? rv[r][e] == 0.0 : fabs(rv[r][e]) < 1e-13)) { rc[r][e] = -1; mp[k] = 0; cl[k]--; rdead[r]++; }
+                        }
+                        if (rl[r] > -LP_INF) rl[r] -= f * b;
+                        if (ru[r] < LP_INF) ru[r] -= f * b;
+                        if (!rswept[r]) {
+                            /* the first substitution into the row since its map: x_j and every entry below the limit leave
+                             * it (entries of the problem as read among them), as in the compaction without a map; from
+                             * then on only the entries a substitution changes can fall below the limit */
+                            int w2 = 0;
+                            for (int e = 0; e < rn[r]; e++) { const int k = rc[r][e]; mp[k] = 0; if (k == j) continue; if (esc ? rv[r][e] == 0.0 : fabs(rv[r][e]) < 1e-13) { cl[k]--; continue; } rc[r][w2] = k; rv[r][w2++] = rv[r][e]; mp[k] = w2; }
+                            rn[r] = w2; rswept[r] = 1; rdead[r] = 0;
+                        } else {
+                            rc[r][ej] = -1; mp[j] = 0; rdead[r]++;
+                            if (2 * rdead[r] > rn[r]) { elim_row_compact(rc[r], rv[r], &rn[r], mp); rdead[r] = 0; }
+                        }
+                        continue;
+                    }
                     int ej = -1;
                     for (int e = 0; e < rn[r]; e++) { pos[rc[r][e]] = e + 1; if (rc[r][e] == j) ej = e; }
                     if (ej >= 0) {
@@ -1117,7 +1578,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                         for (int q = 0; q < lr; q++) {
                             if (q == bq) continue;
                             const int k = rc[i][q]; const double dv = -f * rv[i][q];
-                            if (pos[k]) rv[r][pos[k] - 1] += dv;
+                            if (pos[k]) { const double o_ = rv[r][pos[k] - 1]; rv[r][pos[k] - 1] += dv; if (esc && fabs(rv[r][pos[k] - 1]) <= 64 * DBL_EPSILON * (fabs(o_) + fabs(dv))) rv[r][pos[k] - 1] = 0.0; }
                             else {
                                 if (rn[r] == rcap[r]) { rcap[r] = 2 * rcap[r] + 4; rc[r] = realloc(rc[r], sizeof(int) * rcap[r]); rv[r] = realloc(rv[r], sizeof(double) * rcap[r]); }
                                 rc[r][rn[r]] = k; rv[r][rn[r]++] = dv; pos[k] = rn[r];
@@ -1130,14 +1591,24 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                     }
                     for (int e = 0; e < rn[r]; e++) pos[rc[r][e]] = 0;
                     /* x_j and the entries that cancelled leave the row */
-                    if (ej >= 0) { int w2 = 0; for (int e = 0; e < rn[r]; e++) { const int k = rc[r][e]; if (k == j) continue; if (fabs(rv[r][e]) < 1e-13) { cl[k]--; continue; } rc[r][w2] = k; rv[r][w2++] = rv[r][e]; } rn[r] = w2; }
+                    if (ej >= 0) { int w2 = 0; for (int e = 0; e < rn[r]; e++) { const int k = rc[r][e]; if (k == j) continue; if (esc ? rv[r][e] == 0.0 : fabs(rv[r][e]) < 1e-13) { cl[k]--; continue; } rc[r][w2] = k; rv[r][w2++] = rv[r][e]; } rn[r] = w2; }
                 }
                 for (int q = 0; q < lr; q++) if (q != bq) cl[rc[i][q]]--;
                 ra[i] = 0; nrowrm++; ca[j] = 0; nfixed++; nelim++; did = 1;
+                if (rmap && rmap[i]) { free(rmap[i]); rmap[i] = NULL; mbud += (long)n + 1; }
+                { struct timespec op_t1_; clock_gettime(CLOCK_MONOTONIC, &op_t1_); el_op_ += (op_t1_.tv_sec - op_t0_.tv_sec) + 1e-9 * (op_t1_.tv_nsec - op_t0_.tv_nsec); }
             }
-            if (!did || status || (g_lp_stopf && *g_lp_stopf)) break;
+            if (!did || status || (brisk_flag_get(g_lp_stopf))) break;
         }
-        free(pos);
+        free(pos); free(ers); free(ecs);
+        if (rmap) {         /* the rows as without the maps, for what reads them below */
+            for (int i = 0; i < m; i++) if (rmap[i]) { if (rdead[i]) elim_row_compact(rc[i], rv[i], &rn[i], rmap[i]); free(rmap[i]); }
+            free(rmap); free(rdead); free(rswept); free(rscan);
+        }
+#undef ESC_R
+#undef ESC_C
+#undef ESC_NEED
+        if (getenv("BRISK_LPDBG")) { struct timespec el_t1_; clock_gettime(CLOCK_MONOTONIC, &el_t1_); printf("   [eliminator: %.3f s, the substitutions %.3f s]\n", (el_t1_.tv_sec - el_t0_.tv_sec) + 1e-9 * (el_t1_.tv_nsec - el_t0_.tv_nsec), el_op_); }
         if (getenv("BRISK_LPDBG")) printf("   [eliminator: %d taken; candidates refused: column too long %ld, fill %ld, lower bound not implied %ld, upper bound not implied %ld; rows of two entries: %ld refused, %ld taken (candidates refused: long %ld, small in the row %ld, a new bound on a free column %ld, small in the column %ld)]\n", nelim, dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], d2[0], d2[1], d2[2], d2[3]);
         if (nelim) {
             /* the matrix after the substitutions, by columns */
@@ -1147,6 +1618,15 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
             for (int j = 0; j < n; j++) E_p[j + 2] += E_p[j + 1];
             for (int i = 0; i < m; i++) if (ra[i]) for (int e = 0; e < rn[i]; e++) { const int q = E_p[rc[i][e] + 1]++; E_i[q] = i; E_x[q] = rv[i][e]; }
             A2p = E_p; A2i = E_i; A2x = E_x;
+            if (getenv("BRISK_LPDBG")) {    /* (a checksum of the problem the eliminator leaves, to compare two builds) */
+                unsigned long long h_ = 1469598103934665603ULL; unsigned long long w_;
+#define EL_H(x_) do { const double d_ = (x_); memcpy(&w_, &d_, 8); h_ = (h_ ^ w_) * 1099511628211ULL; } while (0)
+                for (int i = 0; i < m; i++) if (ra[i]) { EL_H(rl[i]); EL_H(ru[i]); }
+                for (int j = 0; j < n; j++) if (ca[j]) { EL_H(c[j]); EL_H(l[j]); EL_H(u[j]); for (int p = E_p[j]; p < E_p[j + 1]; p++) { EL_H((double)E_i[p]); EL_H(E_x[p]); } }
+                EL_H(c0);
+#undef EL_H
+                printf("   [eliminator: checksum of the rows, the bounds and the costs it leaves %016llx]\n", h_);
+            }
             if (verbose > 0) printf("presolve: %d columns substituted by their equality rows (the eliminator)\n", nelim);
         }
         for (int i = 0; i < m; i++) { free(rc[i]); free(rv[i]); }
@@ -1194,7 +1674,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
         memcpy(l2, l, sizeof(double) * n); memcpy(u2, u, sizeof(double) * n);
         for (int j = 0; j < n; j++) {
             if (!ca[j] || (l[j] <= -LP_INF && u[j] >= LP_INF)) continue;
-            double lo = -LP_INF, hi = LP_INF;
+            double lo = -LP_INF, hi = LP_INF; int ilo = -1, ihi = -1;     /* (the rows that imply them, for the dual postsolve) */
             for (int p = A2p[j]; p < A2p[j + 1]; p++) {
                 const int i = A2i[p]; if (!ra[i]) continue;
                 const double a = A2x[p], bl = a > 0 ? l[j] : u[j], bu = a > 0 ? u[j] : l[j];
@@ -1204,11 +1684,11 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 const double tol = 1e-9 * (1.0 + asc[i] + fmax(rl[i] > -LP_INF ? fabs(rl[i]) : 0, ru[i] < LP_INF ? fabs(ru[i]) : 0)) / fabs(a);
                 if (ru[i] < LP_INF && imn[i] - il == 0) {
                     const double v = (ru[i] - (amn[i] - (il ? 0 : a * bl))) / a;
-                    if (a > 0) hi = fmin(hi, v + tol); else lo = fmax(lo, v - tol);
+                    if (a > 0) { if (v + tol < hi) { hi = v + tol; ihi = i; } } else { if (v - tol > lo) { lo = v - tol; ilo = i; } }
                 }
                 if (rl[i] > -LP_INF && imx[i] - iu == 0) {
                     const double v = (rl[i] - (amx[i] - (iu ? 0 : a * bu))) / a;
-                    if (a > 0) lo = fmax(lo, v - tol); else hi = fmin(hi, v + tol);
+                    if (a > 0) { if (v - tol > lo) { lo = v - tol; ilo = i; } } else { if (v + tol < hi) { hi = v + tol; ihi = i; } }
                 }
             }
             /* only a bound whose size exceeds that of the implied one by three orders of magnitude: what harms is the
@@ -1217,10 +1697,13 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
              * greenbea (LP; lower bounds 0 -> 29 to 258, likely active at the optimum) it cost the accuracy of the
              * result on the problem as read (a row violated by 1.2e-6 of its activity, above the limit of 1e-6) */
             if (l[j] > -LP_INF && lo > l[j] && fabs(l[j]) > 1e3 * (1.0 + fabs(lo)) && lo < u[j] && lo < hi) { l2[j] = lo; ntight++;
-                if (getenv("BRISK_LPDBG")) printf("   [tightened: column %d lower %.6g -> %.6g (upper %.6g)]\n", j, l[j], lo, u[j]); }
+                if (e_lpdbg) printf("   [tightened: column %d lower %.6g -> %.6g (upper %.6g)]\n", j, l[j], lo, u[j]); }
             if (u[j] < LP_INF && hi < u[j] && fabs(u[j]) > 1e3 * (1.0 + fabs(hi)) && hi > l[j] && hi > lo) { u2[j] = hi; ntight++;
-                if (getenv("BRISK_LPDBG")) printf("   [tightened: column %d upper %.6g -> %.6g (lower %.6g)]\n", j, u[j], hi, l[j]); }
+                if (e_lpdbg) printf("   [tightened: column %d upper %.6g -> %.6g (lower %.6g)]\n", j, u[j], hi, l[j]); }
             if (l2[j] >= u2[j]) { l2[j] = l[j]; u2[j] = u[j]; }
+            /* (11 November 2026) for the dual postsolve: a multiplier of the tightened bound belongs to the row that implies it */
+            if (l2[j] != l[j] && ilo >= 0) ps_push(11, j, ilo, -1.0);
+            if (u2[j] != u[j] && ihi >= 0) ps_push(11, j, ihi, 1.0);
         }
         memcpy(l, l2, sizeof(double) * n); memcpy(u, u2, sizeof(double) * n);
         free(l2); free(u2); free(amn); free(amx); free(asc); free(imn); free(imx);
@@ -1233,7 +1716,7 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
     for (int i = 0; i < m; i++) { M->rpos[i] = -1; M->rsgn[i] = 1; }
     /* (28 October 2026, the night; ISSUES 626) the linearly dependent equality rows, once after the passes (lp_dependent_rows
      * above): dropped as the redundant rows are, their duals 0. BRISK_LPDEPROWS=0: kept */
-    if (status == 0 && presolve > 0 && !g_lp_nodep && !(g_lp_stopf && *g_lp_stopf) && !(getenv("BRISK_LPDEPROWS") && atoi(getenv("BRISK_LPDEPROWS")) == 0)) {
+    if (status == 0 && presolve > 0 && !g_lp_nodep && !(brisk_flag_get(g_lp_stopf)) && !(getenv("BRISK_LPDEPROWS") && atoi(getenv("BRISK_LPDEPROWS")) == 0)) {
         int me = 0; for (int i = 0; i < m; i++) if (ra[i] && rcnt[i] > 0 && rl[i] == ru[i] && rl[i] > -LP_INF) me++;
         if (me >= 2) {
             int *erow = xm(sizeof(int) * (size_t)me), *ei = xm(sizeof(int) * ((size_t)m + 1)); long *ep = xz(sizeof(long) * ((size_t)me + 2));
@@ -1277,6 +1760,18 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
     S->b = xz(sizeof(double) * (ms + 1)); S->c = xz(sizeof(double) * (ns + 1));
     /* right-hand sides: an equality b = rl; a >= row: a'x - s = rl; a <= row: a'x + s = ru; a range: a'x - s = rl, s + t = ru - rl */
     for (int i = 0; i < m; i++) if (ra[i]) S->b[M->rpos[i]] = rl[i] > -LP_INF ? rl[i] : ru[i];
+    /* (7 November 2026, BRISK_LPSTDBZERO, on by default since that day; 0: off) a side that is zero up to the rounding of the terms it was computed from
+     * (the side as read, the fixed columns' and the shifted columns' terms a_ij v_j) made zero: where the exact value is zero
+     * the computed one is noise of either sign, or zero, depending on the input's scaling, and a side's being zero or not
+     * decides the folding's classes and the scaling the folding takes on rescaled copies (graphdraw-grafo2's (LP)
+     * column-rescaled copy: 268 such rows, the fold of its standard form 52,712 rows lost to 97,241) */
+    static int bzero = -1; if (bzero < 0) bzero = !(getenv("BRISK_LPSTDBZERO") && atoi(getenv("BRISK_LPSTDBZERO")) == 0);   /* (on by default since 7 November 2026: the default route, 4 threads, 23 problem LPs 1.006, 40 development LPs 1.008, 46 fresh rescaled copies 1.003, the iterations the same but on 4; BRISK_LPSTDBZERO=0: off) */
+    double *bterm = NULL;
+    if (bzero) {
+        bterm = xz(sizeof(double) * (m + 1));
+        for (int i = 0; i < m; i++) if (ra[i]) bterm[i] = fabs(S->b[M->rpos[i]]) + (L->rl[i] > -LP_INF ? fabs(L->rl[i]) : 0) + (L->ru[i] < LP_INF ? fabs(L->ru[i]) : 0);
+        for (int j = 0; j < n; j++) if (!ca[j] && xfix[j] != 0) for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) bterm[L->Ai[p]] += fabs(L->Ax[p] * xfix[j]);
+    }
     int col = 0, brow = mrow; long w = 0;
     int *bndrow = xm(sizeof(int) * (n + 1));
     for (int pass = 0; pass < 2; pass++)                     /* free columns, then the others */
@@ -1289,12 +1784,14 @@ int lp_to_std(LpProb *L, int presolve, int verbose, SedumiProb *S, LpMap *M, dou
                 const int i = A2i[p]; if (!ra[i]) continue;
                 S->Ai[w] = M->rpos[i]; S->Ax[w] = sg * A2x[p]; w++;
                 S->b[M->rpos[i]] -= A2x[p] * sh;
+                if (bterm) bterm[i] += fabs(A2x[p] * sh);
             }
             bndrow[j] = -1;
             if (bform) { if (M->ckind[j] == 0 && u[j] < LP_INF) U[col] = u[j] - l[j]; }
             else if (M->ckind[j] == 0 && u[j] < LP_INF) { bndrow[j] = brow; S->Ai[w] = brow; S->Ax[w] = 1.0; w++; S->b[brow] = u[j] - l[j]; brow++; }
             col++;
         }
+    if (bterm) { for (int i = 0; i < m; i++) if (ra[i] && fabs(S->b[M->rpos[i]]) <= 64 * DBL_EPSILON * bterm[i]) S->b[M->rpos[i]] = 0.0; free(bterm); }
     /* row slacks */
     for (int i = 0; i < m; i++) if (ra[i] && rl[i] != ru[i]) {
         S->Ap[col] = (int)w; S->Ai[w] = M->rpos[i]; S->Ax[w] = rl[i] > -LP_INF ? -1.0 : 1.0; w++;
@@ -1324,7 +1821,7 @@ double lp_recover(const LpProb *L, const LpMap *M, const double *xstd, double *x
     }
     /* the operations of the presolve that left a value open, in reverse */
     int any = 0;
-    for (int e = 0; e < g_ps.nop; e++) if (g_ps.op[e].kind >= 1) any = 1;
+    for (int e = 0; e < g_ps.nop; e++) if (g_ps.op[e].kind >= 1 && g_ps.op[e].kind <= 8) any = 1;   /* (9, 10: the dual postsolve's) */
     if (any) {
         const int m = L->m;
         int *Rp = xz(sizeof(int) * (m + 2)), *Rj = xm(sizeof(int) * (L->Ap[n] + 1)); double *Rx = xm(sizeof(double) * (L->Ap[n] + 1));
@@ -1376,6 +1873,91 @@ double lp_recover(const LpProb *L, const LpMap *M, const double *xstd, double *x
     return obj;
 }
 
+/* (11 November 2026, the LP developer, at the owner's request) the rows' duals of the problem as read for the rows the
+ * presolve removed, from the dual equation of the column each removal hinged on, in the reverse order of the operations:
+ * a singleton row made a bound of x_j (kind 9) takes the residual c_j - a_j'y of column j when the row is the side x_j is at
+ * (with the sign of that side); the row of a free column singleton (kind 1) and the equality row a column was substituted by
+ * (kind 8) take y_i = (c_j - sum_{r != i} a_rj y_r) / a_ij, which makes x_j's reduced cost zero. Rows removed otherwise keep
+ * 0 (empty, redundant and the rows of a column of zero cost have the dual 0; a forcing row's is not recovered). y holds the
+ * duals of the rows the solved problem kept (0 for the others) and is completed in place; the caller measures the result
+ * (the duals are returned only when exact). Before, every removed row's dual was 0: 31 of netlib's 98 LPs returned no duals
+ * when the interior-point method gave the result. */
+void lp_dual_postsolve(const LpProb *L, const double *x, double *y) {
+    const int n = L->n;
+    if (getenv("BRISK_LPDUALDBG")) for (int e = 0; e < g_ps.nop; e++) fprintf(stderr, "[duals] op %d: kind %d column %d row/at %d value %.6g\n", e, g_ps.op[e].kind, g_ps.op[e].j, g_ps.op[e].i, g_ps.op[e].v);
+    /* the reverse pass repeated until the duals stop changing: a substitution can use a row that an earlier one changed (scfxm1,
+     * LP: two columns substituted one after the other, each by a row holding the other's column), so their equations form a
+     * small system over the original matrix; repeated passes solve it (each pass is exact for the operations it can order) */
+    for (int pass = 0; pass < 50; pass++) {
+    double dmax = 0, ymax = 0;
+    for (int e = g_ps.nop - 1; e >= 0; e--) {
+        const int kind = g_ps.op[e].kind, j = g_ps.op[e].j;
+        if (kind == 10) {
+            /* a forcing row: its columns were fixed at the bounds the row forced (the kind-0 records before it); its dual is the
+             * extreme ratio z_j / a_ij over them on the side of the row (y_i >= 0 at its lower side: the largest; <= 0 at its upper:
+             * the smallest), which leaves every one of them with a reduced cost of the sign its bound allows (as the simplex
+             * presolve's postsolve of a forcing row) */
+            const int i = g_ps.op[e].i, side = g_ps.op[e].v > 0 ? 1 : -1;
+            if (i < 0 || i >= L->m) continue;
+            double yi = 0;
+            for (int f = e - 1; f >= 0 && f >= e - j && g_ps.op[f].kind == 0; f--) {     /* (its j records: the row's columns) */
+                const int k = g_ps.op[f].j; double a = 0, zk = L->c[k];
+                for (int p = L->Ap[k]; p < L->Ap[k + 1]; p++) { if (L->Ai[p] == i) a += L->Ax[p]; else zk -= L->Ax[p] * y[L->Ai[p]]; }
+                if (a == 0.0) continue;
+                const double rr = zk / a;
+                if (side > 0 ? rr > yi : rr < yi) yi = rr;
+            }
+            dmax = fmax(dmax, fabs(y[i] - yi)); ymax = fmax(ymax, fabs(yi)); y[i] = yi;
+            continue;
+        }
+        if (kind == 11) {
+            /* (11 November 2026) a bound far beyond the one row i implies, tightened to it for the interior-point method (the
+             * standard form's last step): at the tightened bound x_j's multiplier z_j is the row's. Row i holds x_j there only
+             * with its side active and every other column of the row at the bound that gives the row's extreme, so the
+             * multiplier moved to the row, y_i += z_j / a_ij, leaves z_j zero and changes the others' reduced costs in the
+             * direction their bounds allow. Only when x_j is at the tightened side by the complementarity rule and its own bound
+             * (far away) does not hold it (ken-13, LP: 922 columns at 26 to 104 within [0, 114370] with multipliers, a duality
+             * gap of 3 % on the problem as read) */
+            const int i = g_ps.op[e].i, up = g_ps.op[e].v > 0;
+            if (i < 0 || i >= L->m || j < 0 || j >= n) continue;
+            double aij = 0, zj = L->c[j];
+            for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { if (L->Ai[p] == i) aij += L->Ax[p]; zj -= L->Ax[p] * y[L->Ai[p]]; }
+            if (aij == 0.0) continue;
+            const int act = up ? zj < 0 && !(L->u[j] < LP_INF && -zj > L->u[j] - x[j]) : zj > 0 && !(L->l[j] > -LP_INF && zj > x[j] - L->l[j]);
+            if (!act) continue;
+            const double dy = zj / aij;
+            dmax = fmax(dmax, fabs(dy)); y[i] += dy; ymax = fmax(ymax, fabs(y[i]));
+            continue;
+        }
+        if (kind != 1 && kind != 8 && kind != 9) continue;
+        int i = g_ps.op[e].i;
+        if (kind == 8) { int r = i; while (g_ps.rows[r] >= 0) r++; i = -1 - g_ps.rows[r]; }
+        if (i < 0 || i >= L->m || j < 0 || j >= n) continue;
+        double aij = 0, rj = L->c[j];
+        for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) { if (L->Ai[p] == i) aij += L->Ax[p]; else rj -= L->Ax[p] * y[L->Ai[p]]; }
+        if (aij == 0.0) continue;
+        if (kind != 9) { const double yn = rj / aij; dmax = fmax(dmax, fabs(y[i] - yn)); ymax = fmax(ymax, fabs(yn)); y[i] = yn; continue; }
+        /* the singleton row: its dual only when x_j is at the bound the row gave, with the sign of that side, and x_j's own bound
+         * does not hold it there as well with the right sign (then the column keeps the multiplier). rj is the reduced cost of x_j
+         * without row i's own dual (the loop above leaves row i out), so that a pass computes what the first one did, when y_i was
+         * still 0. (14 November 2026) Before, row i's current dual was taken out of rj as well: from the second pass on, a dual set
+         * by the first pass made the residual zero, the next pass set it back to 0, and so on; the passes never met their stop
+         * test and ran all 50: map18 (LP, 390,178 operations) 20 s of the library's 22 s solve call, its dual flipping between
+         * 3.6e-12 and 0 (the command line does not run this postsolve unless the duals are asked for) */
+        /* at a side when the multiplier it would take is larger than the distance to it (the larger of a complementary pair:
+         * the point of an interior-point method is only near its bounds, 7e-6 from 55.2 on scfxm1, LP) */
+        const double ax = aij * x[j], yi = rj / aij;
+        const int ownl = L->l[j] > -LP_INF && rj > 0 && rj > x[j] - L->l[j], ownu = L->u[j] < LP_INF && rj < 0 && -rj > L->u[j] - x[j];
+        if (ownl || ownu) { dmax = fmax(dmax, fabs(y[i])); y[i] = 0; continue; }     /* x_j's own bound takes it with the right sign */
+        const int atl = L->rl[i] > -LP_INF && yi > 0 && yi > ax - L->rl[i], atu = L->ru[i] < LP_INF && yi < 0 && -yi > L->ru[i] - ax;
+        { const double yn = atl || atu ? yi : 0.0; dmax = fmax(dmax, fabs(y[i] - yn)); ymax = fmax(ymax, fabs(yn)); y[i] = yn; }
+    }
+    {   static int pv_ = -1; if (pv_ < 0) { const char *e_ = getenv("BRISK_LPDUALPSV"); pv_ = e_ && atoi(e_) != 0; }   /* (14 November 2026, a diagnostic) each pass's change */
+        if (pv_) { struct timespec t_; clock_gettime(CLOCK_MONOTONIC, &t_); fprintf(stderr, "[dual postsolve] pass %d: %d operations, largest change %.3e, largest dual %.3e, clock %.3f\n", pass, g_ps.nop, dmax, ymax, t_.tv_sec + 1e-9 * t_.tv_nsec); } }
+    if (dmax <= 1e-15 * (1 + ymax)) break;
+    }
+}
+
 void lp_errors(const LpProb *L, const double *x, double *ebound, double *erow) {
     const int m = L->m, n = L->n;
     double eb = 0, er = 0, xn = 0;
@@ -1401,6 +1983,21 @@ void lp_errors(const LpProb *L, const double *x, double *ebound, double *erow) {
     }
     free(ax); free(an);
     *ebound = eb > 0 ? eb : 0; *erow = er > 0 ? er : 0;
+}
+void lp_errors_abs(const LpProb *L, const double *x, double *ebound, double *erow) {
+    const int m = L->m, n = L->n;
+    double eb = 0, er = 0, *ax = xz(sizeof(double) * (m + 1));
+    for (int j = 0; j < n; j++) {
+        if (L->l[j] > -LP_INF) eb = fmax(eb, L->l[j] - x[j]);
+        if (L->u[j] < LP_INF) eb = fmax(eb, x[j] - L->u[j]);
+        for (int p = L->Ap[j]; p < L->Ap[j + 1]; p++) ax[L->Ai[p]] += L->Ax[p] * x[j];
+    }
+    for (int i = 0; i < m; i++) {
+        if (L->rl[i] > -LP_INF) er = fmax(er, L->rl[i] - ax[i]);
+        if (L->ru[i] < LP_INF) er = fmax(er, ax[i] - L->ru[i]);
+    }
+    free(ax);
+    *ebound = eb; *erow = er;
 }
 /* (21 October 2026, the night) the largest row violation against the row's activity, (violation) / (1 + |side| +
  * sum_j |a_ij x_j|): unlike lp_errors' measure it does not grow with the terms of a row (agg, pilot.we: 1.6e-10 and
@@ -1457,17 +2054,19 @@ int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out
 int cbf_read(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, char *msg, size_t nmsg) {
     return cbf_read_ex(fname, S, c0_out, maxim_out, nint_out, NULL, NULL, msg, nmsg);
 }
-static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, int **vmap, signed char **vmsgn, int *nvar_out, char *msg, size_t nmsg);
+static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, int **vmap, signed char **vmsgn, int *nvar_out, CbfDualMap *dm, char *msg, size_t nmsg);
 int cbf_read_ex(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, char *msg, size_t nmsg) {
-    return cbf_read_core(fname, S, c0_out, maxim_out, nint_out, intcol, intsgn, NULL, NULL, NULL, msg, nmsg);
+    return cbf_read_core(fname, S, c0_out, maxim_out, nint_out, intcol, intsgn, NULL, NULL, NULL, NULL, msg, nmsg);
 }
 /* (27 October 2026, the SOCP developer) cbf_read_vmap: also the SeDuMi column of every CBF variable (vmap, -1 for an L=
  * variable, which is zero) and its sign (vmsgn: -1 for an L- variable), so that a solution can be written in the file's
  * own variables (the command line's -x) */
-int cbf_read_vmap(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **vmap, signed char **vmsgn, int *nvar_out, char *msg, size_t nmsg) {
-    return cbf_read_core(fname, S, c0_out, maxim_out, nint_out, NULL, NULL, vmap, vmsgn, nvar_out, msg, nmsg);
+int cbf_read_vmap(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **vmap, signed char **vmsgn, int *nvar_out, CbfDualMap *dm, char *msg, size_t nmsg) {
+    return cbf_read_core(fname, S, c0_out, maxim_out, nint_out, NULL, NULL, vmap, vmsgn, nvar_out, dm, msg, nmsg);
 }
-static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, int **vmap, signed char **vmsgn, int *nvar_out, char *msg, size_t nmsg) {
+void cbf_dualmap_free(CbfDualMap *dm) { if (dm) { free(dm->rmap); free(dm->c0col); free(dm->zp); free(dm->zi); free(dm->zx); memset(dm, 0, sizeof *dm); } }
+static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *maxim_out, int *nint_out, int **intcol, signed char **intsgn, int **vmap, signed char **vmsgn, int *nvar_out, CbfDualMap *dm, char *msg, size_t nmsg) {
+    if (dm) memset(dm, 0, sizeof *dm);
     memset(S, 0, sizeof(*S)); *c0_out = 0; *maxim_out = 0; *nint_out = 0;
     int *intv = NULL; int nintv = 0;
     if (intcol) *intcol = NULL;
@@ -1599,6 +2198,22 @@ static int cbf_read_core(const char *fname, SedumiProb *S, double *c0_out, int *
                 if (intsgn) (*intsgn)[t] = (j >= 0 && j < nvar && vk[j] == 2) ? -1 : 1;
             }
             *nint_out = nintv;
+        }
+        if (dm) {
+            /* (12 November 2026, the SOCP developer) for -y and -z on a CBF file: the row of every constraint (-1: a free one, no
+             * multiplier), and the cost and file columns of the variables fixed at zero (L=), which the solver's form drops: their z is
+             * c_j - a_j'y, computed from these */
+            dm->ncon = ncon; dm->rmap = crow; crow = NULL;
+            int nz0 = 0; for (int j = 0; j < nvar; j++) if (vk[j] == 3) nz0++;
+            dm->n0 = nz0; dm->c0col = xm(sizeof(double) * (nz0 + 1)); dm->zp = xz(sizeof(long) * (nz0 + 2));
+            int *pos = xm(sizeof(int) * (nvar + 1)); { int q = 0; for (int j = 0; j < nvar; j++) pos[j] = vk[j] == 3 ? q++ : -1; }
+            for (int j = 0; j < nvar; j++) if (pos[j] >= 0) dm->c0col[pos[j]] = cobj[j];
+            for (long t = 0; t < nza; t++) if (pos[aj[t]] >= 0 && dm->rmap[ai[t]] >= 0) dm->zp[pos[aj[t]] + 1]++;
+            for (int q = 0; q < nz0; q++) dm->zp[q + 1] += dm->zp[q];
+            dm->zi = xm(sizeof(int) * (dm->zp[nz0] + 1)); dm->zx = xm(sizeof(double) * (dm->zp[nz0] + 1));
+            long *nxt = xm(sizeof(long) * (nz0 + 1)); for (int q = 0; q < nz0; q++) nxt[q] = dm->zp[q];
+            for (long t = 0; t < nza; t++) if (pos[aj[t]] >= 0 && dm->rmap[ai[t]] >= 0) { const int q = pos[aj[t]]; dm->zi[nxt[q]] = dm->rmap[ai[t]]; dm->zx[nxt[q]] = av[t]; nxt[q]++; }
+            free(nxt); free(pos);
         }
         if (vmap) {
             *vmap = vcol; vcol = NULL; *nvar_out = nvar;

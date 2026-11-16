@@ -29,7 +29,9 @@
 #include "sedumi.h"
 #include "qp.h"
 #include "socpmodel.h"
+#include "lpio.h"
 int brisk_run_qp(const QpProb *P, int argc, char **argv, BriskResult *res);
+int brisk_run_lp(const LpProb *P, int argc, char **argv, BriskResult *res);
 
 #if defined(__GNUC__)
 #define BRISK_API __attribute__((visibility("default")))
@@ -306,10 +308,11 @@ BRISK_API int brisk_solve_qp_lean(int n, int m, const int *Pp, const int *Pi, co
 
 /* (22 October 2026) the QP solver object for warm starts (mixed-integer QPs by branch and bound): created on the data of
  * brisk_solve_qp, then bounds, row bounds and the cost changed and the problem re-solved from the previous active set.
- * Options: -qpas (the active-set method, the default here: it carries the active set from solve to solve), -qpipm (each
- * solve cold), -qpauto (the choice of brisk_solve_qp: the active-set method, warm, for a small QP with H positive
- * definite, else the interior-point method, cold; used by JuMP), -tol, -maxit, -timelimit, -q, -v, -vv. NULL on bad data
- * or an unknown option. */
+ * Options: -qpas (the active-set method, the default here: it carries the active set from solve to solve), -qpipm (the
+ * interior-point method: it keeps its setup between solves and starts from the last solution), -qpauto (the model's own
+ * choice, qp.c's qp_as_stream: the active-set method for a small QP with H positive definite and where eliminating the
+ * equality rows leaves a problem that a stream of solves pays for, else the interior-point method; used by JuMP and by
+ * Python's QpModel), -tol, -maxit, -timelimit, -q, -v, -vv. NULL on bad data or an unknown option. */
 void brisk_qp_fill_result(BriskResult *res, int n, int m, QpRes *R, double t);
 typedef struct { QpSolver *S; int n, m, brief, nsolve; } BriskQp;   /* brief: the default log, one line a solve (2 November 2026) */
 static double qp_bnd(const double v, const int lo) { return lo ? (v <= -QP_INF ? -QP_INF : v) : (v >= QP_INF ? QP_INF : v); }
@@ -563,5 +566,215 @@ BRISK_API int brisk_solve_sedumi(int m, int n, const int *Ap, const int *Ai, con
         R.x = R.y = R.z = NULL;
     }
     sedumi_result_free(&R);
+    return rc;
+}
+
+/* (10 November 2026, the LP developer, at the owner's request) An LP in general form:
+ *     min c'x + c0  s.t.  rl <= A x <= ru,  xl <= x <= xu.
+ * A: m x n by columns (Ap: n + 1 column starts, Ai: rows, 0-based, Ax), the shape of brisk_solve_qp's and brisk_solve_socp's
+ * rows and bounds; a bound of magnitude 1e20 or more (or infinite) is absent, and a NULL array means no bounds of that kind (as
+ * for the QP and SOCP calls; note that an MPS file's default lower bound is 0, here it is absent unless xl gives it). The LP
+ * goes to the same path as an MPS file of the same LP (brisk_solve_file): the default race of the interior-point method and
+ * the dual simplex method, the presolves, -lpmethod 1-5, the crossover, the log and the Summary, with the same options. The
+ * result: status (0 optimal, 1 primal infeasible, 2 dual infeasible, 3 the iteration limit, 4 numerical difficulties, 5 reduced
+ * accuracy, 6 the time limit), pobj and dobj (the objective with c0), brisk_result_sx (x, n) when a point is returned
+ * (brisk_result_have_x), brisk_result_y (the rows' multipliers, m: >= 0 at rl, <= 0 at ru) and brisk_result_sz (z = c - A'y, n:
+ * >= 0 at xl, <= 0 at xu) when the route gives exact duals (the simplex methods and the crossover always; the interior-point
+ * method's point when its duals, carried through the presolves (11 November 2026), pass the measure of optimality on the
+ * problem as given: the multipliers' signs and a duality gap within 1e-6; NULL otherwise: -lpmethod 4 gives them), iterations
+ * and time; as for an MPS file. Returns as brisk_solve_file (2: bad data: a value not
+ * finite, an index out of range or columns out of order, rl > ru or xl > xu, a lower bound of +inf or an upper bound of -inf). */
+static int lpg_inf(double v) { return !(fabs(v) < 1e20); }
+BRISK_API int brisk_solve_lp(int n, int m, const int *Ap, const int *Ai, const double *Ax, const double *c, double c0,
+                             const double *rl, const double *ru, const double *xl, const double *xu,
+                             int nopt, const char *const *opts, BriskResult *res) {
+    if (!res) return -1;
+    brisk_result_free(res);
+    if (n < 1 || m < 0 || !Ap || !c || (Ap[n] > 0 && (!Ai || !Ax))) return 2;
+    if (Ap[0] != 0) return 2;
+    for (int j = 0; j < n; j++) { if (Ap[j + 1] < Ap[j]) return 2; if (!isfinite(c[j])) return 2; }
+    for (int p = 0; p < Ap[n]; p++) if (Ai[p] < 0 || Ai[p] >= m || !isfinite(Ax[p])) return 2;
+    if (!isfinite(c0)) return 2;
+    LpProb L; memset(&L, 0, sizeof L);
+    L.m = m; L.n = n; L.Ap = (int *)Ap; L.Ai = (int *)Ai; L.Ax = (double *)Ax; L.c = (double *)c; L.c0 = c0; L.maxim = 0;
+    snprintf(L.name, sizeof L.name, "LP");
+    double *b = malloc(sizeof(double) * (2 * (size_t)m + 2 * (size_t)n + 1));
+    if (!b) return -1;
+    L.rl = b; L.ru = b + m; L.l = b + 2 * (size_t)m; L.u = b + 2 * (size_t)m + n;
+    for (int i = 0; i < m; i++) {
+        const double a = rl ? rl[i] : -INFINITY, u = ru ? ru[i] : INFINITY;
+        if (isnan(a) || isnan(u) || a >= 1e20 || u <= -1e20 || (!lpg_inf(a) && !lpg_inf(u) && a > u)) { free(b); return 2; }
+        L.rl[i] = lpg_inf(a) ? -LP_INF : a; L.ru[i] = lpg_inf(u) ? LP_INF : u;
+    }
+    for (int j = 0; j < n; j++) {
+        const double a = xl ? xl[j] : -INFINITY, u = xu ? xu[j] : INFINITY;
+        if (isnan(a) || isnan(u) || a >= 1e20 || u <= -1e20 || (!lpg_inf(a) && !lpg_inf(u) && a > u)) { free(b); return 2; }
+        L.l[j] = lpg_inf(a) ? -LP_INF : a; L.u[j] = lpg_inf(u) ? LP_INF : u;
+    }
+    int argc;
+    char **av = make_argv(NULL, nopt, opts, &argc);
+    if (!av) { free(b); return -1; }
+    g_caller = pthread_self();
+    STOP_RESET();
+    brisk_print_hook = capi_print;
+    const int rc = brisk_run_lp(&L, argc, av, res);
+    finish();
+    free(av); free(b);
+    return rc;
+}
+
+/* (10 November 2026, the SOCP developer, at the owner's request) An SOCP in general form:
+ *     min c'x + c0  s.t.  rl <= A x <= ru,  xl <= x <= xu,  x_{Q_k} in a second-order cone (k < nq),  x_{R_k} in a rotated cone (k < nr).
+ * A: m x n by columns (Ap: n + 1 column starts, Ai: rows, 0-based, Ax), the shape of brisk_solve_qp's and brisk_solve_lp's rows and
+ * bounds; a bound of magnitude 1e20 or more (or infinite) is absent. The cones are lists of variables: second-order cone k is the
+ * variables qi[qp[k]], ..., qi[qp[k+1]-1], the first one the cone's head (x_0 >= |x_rest|); rotated cone k is ri[rp[k]], ...,
+ * ri[rp[k+1]-1], the first two its heads (2 x_0 x_1 >= |x_rest|^2, x_0, x_1 >= 0). A variable is in at most one cone; a cone's
+ * variables may have bounds too. Options as for brisk_solve_sedumi. The problem goes to the SOCP solver in SeDuMi's form: a
+ * variable with a finite lower bound is shifted to a nonnegative one, one with only an upper bound is mirrored, a box adds a row,
+ * a fixed variable is substituted, an inequality or ranged row gets a slack, a row with no finite bound is dropped. The result:
+ * brisk_result_sx (x, n), brisk_result_y (the rows' multipliers, m; 0 on a dropped row), brisk_result_sz (z = c - A'y, n: in the
+ * dual cone on each cone, > 0 at a lower bound and < 0 at an upper bound on the other variables), status as brisk_solve_sedumi's,
+ * pobj and dobj including c0; brisk_result_dimacs: the errors of the solve in SeDuMi's form. For a dual infeasible problem x is a
+ * direction of unbounded descent, for a primal infeasible one y a certificate of infeasibility. Returns as brisk_solve_sedumi
+ * (2: bad data: a value not finite, an index out of range, rl > ru or xl > xu, a variable in two cones, a cone too short). */
+static int socpg_inf(double v) { return !(fabs(v) < 1e20); }
+BRISK_API int brisk_solve_socp(int n, int m, const int *Ap, const int *Ai, const double *Ax, const double *c, double c0,
+                               const double *rl, const double *ru, const double *xl, const double *xu,
+                               int nq, const int *qp, const int *qi, int nr, const int *rp, const int *ri,
+                               int nopt, const char *const *opts, BriskResult *res) {
+    if (!res) return -1;
+    brisk_result_free(res);
+    if (n < 1 || m < 0 || nq < 0 || nr < 0 || !Ap || !c || (m > 0 && (!Ai || !Ax)) || (nq > 0 && (!qp || !qi)) || (nr > 0 && (!rp || !ri))) return 2;
+    if (Ap[0] != 0) return 2;
+    for (int j = 0; j < n; j++) { if (Ap[j + 1] < Ap[j]) return 2; if (!isfinite(c[j])) return 2; }
+    for (int p = 0; p < Ap[n]; p++) if (Ai[p] < 0 || Ai[p] >= m || !isfinite(Ax[p])) return 2;
+    if (!isfinite(c0)) return 2;
+    #define RL(i) (rl ? rl[i] : -INFINITY)
+    #define RU(i) (ru ? ru[i] : INFINITY)
+    #define XL(j) (xl ? xl[j] : -INFINITY)
+    #define XU(j) (xu ? xu[j] : INFINITY)
+    for (int i = 0; i < m; i++) { const double a = RL(i), b = RU(i); if (isnan(a) || isnan(b) || (!socpg_inf(a) && !socpg_inf(b) && a > b) || (a >= 1e20) || (b <= -1e20)) return 2; }
+    for (int j = 0; j < n; j++) { const double a = XL(j), b = XU(j); if (isnan(a) || isnan(b) || (!socpg_inf(a) && !socpg_inf(b) && a > b) || (a >= 1e20) || (b <= -1e20)) return 2; }
+    int *cone = (int *)malloc(sizeof(int) * (size_t)n); if (!cone) return -1;      /* (the cone of each variable, -1: none) */
+    for (int j = 0; j < n; j++) cone[j] = -1;
+    if ((nq > 0 && qp[0] != 0) || (nr > 0 && rp[0] != 0)) { free(cone); return 2; }
+    for (int k = 0; k < nq + nr; k++) {
+        const int *pp = k < nq ? qp : rp, *ii = k < nq ? qi : ri; const int kk = k < nq ? k : k - nq;
+        const int len = pp[kk + 1] - pp[kk];
+        if (len < (k < nq ? 1 : 2)) { free(cone); return 2; }
+        for (int t = pp[kk]; t < pp[kk + 1]; t++) { const int j = ii[t]; if (j < 0 || j >= n || cone[j] >= 0) { free(cone); return 2; } cone[j] = k; }
+    }
+    /* the variables' kinds: 0 free, 1 shifted (x = l + s), 2 mirrored (x = u - s), 3 fixed, 4 in a cone; a box (kind 1 with a finite
+     * upper bound) adds a row s + t = u - l */
+    int *kind = (int *)malloc(sizeof(int) * (size_t)n), *col = (int *)malloc(sizeof(int) * (size_t)n), *rowof = (int *)malloc(sizeof(int) * (size_t)(m + 1));
+    double *shift = (double *)calloc((size_t)n, sizeof(double));
+    if (!kind || !col || !rowof || !shift) { free(cone); free(kind); free(col); free(rowof); free(shift); return -1; }
+    int nfree = 0, nnn = 0, nbox = 0, ncb = 0;         /* (ncb: bound rows of cone variables) */
+    for (int j = 0; j < n; j++) {
+        const double l = XL(j), u = XU(j);
+        if (cone[j] >= 0) { kind[j] = 4; ncb += !socpg_inf(l) + !socpg_inf(u) - (!socpg_inf(l) && !socpg_inf(u) && l == u); continue; }
+        if (!socpg_inf(l) && !socpg_inf(u) && l == u) { kind[j] = 3; shift[j] = l; }
+        else if (!socpg_inf(l)) { kind[j] = 1; shift[j] = l; nnn++; if (!socpg_inf(u)) nbox++; }
+        else if (!socpg_inf(u)) { kind[j] = 2; shift[j] = u; nnn++; }
+        else { kind[j] = 0; nfree++; }
+    }
+    /* rows: kept (a finite bound) in order; a one-sided row gets a slack, a ranged one a slack and a row s + t = ru - rl */
+    int mk = 0, nslk = 0, nrng = 0;
+    for (int i = 0; i < m; i++) {
+        const double a = RL(i), b = RU(i);
+        if (socpg_inf(a) && socpg_inf(b)) { rowof[i] = -1; continue; }
+        rowof[i] = mk++;
+        if (!(a == b)) { nslk++; if (!socpg_inf(a) && !socpg_inf(b)) nrng++; }
+    }
+    /* the SeDuMi form's columns: [free | nonnegative: shifted or mirrored variables, the boxes' second slacks, the rows' slacks, the
+     * ranged rows' second slacks, the cone variables' bound slacks | the second-order cones | the rotated cones]; rows: [the kept rows
+     * | the boxes' rows | the ranged rows' rows | the cone variables' bound rows] */
+    long nqv = 0, nrv = 0; for (int k = 0; k < nq; k++) nqv += qp[k + 1] - qp[k]; for (int k = 0; k < nr; k++) nrv += rp[k + 1] - rp[k];
+    const int Nl = nnn + nbox + nslk + nrng + ncb, Nn = nfree + Nl + (int)nqv + (int)nrv, Mm = mk + nbox + nrng + ncb;
+    int *q = (int *)malloc(sizeof(int) * (size_t)(nq + 1)), *r = (int *)malloc(sizeof(int) * (size_t)(nr + 1));
+    long nzmax = (long)Ap[n] + 2L * nbox + 2L * nslk + 2L * nrng + 2L * ncb + 1;
+    int *Bp = (int *)calloc((size_t)Nn + 1, sizeof(int)), *Bi = (int *)malloc(sizeof(int) * (size_t)nzmax);
+    double *Bx = (double *)malloc(sizeof(double) * (size_t)nzmax), *bb = (double *)calloc((size_t)Mm + 1, sizeof(double)), *cc = (double *)calloc((size_t)Nn + 1, sizeof(double));
+    int *map = (int *)malloc(sizeof(int) * (size_t)n);      /* (the SeDuMi column of each variable, -1: fixed) */
+    if (!q || !r || !Bp || !Bi || !Bx || !bb || !cc || !map) { free(cone); free(kind); free(col); free(rowof); free(shift); free(q); free(r); free(Bp); free(Bi); free(Bx); free(bb); free(cc); free(map); return -1; }
+    for (int k = 0; k < nq; k++) q[k] = qp[k + 1] - qp[k];
+    for (int k = 0; k < nr; k++) r[k] = rp[k + 1] - rp[k];
+    /* column positions */
+    int pf = 0, pl = nfree, pq = nfree + Nl, pr = pq + (int)nqv;
+    for (int j = 0; j < n; j++) { map[j] = -1; if (kind[j] == 0) map[j] = pf++; else if (kind[j] == 1 || kind[j] == 2) map[j] = pl++; }
+    for (int k = 0; k < nq; k++) for (int t = qp[k]; t < qp[k + 1]; t++) map[qi[t]] = pq++;
+    for (int k = 0; k < nr; k++) for (int t = rp[k]; t < rp[k + 1]; t++) map[ri[t]] = pr++;
+    /* the entries by SeDuMi column: first count, then fill (each column's entries in increasing row order: the kept rows' entries come
+     * from A by columns in A's order, which is sorted when A is; extra rows follow them) */
+    typedef struct { int row; double v; } Ent;
+    long ne = 0; Ent *E = (Ent *)malloc(sizeof(Ent) * (size_t)nzmax); int *ecol = (int *)malloc(sizeof(int) * (size_t)nzmax);
+    if (!E || !ecol) { free(E); free(ecol); free(cone); free(kind); free(col); free(rowof); free(shift); free(q); free(r); free(Bp); free(Bi); free(Bx); free(bb); free(cc); free(map); return -1; }
+    double off = c0;                 /* (the objective's constant: c0 and the shifted and fixed variables' parts) */
+    for (int i = 0; i < m; i++) if (rowof[i] >= 0) bb[rowof[i]] = !socpg_inf(RL(i)) ? RL(i) : RU(i);
+    for (int j = 0; j < n; j++) {
+        const double sg = kind[j] == 2 ? -1.0 : 1.0;
+        if (kind[j] != 4 && kind[j] != 0) off += c[j] * shift[j];
+        for (int p = Ap[j]; p < Ap[j + 1]; p++) {
+            const int i = Ai[p], rr = rowof[i]; if (rr < 0) continue;
+            if (kind[j] != 0 && kind[j] != 4) bb[rr] -= Ax[p] * shift[j];
+            if (kind[j] == 3) continue;
+            E[ne].row = rr; E[ne].v = sg * Ax[p]; ecol[ne] = map[j]; ne++;
+        }
+        if (map[j] >= 0) cc[map[j]] = sg * c[j];
+    }
+    int xr = mk, xc = nfree + nnn;     /* (the next extra row and the next nonnegative slack column) */
+    for (int j = 0; j < n; j++) if (kind[j] == 1 && !socpg_inf(XU(j))) {      /* a box: s + t = u - l */
+        E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = map[j]; ne++;
+        E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = xc++; ne++;
+        bb[xr++] = XU(j) - XL(j);
+    }
+    int *slk = (int *)malloc(sizeof(int) * (size_t)(m + 1)); for (int i = 0; i < m; i++) slk[i] = -1;
+    for (int i = 0; i < m; i++) {
+        if (rowof[i] < 0) continue;
+        const double a = RL(i), b = RU(i);
+        if (a == b) continue;
+        slk[i] = xc;
+        E[ne].row = rowof[i]; E[ne].v = !socpg_inf(a) ? -1.0 : 1.0; ecol[ne] = xc++; ne++;     /* (a x - s = rl, or a x + s = ru) */
+    }
+    for (int i = 0; i < m; i++) {
+        if (rowof[i] < 0 || slk[i] < 0 || socpg_inf(RL(i)) || socpg_inf(RU(i))) continue;
+        E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = slk[i]; ne++;            /* a ranged row: s + t = ru - rl */
+        E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = xc++; ne++;
+        bb[xr++] = RU(i) - RL(i);
+    }
+    for (int j = 0; j < n; j++) {                                          /* a cone variable's bounds: x - s = l, x + t = u, x = l */
+        if (kind[j] != 4) continue;
+        const double l = XL(j), u = XU(j);
+        if (!socpg_inf(l) && !socpg_inf(u) && l == u) { E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = map[j]; ne++; bb[xr++] = l; continue; }
+        if (!socpg_inf(l)) { E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = map[j]; ne++; E[ne].row = xr; E[ne].v = -1.0; ecol[ne] = xc++; ne++; bb[xr++] = l; }
+        if (!socpg_inf(u)) { E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = map[j]; ne++; E[ne].row = xr; E[ne].v = 1.0; ecol[ne] = xc++; ne++; bb[xr++] = u; }
+    }
+    /* by columns (counting sort; within a column the entries keep their order: A's rows, then the extra rows in increasing order) */
+    for (long e = 0; e < ne; e++) Bp[ecol[e] + 1]++;
+    for (int j = 0; j < Nn; j++) Bp[j + 1] += Bp[j];
+    { int *pos = (int *)malloc(sizeof(int) * (size_t)(Nn + 1)); memcpy(pos, Bp, sizeof(int) * (size_t)(Nn + 1));
+      for (long e = 0; e < ne; e++) { const int k = pos[ecol[e]]++; Bi[k] = E[e].row; Bx[k] = E[e].v; }
+      free(pos); }
+    free(E); free(ecol);
+    const int rc = brisk_solve_sedumi(Mm, Nn, Bp, Bi, Bx, bb, cc, nfree, Nl, nq, q, nr, r, 0, NULL, nopt, opts, res);
+    /* back to the problem as given */
+    if (res->status >= 0 && res->sx) {
+        const int ray = res->status == 2;      /* (a direction: no shifts) */
+        double *x = (double *)malloc(sizeof(double) * (size_t)n), *y = (double *)calloc((size_t)m + 1, sizeof(double)), *z = (double *)malloc(sizeof(double) * (size_t)n);
+        for (int j = 0; j < n; j++) {
+            const double v = map[j] >= 0 ? res->sx[map[j]] : 0.0;
+            x[j] = kind[j] == 1 ? (ray ? 0.0 : shift[j]) + v : kind[j] == 2 ? (ray ? 0.0 : shift[j]) - v : kind[j] == 3 ? (ray ? 0.0 : shift[j]) : v;
+        }
+        if (res->y) for (int i = 0; i < m; i++) y[i] = rowof[i] >= 0 ? res->y[rowof[i]] : 0.0;
+        for (int j = 0; j < n; j++) { double v = res->status == 1 ? 0.0 : c[j]; for (int p = Ap[j]; p < Ap[j + 1]; p++) v -= Ax[p] * y[Ai[p]]; z[j] = v; }
+        free(res->sx); free(res->sz); free(res->y);
+        res->sx = x; res->sz = z; res->y = y; res->sn = n; res->m = m;
+        if (res->status != 1 && res->status != 2) { res->pobj += off; res->dobj += off; }
+    }
+    #undef RL
+    #undef RU
+    #undef XL
+    #undef XU
+    free(slk); free(cone); free(kind); free(col); free(rowof); free(shift); free(q); free(r); free(Bp); free(Bi); free(Bx); free(bb); free(cc); free(map);
     return rc;
 }

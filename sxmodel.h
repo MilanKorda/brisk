@@ -19,6 +19,11 @@ void sxm_col_bounds(SxModel *M, int j, double l, double u);
 void sxm_row_bounds(SxModel *M, int i, double rl, double ru);
 void sxm_cost(SxModel *M, int j, double c);
 
+/* (7 November 2026) the integer columns of a mixed-integer program (n flags, nonzero: integer; copied; NULL or none set: no
+ * flags). They change nothing unless BRISK_SXINTPREF is set: then the dual ratio test prefers a row logical or a continuous
+ * column to an integer column among the candidates of its final group (simplex.c, int_pref_pick) */
+void sxm_set_integer(SxModel *M, const signed char *isint);
+
 /* the basis (statuses of simplex.h); set: repaired by the factorization, returns the number of columns replaced */
 void sxm_get_basis(const SxModel *M, int *cstat, int *rstat);
 int  sxm_set_basis(SxModel *M, const int *cstat, const int *rstat);
@@ -31,6 +36,8 @@ typedef struct {
     long maxit; double timelimit; const volatile int *stop;
     double tol_primal, tol_dual;    /* <= 0: 1e-7 */
     int cutoff_on; double cutoff;   /* the objective as given without its constant */
+    int polish;                     /* (7 November 2026) 1: an optimal basis polished, integer columns out of it, when integer
+                                       flags are given (sxm_set_integer); 0: not (BRISK_SXPOLISH=1 still turns it on everywhere) */
 } SxmOpts;
 typedef struct { int status; long iters, iters_dual, iters_primal; int nfactor; double work; } SxmRes;
 /* from the current basis: the dual method when it is dual feasible (boxed columns moved to the bound their reduced cost

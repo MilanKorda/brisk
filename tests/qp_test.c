@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 static unsigned long long rs = 88172645463325252ULL;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) / 9007199254740992.0; }
@@ -264,6 +267,131 @@ int main(void) {
             qp_res_free(&A); qp_res_free(&B); qp_res_free(&C);
         }
         qp_destroy(Qe); qp_destroy(Qf); qp_prob_free(&P); free(Ad); free(Bd); free(x0);
+    }
+    printf("7. MPC QPs with wider stages: the interior-point method's stage-wise factorizations against its general path; a\n"
+           "   persistent model's interior-point re-solves (the levels, the scaling and the last solution kept) and its own\n"
+           "   choice of method over a stream, against fresh solves\n");
+    for (int t = 0; t < 4; t++) {
+        extern void qp_ipm_stage_mode(int mode);
+        const int nx = 9 + 2 * t, nu = 3 + t % 2, N = 10 + 4 * t, n = (N + 1) * nx + N * nu, m = (N + 1) * nx;
+        double *Ad = malloc(sizeof(double) * nx * nx), *Bd = malloc(sizeof(double) * nx * nu);
+        for (int i = 0; i < nx * nx; i++) Ad[i] = (i % (nx + 1) == 0 ? 0.7 : 0.0) + 0.2 / sqrt((double)nx) * nrand();      /* (stable: the states' elimination stays accurate over the horizon) */
+        for (int i = 0; i < nx * nu; i++) Bd[i] = nrand();
+        QpProb P; memset(&P, 0, sizeof P); P.n = n; P.m = m;
+        P.Ap = malloc(sizeof(int) * (n + 1)); P.Ai = malloc(sizeof(int) * (n * (nx + 1) + 1)); P.Ax = malloc(sizeof(double) * (n * (nx + 1) + 1));
+        int w = 0;
+        for (int j = 0; j < n; j++) {
+            P.Ap[j] = w;
+            if (j < (N + 1) * nx) {
+                const int s0 = j / nx, a = j % nx;
+                P.Ai[w] = j; P.Ax[w] = 1.0; w++;
+                if (s0 < N) for (int i = 0; i < nx; i++) { P.Ai[w] = (s0 + 1) * nx + i; P.Ax[w] = -Ad[i + a * nx]; w++; }
+            } else {
+                const int s0 = (j - (N + 1) * nx) / nu, b = (j - (N + 1) * nx) % nu;
+                for (int i = 0; i < nx; i++) { P.Ai[w] = (s0 + 1) * nx + i; P.Ax[w] = -Bd[i + b * nx]; w++; }
+            }
+        }
+        P.Ap[n] = w;
+        P.Hp = malloc(sizeof(int) * (n + 1)); P.Hi = malloc(sizeof(int) * n); P.Hx = malloc(sizeof(double) * n);
+        P.c = calloc(n, sizeof(double)); P.xl = malloc(sizeof(double) * n); P.xu = malloc(sizeof(double) * n);
+        for (int j = 0; j < n; j++) { P.Hp[j] = j; P.Hi[j] = j; P.Hx[j] = j < (N + 1) * nx ? 1.0 + (j % 3) : 0.1; P.xl[j] = j < (N + 1) * nx ? -4 : -0.6; P.xu[j] = -P.xl[j]; P.c[j] = 0.3 * nrand(); }
+        P.Hp[n] = n;
+        P.rl = calloc(m, sizeof(double)); P.ru = calloc(m, sizeof(double));
+        double *x0 = malloc(sizeof(double) * nx); for (int i = 0; i < nx; i++) x0[i] = nrand();
+        for (int i = 0; i < nx; i++) P.rl[i] = P.ru[i] = x0[i];
+        QpOpts oi = o; oi.method = QP_METHOD_IPM;
+        /* one solve by each factorization: the general path (0), the normal equations by stage (3), the augmented system by stage (2) */
+        QpRes G, S3, S2; qp_ipm_stage_mode(0); qp_solve(&P, &oi, &G); qp_ipm_stage_mode(3); qp_solve(&P, &oi, &S3); qp_ipm_stage_mode(2); qp_solve(&P, &oi, &S2); qp_ipm_stage_mode(-1);
+        CHECK(G.status == QP_OPTIMAL && S3.status == QP_OPTIMAL && S2.status == QP_OPTIMAL && fabs(S3.obj - G.obj) <= 1e-7 * (1 + fabs(G.obj)) && fabs(S2.obj - G.obj) <= 1e-7 * (1 + fabs(G.obj)),
+              "MPC %d (n %d, %d states): the general path %s %.10g, the normal equations by stage %s %.10g, the augmented system by stage %s %.10g", t, n, nx,
+              qp_status_name(G.status), G.obj, qp_status_name(S3.status), S3.obj, qp_status_name(S2.status), S2.obj);
+        qp_res_free(&G); qp_res_free(&S3); qp_res_free(&S2);
+        /* a stream: the model with the interior-point method, the model that chooses, and a fresh solve by the general path */
+        QpOpts oa = o; oa.method = QP_METHOD_AUTO;
+        QpSolver *Qi = qp_create(&P, &oi), *Qa = qp_create(&P, &oa);
+        int nas = 0;
+        for (int step = 0; step < 10; step++) {
+            const double mv = step < 6 ? 0.02 : 0.3;            /* small moves of the initial state (a stream the active-set method serves), then large ones (a solve over its budget is handed to the interior-point method) */
+            for (int i = 0; i < nx; i++) { x0[i] = 0.8 * x0[i] + mv * nrand(); qp_set_row_bounds(Qi, i, x0[i], x0[i]); qp_set_row_bounds(Qa, i, x0[i], x0[i]); P.rl[i] = P.ru[i] = x0[i]; }
+            QpRes A, B, C; memset(&A, 0, sizeof A); memset(&B, 0, sizeof B);
+            qp_resolve(Qi, &A); qp_resolve(Qa, &B);
+            qp_ipm_stage_mode(0); qp_solve(&P, &oi, &C); qp_ipm_stage_mode(-1);
+            nas += B.method == QP_METHOD_ACTIVESET;
+            CHECK(A.status == C.status && B.status == C.status && (C.status != QP_OPTIMAL || (fabs(A.obj - C.obj) <= 1e-6 * (1 + fabs(C.obj)) && fabs(B.obj - C.obj) <= 1e-6 * (1 + fabs(C.obj)))),
+                  "MPC %d, step %d: the interior-point model %s %.10g (%d iterations), the choosing model %s %.10g, a fresh solve %s %.10g (%d iterations)", t, step,
+                  qp_status_name(A.status), A.obj, A.iter, qp_status_name(B.status), B.obj, qp_status_name(C.status), C.obj, C.iter);
+            qp_res_free(&A); qp_res_free(&B); qp_res_free(&C);
+        }
+        CHECK(nas >= 6, "MPC %d (n %d, %d left after the elimination): the choosing model took the active-set method on %d of 10 solves (at least the 6 with small moves expected)", t, n, N * nu, nas);
+        /* (15 November 2026) the interior-point model's kept reduction: steps that keep the fixed columns and the rows' kinds
+         * (the kept reduction is used) and steps that change them (a column fixed and freed again, an equality row made a
+         * range and back, bounds that contradict each other), each against a fresh solve */
+        for (int step = 0; step < 9; step++) {
+            const int ju = (N + 1) * nx + 1 % (N * nu);         /* an input */
+            if (step == 1 || step == 2) { P.xl[ju] = P.xu[ju] = 0.1; qp_set_var_bounds(Qi, ju, 0.1, 0.1); }
+            if (step == 3) { P.xl[ju] = -0.6; P.xu[ju] = 0.6; qp_set_var_bounds(Qi, ju, -0.6, 0.6); }
+            if (step == 4 || step == 5) { P.rl[0] = x0[0] - 0.1; P.ru[0] = x0[0] + 0.1; qp_set_row_bounds(Qi, 0, P.rl[0], P.ru[0]); }
+            if (step == 6) { P.rl[0] = P.ru[0] = x0[0]; qp_set_row_bounds(Qi, 0, x0[0], x0[0]); }
+            if (step == 7) { P.xl[ju] = 0.5; P.xu[ju] = 0.3; qp_set_var_bounds(Qi, ju, 0.5, 0.3); }
+            if (step == 8) { P.xl[ju] = -0.6; P.xu[ju] = 0.6; qp_set_var_bounds(Qi, ju, -0.6, 0.6); }
+            for (int i = 1; i < nx; i++) { x0[i] = 0.8 * x0[i] + 0.05 * nrand(); qp_set_row_bounds(Qi, i, x0[i], x0[i]); P.rl[i] = P.ru[i] = x0[i]; }
+            QpRes A, C; memset(&A, 0, sizeof A);
+            qp_resolve(Qi, &A);
+            qp_ipm_stage_mode(0); qp_solve(&P, &oi, &C); qp_ipm_stage_mode(-1);
+            CHECK(A.status == C.status && (step == 7 ? A.status == QP_PRIMAL_INFEASIBLE : A.status == QP_OPTIMAL && fabs(A.obj - C.obj) <= 1e-6 * (1 + fabs(C.obj))),
+                  "MPC %d, the kept reduction, step %d: the interior-point model %s %.10g, a fresh solve %s %.10g", t, step,
+                  qp_status_name(A.status), A.obj, qp_status_name(C.status), C.obj);
+            qp_res_free(&A); qp_res_free(&C);
+        }
+        qp_destroy(Qi); qp_destroy(Qa); qp_prob_free(&P); free(Ad); free(Bd); free(x0);
+    }
+    printf("8. An MPC QP with stages of 176 states: the stage-wise factorization's chunks of a wide level and its two ends on\n"
+           "   the threads against the general path, and the same bits on one thread and on all\n");
+    {
+        extern void qp_ipm_stage_mode(int mode);
+        const int nx = 176, nu = 20, N = 9, n = (N + 1) * nx + N * nu, m = (N + 1) * nx;
+        double *Ad = malloc(sizeof(double) * nx * nx), *Bd = malloc(sizeof(double) * nx * nu);
+        for (int i = 0; i < nx * nx; i++) Ad[i] = (i % (nx + 1) == 0 ? 0.7 : 0.0) + 0.2 / sqrt((double)nx) * nrand();
+        for (int i = 0; i < nx * nu; i++) Bd[i] = nrand();
+        QpProb P; memset(&P, 0, sizeof P); P.n = n; P.m = m;
+        P.Ap = malloc(sizeof(int) * (n + 1)); P.Ai = malloc(sizeof(int) * ((size_t)n * (nx + 1) + 1)); P.Ax = malloc(sizeof(double) * ((size_t)n * (nx + 1) + 1));
+        int w = 0;
+        for (int j = 0; j < n; j++) {
+            P.Ap[j] = w;
+            if (j < (N + 1) * nx) {
+                const int s0 = j / nx, a = j % nx;
+                P.Ai[w] = j; P.Ax[w] = 1.0; w++;
+                if (s0 < N) for (int i = 0; i < nx; i++) { P.Ai[w] = (s0 + 1) * nx + i; P.Ax[w] = -Ad[i + a * nx]; w++; }
+            } else {
+                const int s0 = (j - (N + 1) * nx) / nu, b = (j - (N + 1) * nx) % nu;
+                for (int i = 0; i < nx; i++) { P.Ai[w] = (s0 + 1) * nx + i; P.Ax[w] = -Bd[i + b * nx]; w++; }
+            }
+        }
+        P.Ap[n] = w;
+        P.Hp = malloc(sizeof(int) * (n + 1)); P.Hi = malloc(sizeof(int) * n); P.Hx = malloc(sizeof(double) * n);
+        P.c = calloc(n, sizeof(double)); P.xl = malloc(sizeof(double) * n); P.xu = malloc(sizeof(double) * n);
+        for (int j = 0; j < n; j++) { P.Hp[j] = j; P.Hi[j] = j; P.Hx[j] = j < (N + 1) * nx ? 1.0 + (j % 3) : 0.1; P.xl[j] = j < (N + 1) * nx ? -4 : -0.6; P.xu[j] = -P.xl[j]; P.c[j] = 0.3 * nrand(); }
+        P.Hp[n] = n;
+        P.rl = calloc(m, sizeof(double)); P.ru = calloc(m, sizeof(double));
+        for (int i = 0; i < nx; i++) P.rl[i] = P.ru[i] = 0.3 * nrand();
+        QpOpts oi = o; oi.method = QP_METHOD_IPM;
+        QpRes G, S1, Sn; int nt = 1;
+        qp_ipm_stage_mode(0); qp_solve(&P, &oi, &G);
+        qp_ipm_stage_mode(3);
+#ifdef _OPENMP
+        nt = omp_get_max_threads(); omp_set_num_threads(1);
+#endif
+        qp_solve(&P, &oi, &S1);
+#ifdef _OPENMP
+        omp_set_num_threads(nt);
+#endif
+        qp_solve(&P, &oi, &Sn); qp_ipm_stage_mode(-1);
+        CHECK(G.status == QP_OPTIMAL && S1.status == QP_OPTIMAL && Sn.status == QP_OPTIMAL && fabs(S1.obj - G.obj) <= 1e-7 * (1 + fabs(G.obj)) && S1.iter == Sn.iter &&
+              !memcmp(S1.x, Sn.x, sizeof(double) * n) && !memcmp(S1.y, Sn.y, sizeof(double) * m) && !memcmp(S1.z, Sn.z, sizeof(double) * n),
+              "MPC with %d states (n %d): the general path %s %.10g, the stage-wise path on one thread %s %.10g (%d iterations), on %d threads %s %.10g (%d iterations), the same bits: %s",
+              nx, n, qp_status_name(G.status), G.obj, qp_status_name(S1.status), S1.obj, S1.iter, nt, qp_status_name(Sn.status), Sn.obj, Sn.iter,
+              S1.x && Sn.x && !memcmp(S1.x, Sn.x, sizeof(double) * n) ? "yes" : "no");
+        qp_res_free(&G); qp_res_free(&S1); qp_res_free(&Sn); qp_prob_free(&P); free(Ad); free(Bd);
     }
     printf(fails ? "qp_test: %d failures\n" : "qp_test: all checks passed\n", fails);
     return fails != 0;

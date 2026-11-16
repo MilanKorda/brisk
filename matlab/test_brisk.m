@@ -78,8 +78,8 @@ nfail = nfail + check('SeDuMi second-order cone program (K.q, K.r): SOCP solver'
     norm(Aq * x - bq) < 1e-7 * (1 + norm(bq)) && abs(info.pobj - info.dobj) < 1e-7 * (1 + abs(info.pobj)) && ...
     x(6) >= norm(x(7:9)) - 1e-8 && 2 * x(13) * x(14) >= norm(x(15:16))^2 - 1e-8 && norm(z - (cq - Aq' * y)) < 1e-6 * (1 + norm(cq)));    % z is the solver's slack (in K); c - A'y up to the dual residual
 pq = info.pobj;
-[~, ~, info] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0, 'conesolver', 0));
-nfail = nfail + check('the same through the semidefinite solver (conesolver = 0)', info.numerr <= 1 && abs(info.pobj - pq) < 1e-6 * (1 + abs(pq)));
+[~, ~, info] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0, 'socpsolver', 0));
+nfail = nfail + check('the same through the semidefinite solver (socpsolver = 0)', info.numerr <= 1 && abs(info.pobj - pq) < 1e-6 * (1 + abs(pq)));
 [~, ~, info] = brisk_sedumi(Aq, bq, cq, Kq, struct('verbose', 0, 'prec', 'dd'));
 nfail = nfail + check('the same in double-double', strcmp(info.status, 'OPTIMAL') && max(abs(info.dimacs)) < 1e-18 && abs(info.pobj - pq) < 1e-7 * (1 + abs(pq)));
 Km = Kq; Km.s = 3;
@@ -188,6 +188,26 @@ catch
 end
 nfail = nfail + check('opts: output files are refused (the solution is returned)', thrown);
 
+% ---- LPs: brisk_lp (the path of an MPS file of the same LP) ---------------------------------------
+% min -x1 - 2 x2  s.t.  x1 + x2 <= 4,  x1 + 3 x2 <= 6,  -1 <= x1 - x2 <= 3,  0 <= x1 <= 3,  x2 >= 0: x = (3, 1), -5
+fl = [-1; -2]; Al = [1 1; 1 3; 1 -1]; ll = [-Inf; -Inf; -1]; ul = [4; 6; 3]; lbl = [0; 0]; ubl = [3; Inf];
+[xl, il] = brisk_lp(fl, Al, ll, ul, lbl, ubl, struct('threads', 1));
+nfail = nfail + check('LP: optimal', strcmp(il.status, 'OPTIMAL') && norm(xl - [3; 1]) < 1e-9 && abs(il.obj + 5) < 1e-9);
+[xd, id] = brisk_lp(fl, sparse(Al), ll, ul, lbl, ubl, struct('threads', 1, 'lpmethod', 2));
+nfail = nfail + check('LP: the dual simplex method''s duals, z = f - A''y, the dual value equal to the optimum', ~isempty(id.y) ...
+                       && norm(id.z - (fl - Al' * id.y)) < 1e-12 && all(id.y <= 1e-9) && abs(4 * id.y(1) + 6 * id.y(2) + 3 * id.z(1) + 5) < 1e-9);
+okm = true;
+for meth = 1:5
+    [xm, im] = brisk_lp(fl, Al, ll, ul, lbl, ubl, struct('threads', 1, 'lpmethod', meth));
+    okm = okm && strcmp(im.status, 'OPTIMAL') && norm(xm - [3; 1]) < 1e-6;
+end
+nfail = nfail + check('LP: every method gives the optimum', okm);
+[~, ii] = brisk_lp(1, 1, 2, [], 0, 1);
+[~, iun] = brisk_lp([-1; 0], [1 -1], [], 1, [0; 0], []);
+nfail = nfail + check('LP: infeasible and unbounded', ii.statuscode == 1 && iun.statuscode == 2);
+thrown = false; try, brisk_lp([NaN; -2], Al, ll, ul, lbl, ubl); catch, thrown = true; end
+nfail = nfail + check('LP: a NaN cost refused', thrown);
+
 % ---- QPs: brisk_qp and BriskQpModel (re-solves from the previous active set) ----------------
 % HS21: min 0.01 x1^2 + x2^2 s.t. 10 x1 - x2 >= 10, 2 <= x1 <= 50, -50 <= x2 <= 50 (the optimum x = (2, 0), 0.04)
 Hq = diag([0.02, 2]); fq = [0; 0]; Aq = [10 -1]; lbq = [2; -50]; ubq = [50; 50];
@@ -212,6 +232,12 @@ nfail = nfail + check('QP model: the cost and a row changed, as a cold solve', s
 h = mdl.handle; delete(mdl);
 thrown = false; try, brisk_mex('qp_solve', h); catch, thrown = true; end
 nfail = nfail + check('QP model: freed by delete', thrown);
+% (the model chooses its method by default; the method asked for gives the same solution)
+mdla = BriskQpModel(Hq, fq, Aq, 10, Inf, lbq, ubq, struct('qpas', true)); [xa1, ia1] = mdla.solve();
+mdli = BriskQpModel(Hq, fq, Aq, 10, Inf, lbq, ubq, struct('qpipm', true)); [xi1, ii1] = mdli.solve();
+nfail = nfail + check('QP model: the active-set method and the interior-point method asked for', strcmp(ia1.status, 'OPTIMAL') ...
+                       && strcmp(ii1.status, 'OPTIMAL') && norm(xa1 - xq) < 1e-7 && norm(xi1 - xq) < 1e-6);
+delete(mdla); delete(mdli);
 rng_seed(7);
 nq = 30; mq = 12; Mq = randn(nq); Hr = Mq' * Mq + eye(nq); fr = randn(nq, 1); Ar = sprandn(mq, nq, 0.3) + [speye(mq), sparse(mq, nq - mq)];
 lr = -ones(mq, 1); ur = ones(mq, 1); ur(1:3) = lr(1:3);
@@ -258,11 +284,11 @@ nfail = nfail + check('brisk_sedumi: fid = 0 is quiet, fid = 1 prints the log', 
 % ---- the thread count: per solve (31 October 2026; until 1.6.1 these tests left later solves on one thread) ----
 if ~isempty(nt_fresh)
     [nt1, txt1] = log_threads(thr_file, struct('verbose', 1, 'threads', 1));
-    nfail = nfail + check('threads = 1 is forced for that solve ("forced by user")', isequal(nt1, 1) && ~isempty(strfind(txt1, '(forced by user)')));
+    nfail = nfail + check('threads = 1 is the limit for that solve ("at most 1 as set by the user")', isequal(nt1, 1) && ~isempty(strfind(txt1, '(at most 1 as set by the user)')));
     [nt2, txt2] = log_threads(thr_file, struct('verbose', 1));
     % (the automatic count can be lower than the fresh one when other processes keep cores busy, never one held over:
     % not "forced", and not stuck at one thread when the fresh session had more)
-    nfail = nfail + check('a later solve without threads starts from the automatic count again', ~isempty(nt2) && isempty(strfind(txt2, 'forced')) && (nt2 > 1 || nt_fresh == 1));
+    nfail = nfail + check('a later solve without threads starts from the automatic count again', ~isempty(nt2) && isempty(strfind(txt2, 'as set by the user')) && (nt2 > 1 || nt_fresh == 1));
     [nt3, txt3] = log_threads(thr_file, struct('verbose', 1, 'threads', 0));
     nfail = nfail + check('threads = 0 is the automatic count', ~isempty(nt3) && isempty(strfind(txt3, 'forced')) && (nt3 > 1 || nt_fresh == 1));
 end

@@ -8,7 +8,7 @@
 #   3. the high-precision solver advises the bound only, and nothing with -bound,
 #   4. a linear program is advised the tolerance only,
 #   5. second-order cone input gets the same advice from the SOCP solver and from the SDP
-#      solver (-conesolver 0), with one summary each,
+#      solver (-socpsolver 0), with one summary each,
 #   6. -q prints no advice,
 #   7. a solve that misses the tolerance on badly scaled blocks names -blkscale -2 (not an OPTIMAL solve, not
 #      after -blkscale -2).
@@ -33,17 +33,24 @@ out=$($B $D/truss1.dat-s -threads 1 -bound d -certify -v 2>&1); chk "-bound d -c
 out=$($B $D/truss1.dat-s -threads 1 -prec dd -v 2>&1);        chk "-prec dd: the bound only" "$G|  -bound d " "$A|  -certify "
 out=$($B $D/truss1.dat-s -threads 1 -prec dd -bound d -v 2>&1); chk "-prec dd -bound d: nothing" "certif" "$A|$G|$R"
 out=$($B $D/afiro.mps -threads 1 2>&1);                    chk "linear program, OPTIMAL: no advice in the default log (ISSUES 639)" "Status:            OPTIMAL" "$A|  -tol <t> |  -prec dd |$G"
-out=$($B $D/afiro.mps -threads 1 -v 2>&1);                 chk "linear program -v: the tolerance only" "$A|  -tol <t> " "  -prec dd |$G"
+# (8 November 2026) the interior-point method asked for: an LP below 1,000 nonzeros (afiro) goes to the dual simplex method by
+# default (BRISK_LPTINYDUAL), whose basic solution needs no accuracy advice
+out=$($B $D/afiro.mps -threads 1 -lpmethod 1 -v 2>&1);     chk "linear program -v: the tolerance only" "$A|  -tol <t> " "  -prec dd |$G"
 # (5 November 2026, the merge for 1.6.5) the SOCP developer's check "second-order cones, OPTIMAL: no advice in the default log"
 # left out: the owner decided on 1 November that the accuracy advice follows an optimal solve too, in the default log, so that
 # the high-precision solver is known (CHANGES: "The default log: the accuracy advice after an optimal solve too")
 out=$($B $D/soc_small.mat -threads 1 -v 2>&1);             chk "second-order cones -v, SOCP solver" "SOCP solver|$A|  -prec dd |$G" ""
 [ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL SOCP solver: not exactly one summary"; fail=1; }
-out=$($B $D/soc_small.mat -threads 1 -conesolver 0 -v 2>&1);  chk "second-order cones, SDP solver" "$A|  -prec dd |$G" ""
-[ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL -conesolver 0: not exactly one summary"; fail=1; }
+out=$($B $D/soc_small.mat -threads 1 -socpsolver 0 -v 2>&1);  chk "second-order cones, SDP solver" "$A|  -prec dd |$G" ""
+[ "$(echo "$out" | grep -c '^Summary')" = 1 ] || { echo "FAIL -socpsolver 0: not exactly one summary"; fail=1; }
 out=$($B $D/truss1.dat-s -threads 1 -q 2>&1);              chk "-q: no advice" "" "$A|$G"
 S="The blocks are badly scaled"
 out=$($B $D/control1.dat-s -threads 1 -tol 1e-13 2>&1);    chk "badly scaled blocks, tolerance missed: -blkscale -2" "$S|  -blkscale -2 |$A" ""
 out=$($B $D/control1.dat-s -threads 1 2>&1);               chk "badly scaled blocks, OPTIMAL: no -blkscale advice" "" "$S"
 out=$($B $D/control1.dat-s -threads 1 -tol 1e-13 -blkscale -2 2>&1); chk "-blkscale -2 is not advised again" "" "$S"
+# (11 November 2026, the owner: the SOCP solver's facial reduction off by default; a failed solve that shows the problem has no strictly
+#  feasible point says so and gives -socpfr 1; examples/socp_touch.cbf: two balls touching in one point, bench/socp_gen/gen_socp6.py)
+F="No strictly feasible point."
+out=$($B $D/socp_touch.cbf -threads 1 2>&1);               chk "no strictly feasible point: the face and -socpfr 1" "$F|  -socpfr 1 " "Status:            OPTIMAL"
+out=$($B $D/socp_touch.cbf -threads 1 -socpfr 1 2>&1);     chk "-socpfr 1: OPTIMAL on the face, not advised again" "Status:            OPTIMAL|on a face of the feasible set" "$F|  -socpfr 1 "
 [ $fail = 0 ] && echo "advice_test: all checks passed" || { echo "advice_test: FAILED"; exit 1; }

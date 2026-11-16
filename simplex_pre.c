@@ -25,6 +25,7 @@
  * is optimal, or a few iterations finish (the postsolve need not be exact for the result to be). */
 #include "simplex_pre.h"
 #include "simplex.h"
+#include "lpsolve.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,7 +92,9 @@ static void run_close(SxPre *P) {
 static __thread const volatile int *g_sxpre_stop;
 void sxpre_set_stop(const volatile int *stop) { g_sxpre_stop = stop; }
 const volatile int *sxpre_get_stop(void) { return g_sxpre_stop; }
-#define SXPRE_STOPPED() (g_sxpre_stop && *g_sxpre_stop)
+#define SXPRE_STOPPED() (brisk_flag_get(g_sxpre_stop))
+/* (5 November 2026, experiments) the reduced problem's rows and columns as indices of the problem presolved */
+void sxpre_maps(const SxPre *P, const int **rmap, const int **cmap) { *rmap = P->rmap; *cmap = P->cmap; }
 void sxpre_free(SxPre *P) {
     if (!P) return;
     free(P->rmap); free(P->cmap); free(P->l); free(P->u); free(P->rl); free(P->ru);
@@ -346,7 +349,7 @@ static void cost_sub(W *w, int k, double d) {
     w->cmod[k] = 1; w->cver[k]++;
 }
 /* a_rk += d for an active row r and column k (an entry added, changed, or removed when it cancels) */
-static void add_entry(W *w, int r, int k, double d, double scale) {
+static double add_entry(W *w, int r, int k, double d, double scale) {   /* (returns |a_rk| after the change, 0 when it is gone) */
     w->cmod[k] = 1; w->cver[k]++;
     /* (26 October 2026) whether the entry is there is read from the shorter of the two lists (only this function
      * changes them, so they hold the same entries): substitutions into one long row searched it once per entry added
@@ -360,13 +363,16 @@ static void add_entry(W *w, int r, int k, double d, double scale) {
         wrow_push(w, r, k, d);
         wpush(w, w->ci, w->cv, w->clen, w->ccap, k, r, d);
         w->rcnt[r]++; w->ccnt[k]++;
-        return;
+        return fabs(d);
     }
     const double v = w->rv[r][pr] + d;
     if (fabs(v) <= ZTOL * scale) {
         wrow_del(w, r, pr); wdel(w->ci, w->cv, w->clen, k, pc);
         w->rcnt[r]--; w->ccnt[k]--;
-    } else { w->rv[r][pr] = v; w->cv[k][pc] = v; }
+        return 0;
+    }
+    w->rv[r][pr] = v; w->cv[k][pc] = v;
+    return fabs(v);
 }
 /* the bounds of row i's activity without column skip: min and max, with the counts of infinite contributions */
 
@@ -389,24 +395,39 @@ static void activity(const W *w, int i, int skip, double *lmin, double *lmax, in
  * 0.56 s presolve. A row of at least 64 entries keeps its sums over the active columns (computed at the first question
  * of the pass), a column's part is taken out when it leaves the row, and a question subtracts the asking column's part.
  * Not where a column's part exceeds 1e6 in size (the subtraction could cancel digits the tests need: the exact sum) */
-typedef struct { double *a0, *a1, *big; int *n0, *n1; char *val; } ActCache;
+typedef struct { double *a0, *a1, *big; int *n0, *n1; char *val; double *a0l, *a1l; } ActCache;
+/* (15 November 2026) the kept sums in twice the precision: each term added by an error-free transformation (TwoSum), its
+ * rounding error gathered in the low part (Ogita, Rump and Oishi's cascaded summation), so that taking a column's part out
+ * loses no digits of the others' sum however large the part. Before, a row whose terms passed 1e6 was rescanned in full at
+ * every question: neos-4984115-canche (LP), 1,762 questions a pass on rows of about 130,000 entries, 230 million entries a
+ * pass, 0.42 s of its 1.6 s. A term above 1e15 still rescans (the sum's own magnitude then exceeds what double-double
+ * keeps exact for the tests). BRISK_SXPRE_ACTDD=0: the rescan above 1e6, as before */
+static inline void act_dd_add(double *hi, double *lo, double x) { const double s = *hi + x, bp = s - *hi; *lo += (*hi - (s - bp)) + (x - bp); *hi = s; }
+static int act_dd_on(void) { static int on = -1; if (on < 0) { const char *e_ = getenv("BRISK_SXPRE_ACTDD"); on = !(e_ && atoi(e_) == 0); } return on; }
 static void act_get(const W *w, ActCache *C, int i, int j, double a, double *lmin, double *lmax, int *nimin, int *nimax) {
     if (w->rlen[i] < 64) { activity(w, i, j, lmin, lmax, nimin, nimax); return; }
+    const int dd = act_dd_on();
     if (!C->val[i]) {
-        double a0 = 0, a1 = 0, big = 0; int n0 = 0, n1 = 0;
+        double a0 = 0, a1 = 0, l0 = 0, l1 = 0, big = 0; int n0 = 0, n1 = 0;
         for (int p = 0; p < w->rlen[i]; p++) {
             const int k = w->ri[i][p]; if (!w->colon[k]) continue;
             const double e = w->rv[i][p], bl = e > 0 ? w->l[k] : w->u[k], bu = e > 0 ? w->u[k] : w->l[k];
-            if (fabs(bl) >= PHUGE) n0++; else { a0 += e * bl; big = fmax(big, fabs(e * bl)); }
-            if (fabs(bu) >= PHUGE) n1++; else { a1 += e * bu; big = fmax(big, fabs(e * bu)); }
+            if (fabs(bl) >= PHUGE) n0++; else { if (dd) act_dd_add(&a0, &l0, e * bl); else a0 += e * bl; big = fmax(big, fabs(e * bl)); }
+            if (fabs(bu) >= PHUGE) n1++; else { if (dd) act_dd_add(&a1, &l1, e * bu); else a1 += e * bu; big = fmax(big, fabs(e * bu)); }
         }
-        C->a0[i] = a0; C->a1[i] = a1; C->n0[i] = n0; C->n1[i] = n1; C->big[i] = big; C->val[i] = 1;
+        C->a0[i] = a0; C->a1[i] = a1; C->a0l[i] = l0; C->a1l[i] = l1; C->n0[i] = n0; C->n1[i] = n1; C->big[i] = big; C->val[i] = 1;
     }
-    if (C->big[i] > 1e6) { activity(w, i, j, lmin, lmax, nimin, nimax); return; }
-    double a0 = C->a0[i], a1 = C->a1[i]; int n0 = C->n0[i], n1 = C->n1[i];
+    if (C->big[i] > (dd ? 1e15 : 1e6)) { activity(w, i, j, lmin, lmax, nimin, nimax); return; }
+    double a0 = C->a0[i], a1 = C->a1[i], l0 = C->a0l[i], l1 = C->a1l[i]; int n0 = C->n0[i], n1 = C->n1[i];
     const double bl = a > 0 ? w->l[j] : w->u[j], bu = a > 0 ? w->u[j] : w->l[j];
-    if (fabs(bl) >= PHUGE) n0--; else a0 -= a * bl;
-    if (fabs(bu) >= PHUGE) n1--; else a1 -= a * bu;
+    if (dd) {
+        if (fabs(bl) >= PHUGE) n0--; else act_dd_add(&a0, &l0, -(a * bl));
+        if (fabs(bu) >= PHUGE) n1--; else act_dd_add(&a1, &l1, -(a * bu));
+        a0 += l0; a1 += l1;
+    } else {
+        if (fabs(bl) >= PHUGE) n0--; else a0 -= a * bl;
+        if (fabs(bu) >= PHUGE) n1--; else a1 -= a * bu;
+    }
     *lmin = a0; *lmax = a1; *nimin = n0; *nimax = n1;
 }
 /* column j (still active) leaves its rows: its part out of the kept sums */
@@ -414,8 +435,13 @@ static void act_leave(const W *w, ActCache *C, int j) {
     for (int p = 0; p < w->clen[j]; p++) {
         const int i = w->ci[j][p]; if (!w->rowon[i] || !C->val[i]) continue;
         const double e = w->cv[j][p], bl = e > 0 ? w->l[j] : w->u[j], bu = e > 0 ? w->u[j] : w->l[j];
-        if (fabs(bl) >= PHUGE) C->n0[i]--; else C->a0[i] -= e * bl;
-        if (fabs(bu) >= PHUGE) C->n1[i]--; else C->a1[i] -= e * bu;
+        if (act_dd_on()) {
+            if (fabs(bl) >= PHUGE) C->n0[i]--; else act_dd_add(&C->a0[i], &C->a0l[i], -(e * bl));
+            if (fabs(bu) >= PHUGE) C->n1[i]--; else act_dd_add(&C->a1[i], &C->a1l[i], -(e * bu));
+        } else {
+            if (fabs(bl) >= PHUGE) C->n0[i]--; else C->a0[i] -= e * bl;
+            if (fabs(bu) >= PHUGE) C->n1[i]--; else C->a1[i] -= e * bu;
+        }
     }
 }
 
@@ -777,6 +803,7 @@ static int sparsify_rows(W *w, SxPre *P) {
 }
 /* (28 October 2026, the night; ISSUES 626) linearly dependent equality rows dropped (lp_dependent_rows, lpio.c), once at the end
  * of the passes; the record of a redundant row (its dual 0, its logical basic). BRISK_SXPRE_DEPROWS=0: off */
+static int dep_key3_cmp(const void *a_, const void *b_) { const long *a = a_, *b = b_; for (int t = 0; t < 3; t++) if (a[t] != b[t]) return a[t] < b[t] ? -1 : 1; return 0; }
 static int dependent_rows(W *w, SxPre *P) {
     const int m = w->m, n = w->n;
     int me = 0; long nze = 0;
@@ -798,6 +825,30 @@ static int dependent_rows(W *w, SxPre *P) {
           else for (int v = mx_; v >= 0; v--) for (int k = 0; k < me; k++) { const int i = ord[k]; if (nc_[i] == v) o2[b++] = i; }
           free(nc_);
           memcpy(ord, o2, sizeof(int) * (size_t)me); free(o2); } }
+    {   /* (15 November 2026; BRISK_SXPRE_DEPFREE=0: off) within the order above, the rows ordered by the count of their columns
+         * with two active entries, fewest first (a stable sort): the search takes the rows in this order within a length, the rows it
+         * finds dependent are those that come last, and a row dropped leaves each such column alone in its other row, where the passes
+         * after (BRISK_SXPRE_DEPREPASS) remove it as a slack column or a singleton. Satellites4-25 (LP): the slack columns removed
+         * depended on the rows' order (20,690 as written, 30,188 with the rows in reverse Cuthill-McKee order, 17,864 on a shuffled copy);
+         * the columns kept in one form only were columns of three entries without cost */
+        /* (on by default since 15 November 2026: the 618 development LPs 548 of 560 identical, the satellites 17-42 % fewer iterations, the
+         * held-out set 1.007 with the same iterations on 68 of 72 and no loss; BRISK_SXPRE_DEPFREE=0: the order as before) */
+        static int depfree = -1; if (depfree < 0) { const char *e_ = getenv("BRISK_SXPRE_DEPFREE"); depfree = !(e_ && atoi(e_) == 0); }
+        if (depfree) {
+            /* (each row's key once: its part (a row with a cost first, as the order above has it) and its count; then one stable sort by
+             * (part, count, place in the order above). A first version recomputed the part in a loop over every count value: rail03, LP,
+             * whose rows hold thousands of such columns, 1.9 -> 21 s of presolve) */
+            long *key3 = xmalloc(sizeof(long) * (size_t)me * 3);
+            for (int k = 0; k < me; k++) { const int i = ord[k]; long cnt = 0; int hasc = !depcost;
+                for (int p = 0; p < w->rlen[i]; p++) { const int j = w->ri[i][p]; if (!w->colon[j] || w->rv[i][p] == 0) continue; if (w->ccnt[j] == 2) cnt++; if (w->c[j] != 0) hasc = 1; }
+                key3[3 * k] = hasc ? 0 : 1; key3[3 * k + 1] = cnt; key3[3 * k + 2] = k; }
+            qsort(key3, (size_t)me, 3 * sizeof(long), dep_key3_cmp);
+            int *o3 = xmalloc(sizeof(int) * (size_t)me);
+            for (int k = 0; k < me; k++) o3[k] = ord[key3[3 * k + 2]];
+            memcpy(ord, o3, sizeof(int) * (size_t)me);
+            free(key3); free(o3);
+        }
+    }
     for (int k_ = 0; k_ < me; k_++) { const int i = ord[k_];
         rows[t] = i; ep[t] = q; eb[t] = w->rl[i];
         for (int p = 0; p < w->rlen[i]; p++) if (w->colon[w->ri[i][p]] && w->rv[i][p] != 0) { ej[q] = w->ri[i][p]; ev[q++] = w->rv[i][p]; }
@@ -805,12 +856,91 @@ static int dependent_rows(W *w, SxPre *P) {
     }
     free(ord);
     ep[me] = q;
-    const int nd = lp_dependent_rows(me, n, ep, ej, ev, eb, dep, g_sxpre_stop);
+    int nd = lp_dependent_rows(me, n, ep, ej, ev, eb, dep, g_sxpre_stop);
+    /* (15 November 2026, the night; BRISK_SXPRE_DEPPAIR=k: an experiment, k rounds) the choice refined by the columns it frees: a
+     * column with two active entries is freed when one of its rows is dropped, a column of three entries without cost when two are
+     * (it then becomes a slack column or a singleton in the passes after). Given the rows found dependent, each equation's gain is
+     * the count of its columns that dropping it would free with the others dropped (two entries; three entries without cost whose
+     * other two rows hold a dropped one); the rows ordered by (part, gain, place), the search run again, and its result kept when it
+     * frees more columns. Satellites4-25 (LP): of 1,260 rows dropped, 40 differed between the file and a shuffled copy, all ties of
+     * the order above, and the three-entry columns freed were 25,036 against 24,815, the difference of the slack columns removed */
+    static int deppair = -1; if (deppair < 0) { const char *e_ = getenv("BRISK_SXPRE_DEPPAIR"); deppair = e_ ? atoi(e_) : 0; }
+    if (deppair > 0 && nd > 0) {
+        char *dr = xcalloc((size_t)m + 1, 1);
+        long *key3 = xmalloc(sizeof(long) * (size_t)me * 3);
+        int *rows2 = xmalloc(sizeof(int) * (size_t)me); long *ep2 = xmalloc(sizeof(long) * ((size_t)me + 1));
+        int *ej2 = xmalloc(sizeof(int) * ((size_t)nze + 1)); double *ev2 = xmalloc(sizeof(double) * ((size_t)nze + 1)), *eb2 = xmalloc(sizeof(double) * (size_t)me);
+        char *dep2 = xmalloc((size_t)me);
+        for (int r_ = 0; r_ < deppair && !brisk_flag_get(g_sxpre_stop); r_++) {
+            long T[2];
+            for (int s_ = 0; s_ < 2; s_++) {   /* (s_ 0: the current choice; 1: after the search in the new order) */
+                const int *rw = s_ ? rows2 : rows; const char *dp = s_ ? dep2 : dep;
+                for (int k = 0; k < me; k++) dr[rw[k]] = dp[k];
+                long tot = 0;
+                for (int j = 0; j < n; j++) {
+                    if (!w->colon[j] || (w->ccnt[j] != 2 && !(w->ccnt[j] == 3 && w->c[j] == 0))) continue;
+                    int kd = 0; for (int p = 0; p < w->clen[j]; p++) if (w->rowon[w->ci[j][p]] && w->cv[j][p] != 0) kd += dr[w->ci[j][p]];
+                    tot += kd >= w->ccnt[j] - 1;
+                }
+                T[s_] = tot;
+                if (s_ == 1) break;
+                /* the gains under the current choice, the new order and the search */
+                for (int k = 0; k < me; k++) { const int i = rows[k]; long g = 0; int hasc = !depcost;
+                    for (int p = 0; p < w->rlen[i]; p++) { const int j = w->ri[i][p]; if (!w->colon[j] || w->rv[i][p] == 0) continue;
+                        if (w->c[j] != 0) hasc = 1;
+                        if (w->ccnt[j] == 2) g++;
+                        else if (w->ccnt[j] == 3 && w->c[j] == 0) { int kd = 0; for (int pp = 0; pp < w->clen[j]; pp++) { const int r2 = w->ci[j][pp]; if (r2 != i && w->rowon[r2] && w->cv[j][pp] != 0) kd += dr[r2]; } g += kd >= 1; } }
+                    key3[3 * k] = hasc ? 0 : 1; key3[3 * k + 1] = g; key3[3 * k + 2] = k; }
+                qsort(key3, (size_t)me, 3 * sizeof(long), dep_key3_cmp);
+                long q2 = 0;
+                for (int k = 0; k < me; k++) { const int i = rows[key3[3 * k + 2]]; rows2[k] = i; ep2[k] = q2; eb2[k] = w->rl[i];
+                    for (int p = 0; p < w->rlen[i]; p++) if (w->colon[w->ri[i][p]] && w->rv[i][p] != 0) { ej2[q2] = w->ri[i][p]; ev2[q2++] = w->rv[i][p]; } }
+                ep2[me] = q2;
+                const int nd2 = lp_dependent_rows(me, n, ep2, ej2, ev2, eb2, dep2, g_sxpre_stop);
+                if (nd2 != nd) { T[1] = -1; break; }   /* (the rank is the rank: a different count is a numerical difference, not a choice) */
+            }
+            for (int k = 0; k < me; k++) dr[rows[k]] = 0, dr[rows2[k]] = 0;
+            if (getenv("BRISK_LPDEPDBG")) fprintf(stderr, "  [dependent rows, round %d: columns freed %ld -> %ld]\n", r_ + 1, T[0], T[1]);
+            if (T[1] <= T[0]) break;
+            { int *t1 = rows; rows = rows2; rows2 = t1; } { long *t2 = ep; ep = ep2; ep2 = t2; } { int *t3 = ej; ej = ej2; ej2 = t3; }
+            { double *t4 = ev; ev = ev2; ev2 = t4; } { double *t5 = eb; eb = eb2; eb2 = t5; } { char *t6 = dep; dep = dep2; dep2 = t6; }
+        }
+        free(dr); free(key3); free(rows2); free(ep2); free(ej2); free(ev2); free(eb2); free(dep2);
+    }
     if (getenv("BRISK_LPDEPDBG")) { long h[8] = {0}, g[8] = {0}; for (int k = 0; k < me; k++) { const long l = ep[k + 1] - ep[k]; const int b = l <= 2 ? 0 : l <= 4 ? 1 : l <= 8 ? 2 : l <= 16 ? 3 : l <= 32 ? 4 : l <= 64 ? 5 : 6; g[b]++; if (dep[k]) h[b]++; }
         fprintf(stderr, "  [dependent rows by length (<=2,4,8,16,32,64,more): dropped %ld %ld %ld %ld %ld %ld %ld of %ld %ld %ld %ld %ld %ld %ld]\n", h[0], h[1], h[2], h[3], h[4], h[5], h[6], g[0], g[1], g[2], g[3], g[4], g[5], g[6]); }
-    if (getenv("BRISK_LPDEPLIST")) { FILE *f_ = fopen(getenv("BRISK_LPDEPLIST"), "w"); if (f_) { for (int k = 0; k < me; k++) if (dep[k]) fprintf(f_, "%d\n", rows[k]); fclose(f_); } }
+    if (getenv("BRISK_LPDEPLIST")) { FILE *f_ = fopen(getenv("BRISK_LPDEPLIST"), "a"); if (f_) { for (int k = 0; k < me; k++) if (dep[k]) fprintf(f_, "%d\n", rows[k]); fclose(f_); } }
     for (int k = 0; k < me; k++) if (dep[k]) { rec_begin(P, R_REDROW); rec_i(P, rows[k]); drop_row(w, rows[k]); }
     free(rows); free(ep); free(ej); free(ev); free(eb); free(dep);
+    return nd;
+}
+/* (15 November 2026, the night; the SDP developer's finding on two SDPs, MESSAGES.md 15 November) the free columns that are linear
+ * combinations of other free columns with the same combination of costs: A_f d = 0 and c_f'd = 0 for some d over free columns. Along d
+ * every solution stays a solution of the same value, so a column k with d_k != 0 is fixed at 0 (a solution keeps a representation with
+ * x_k = 0: shift it along d), and its dual equation a_k'y = c_k is implied by the others' (its reduced cost 0 at every dual feasible
+ * point). The search is the dependent equations' (lp_dependent_rows) on the free columns as rows over the active rows, the costs as the
+ * right-hand sides: it marks a column only when the cost follows the combination (otherwise the LP is unbounded or infeasible, and
+ * nothing is fixed). In the interior-point method such a direction is held only by the free columns' weight; the normal equations
+ * lose rank and their pivots are replaced: stockholm (LP) has 45 among its 18,720 free columns. BRISK_SXPRE_DEPFREECOL=0: kept */
+static int dependent_free_cols(W *w, SxPre *P) {
+    const int m = w->m, n = w->n;
+    int nf = 0; long nzf = 0;
+    for (int j = 0; j < n; j++) if (w->colon[j] && w->l[j] <= -PHUGE && w->u[j] >= PHUGE && w->ccnt[j] > 0) {
+        nf++; for (int p = 0; p < w->clen[j]; p++) nzf += w->rowon[w->ci[j][p]] && w->cv[j][p] != 0; }
+    if (nf < 2) return 0;
+    int *fcol = xmalloc(sizeof(int) * (size_t)nf); long *ep = xmalloc(sizeof(long) * ((size_t)nf + 1));
+    int *ej = xmalloc(sizeof(int) * ((size_t)nzf + 1)); double *ev = xmalloc(sizeof(double) * ((size_t)nzf + 1)), *eb = xmalloc(sizeof(double) * (size_t)nf);
+    char *dep = xmalloc((size_t)nf); int t = 0; long q = 0;
+    for (int j = 0; j < n; j++) {
+        if (!(w->colon[j] && w->l[j] <= -PHUGE && w->u[j] >= PHUGE && w->ccnt[j] > 0)) continue;
+        fcol[t] = j; ep[t] = q; eb[t] = w->c[j];
+        for (int p = 0; p < w->clen[j]; p++) if (w->rowon[w->ci[j][p]] && w->cv[j][p] != 0) { ej[q] = w->ci[j][p]; ev[q++] = w->cv[j][p]; }
+        t++;
+    }
+    ep[nf] = q;
+    const int nd = lp_dependent_rows(nf, m, ep, ej, ev, eb, dep, g_sxpre_stop);
+    for (int k = 0; k < nf; k++) if (dep[k]) { const int j = fcol[k]; rec_begin(P, R_FIXCOL); rec_i(P, j); rec_i(P, SX_ZERO); rec_d(P, 0.0); drop_col(w, j, 0.0); }
+    free(fcol); free(ep); free(ej); free(ev); free(eb); free(dep);
     return nd;
 }
 /* parallel columns: columns whose active entries and costs are proportional (a_k = lambda a_j, c_k = lambda c_j) act
@@ -938,6 +1068,8 @@ static double box_sup(const W *w, int j, int i1, double t1, int i2, double t2, d
     }
     return sup;
 }
+/* (7 November 2026) BRISK_SXPRE_TIGHTZERO=0: the rule that makes a row an equation by a cost (below) leaves out the columns of cost zero */
+static int sx_tightzero_off(void) { static int off = -1; if (off < 0) { const char *e = getenv("BRISK_SXPRE_TIGHTZERO"); off = e && atoi(e) == 0; } return off; }
 /* (27 October 2026; BRISK_SXPRE_ZFREE=0 turns it off) a column of cost zero whose rows its value can always satisfy:
  * for every point of the other columns within their bounds, some x_j within its bounds satisfies every row of x_j. Then
  * x_j and its rows are removed, and the postsolve gives x_j such a value. Each side of a row gives x_j a lower or an upper
@@ -1265,17 +1397,52 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
     const int noparallel = getenv("BRISK_SXPRE_NOPARALLEL") != NULL, nocascade = getenv("BRISK_SXPRE_NOCASCADE") != NULL;
     int nslack = 0, ntight = 0, npar = 0, nparc = 0, ncostsing = 0;
     int nagg = 0, naggb = 0, naggi = 0, naggi_bz[3] = { 0, 0, 0 };
-    const int aggb = aggbmode >= 0 ? aggbmode == 1 : getenv("BRISK_SXAGGB") && atoi(getenv("BRISK_SXAGGB")) == 1;   /* (experiment) */
-    const long aggbfill = aggbmode >= 0 ? 4 : getenv("BRISK_SXAGGBFILL") ? atol(getenv("BRISK_SXAGGBFILL")) : 16;   /* (experiment: the fill allowed a bounded substitution) */
-    const int aggbzc = aggbmode >= 0 ? 1 : getenv("BRISK_SXAGGBZC") && atoi(getenv("BRISK_SXAGGBZC")) == 1;   /* (experiment: only columns without cost) */
+    /* (5 November 2026, an experiment: BRISK_SXAGGBSX=1, simplex.c) the presolve of the simplex methods alone (g_sxpre_simplex
+     * 2: the dual or the primal simplex method, whose presolved problem no interior-point method sees) makes the bounded
+     * substitution of columns without cost, at most 4 new entries, as the second presolve of the bounded-substitution route
+     * does (aggbmode 1) */
+    const int sxonly = aggbmode < 0 && g_sxpre_simplex == 2 && !getenv("BRISK_SXAGGB");
+    const int aggb = aggbmode >= 0 ? aggbmode == 1 : sxonly ? 1 : getenv("BRISK_SXAGGB") && atoi(getenv("BRISK_SXAGGB")) == 1;   /* (experiment) */
+    const long aggbfill = aggbmode >= 0 || sxonly ? 4 : getenv("BRISK_SXAGGBFILL") ? atol(getenv("BRISK_SXAGGBFILL")) : 16;   /* (experiment: the fill allowed a bounded substitution) */
+    const int aggbzc = aggbmode >= 0 || sxonly ? 1 : getenv("BRISK_SXAGGBZC") && atoi(getenv("BRISK_SXAGGBZC")) == 1;   /* (experiment: only columns without cost) */
+    /* (5 November 2026, with BRISK_SXAGGBSX=1 and BRISK_SXAGGBLATE=1) the bounded substitution waits until the other steps (the dependent equations
+     * included) find nothing more: a row it keeps as a range is no longer an equation for the slack columns, the doubleton
+     * equations and the dependent equations (with the other steps: pds-06, LP, 2,358 -> 3,943 rows and 13,420 -> 19,252
+     * columns, seqsolve1 8,829 -> 37,545 rows, its iterations 10,994 -> 27,758). Waiting keeps those LPs as they were but
+     * loses most of the satellites' gain (satellites4-25, LP: 4,040-5,167 -> 6,105-8,936 iterations) and costs mzzv11 (LP)
+     * 16,929 -> 70,855. Off: BRISK_SXAGGBLATE=1 waits */
+    static int aglate = -1; if (aglate < 0) { const char *e_ = getenv("BRISK_SXAGGBLATE"); aglate = e_ && atoi(e_) == 1; }
+    const int aggb_late = sxonly && aglate; int aggb_phase = 0;
+    /* (5 November 2026) two limits on the bounded substitution, from ofi (LP), whose substituted problem the dual simplex
+     * method took over 150 s on against 21 s without it:
+     * (1) one of the column's bounds implied by the rows, so that the row becomes a one-sided inequality, not a range (as in
+     *     Gurobi's aggregation, whose presolved problems hold no ranged rows: satellites2-25, LP, x1 + x2 + x3 - z = 0 with x1
+     *     in [0, 1], x1 <= 1 implied, becomes z - x2 - x3 >= 0). With both bounds kept by the row (21,549 ranged rows on ofi)
+     *     the pivot rows were 1.5 times longer and the run 1.35 times slower even without (2). BRISK_SXAGGBHALF=0: either;
+     * (2) not into a long row: the substitution moves the row's other columns into each other row of the column, and in a
+     *     row of tens of thousands of entries (ofi: 10,806 of its 35,000 substitutions, columns of two entries one of which
+     *     is in a row of 97,000 to 112,000) they tie the basis to it, so that the rows of the basis inverse reach it far
+     *     more often (average |rho| 2,194 -> 8,322, pivot rows 19,600 -> 89,000 entries). A row is long when it is dense by
+     *     the rule of the AMD ordering: more than max(16, 10 sqrt(n)) entries, n the columns (ofi 4,698; satellites2-25
+     *     1,638, whose substitutions reach rows of at most 99). A limit relative to the mean row length (10 times) cost
+     *     satellites2-60-fs (LP, mean 6 entries a row) most of its gain. BRISK_SXAGGBLONG: the factor 10 (0: no limit);
+     *     BRISK_SXAGGBMAXROW: an absolute limit instead (experiments) */
+    const int aggbmaxrow0 = getenv("BRISK_SXAGGBMAXROW") ? atoi(getenv("BRISK_SXAGGBMAXROW")) : 0;
+    const double aggblong = getenv("BRISK_SXAGGBLONG") ? atof(getenv("BRISK_SXAGGBLONG")) : 10.0;
+    const int aggbmaxrow = aggbmaxrow0 > 0 ? aggbmaxrow0 : aggblong > 0 ? (int)fmin(2e9, fmax(16.0, ceil(aggblong * sqrt((double)n)))) : 0;
+    const int aggbhalf = !(getenv("BRISK_SXAGGBHALF") && atoi(getenv("BRISK_SXAGGBHALF")) == 0);
     const int aggnet = getenv("BRISK_SXAGGNET") && atoi(getenv("BRISK_SXAGGNET")) == 1;   /* (experiment: substitutions by their net fill) */
     const int aggnet2 = getenv("BRISK_SXAGGNET2") ? atoi(getenv("BRISK_SXAGGNET2")) : 0;   /* (experiment: 1, only columns of two entries) */
+    static int aggexact = -1; if (aggexact < 0) { const char *e_ = getenv("BRISK_SXAGGEXACT"); aggexact = !(e_ && atoi(e_) == 0); }
+    long n_aggexact = 0;
+    static int aggbex = -1; if (aggbex < 0) { const char *e_ = getenv("BRISK_SXAGGBEXACT"); aggbex = e_ && atoi(e_) != 0; }   /* (12 November 2026, an experiment: the exact count for the bounded substitution too) */
+    static long aggexlim = -1000; if (aggexlim == -1000) { const char *e_ = getenv("BRISK_SXAGGEXACTLIM"); aggexlim = e_ ? atol(e_) : 0; }
     const double aggnettol = getenv("BRISK_SXAGGNETTOL") ? atof(getenv("BRISK_SXAGGNETTOL")) : 0.01;   /* (experiment: the substituted entry against its row's largest, for the net-fill substitutions) */
     /* (27 October 2026, an experiment) the substitution through a one-sided inequality row, the column kept as the row's
      * slack (the aggregator below); BRISK_SXPRE_AGGI=1: on */
     /* 1: every column with one infinite bound; 2: free columns only; 3: free columns only, in the simplex methods' presolve;
      * 9: as 3 with a rule on the row (4 November 2026, an experiment: aggibz below) */
-    const int aggim = getenv("BRISK_SXPRE_AGGI") ? atoi(getenv("BRISK_SXPRE_AGGI")) : 0;
+    const int aggim = getenv("BRISK_SXPRE_AGGI") ? atoi(getenv("BRISK_SXPRE_AGGI")) : 9;   /* (9 by default since 7 November 2026, with the ratio test's last group in the order of its ratios: the default route on the 21 LPs whose presolve it changes 0.936 of the time, stockholm 1.56 -> 0.58 s, ns1644855 60.0 -> 63.7 s; BRISK_SXPRE_AGGI=0: off) */
     const int aggi = aggim == 1 || aggim == 2 || ((aggim == 3 || aggim == 9) && g_sxpre_simplex > 0);
     /* (4 November 2026, an experiment: BRISK_SXPRE_AGGI=9) as 3, a row not used when more than BRISK_SXPRE_AGGIBZ (default 0)
      * of its other columns are boxed without cost. The substitution replaces the free column, which the dual simplex method
@@ -1286,6 +1453,23 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
      * the 814 are left and take 79,658 iterations; with none 14, and 37,711 */
     const int aggibz = aggim == 9 ? (getenv("BRISK_SXPRE_AGGIBZ") ? atoi(getenv("BRISK_SXPRE_AGGIBZ")) : 0) : -1;
     const int aggifree = aggim >= 2;
+    /* (12 November 2026) the substitution through an inequality row of a column with one infinite bound, in the simplex methods'
+     * presolve, when it adds no entries on balance (the aggregator below) */
+    /* Off by default (12 November 2026, four A/B runs on the 618 development LPs: 1.002; neos-4264598-oueme 0.61-0.70,
+     * ger50_17_trans 0.54-0.73 and ger50-17-trans-dfn-3t (Gurobi's presolved size; 1,717 -> 1,108 iterations), but gmut-76-40
+     * 1.21-1.26 from two substitutions and neos-5188808-nattai up to 1.24, var-smallemery-m6j6 1.33: the rule of no file
+     * worse). BRISK_SXPRE_AGGINET=1: on */
+    /* (13 November 2026) on by default for columns with a cost only (BRISK_SXPRE_AGGINETC, below): the substitution moves the
+     * column's cost onto the row's other columns, which the dominated-column test can then fix (ger50-17-trans-dfn-3t, LP: about
+     * 9,000 columns, Gurobi's presolved size); a column of cost zero moves no cost and only reshapes rows (gmut-76-40, LP: 7-11 %
+     * more iterations on every permuted copy). Judged on the 618 development LPs (68 changed, no status changed; the 30 finished
+     * ones by the default route 0.982, ger50-17-trans-dfn-3t 0.181 -> 0.091 s and ger50_17_trans 0.143 -> 0.086 s), the losers on
+     * three permuted copies each (the originals' paths: level or gains on the copies), the held-out sets of 345 LPs untouched;
+     * the cost a few milliseconds of later passes on small LPs (a1c1s1, cre-a). BRISK_SXPRE_AGGINET=0: off; BRISK_SXPRE_AGGINETC=0:
+     * columns of cost zero as well (the form of 12 November) */
+    const int agginet = g_sxpre_simplex > 0 && !(getenv("BRISK_SXPRE_AGGINET") && atoi(getenv("BRISK_SXPRE_AGGINET")) == 0);
+    int agginet_phase = 0;
+    long network = 0; const long netbudget = 10L * (long)L->Ap[L->n] + 1000L;
     int ndom = 0, ndomp = 0, nzfree = 0, pd_idle = 0, zf_idle = 0, nsparsify = 0, sp_idle = 0;
     int parstall = 0, depdone = 0, ndeprow = 0;
     /* (22 October 2026) a step that ran on the problem as it is now and found nothing finds nothing again: nch counts
@@ -1294,7 +1478,8 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
      * full: lp_cheb_10000x300 (6.04 million nonzeros), one fixed column removed, a second pass of whole-matrix sweeps */
     long nch = 0, col_clean = -1, dom_clean = -1, agg_clean = -1, act_clean = -1;
     ActCache acache = { xmalloc(sizeof(double) * (m + 1)), xmalloc(sizeof(double) * (m + 1)), xmalloc(sizeof(double) * (m + 1)),
-                        xmalloc(sizeof(int) * (m + 1)), xmalloc(sizeof(int) * (m + 1)), xcalloc(m + 1, 1) };
+                        xmalloc(sizeof(int) * (m + 1)), xmalloc(sizeof(int) * (m + 1)), xcalloc(m + 1, 1),
+                        xmalloc(sizeof(double) * (m + 1)), xmalloc(sizeof(double) * (m + 1)) };
     /* (25 October 2026) three costly steps that found nothing in their last run wait while the other steps still change
      * the problem (the previous pass changed it), and run again in a pass of every step before the presolve ends: the rows
      * the cost makes tight, the aggregator and the rows redundant by implied bounds sweep every row with the implied
@@ -1303,6 +1488,7 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
      * the passes), each sweeping all rows with both steps that found nothing. BRISK_SXPRE_NODEFER=1: every step each pass */
     static int nodefer = -1; if (nodefer < 0) nodefer = getenv("BRISK_SXPRE_NODEFER") != NULL;
     int tr_idle = 0, ir_idle = 0, ag_idle = 0, dm_idle = 0, prev_changed = 0;
+    long dom_act = 0;   /* (the rows and columns left at the dominated-column test's last run) */
     long par_clean = -1;   /* (the count of changes at which the parallel rows and columns last found nothing) */
     /* (26 October 2026, a diagnostic: BRISK_SXPRE_TIMES=1) the time of each step over the passes, on stderr: the set-up,
      * rows, columns, dominated columns, rows the cost makes tight, doubleton equations, the aggregator, activity bounds,
@@ -1453,7 +1639,16 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
          * change the problem: pds-20 (LP) swept the whole matrix for the implied bounds on the duals after each pass of
          * substitutions, finding nothing. BRISK_SXPRE_DOMNODEFER=1: each pass as before */
         static int domnodefer = -1; if (domnodefer < 0) domnodefer = getenv("BRISK_SXPRE_DOMNODEFER") != NULL;
-        const long nch_d = nch; const int dom_want = !nodom && nch != dom_clean, dom_run = dom_want && !(defer && dm_idle && !domnodefer);
+        /* (13 November 2026, an experiment: BRISK_SXPRE_DOMSHRINK=f) a deferred run made anyway once the problem has shrunk by a
+         * fraction f since the test's last run: its dual bounds rest on the columns and rows that are left, and a large removal
+         * (bmocbd, LP: dual fixing of 126,223 columns in pass 0, the test finding nothing then and 101,148 dominated columns at
+         * pass 5, the passes between on a problem twice the size) can make many columns dominated; a pass of a few substitutions
+         * (pds-20, LP, the reason for the deferral) does not reach it */
+        static double dsh_ = -1; if (dsh_ < 0) { const char *e_ = getenv("BRISK_SXPRE_DOMSHRINK"); dsh_ = e_ ? atof(e_) : 0; }
+        const long nch_d = nch; const int dom_want = !nodom && nch != dom_clean;
+        const int dom_shrunk = dsh_ > 0 && dom_act > 0 && (double)act0 < (1.0 - dsh_) * (double)dom_act;
+        const int dom_run = dom_want && !(defer && dm_idle && !domnodefer && !dom_shrunk);
+        if (dom_run) dom_act = act0;
         if (dom_want && !dom_run) deferred = 1;
         if (dom_run) {
             implied_col_bounds_c(&w, &ibc, nch, ilo, iup, NULL, NULL);
@@ -1516,6 +1711,12 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
             for (int jj = 0; jj < 2 * n; jj++) {
                 const int j = jj % n;
                 if (!w.colon[j] || (jj >= n && w.c[j] != 0)) continue;
+                /* (7 November 2026; BRISK_SXPRE_TIGHTZERO=0) not for a column of cost zero: its row made an equation fixes the
+                 * column, then substituted from it, at the value that makes the row tight, a fraction set by the row's other
+                 * columns, where the inequality also has optima with the column at a bound (lectsched-1, MILP, cost zero
+                 * throughout: 12,091 rows made equations, then 2,585 doubleton equations and 9,509 substitutions, 12,206 of
+                 * the postsolved point's 28,718 columns fractional; without it 1,906) */
+                if (w.c[j] == 0 && sx_tightzero_off()) continue;
                 const int up = jj < n ? w.c[j] < 0 : 1;    /* the cost pushes x_j up (else down); cost zero: down, then up */
                 const int r = up ? su[j] : sl[j];
                 if (r < 0 || !w.rowon[r] || rchg[r] || w.rl[r] == w.ru[r]) continue;
@@ -1639,6 +1840,12 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
         if (agg_want && !agg_run) deferred = 1;
         if (agg_run) {
             int *srl = xmalloc(sizeof(int) * (n + 1)), *sru = xmalloc(sizeof(int) * (n + 1));
+            memset(acache.val, 0, (size_t)m);     /* (the kept row sums, for the substitution through an inequality: rebuilt here, dropped for every row a substitution changes) */
+            int *nmark = xmalloc(sizeof(int) * ((size_t)n + 1)); for (int k = 0; k <= n; k++) nmark[k] = 0; int stamp_ = 0;
+            double *rmaxc = xmalloc(sizeof(double) * ((size_t)m + 1)); char *rmaxv = xcalloc((size_t)m + 1, 1); int *rbz = xmalloc(sizeof(int) * ((size_t)m + 1));
+            char *rbzv = xcalloc((size_t)m + 1, 1);   /* (14 November 2026) rbz[i] exact (1) or not kept (0): computed where it is tested */
+            int *rmaxk = xmalloc(sizeof(int) * ((size_t)m + 1));   /* (14 November 2026) the column of row i's largest entry, while rmaxv[i] = 1 */
+            char *rold = xcalloc((size_t)m + 1, 1);   /* (14 November 2026) whether the row was read since a substitution last changed it (the net rule's budget charges a row's length then, as before the summaries were kept) */
             char *stale = xcalloc(n + 1, 1);
             /* (26 October 2026) sweeps until one substitutes nothing, the implied bounds computed again before each: the
              * stale columns waited for the next pass, and a chain of substitutions then took one full pass a link, every
@@ -1686,19 +1893,78 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                 /* (an experiment, BRISK_SXAGGB=1, 23 October 2026) a column with bounds the rows do not imply is
                  * substituted too, its bounds kept by the row, which stays as a range (R_AGGB) */
                 const int bnd = !(lok && uok);
-                const int eqok = !(bnd && (!aggb || (aggbzc && w.c[j] != 0.0)));
-                if (!eqok && !(aggi && (aggifree ? (w.l[j] <= -PHUGE && w.u[j] >= PHUGE) : (w.l[j] <= -PHUGE || w.u[j] >= PHUGE)))) continue;
+                int eqok = !(bnd && (!aggb || (aggb_late && !aggb_phase) || (aggbzc && w.c[j] != 0.0)));
+                if (eqok && bnd && aggbhalf && !lok && !uok) eqok = 0;     /* (experiment: one of the bounds implied) */
+                if (eqok && bnd && aggbmaxrow > 0)     /* (the bounded substitution not into a long row: see aggbmaxrow) */
+                    for (int p = 0; p < w.clen[j] && eqok; p++) { const int r = w.ci[j][p]; if (w.rowon[r] && w.rcnt[r] > aggbmaxrow) eqok = 0; }
+                /* (12 November 2026) oknet: a column with one infinite bound substituted through a one-sided inequality row
+                 * that implies its finite bound, in the simplex methods' presolve, when the substitution does not add
+                 * entries on balance (below; BRISK_SXPRE_AGGINET=0: off) */
+                /* (the entries the net rule's counts read capped at ten times the matrix's entries over the presolve: on rows
+                 * of 100,000 entries every column of the row can pass the cached checks and each count reads the row, the
+                 * square of its length; neos-4984115-canche, LP: its aggregator 0.64 -> 1.55 s for no substitution) */
+                const int oneinf_j = w.l[j] <= -PHUGE || w.u[j] >= PHUGE;
+                const int okold = aggi && (aggifree ? (w.l[j] <= -PHUGE && w.u[j] >= PHUGE) : oneinf_j);
+                /* (at most 8 entries in the column: the check below costs the column's length for each of its rows, and a
+                 * substitution that adds nothing needs each of the column's other rows to hold nearly all of the row's
+                 * columns, which a long column rarely meets; neos-5149806-wieprz, LP, spent 53-83 s checking columns in
+                 * thousands of rows for no substitution. ger50-17-trans-dfn-3t's columns have 2) */
+                /* (13 November 2026, by default; BRISK_SXPRE_AGGINETC=0: every column) only a column with a cost: its substitution
+                 * moves the cost onto the row's other columns, which can then be fixed as dominated (ger50-17-trans-dfn-3t, LP:
+                 * about 9,000 columns); a column of cost zero moves no cost and only reshapes rows (gmut-76-40, LP: two such
+                 * substitutions, 7-11 % more iterations on every permuted copy) */
+                static int aggic = -1; if (aggic < 0) { const char *e_ = getenv("BRISK_SXPRE_AGGINETC"); aggic = !(e_ && atoi(e_) == 0); }
+                const int oknet = agginet && agginet_phase && oneinf_j && !(w.l[j] <= -PHUGE && w.u[j] >= PHUGE) && w.ccnt[j] <= 8 && !(aggic && w.c[j] == 0);
+                if (!eqok && !okold && !oknet) continue;
                 int ib = -1; double ab = 0; long fb = 0; int ineq = 0;
                 if (eqok) for (int p = 0; p < w.clen[j]; p++) {
                     const int i = w.ci[j][p];
                     if (!w.rowon[i] || w.rl[i] != w.ru[i] || w.rl[i] <= -PHUGE) continue;
-                    const long fill = (long)(w.ccnt[j] - 1) * (w.rcnt[i] - 2);
+                    long fill = (long)(w.ccnt[j] - 1) * (w.rcnt[i] - 2);
                     /* (BRISK_SXAGGNET=1, an experiment of 26 October 2026) a substitution that does not add entries
                      * on balance (fill minus the row's own entries, the column's other entries already in fill's
                      * count) is taken whatever the row's length: a column of two entries always removes two
                      * (neos-1445765, LP: sum x = k w, w in a knapsack row; Gurobi 1,001 rows left, ours 1,478) */
-                    const int oldok = !(w.rcnt[i] > 24 || fill > (bnd ? aggbfill : 16));
+                    int oldok = !(w.rcnt[i] > 24 || fill > (bnd ? aggbfill : 16));
                     const int netok = aggnet && !bnd && fill - w.rcnt[i] <= 0 && (aggnet2 == 0 || w.ccnt[j] == 2);
+                    /* (12 November 2026) the fill counted exactly: (entries of the column - 1)(entries of the row - 2) assumes that
+                     * the column's other rows share none of the row's columns. Where they share them, the substitution adds fewer
+                     * entries, none at all when the other row holds the same columns (neos-1367061, LP: 336 columns y of two
+                     * entries, sum x - 8000 y = 0 with 25 flows x and -sum x + 4000 y <= 0 over the same flows; the substitution
+                     * adds nothing and the second row becomes sum x >= 0, redundant; Gurobi's presolve does it, and the problem's
+                     * symmetry, hidden by these rows, then halves it). A substitution that the estimate refuses and that adds no
+                     * entry on balance by the exact count is taken whatever the row's length; the count for columns of at most 8
+                     * entries, within the presolve's budget for such counts (network). Not those that add entries up to the
+                     * estimate's limit of 16: on pilot (Netlib, LP) they took short rows with pivots 0.03-0.2 of their row's
+                     * largest, and the interior-point method then stalled near the optimum (0.25 -> 0.48 s).
+                     * BRISK_SXAGGEXACT=0: the estimate alone, as before; BRISK_SXAGGEXACTLIM=k: up to k new entries (0) */
+                    if (!oldok && !netok && (!bnd || aggbex) && aggexact && w.ccnt[j] <= 8 && network <= netbudget) {
+                        long lb = 0;
+                        for (int pp = 0; pp < w.clen[j] && lb <= aggexlim; pp++) {
+                            const int r = w.ci[j][pp]; if (!w.rowon[r] || r == i) continue;
+                            const long sh = (w.rcnt[r] < w.rcnt[i] ? w.rcnt[r] : w.rcnt[i]) - 1;
+                            lb += (w.rcnt[i] - 2) - (sh > 0 ? sh : 0);
+                        }
+                        if (lb <= aggexlim) {
+                            network += w.rlen[i];
+                            for (int pp = 0; pp < w.clen[j]; pp++) { const int r = w.ci[j][pp]; if (w.rowon[r] && r != i) network += w.rlen[r] > 4 * w.rlen[i] && w.rlen[r] >= RIDX_MIN ? w.rlen[i] : w.rlen[r]; }
+                            stamp_++;
+                            for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (k != j && w.colon[k]) nmark[k] = stamp_; }
+                            long add = 0;
+                            for (int pp = 0; pp < w.clen[j] && add <= aggexlim; pp++) {
+                                const int r = w.ci[j][pp]; if (!w.rowon[r] || r == i) continue;
+                                long have = 0;
+                                if (w.rlen[r] > 4 * w.rlen[i] && w.rlen[r] >= RIDX_MIN) {
+                                    if (!w.ridx[r]) ridx_build(&w, r);
+                                    for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (k != j && w.colon[k] && wrow_find(&w, r, k) >= 0) have++; }
+                                } else for (int q = 0; q < w.rlen[r]; q++) { const int k = w.ri[r][q]; if (k != j && w.colon[k] && nmark[k] == stamp_) have++; }
+                                add += (w.rcnt[i] - 2) - have;
+                            }
+                            if (add <= aggexlim) { oldok = 1; fill = add; n_aggexact++;
+                                if (getenv("BRISK_SXAGGEXACTDBG")) { double am_ = 0, cm_ = 0; for (int q = 0; q < w.rlen[i]; q++) if (w.colon[w.ri[i][q]]) am_ = fmax(am_, fabs(w.rv[i][q])); for (int q = 0; q < w.clen[j]; q++) if (w.rowon[w.ci[j][q]]) cm_ = fmax(cm_, fabs(w.cv[j][q]));
+                                    fprintf(stderr, "[aggexact] column %d (%d entries) row %d (%d entries): new %ld, pivot/row max %.3g, pivot/column max %.3g\n", j, w.ccnt[j], i, w.rcnt[i], add, fabs(w.cv[j][p]) / am_, fabs(w.cv[j][p]) / cm_); } }
+                        }
+                    }
                     if (!oldok && !netok) continue;
                     if (ib >= 0 && fill >= fb) continue;
                     double amax = 0;
@@ -1727,7 +1993,7 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                  * 2,482 -> 1,357 dual iterations and 25 % faster, cre-c 25-39 %, but on cre-d the pivot rows 35 % longer
                  * for 12 % fewer rows, and the fill it puts into the normal equations stops the interior-point method
                  * (irish-electricity, LP: 8.3 s without, unfinished in 40 s with it) */
-                if (ib < 0 && aggi && (aggifree ? (w.l[j] <= -PHUGE && w.u[j] >= PHUGE) : (w.l[j] <= -PHUGE || w.u[j] >= PHUGE))) for (int p = 0; p < w.clen[j]; p++) {
+                if (ib < 0 && (okold || oknet)) for (int p = 0; p < w.clen[j]; p++) {
                     const int i = w.ci[j][p];
                     if (!w.rowon[i]) continue;
                     const int le = w.ru[i] < PHUGE;
@@ -1735,27 +2001,91 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                     const double a = w.cv[j][p];
                     const int below = le == (a < 0);                     /* the row bounds x_j from below: x_j' >= 0 */
                     if (below ? w.u[j] < PHUGE : w.l[j] > -PHUGE) continue;
-                    if (w.rcnt[i] > 24) continue;
-                    if (aggibz >= 0) {  /* (mode 9) at most aggibz of the row's other columns boxed without cost */
-                        int bz = 0;
-                        for (int q = 0; q < w.rlen[i] && bz <= aggibz; q++) { const int k = w.ri[i][q]; if (k != j && w.colon[k] && w.l[k] > -PHUGE && w.u[k] < PHUGE && w.l[k] < w.u[k] && w.c[k] == 0) bz++; }
-                        if (bz > aggibz) continue;
+                    /* (12 November 2026) the row's largest entry and its activity sums kept per row (rmaxc; the presolve's
+                     * cache of long rows' sums, act_get) and dropped for each row a substitution changes: with long rows
+                     * every column of a row that bounds it on the right side is a candidate, and each asked the whole row
+                     * twice (ger50-17-trans-dfn-3t, LP, with the row limits lifted: 4.35 s of the aggregator, 76 % of the
+                     * instructions in the activity's scans) */
+                    /* (a candidate of the net rule alone pays from its budget for the rows it reads: the cached sums of a row
+                     * are computed again after a substitution changed it) */
+                    const int netonly = oknet && !okold;
+                    if (netonly) {
+                        if (network > netbudget) continue;
+                        if (!rold[i]) network += w.rlen[i];
+                        if (w.rlen[i] < 64 || !acache.val[i]) network += w.rlen[i];
                     }
-                    const long fill = (long)(w.ccnt[j] - 1) * (w.rcnt[i] - 1);
-                    if (fill > 16 || (ib >= 0 && fill >= fb)) continue;
-                    double amax = 0;
-                    for (int q = 0; q < w.rlen[i]; q++) if (w.colon[w.ri[i][q]] && fabs(w.rv[i][q]) > amax) amax = fabs(w.rv[i][q]);
+                    /* (14 November 2026) rmaxv[i] = 1: the row's largest entry (rmaxc, in column rmaxk) is exact; the substitutions keep it so
+                     * (below, where they change the rows) and drop it only when the column holding it leaves the row or that entry shrinks.
+                     * Before, every row a substitution touched lost it, and the next candidate of the row scanned it whole: with the
+                     * candidates of a long row one after another the scans grew with the square of its length (neos-4984115-canche, LP, its
+                     * rows in reverse Cuthill-McKee order: 4.5e9 entries scanned, 5.7 s; as written 5.3e8, 2.6 s; now 2.6e6 and 2.8e6 entries,
+                     * 1.8 s both; the same presolved problem). The count of boxed columns without cost (rbz) is computed where it is tested */
+                    { static int rd_ = -1; if (rd_ < 0) { const char *e_ = getenv("BRISK_SXPRE_RMAXDBG"); rd_ = e_ && atoi(e_) != 0; }   /* (a diagnostic: the rows' scans) */
+                      if (rd_) { static long c0_, c3_, cl_; if (!rmaxv[i]) c0_++, cl_ += w.rlen[i]; else c3_++;
+                        if ((c0_ + c3_) % 200000 == 0) fprintf(stderr, "  [the rows' largest entries: scanned %ld times (%ld entries), kept %ld times]\n", c0_, cl_, c3_); } }
+                    if (!rmaxv[i]) {   /* (with the count of the row's columns boxed without cost: x_j itself is never one, it has an infinite bound) */
+                        double am = 0; int bzc_ = 0, ak_ = -1;
+                        for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (!w.colon[k]) continue; if (fabs(w.rv[i][q]) > am) { am = fabs(w.rv[i][q]); ak_ = k; }
+                            if (w.l[k] > -PHUGE && w.u[k] < PHUGE && w.l[k] < w.u[k] && w.c[k] == 0) bzc_++; }
+                        rmaxc[i] = am; rmaxk[i] = ak_; rbz[i] = bzc_; rmaxv[i] = 1; rbzv[i] = 1; }
+                    rold[i] = 1;
+                    const double amax = rmaxc[i];
                     if (fabs(a) < 0.01 * amax) continue;
                     /* x_j's finite bound implied by this row alone: x_j >= (rhs - s) / a for all s (below), <= (above) */
                     const double bj = below ? w.l[j] : w.u[j];
                     if (fabs(bj) < PHUGE) {
-                        double lmin, lmax; int n0, n1; activity(&w, i, j, &lmin, &lmax, &n0, &n1);
+                        double lmin, lmax; int n0, n1; act_get(&w, &acache, i, j, a, &lmin, &lmax, &n0, &n1);
                         const double rhs = le ? w.ru[i] : w.rl[i];
                         const int sm = below == (a > 0);                 /* the extreme from s's maximum (else its minimum) */
                         if (sm ? n1 : n0) continue;
                         const double ext = (rhs - (sm ? lmax : lmin)) / a;
                         if (below ? ext < bj - FTOL * (1 + fabs(bj)) : ext > bj + FTOL * (1 + fabs(bj))) continue;
                     }
+                    const int bzmax = aggibz >= 0 ? aggibz : oknet && !okold ? 0 : -1;
+                    if (bzmax >= 0 && !rbzv[i]) {   /* (the count where it is tested: a row's scan only for the candidates that reach here) */
+                        int bzc_ = 0;
+                        for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (w.colon[k] && w.l[k] > -PHUGE && w.u[k] < PHUGE && w.l[k] < w.u[k] && w.c[k] == 0) bzc_++; }
+                        rbz[i] = bzc_; rbzv[i] = 1;
+                    }
+                    if (bzmax >= 0 && rbz[i] > bzmax) continue;   /* (mode 9, and the net rule) at most bzmax of the row's other columns boxed without cost */
+                    long fill = (long)(w.ccnt[j] - 1) * (w.rcnt[i] - 1);
+                    const int small_ = okold && w.rcnt[i] <= 24 && fill <= 16;
+                    int bynet = 0;
+                    if (!small_) {
+                        if (!oknet) continue;
+                        /* the entries the substitution adds (row i's other columns not yet in each other row of column j)
+                         * against those it removes (row i's): at most as many. Counted exactly with marks */
+                        /* first a lower bound (row r shares at most min(|row i|, |row r|) - 1 of row i's other columns), then the
+                         * count, each row compared from its shorter side (row i's columns looked up in a long row's index):
+                         * a column in many long rows was counted by scanning each of them, in every sweep (neos-5149806-wieprz,
+                         * LP: 52.6 s of the aggregator for no substitution) */
+                        long lb = 0;
+                        for (int pp = 0; pp < w.clen[j] && lb <= w.rcnt[i]; pp++) {
+                            const int r = w.ci[j][pp]; if (!w.rowon[r] || r == i) continue;
+                            const long sh = (w.rcnt[r] < w.rcnt[i] ? w.rcnt[r] : w.rcnt[i]) - 1;
+                            lb += (w.rcnt[i] - 1) - (sh > 0 ? sh : 0);
+                        }
+                        if (lb > w.rcnt[i]) continue;
+                        if (network > netbudget) continue;
+                        network += w.rlen[i];
+                        for (int pp = 0; pp < w.clen[j]; pp++) { const int r = w.ci[j][pp]; if (w.rowon[r] && r != i) network += w.rlen[r] > 4 * w.rlen[i] && w.rlen[r] >= RIDX_MIN ? w.rlen[i] : w.rlen[r]; }
+                        stamp_++;
+                        for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (k != j && w.colon[k]) nmark[k] = stamp_; }
+                        long add = 0;
+                        for (int pp = 0; pp < w.clen[j] && add <= w.rcnt[i]; pp++) {
+                            const int r = w.ci[j][pp]; if (!w.rowon[r] || r == i) continue;
+                            long have = 0;
+                            if (w.rlen[r] > 4 * w.rlen[i] && w.rlen[r] >= RIDX_MIN) {
+                                if (!w.ridx[r]) ridx_build(&w, r);
+                                for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (k != j && w.colon[k] && wrow_find(&w, r, k) >= 0) have++; }
+                            } else for (int q = 0; q < w.rlen[r]; q++) { const int k = w.ri[r][q]; if (k != j && w.colon[k] && nmark[k] == stamp_) have++; }
+                            add += (w.rcnt[i] - 1) - have;
+                        }
+                        if (add > w.rcnt[i]) continue;
+                        fill = add; bynet = 1;
+                    }
+                    if (ib >= 0 && fill >= fb) continue;
+                    (void)bynet;
                     ib = i; ab = a; fb = fill; ineq = (below ? 1 : 2) | (le ? 4 : 0);
                 }
                 if (ib < 0) continue;
@@ -1783,6 +2113,11 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                 /* the row's other columns and entries (a copy: the substitution changes the rows) */
                 int *kk = xmalloc(sizeof(int) * (cnt + 1)); double *ak = xmalloc(sizeof(double) * (cnt + 1)); int t = 0;
                 for (int q = 0; q < w.rlen[i]; q++) { const int k = w.ri[i][q]; if (k != j && w.colon[k]) { kk[t] = k; ak[t] = w.rv[i][q]; t++; } }
+                /* (14 November 2026) the rows' largest entries kept exact through the substitution: a row's is lost only when the
+                 * column holding it leaves the row (x_j, which leaves its rows unless it is kept as the row's slack) or that entry
+                 * shrinks; an entry that grows above it takes its place (below, with the entries the substitution changes) */
+                acache.val[i] = 0; rbzv[i] = 0; rold[i] = 0; if (rmaxv[i] == 1 && !ineq && rmaxk[i] == j) rmaxv[i] = 0;
+                for (int p = 0; p < w.clen[j]; p++) { const int r_ = w.ci[j][p]; acache.val[r_] = 0; rbzv[r_] = 0; rold[r_] = 0; if (rmaxv[r_] == 1 && !ineq && rmaxk[r_] == j) rmaxv[r_] = 0; }
                 for (int q = 0; q < t; q++) cost_sub(&w, kk[q], cj * ak[q] / a);
                 for (int p = 0; p < w.clen[j]; p++) {
                     const int r = w.ci[j][p];
@@ -1806,6 +2141,16 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                     if (w.ru[i] >= PHUGE) w.ru[i] = PINF;
                     w.rcnt[i]--;
                     naggb++;
+                    if (getenv("BRISK_SXAGGBSTATS")) {   /* (a diagnostic, one problem a process: its counts are static) the substituted column's entries and its row's length, and the rows its entries go to */
+                        static long hc[6], hr[6], nsub, sumlen, maxlen, hl[6]; const int cc = w.ccnt[j], rc = w.rcnt[i] + 1;
+                        { int ml = 0; for (int p = 0; p < w.clen[j]; p++) { const int r = w.ci[j][p]; if (w.rowon[r] && r != i && w.rcnt[r] > ml) ml = w.rcnt[r]; }
+                          hl[ml <= 30 ? 0 : ml <= 100 ? 1 : ml <= 300 ? 2 : ml <= 1000 ? 3 : ml <= 10000 ? 4 : 5]++;
+                          if (nsub % 5000 == 0) fprintf(stderr, "  [the longest other row of the substituted columns: <=30 %ld, <=100 %ld, <=300 %ld, <=1000 %ld, <=10000 %ld, more %ld]\n", hl[0], hl[1], hl[2], hl[3], hl[4], hl[5]); }
+                        hc[cc < 5 ? cc : 5]++; hr[rc < 5 ? rc : 5]++; nsub++;
+                        for (int p = 0; p < w.clen[j]; p++) { const int r = w.ci[j][p]; if (!w.rowon[r] || r == i) continue; sumlen += w.rcnt[r]; if (w.rcnt[r] > maxlen) maxlen = w.rcnt[r]; }
+                        if (nsub % 5000 == 0 || nsub < 2) fprintf(stderr, "  [bounded substitutions %ld: column entries 2:%ld 3:%ld 4:%ld 5+:%ld; row entries 2:%ld 3:%ld 4:%ld 5+:%ld; the other rows of the columns: mean %.1f entries, longest %ld]\n",
+                                nsub, hc[2], hc[3], hc[4], hc[5], hr[2], hr[3], hr[4], hr[5], (double)sumlen / nsub, maxlen);
+                    }
                 }
                 for (int p = 0; p < w.clen[j]; p++) {
                     const int r = w.ci[j][p];
@@ -1815,7 +2160,8 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                     if (w.rl[r] > -PHUGE) w.rl[r] -= f * rhs;
                     if (w.ru[r] < PHUGE) w.ru[r] -= f * rhs;
                     w.rmag[r] += fabs(f * rhs);
-                    for (int q = 0; q < t; q++) { double sc = fabs(f * ak[q]); if (sc < 1) sc = 1; add_entry(&w, r, kk[q], -f * ak[q], sc); }
+                    for (int q = 0; q < t; q++) { double sc = fabs(f * ak[q]); if (sc < 1) sc = 1; const double nv_ = add_entry(&w, r, kk[q], -f * ak[q], sc);
+                        if (rmaxv[r] == 1) { if (nv_ > rmaxc[r]) { rmaxc[r] = nv_; rmaxk[r] = kk[q]; } else if (kk[q] == rmaxk[r] && nv_ < rmaxc[r]) rmaxv[r] = 0; } }
                 }
                 free(kk); free(ak);
                 if (ineq) { w.l[j] = (ineq & 1) ? 0 : -PINF; w.u[j] = (ineq & 1) ? PINF : 0; stale[j] = 1; naggi++; }
@@ -1827,7 +2173,7 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
             for (int i = 0; i < m; i++) if (rdx[i]) { rdx[i] = 0; for (int q = 0; q < w.rlen[i]; q++) cnext[w.ri[i][q]] = 1; }
             if (nch == nch_s) break;
             }
-            free(stale); free(srl); free(sru); free(cnow); free(cnext); free(ra); free(rn); free(rst); free(rdn); free(rdx); free(iptr); free(ilst);
+            free(stale); free(srl); free(sru); free(cnow); free(cnext); free(ra); free(rn); free(rst); free(rdn); free(rdx); free(iptr); free(ilst); free(rmaxc); free(rmaxv); free(rbzv); free(rmaxk); free(rold); free(nmark); free(rbz);
         }
         if (status) break;
         if (agg_run && nch == nch_a) agg_clean = nch;
@@ -1995,7 +2341,8 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
          * full passes). The parallel rows and columns once more, then the end. */
         if (changed && pass >= 2) {
             int act1 = 0; for (int i = 0; i < m; i++) act1 += w.rowon[i]; for (int j = 0; j < n; j++) act1 += w.colon[j];
-            if ((double)(act0 - act1) < 1e-3 * act0) { if (parstall) break; parstall = 1; changed = 0; }
+            static double stf_ = -1; if (stf_ < 0) { const char *e_ = getenv("BRISK_SXPRE_STALLFRAC"); stf_ = e_ ? atof(e_) : 1e-3; }   /* (13 November 2026, an experiment: the fraction) */
+            if ((double)(act0 - act1) < stf_ * act0) { if (parstall) break; parstall = 1; changed = 0; }
         }
         /* (26 October 2026) not again when nothing changed since a run found nothing (pds-20, LP: three runs at the end) */
         if (!changed && !noparallel && nch != par_clean) {
@@ -2020,6 +2367,9 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
         PT(9); if (status) break;
         /* (26 October 2026, a diagnostic: BRISK_SXPRE_PASSES=1) each pass: the rows and columns left, the reductions so far */
         { static int pp = -1; if (pp < 0) pp = getenv("BRISK_SXPRE_PASSES") != NULL;
+          static _Thread_local double pt_last = 0; { const double t_ = omp_get_wtime(); if (pp) { long cl_ = 0, ca_ = 0, rl_ = 0, maxcl_ = 0; for (int j_ = 0; j_ < n; j_++) if (w.colon[j_]) { cl_ += w.clen[j_]; if (w.clen[j_] > maxcl_) maxcl_ = w.clen[j_]; for (int p_ = 0; p_ < w.clen[j_]; p_++) ca_ += w.rowon[w.ci[j_][p_]] != 0; } for (int i_ = 0; i_ < m; i_++) if (w.rowon[i_]) rl_ += w.rlen[i_];
+              fprintf(stderr, "  [presolve pass %d lists: columns %ld entries listed, %ld in active rows, the longest %ld; rows %ld listed]\n", pass, cl_, ca_, maxcl_, rl_); }
+          if (pp) { fprintf(stderr, "  [presolve pass %d time %.5f s; steps so far:", pass, pt_last > 0 && pass > 0 ? t_ - pt_last : 0.0); if (ptimes) for (int k_ = 1; k_ < 12; k_++) fprintf(stderr, " %.4f", tt[k_]); fprintf(stderr, "]\n"); } pt_last = t_; }
           if (pp) { int a1 = 0; for (int i = 0; i < m; i++) a1 += w.rowon[i]; for (int j = 0; j < n; j++) a1 += w.colon[j];
                     fprintf(stderr, "  [presolve pass %d: %d rows and columns left (-%d), changed %d, deferred %d; singleton rows %d, fixed %d, dual %d, dominated %d, free %d, slack %d, redundant %d, parallel %d/%d, doubleton %d, substituted %d/%d, forcing %d, empty %d, tight rows %d, implied redundant %d, cost singletons %d, sides %d]\n",
                             pass, a1, act0 - a1, changed, deferred, nsing, nfix, ndual, ndom, nfree, nslack, nred, npar, nparc, ndbl, nagg, naggb, nforce, nempty, ntightrow, nimplred, ncostsing, nside); } }
@@ -2038,12 +2388,41 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
                 ndeprow += nd_;
                 if (nd_ > 0) { nch++; prev_changed = 1; parstall = 0; continue; }
             }
+            if (aggb_late && !aggb_phase && !SXPRE_STOPPED()) { aggb_phase = 1; nch++; prev_changed = 0; parstall = 0; continue; }   /* (the bounded substitution now, then the passes again) */
+            /* (12 November 2026) the substitution through an inequality row with no net fill likewise waits until the other steps
+             * find nothing more: taken early, it changed rows that the singleton rows and the doubleton equations would have
+             * removed (neos4, LP: 3,939 x 3,825 left before, 5,182 x 4,555 with it early, 1,404 -> 1,528 iterations) */
+            if (agginet && !agginet_phase && !SXPRE_STOPPED()) {
+                agginet_phase = 1;
+                /* (only when some column can qualify: one infinite bound, at most 8 entries, in a one-sided row that bounds it
+                 * on that side; otherwise the passes are not run again for nothing) */
+                int cand_ = 0;
+                /* (with BRISK_SXPRE_AGGINETC=1 a column of cost zero is no candidate: it is never substituted) */
+                const int aggic_ = !(getenv("BRISK_SXPRE_AGGINETC") && atoi(getenv("BRISK_SXPRE_AGGINETC")) == 0);
+                for (int j = 0; j < n && !cand_; j++) {
+                    if (!w.colon[j] || w.ccnt[j] < 2 || w.ccnt[j] > 8 || (aggic_ && w.c[j] == 0)) continue;
+                    const int li = w.l[j] <= -PHUGE, ui = w.u[j] >= PHUGE;
+                    if (li == ui) continue;
+                    for (int p = 0; p < w.clen[j] && !cand_; p++) {
+                        const int i = w.ci[j][p]; if (!w.rowon[i]) continue;
+                        const int le = w.ru[i] < PHUGE; if (le == (w.rl[i] > -PHUGE)) continue;
+                        const int below = le == (w.cv[j][p] < 0);
+                        if (below ? ui : li) cand_ = 1;
+                    }
+                }
+                /* (the aggregator alone runs again: the other steps keep their marks of the count of changes and run again only
+                 * if it substitutes something; before, every step ran once more, 15-50 ms on LPs where nothing was substituted) */
+                if (cand_) { agg_clean = -1; ag_idle = 0; prev_changed = 0; parstall = 0; continue; }
+            }
             break;
         }
         prev_changed = changed;
     }
     /* (28 October 2026) the dependent equations, once at the end (dependent_rows above), when the passes did not */
     if (status == 0 && !depdone && !SXPRE_STOPPED() && !(getenv("BRISK_SXPRE_DEPROWS") && atoi(getenv("BRISK_SXPRE_DEPROWS")) == 0)) ndeprow = dependent_rows(&w, P);
+    /* (15 November 2026) the free columns that are combinations of other free columns with the same costs, fixed at 0 (dependent_free_cols) */
+    int ndepfree = 0;
+    if (status == 0 && !SXPRE_STOPPED() && !(getenv("BRISK_SXPRE_DEPFREECOL") && atoi(getenv("BRISK_SXPRE_DEPFREECOL")) == 0)) ndepfree = dependent_free_cols(&w, P);
     PT(10);
     run_close(P);
     /* the reduced problem */
@@ -2086,8 +2465,9 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
         PT(11);
         if (ptimes) fprintf(stderr, "  [presolve times: set-up %.4f, rows %.4f, columns %.4f, dominated %.4f, cost-tight rows %.4f, doubletons %.4f, aggregator %.4f, activity %.4f, implied-redundant rows %.4f, parallel %.4f, other %.4f, reduced problem %.4f s]\n",
                             tt[0], tt[1], tt[2], tt[3], tt[4], tt[5], tt[6], tt[7], tt[8], tt[9], tt[10], tt[11]);
-        if (verbose) printf("presolve: %d of %d rows and %d of %d columns left (%d singleton rows, %d fixed columns, %d by dual fixing, %d column singletons in equations, %d in inequalities their cost makes tight, %d slack columns, %d column singletons whose cost moved to their row and bounds to its range, %d doubleton equations, %d substituted columns (%d with their bounds kept by their row), %d inequality rows dropped by a change of variables (a column bounded by the row taken as its slack), %d dominated columns, %d columns dominated by another, %d columns of cost zero removed with their rows (always satisfiable), %d parallel rows, %d parallel columns, %d forcing and %d redundant rows, %d empty, %d sides of ranged rows dropped, %d rows made equations by a cost, %d rows redundant by implied bounds, %d dependent equations, %d equations replaced by their difference with another, %d negligible entries dropped)\n",
-                            mr, m, nr, n, nsing, nfix, ndual, nfree, ntight, nslack, ncostsing, ndbl, nagg, naggb, naggi, ndom, ndomp, nzfree, npar, nparc, nforce, nred, nempty, nside, ntightrow, nimplred, ndeprow, nsparsify, nnegl);
+        if (verbose && n_aggexact) printf("presolve: %ld substitutions by the exact count of their fill\n", n_aggexact);
+        if (verbose) printf("presolve: %d of %d rows and %d of %d columns left (%d singleton rows, %d fixed columns, %d by dual fixing, %d column singletons in equations, %d in inequalities their cost makes tight, %d slack columns, %d column singletons whose cost moved to their row and bounds to its range, %d doubleton equations, %d substituted columns (%d with their bounds kept by their row), %d inequality rows dropped by a change of variables (a column bounded by the row taken as its slack), %d dominated columns, %d columns dominated by another, %d columns of cost zero removed with their rows (always satisfiable), %d parallel rows, %d parallel columns, %d forcing and %d redundant rows, %d empty, %d sides of ranged rows dropped, %d rows made equations by a cost, %d rows redundant by implied bounds, %d dependent equations, %d equations replaced by their difference with another, %d negligible entries dropped, %d free columns fixed at 0 as combinations of other free columns with the same costs)\n",
+                            mr, m, nr, n, nsing, nfix, ndual, nfree, ntight, nslack, ncostsing, ndbl, nagg, naggb, naggi, ndom, ndomp, nzfree, npar, nparc, nforce, nred, nempty, nside, ntightrow, nimplred, ndeprow, nsparsify, nnegl, ndepfree);
         if (getenv("BRISK_SXPRE_STATS")) presolved_stats(R);
     }
     if (naggi && getenv("SXDBG")) printf("presolve: substitutions through an inequality: %d; the row's other columns boxed without cost: none %d, one %d, two or more %d\n", naggi, naggi_bz[0], naggi_bz[1], naggi_bz[2]);
@@ -2097,7 +2477,7 @@ static int sxpre_presolve_m(const LpProb *L, LpProb *R, SxPre **out, int verbose
     free(w.ci); free(w.cv); free(w.clen); free(w.ccap); free(w.ri); free(w.rv); free(w.rlen); free(w.rcap); free(w.ridx); free(w.hkey); free(w.hpos);
     free(w.c); free(w.l); free(w.u); free(w.rl); free(w.ru); free(w.rmag); free(w.rowon); free(w.colon); free(w.cmod); free(w.crec_i); free(w.crec_d); free(w.cver); free(w.crec_ver); free(w.crec_skip); free(w.rcnt); free(w.ccnt);
     free(ylo); free(yup); free(ilo); free(iup); free(ibc.ilo); free(ibc.iup); free(ibc.sl); free(ibc.su); free(y0l); free(y0u); free(ysl); free(ysu); free(inu); free(inl); free(dropsrc); free(trole); free(rowdropsrc); free(rowanydrop);
-    free(acache.a0); free(acache.a1); free(acache.big); free(acache.n0); free(acache.n1); free(acache.val);
+    free(acache.a0); free(acache.a1); free(acache.big); free(acache.n0); free(acache.n1); free(acache.val); free(acache.a0l); free(acache.a1l);
     *out = P;
     return status;
 }
@@ -2171,6 +2551,8 @@ void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const i
     for (int j = 0; j < n; j++) { x[j] = 0; cst[j] = SX_LOWER; }
     for (int k = 0; k < P->mr; k++) { const int i = P->rmap[k]; y[i] = yr ? yr[k] : 0; rst[i] = rstr[k]; rowpres[i] = 1; }
     for (int k = 0; k < P->nr; k++) { const int j = P->cmap[k]; x[j] = xr[k]; cst[j] = cstr[k]; }
+    if (getenv("BRISK_LPDUALDBG")) { int cntr[32] = {0}; for (int r = 0; r < P->nrec; r++) if (P->rtype[r] < 32) cntr[P->rtype[r]]++;
+        fprintf(stderr, "[duals] the simplex presolve's records:"); for (int t = 1; t < 32; t++) if (cntr[t]) fprintf(stderr, " %d:%d", t, cntr[t]); fprintf(stderr, "\n"); }
     for (int r = P->nrec - 1; r >= 0; r--) {
         const int *I = P->ibuf + P->ristart[r];
         const double *D = P->dbuf + P->rdstart[r];
@@ -2219,6 +2601,13 @@ void sxpre_postsolve(const SxPre *P, const double *xr, const double *yr, const i
                 if (fabs(bl) < PHUGE) { const double v = (bl - s) / a; if (lo <= -PHUGE || v > lo + 1e-12 * (1 + fabs(lo))) { lo = v; ilo = i; slo = sl; } }
                 if (fabs(bu) < PHUGE) { const double v = (bu - s) / a; if (hi >= PHUGE || v < hi - 1e-12 * (1 + fabs(hi))) { hi = v; ihi = i; shi = su; } }
             }
+            /* (7 November 2026; BRISK_SXPRE_ZFREEBND, on by default since that day; 0: off) x_j at its own upper bound when no row bounds it below that and its
+             * lower bound is not feasible: the same reduced cost (zero), its rows basic with zero duals, x_j nonbasic, so the
+             * basis keeps the reduced problem's basic columns. The largest lower bound alone made x_j basic at a value that
+             * the rows' other columns decide: on a zero objective (lectsched-1, MILP: big-M rows -103 x_j <= -2 - s) a
+             * fraction where its bound 1 is as good, 1,070 of the 1,338 fractional columns of the postsolved point */
+            static int zfb = -1; if (zfb < 0) { const char *e_ = getenv("BRISK_SXPRE_ZFREEBND"); zfb = !(e_ && atoi(e_) == 0); }   /* (on by default since 7 November 2026: the default route, 4 threads, 23 problem LPs 1.004, 40 development LPs 1.012, 46 rescaled copies 1.005, the iterations the same on 108 of 109; lectsched-1's root LP, MILP, fewer fractional columns, ISSUES 842); BRISK_SXPRE_ZFREEBND=0: off */
+            if (zfb && ilo >= 0 && ihi < 0 && uj < PHUGE && uj == P->u[j] && lo <= uj + 1e-9 * (1 + fabs(uj))) { x[j] = uj; cst[j] = fixstat(uj, lj, uj, P->l[j], P->u[j]); break; }
             if (lo > -PHUGE) { x[j] = lo; if (ilo < 0) cst[j] = fixstat(lo, lj, uj, P->l[j], P->u[j]); else { cst[j] = SX_BASIC; rst[ilo] = slo; } }
             else if (hi < PHUGE) { x[j] = hi; if (ihi < 0) cst[j] = fixstat(hi, lj, uj, P->l[j], P->u[j]); else { cst[j] = SX_BASIC; rst[ihi] = shi; } }
             else { x[j] = 0; cst[j] = SX_ZERO; }
@@ -2623,7 +3012,7 @@ void sxpre_dual_free(SxDual *M) { if (!M) return; free(M->vrow); free(M->vkind);
  * objective (each row's activity becomes the average over its class), so the problem restricted to points constant on
  * the classes has the same optimal value: it is the problem with one variable per column class and one row per row
  * class (Grohe, Kersting, Mladenov and Selman, "Dimension reduction via colour refinement", 2014). */
-struct SxSym { int m, n, mq, nq; int *rcls, *ccls; };
+struct SxSym { int m, n, mq, nq; int *rcls, *ccls; double *rs, *cs; };   /* (rs, cs: the factors of the scaled data, or NULL) */
 static unsigned long long mix64(unsigned long long z) {
     z += 0x9e3779b97f4a7c15ULL; z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL; z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL; return z ^ (z >> 31);
 }
@@ -2651,6 +3040,270 @@ static int lines_equitable(int k, const int *start, const int *idx, const double
     }
     free(rep); free(a); free(b);
     return ok;
+}
+/* a key of a pair of values (as main.c's lp_bounds_key: both values' bits mixed into a finite double) */
+static double canon_key(double lo, double hi) {
+    double l = lo > -1e30 ? lo : -INFINITY, h = hi < 1e30 ? hi : INFINITY;
+    if (l == 0) l = 0;
+    if (h == 0) h = 0;
+    unsigned long long a, b; memcpy(&a, &l, 8); memcpy(&b, &h, 8);
+    unsigned long long z = (a * 0x9e3779b97f4a7c15ull) ^ ((b + 0x632be59bd9b4e019ull) * 0xbf58476d1ce4e5b9ull);
+    z ^= z >> 29; z &= 0x3fffffffffffffffull;
+    double v; memcpy(&v, &z, 8);
+    return v;
+}
+/* (7 November 2026) the problem as read on the scaling that does not depend on the input's (lpsolve.c, lp_canon_scale), its
+ * values equal up to the rounding of that scaling made equal (lp_snap_values; the two sides of a row together, the two
+ * bounds of a column together), for the folding check; 0 when the pattern (the signs, the zero and infinite data) has too
+ * many classes or the scaling does not converge. S shares L's pattern and names; its Ax, rl (ru = rl + m), c, l (u = l + n)
+ * are its own */
+static double canon_sgn(double v) { return v == 0 ? 0.0 : fabs(v) >= 1e29 ? (v > 0 ? 3.0 : -3.0) : v > 0 ? 1.0 : -1.0; }
+/* the order of doubles as unsigned keys (the sign bit flipped for positives, all bits for negatives; -0 as +0) */
+static inline unsigned long long canon_okey(double v) { if (v == 0) v = 0.0; unsigned long long u; memcpy(&u, &v, 8); return (u >> 63) ? ~u : (u | 0x8000000000000000ull); }
+/* idx (k) sorted by key (least significant byte first, stable; the passes whose byte is the same in every key skipped) */
+static void canon_radix(const unsigned long long *key, int k, int *idx) {
+    int *tmp = malloc(sizeof(int) * ((size_t)k + 1)); size_t cnt[256];
+    for (int t = 0; t < k; t++) idx[t] = t;
+    for (int sh = 0; sh < 64; sh += 8) {
+        memset(cnt, 0, sizeof cnt);
+        for (int t = 0; t < k; t++) cnt[(key[t] >> sh) & 255]++;
+        int one = 0; for (int b = 0; b < 256; b++) if (cnt[b] == (size_t)k) one = 1;
+        if (one) continue;
+        size_t s = 0; for (int b = 0; b < 256; b++) { const size_t c = cnt[b]; cnt[b] = s; s += c; }
+        for (int t = 0; t < k; t++) { const int e = idx[t]; tmp[cnt[(key[e] >> sh) & 255]++] = e; }
+        memcpy(idx, tmp, sizeof(int) * (size_t)k);
+    }
+    free(tmp);
+}
+/* group numbers of k values: sorted, a group goes on while two neighbours differ by at most tol relative (chains); zeros,
+ * and values of 1e29 or more in size, by their sign. The groups number at most the values left distinct by lp_snap_values
+ * at the same tol (which leaves the members of a group wider than 8 tol apart), so a count of classes on them is at most
+ * the count on the snapped values */
+static unsigned long long canon_mix(unsigned long long x);
+static void canon_groups(const double *v, int k, double tol, int *gid) {
+    /* zeros group 0, +-infinite (1e29 or more) groups 1 and 2; the distinct finite nonzero values (a hash set: values repeat
+     * often) sorted and chained from 3 on, and every value given its distinct value's group */
+    int nk = 0;
+    for (int t = 0; t < k; t++) { if (v[t] == 0) gid[t] = 0; else if (v[t] >= 1e29) gid[t] = 1; else if (v[t] <= -1e29) gid[t] = 2; else nk++; }
+    if (nk == 0) return;
+    size_t cap = 16; while (cap < 2 * (size_t)nk) cap <<= 1;
+    int *slot = malloc(sizeof(int) * cap); for (size_t h = 0; h < cap; h++) slot[h] = -1;
+    double *w = malloc(sizeof(double) * ((size_t)nk + 1)); int nd = 0;
+    int *dv = malloc(sizeof(int) * ((size_t)k + 1));      /* (each value's distinct number) */
+    for (int t = 0; t < k; t++) {
+        if (v[t] == 0 || fabs(v[t]) >= 1e29) continue;
+        unsigned long long u; memcpy(&u, &v[t], 8);
+        size_t h = (size_t)(canon_mix(u) & (cap - 1));
+        while (slot[h] >= 0 && w[slot[h]] != v[t]) h = (h + 1) & (cap - 1);
+        if (slot[h] < 0) { slot[h] = nd; w[nd++] = v[t]; }
+        dv[t] = slot[h];
+    }
+    free(slot);
+    unsigned long long *key = malloc(sizeof(unsigned long long) * ((size_t)nd + 1)); int *idx = malloc(sizeof(int) * ((size_t)nd + 1)), *dg = malloc(sizeof(int) * ((size_t)nd + 1));
+    for (int q = 0; q < nd; q++) key[q] = canon_okey(w[q]);
+    canon_radix(key, nd, idx);
+    int g = 3;
+    for (int q = 0; q < nd; q++) {
+        if (q > 0) { const double x = w[idx[q - 1]], y = w[idx[q]];
+            if (!(x == y || ((x > 0) == (y > 0) && y - x <= tol * fmax(fabs(x), fabs(y))))) g++; }
+        dg[idx[q]] = g;
+    }
+    for (int t = 0; t < k; t++) if (v[t] != 0 && fabs(v[t]) < 1e29) gid[t] = dg[dv[t]];
+    free(key); free(idx); free(dg); free(w); free(dv);
+}
+/* the number of distinct values (a hash set of open addressing; the order of the values does not matter) */
+static long canon_ndistinct_u(unsigned long long *v, int k) {
+    if (k <= 0) return 0;
+    size_t cap = 16; while (cap < 2 * (size_t)k) cap <<= 1;
+    unsigned long long *hs = malloc(sizeof(unsigned long long) * cap); unsigned char *used = calloc(cap, 1);
+    long d = 0;
+    for (int t = 0; t < k; t++) {
+        size_t h = (size_t)(canon_mix(v[t]) & (cap - 1));
+        while (used[h] && hs[h] != v[t]) h = (h + 1) & (cap - 1);
+        if (!used[h]) { used[h] = 1; hs[h] = v[t]; d++; }
+    }
+    free(hs); free(used);
+    return d;
+}
+static unsigned long long canon_mix(unsigned long long x) { x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull; return x ^ (x >> 31); }
+/* the classes by the sides (rows) and by the costs and bounds (columns) of the data scaled by rs, cs, grouped at tol: the
+ * classes the refinement starts from, or fewer (canon_groups) */
+static long canon_start_classes(const LpProb *L, const double *rs, const double *cs, double tol) {
+    const int m = L->m, n = L->n, mx = m > n ? m : n;
+    double *v = malloc(sizeof(double) * (2 * (size_t)mx + 1)); int *g = malloc(sizeof(int) * (2 * (size_t)mx + 1)), *gc = malloc(sizeof(int) * ((size_t)n + 1));
+    unsigned long long *key = malloc(sizeof(unsigned long long) * ((size_t)mx + 1));
+    for (int i = 0; i < m; i++) { v[i] = fabs(L->rl[i]) < 1e29 ? rs[i] * L->rl[i] : L->rl[i]; v[m + i] = fabs(L->ru[i]) < 1e29 ? rs[i] * L->ru[i] : L->ru[i]; }
+    canon_groups(v, 2 * m, tol, g);
+    for (int i = 0; i < m; i++) key[i] = canon_mix((unsigned long long)g[i] * 0x100000001b3ull) ^ canon_mix(~(unsigned long long)g[m + i]);
+    long ncls = canon_ndistinct_u(key, m);
+    for (int j = 0; j < n; j++) v[j] = cs[j] * L->c[j];
+    canon_groups(v, n, tol, gc);
+    for (int j = 0; j < n; j++) { v[j] = fabs(L->l[j]) < 1e29 ? L->l[j] / cs[j] : L->l[j]; v[n + j] = fabs(L->u[j]) < 1e29 ? L->u[j] / cs[j] : L->u[j]; }
+    canon_groups(v, 2 * n, tol, g);
+    for (int j = 0; j < n; j++) key[j] = canon_mix((unsigned long long)gc[j] * 0x100000001b3ull) ^ canon_mix((unsigned long long)g[j] * 0x9e3779b97f4a7c15ull + 7) ^ canon_mix(~(unsigned long long)g[n + j]);
+    ncls += canon_ndistinct_u(key, n);
+    free(v); free(g); free(gc); free(key);
+    return ncls;
+}
+/* (7 November 2026, later) a lower bound on the classes of the scaled partition from quantities that no scaling of the rows
+ * and columns changes, computed from the data as given (no scaling solved): for an entry a_ij of row i and column j and a
+ * finite side s_i of the row (the lower one when both are finite: the other follows from the ratio), t_ij = s_i c_j / a_ij (row
+ * i multiplied by r_i and column j by d_j: (r s)(d c)/(r a d)); for a
+ * column, c_j l_j, c_j u_j and l_j / u_j; for a row, rl_i / ru_i; and the ratios c_j / a_ij within a row over the row's
+ * largest, s_i / a_ij within a column over the column's largest. Two rows of one class of the scaled partition have equal
+ * scaled sides and, entry by entry, equal scaled entries and costs, hence the same multiset of t_ij; two columns of one
+ * class likewise (and equal products). So the classes of rows keyed by their sides' signs, their ratio and the multiset of
+ * their t_ij (grouped at tol), and of columns keyed by the signs of their data, the products, the ratio and their t_ij, are
+ * at most the classes of any equitable partition on the scaled data: when they exceed stop (m + n), no fold. One pass over
+ * the entries (n3707, LP: 10,151 such classes as its scaled sides show, found without the scaling) */
+static long canon_invariant_classes(const LpProb *L, double tol, int **codes, unsigned long long **rko, unsigned long long **cko, int lite) {
+    const int m = L->m, n = L->n, nz = L->Ap[n];
+    double tci[8] = {0}; tci[0] = omp_get_wtime();
+    double *tl = malloc(sizeof(double) * ((size_t)nz + 1)); int *gl = malloc(sizeof(int) * ((size_t)nz + 1));
+#define CI_FIN(v) ((v) != 0 && fabs(v) < 1e29)
+    if (lite) for (int k = 0; k < nz; k++) { gl[k] = 0; tl[k] = 0.0; }    /* (lite: the entries by their signs only, below) */
+    if (!lite) {
+    for (int j = 0; j < n; j++) for (int k = L->Ap[j]; k < L->Ap[j + 1]; k++) {
+        const int i = L->Ai[k]; const double a = L->Ax[k], s = CI_FIN(L->rl[i]) ? L->rl[i] : CI_FIN(L->ru[i]) ? L->ru[i] : 0.0;   /* (the other side: the row's ratio, below) */
+        tl[k] = a != 0 && s != 0 ? s * L->c[j] / a : 0.0;
+    }
+    tci[1] = omp_get_wtime();
+    canon_groups(tl, nz, tol, gl);
+    tci[2] = omp_get_wtime();
+    /* the ratios within a row, c_j / a_ij over the row's largest (the row's scale cancels, each column's in its own term),
+     * and within a column, s_i / a_ij over the column's largest */
+    {   double *rmx = calloc((size_t)m + 1, sizeof(double)), *cmx = calloc((size_t)n + 1, sizeof(double)), *tw = malloc(sizeof(double) * ((size_t)nz + 1));
+        int *g2 = malloc(sizeof(int) * ((size_t)nz + 1));
+        for (int j = 0; j < n; j++) for (int k = L->Ap[j]; k < L->Ap[j + 1]; k++) {
+            const int i = L->Ai[k]; const double a = L->Ax[k], s = CI_FIN(L->rl[i]) ? L->rl[i] : CI_FIN(L->ru[i]) ? L->ru[i] : 0.0;
+            if (a != 0 && L->c[j] != 0) rmx[i] = fmax(rmx[i], fabs(L->c[j] / a));
+            if (a != 0 && s != 0) cmx[j] = fmax(cmx[j], fabs(s / a));
+        }
+        for (int j = 0; j < n; j++) for (int k = L->Ap[j]; k < L->Ap[j + 1]; k++) { const int i = L->Ai[k]; tw[k] = L->Ax[k] != 0 && L->c[j] != 0 && rmx[i] > 0 ? L->c[j] / L->Ax[k] / rmx[i] : 0.0; }
+        tci[3] = omp_get_wtime();
+        canon_groups(tw, nz, tol, g2);
+        tci[4] = omp_get_wtime();
+        for (int k = 0; k < nz; k++) gl[k] = (int)(canon_mix(((unsigned long long)gl[k] << 32) ^ (unsigned long long)g2[k]) & 0x3fffffff);
+        for (int j = 0; j < n; j++) for (int k = L->Ap[j]; k < L->Ap[j + 1]; k++) { const int i = L->Ai[k]; const double s = CI_FIN(L->rl[i]) ? L->rl[i] : CI_FIN(L->ru[i]) ? L->ru[i] : 0.0;
+            tw[k] = L->Ax[k] != 0 && s != 0 && cmx[j] > 0 ? s / L->Ax[k] / cmx[j] : 0.0; }
+        canon_groups(tw, nz, tol, g2);
+        for (int k = 0; k < nz; k++) gl[k] = (int)(canon_mix(((unsigned long long)gl[k] << 32) ^ (unsigned long long)g2[k] ^ 0x9e37ull) & 0x3fffffff);
+        free(rmx); free(cmx); free(tw); free(g2);
+    }
+    }
+    for (int k = 0; k < nz; k++) if (L->Ax[k] < 0) gl[k] ^= 0x40000000;     /* (the entry's sign) */
+    free(tl);
+    const int mx = m > n ? m : n;
+    double *v = malloc(sizeof(double) * (3 * (size_t)mx + 1)); int *g = malloc(sizeof(int) * (3 * (size_t)mx + 1));
+    unsigned long long *rk = calloc((size_t)m + 1, sizeof(unsigned long long)), *ck = calloc((size_t)n + 1, sizeof(unsigned long long));
+    for (int j = 0; j < n; j++) for (int k = L->Ap[j]; k < L->Ap[j + 1]; k++) {
+        const unsigned long long e = canon_mix((unsigned long long)gl[k] * 0x100000001b3ull);
+        rk[L->Ai[k]] += canon_mix(e ^ 0x51ed27ull); ck[j] += canon_mix(e ^ 0x2545f4914f6cdd1dull);
+    }
+    /* the rows' sides: signs, and the ratio */
+    for (int i = 0; i < m; i++) v[i] = CI_FIN(L->rl[i]) && CI_FIN(L->ru[i]) ? L->rl[i] / L->ru[i] : 0.0;
+    canon_groups(v, m, tol, g);
+    for (int i = 0; i < m; i++) rk[i] = canon_mix(rk[i] ^ canon_mix((unsigned long long)g[i] * 0x9e3779b97f4a7c15ull + (unsigned long long)(3 + canon_sgn(L->rl[i])) * 7 + (unsigned long long)(3 + canon_sgn(L->ru[i]))));
+    /* the columns: signs, the two products, the ratio */
+    for (int j = 0; j < n; j++) { v[j] = CI_FIN(L->l[j]) ? L->c[j] * L->l[j] : 0.0; v[n + j] = CI_FIN(L->u[j]) ? L->c[j] * L->u[j] : 0.0; v[2 * n + j] = CI_FIN(L->l[j]) && CI_FIN(L->u[j]) ? L->l[j] / L->u[j] : 0.0; }
+    canon_groups(v, 3 * n, tol, g);
+    for (int j = 0; j < n; j++) ck[j] = canon_mix(ck[j] ^ canon_mix((unsigned long long)g[j] * 0x100000001b3ull) ^ canon_mix((unsigned long long)g[n + j] * 0x9e3779b97f4a7c15ull + 1)
+                                              ^ canon_mix((unsigned long long)g[2 * n + j] * 0xbf58476d1ce4e5b9ull + 2) ^ (unsigned long long)((3 + canon_sgn(L->c[j])) * 49 + (3 + canon_sgn(L->l[j])) * 7 + (3 + canon_sgn(L->u[j]))));
+#undef CI_FIN
+    free(v); free(g);
+    const long ncls = canon_ndistinct_u(rk, m) + canon_ndistinct_u(ck, n);
+    if (getenv("BRISK_LPFOLDPROF") && !lite) printf("[invariant classes: values %.3f, their grouping %.3f, the ratios %.3f, their grouping %.3f, the rest %.3f s]\n", tci[1] - tci[0], tci[2] - tci[1], tci[3] - tci[2], tci[4] - tci[3], omp_get_wtime() - tci[4]);
+    if (codes) *codes = gl; else free(gl);
+    if (rko) *rko = rk; else free(rk);
+    if (cko) *cko = ck; else free(ck);
+    return ncls;
+}
+/* (7 November 2026, later) the checks in order, each a necessary condition for a fold: (1) the classes by the quantities no
+ * scaling changes (canon_invariant_classes: one pass over the entries, no scaling solved), then the refinement started from
+ * them with the entries labelled by theirs (it refines the partition of the pattern, the signs and the zero and infinite
+ * data, which the scaled partition refines too, and it is itself coarser than the scaled partition); (2) the scaling, and the
+ * classes the refinement would start from (the scaled sides, costs and bounds, grouped: canon_start_classes); then the
+ * scaled problem is built.
+ * (A loose scaling first, the conjugate gradient method to 1e-3, was tried as a cheaper rejection and dropped: its factors
+ * are 1e-2 to 1e-1 off in their logarithms, the grouping it needs merges the scaled sides into a few dozen groups, 72
+ * against 10,151 on n3707 (LP), and it rejects nothing.) Every step is sequential and in a fixed order: the decision does
+ * not depend on the threads. */
+static int canon_core(const LpProb *L, LpProb *S, double **rso, double **cso, double stop, int verbose) {
+    const int m = L->m, n = L->n, nz = L->Ap[n];
+    const double t0 = omp_get_wtime();
+    const double tol = getenv("BRISK_LPFOLDSCALETOL") ? atof(getenv("BRISK_LPFOLDSCALETOL")) : 1e-9;
+    /* (7 November 2026, evening; BRISK_LPFOLDSCALELITE=1, off) the cheapest refinement first: the rows and columns keyed by
+     * their own scale-free data (the sides' ratio, the products and ratio of cost and bounds, the signs) and the entries by
+     * their signs alone, a refinement that the full one below refines; the entries' scale-free values (three groupings of all
+     * the entries) only when it leaves enough classes (square47, LP, 27 million entries: those values 2.0 s, which delayed
+     * the interior-point method behind the dual simplex method beside it) */
+    static int fcost = -1; if (fcost < 0) fcost = getenv("BRISK_LPFOLDSCALELITE") && atoi(getenv("BRISK_LPFOLDSCALELITE")) > 0;
+    for (int lite = fcost ? 1 : 0; lite >= 0; lite--) {   int *code = NULL; unsigned long long *rk = NULL, *ck = NULL;
+        const long nci = canon_invariant_classes(L, tol, &code, &rk, &ck, lite);
+        if (verbose) printf("   [the folding on the scaled data: %ld classes by the quantities no scaling changes (%.4fs)]\n", nci, omp_get_wtime() - t0);
+        if ((double)nci > stop * ((double)m + n)) { free(code); free(rk); free(ck); return 0; }
+        /* the refinement from them: the entries labelled by their codes (sign included), the rows and columns started from
+         * their keys; it refines the partition of the pattern (signs, zero and infinite data), and every class of the
+         * scaled partition lies within one of its classes */
+        double *sx = malloc(sizeof(double) * ((size_t)nz + 1)), *hb = malloc(sizeof(double) * ((size_t)m + 1)), *hc = malloc(sizeof(double) * ((size_t)n + 1));
+        int *rcl = malloc(sizeof(int) * ((size_t)m + 1)), *ccl = malloc(sizeof(int) * ((size_t)n + 1)), nr = m, nc = n;
+        for (int k = 0; k < nz; k++) sx[k] = (double)(code[k] + 1);
+        for (int i = 0; i < m; i++) hb[i] = (double)(rk[i] >> 12);
+        for (int j = 0; j < n; j++) hc[j] = (double)(ck[j] >> 12);
+        free(code); free(rk); free(ck);
+        const int f = lp_fold_partition_stop(m, n, 0, L->Ap, L->Ai, sx, hb, hc, NULL, rcl, ccl, &nr, &nc, stop);
+        free(sx); free(hb); free(hc); free(rcl); free(ccl);
+        if (verbose) printf("   [the folding on the scaled data: their refinement%s %d row and %d column classes (%.4fs)]\n", lite ? " (the entries by their signs)" : "", f ? nr : m, f ? nc : n, omp_get_wtime() - t0);
+        if (!(f && (double)nr + nc <= stop * ((double)m + n))) return 0;
+    }
+    double *rs = malloc(sizeof(double) * ((size_t)m + 1)), *cs = malloc(sizeof(double) * ((size_t)n + 1));
+    int its = 0; double rr = 0;
+    const int ok = lp_canon_scale(m, n, L->Ap, L->Ai, L->Ax, L->rl, L->ru, L->c, L->l, L->u, rs, cs, &its, &rr);
+    if (verbose) printf("   [the folding on the scaled data: the scaling %d conjugate gradient steps, relative residual %.1e (%.4fs)]\n", its, rr, omp_get_wtime() - t0);
+    if (!ok) { free(rs); free(cs); return 0; }
+    {   const long ncls = canon_start_classes(L, rs, cs, tol);
+        if (verbose) printf("   [the folding on the scaled data: %ld classes by the scaled sides, costs and bounds (%.4fs)]\n", ncls, omp_get_wtime() - t0);
+        if ((double)ncls > stop * ((double)m + n)) { free(rs); free(cs); return 0; }
+    }
+    *S = *L;
+    S->Ax = malloc(sizeof(double) * ((size_t)nz + 1)); S->rl = malloc(sizeof(double) * (2 * (size_t)m + 1)); S->c = malloc(sizeof(double) * ((size_t)n + 1)); S->l = malloc(sizeof(double) * (2 * (size_t)n + 1));
+    S->ru = S->rl + m; S->u = S->l + n;
+    for (int i = 0; i < m; i++) { S->rl[i] = fabs(L->rl[i]) < 1e29 ? rs[i] * L->rl[i] : L->rl[i]; S->ru[i] = fabs(L->ru[i]) < 1e29 ? rs[i] * L->ru[i] : L->ru[i]; }
+    for (int j = 0; j < n; j++) { S->c[j] = cs[j] * L->c[j]; S->l[j] = fabs(L->l[j]) < 1e29 ? L->l[j] / cs[j] : L->l[j]; S->u[j] = fabs(L->u[j]) < 1e29 ? L->u[j] / cs[j] : L->u[j]; }
+    lp_snap_values(S->rl, 2 * m, tol); lp_snap_values(S->c, n, tol); lp_snap_values(S->l, 2 * n, tol);
+    for (int j = 0; j < n; j++) for (int k = L->Ap[j]; k < L->Ap[j + 1]; k++) S->Ax[k] = rs[L->Ai[k]] * L->Ax[k] * cs[j];
+    lp_snap_values(S->Ax, nz, tol);
+    if (rso) *rso = rs; else free(rs);
+    if (cso) *cso = cs; else free(cs);
+    return 1;
+}
+int sxpre_canon_problem(const LpProb *L, LpProb *S, double stop, int verbose) { return canon_core(L, S, NULL, NULL, stop, verbose); }
+/* (7 November 2026, later) the scaled problem computed once per problem as read and shared by the threads that ask for it
+ * (main.c's folding check of the problem as read and the dual simplex jobs' sym_first): the first to ask computes it under
+ * the lock, the others wait for it and take the same result. Whoever computes, the result is the same (canon_core is
+ * deterministic); only the waiting depends on the schedule. A problem other than the one the object was made for (another
+ * size or other data: a job's dual problem) is not served */
+void sxpre_canon_init(SxCanon *C, const LpProb *L, double stop) { memset(C, 0, sizeof *C); pthread_mutex_init(&C->mu, NULL); C->L = L; C->stop = stop; C->on = 1; }
+static int canon_same(const LpProb *a, const LpProb *b) {
+    if (a == b) return 1;
+    if (a->m != b->m || a->n != b->n || a->Ap[a->n] != b->Ap[b->n]) return 0;
+    const int m = a->m, n = a->n, nz = a->Ap[n];
+    return !memcmp(a->Ap, b->Ap, sizeof(int) * (n + 1)) && !memcmp(a->Ai, b->Ai, sizeof(int) * nz) && !memcmp(a->Ax, b->Ax, sizeof(double) * nz)
+        && !memcmp(a->rl, b->rl, sizeof(double) * m) && !memcmp(a->ru, b->ru, sizeof(double) * m) && !memcmp(a->c, b->c, sizeof(double) * n)
+        && !memcmp(a->l, b->l, sizeof(double) * n) && !memcmp(a->u, b->u, sizeof(double) * n);
+}
+int sxpre_canon_get(SxCanon *C, const LpProb *L, const LpProb **S, const double **rs, const double **cs, int verbose) {
+    if (!C || !C->on || !canon_same(C->L, L)) return -1;     /* (-1: not served; the caller computes its own) */
+    pthread_mutex_lock(&C->mu);
+    if (!C->done) { C->ok = canon_core(C->L, &C->S, &C->rs, &C->cs, C->stop, verbose); C->done = 1; }
+    pthread_mutex_unlock(&C->mu);
+    if (C->ok) { if (S) *S = &C->S; if (rs) *rs = C->rs; if (cs) *cs = C->cs; }
+    return C->ok;
+}
+void sxpre_canon_free(SxCanon *C) {
+    if (!C || !C->on) return;
+    if (C->ok) { free(C->S.Ax); free(C->S.rl); free(C->S.c); free(C->S.l); free(C->rs); free(C->cs); }
+    pthread_mutex_destroy(&C->mu); C->on = 0;
 }
 /* the classes of one side (rows or columns): sizes, the key every member had when the class was formed, and the lines
  * whose class changed in the last split */
@@ -2727,10 +3380,11 @@ static void ref_split(Refine *R, int *cls, const unsigned long long *key, int *a
         t = e;
     }
 }
-int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double budget) {
+static int sym_core(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double budget, const LpProb *V, double maxcls) {
     const int m = A0->m, n = A0->n;
     *out = NULL;
     if (m == 0 || n == 0) return 0;
+    const double tsym0_ = verbose ? omp_get_wtime() : 0;   /* (12 November 2026: the search's time in its verbose line) */
     const int nz = A0->Ap[n];
     int *rc = xcalloc(m + 1, sizeof(int)), *cc = xcalloc(n + 1, sizeof(int));
     unsigned long long *rk = xmalloc(sizeof(unsigned long long) * (m + 1)), *ck = xmalloc(sizeof(unsigned long long) * (n + 1));
@@ -2752,7 +3406,10 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
     /* (23 October 2026) the refinement only splits classes: when the classes by the data alone are already too many,
      * nothing of use can follow (lp_transport_1000, LP, 1,000,000 columns of distinct costs: 0.5 s for the rounds, twice
      * since the problem as read is tried too, sym_first) */
-    if ((double)(Rr.ncls + Rc.ncls) > ratio * (m + n)) {
+    /* (12 November 2026) the caller's limit on the classes (below), off with BRISK_SXSYMCAP=0 */
+    static int capon = -1; if (capon < 0) { const char *e_ = getenv("BRISK_SXSYMCAP"); capon = !(e_ && atoi(e_) == 0); }
+    if (!capon) maxcls = 0;
+    if ((double)(Rr.ncls + Rc.ncls) > ratio * (m + n) || (maxcls > 0 && (double)(Rr.ncls + Rc.ncls) > maxcls)) {
         if (verbose) printf("symmetry: %d x %d in classes %d x %d by the data (not used)\n", m, n, Rr.ncls, Rc.ncls);
         ref_free(&Rr); ref_free(&Rc); free(alist); free(amark); free(rc); free(cc); free(rk); free(ck);
         return 0;
@@ -2764,7 +3421,7 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
     { int *f = xmalloc(sizeof(int) * (m + 1)); memcpy(f, rp, sizeof(int) * m);
       for (int j = 0; j < n; j++) for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) { const int q = f[A0->Ai[p]]++; ri[q] = j; rv[q] = A0->Ax[p]; }
       free(f); }
-    int first = 1, overbudget = 0; double work = 0;
+    int first = 1, overbudget = 0, capped = 0; double work = 0;
     for (;;) {
         rounds++;
         /* rows next to columns that changed class (all in the first round) */
@@ -2780,14 +3437,20 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
         for (int t = 0; t < na; t++) { const int j = alist[t]; amark[j] = 0; unsigned long long h = 0; for (int p = A0->Ap[j]; p < A0->Ap[j + 1]; p++) h += mix64(((unsigned long long)rc[A0->Ai[p]] << 32) ^ mix64(dbits(A0->Ax[p]))); ck[j] = h; work += A0->Ap[j + 1] - A0->Ap[j] + 1; }
         ref_split(&Rc, cc, ck, alist, na);
         first = 0;
+        if (getenv("BRISK_SXSYMDBG")) fprintf(stderr, "  [symmetry round %d: %d + %d classes of %d + %d (%.3f of the size; caps %.0f, %.0f), %.3f s]\n", rounds, Rr.ncls, Rc.ncls, m, n, (double)(Rr.ncls + Rc.ncls) / (m + n), ratio * (m + n), maxcls, omp_get_wtime() - tsym0_);
         if (Rc.nchg == 0) break;     /* (the rows were refined against these column classes: stable) */
         if ((double)(Rr.ncls + Rc.ncls) > ratio * (m + n)) break;   /* (too many classes to be of use: the check below fails) */
+        /* (12 November 2026) the caller's own limit on the classes (sym_first: the problem as read is folded only when its classes
+         * are at most 0.7 of the presolved problem's size): the refinement only splits classes, so once past it the result cannot
+         * be used. neos-799716 (LP): the problem as read, 40,418 x 30,619, took five rounds to pass 0.7 of its own size, 7.6 % of
+         * the instructions of the dual simplex method's solve, while the presolved problem's limit was passed after the first */
+        if (maxcls > 0 && (double)(Rr.ncls + Rc.ncls) > maxcls) { capped = 1; break; }
         if (budget > 0 && work > budget) { overbudget = 1; break; }   /* (a caller's cap on the entries the rounds touch) */
         if (SXPRE_STOPPED()) { overbudget = 1; break; }                  /* (the caller's stop flag: no symmetry) */
     }
     int nr = Rr.ncls, nc = Rc.ncls;
     ref_free(&Rr); ref_free(&Rc); free(alist); free(amark);
-    int use = !overbudget && (double)(nr + nc) <= ratio * (m + n) && (nr < m || nc < n);
+    int use = !overbudget && !capped && (double)(nr + nc) <= ratio * (m + n) && (nr < m || nc < n);
     if (use) {
         const int e1 = lines_equitable(m, rp, ri, rv, rc, cc, nr), e2 = lines_equitable(n, A0->Ap, A0->Ai, A0->Ax, cc, rc, nc);
         if (getenv("SXDBG")) printf("symmetry check: rows %d columns %d\n", e1, e2);
@@ -2801,7 +3464,7 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
         for (int j = 0; j < n && use; j++) { const int r = cr[cc[j]]; if (r < 0) cr[cc[j]] = j; else if (A0->c[j] != A0->c[r] || A0->l[j] != A0->l[r] || A0->u[j] != A0->u[r]) use = 0; }
         free(rr); free(cr);
     }
-    if (verbose) printf("symmetry: %d x %d in classes %d x %d after %d rounds%s\n", m, n, nr, nc, rounds, use ? "" : " (not used)");
+    if (verbose) printf("symmetry: %d x %d in classes %d x %d after %d rounds%s (%.3f s)\n", m, n, nr, nc, rounds, use ? "" : " (not used)", omp_get_wtime() - tsym0_);
     if (use) {
         /* the problem on the classes: one row per row class (its first row: the sums of its coefficients over each column
          * class), one column per column class (cost: the class' size times the cost) */
@@ -2819,6 +3482,14 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
         memset(Q, 0, sizeof *Q);
         Q->m = nr; Q->n = nc; Q->maxim = A0->maxim; Q->c0 = A0->c0;
         Q->Ap = xmalloc(sizeof(int) * (nc + 1)); Q->Ai = xmalloc(sizeof(int) * (tot + 1)); Q->Ax = xmalloc(sizeof(double) * (tot + 1));
+        /* (7 November 2026, evening) V: the values the problem on the classes takes (the scaled data before the grouping, the
+         * partition being that of the grouped data A0): the grouping moves values by up to its width, which no reduction of
+         * the presolve that compares values to rounding survives (the parallel rows of neos-4264598-oueme's column-rescaled
+         * copy, LP: 1,651 found on the grouped data, against 3,752 on the original's classes) */
+        if (V && V != A0) { int *f = xmalloc(sizeof(int) * (m + 1)); memcpy(f, rp, sizeof(int) * m);
+            for (int j = 0; j < n; j++) for (int p = V->Ap[j]; p < V->Ap[j + 1]; p++) { const int q = f[V->Ai[p]]++; rv[q] = V->Ax[p]; }
+            free(f); }
+        else V = A0;
         memcpy(Q->Ap, cnt, sizeof(int) * (nc + 1));
         int *fill = xmalloc(sizeof(int) * (nc + 1)); memcpy(fill, cnt, sizeof(int) * nc);
         for (int c = 0; c < nc; c++) mark[c] = -1;
@@ -2828,9 +3499,9 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
             for (int p = rp[i]; p < rp[i + 1]; p++) { const int C = cc[ri[p]]; if (mark[C] == R) { Q->Ai[fill[C]] = R; Q->Ax[fill[C]] = acc[C]; fill[C]++; mark[C] = -2 - R; } }
         }
         Q->c = xmalloc(sizeof(double) * (nc + 1)); Q->l = xmalloc(sizeof(double) * (nc + 1)); Q->u = xmalloc(sizeof(double) * (nc + 1));
-        for (int c = 0; c < nc; c++) { const int j = crep[c]; Q->c[c] = csz[c] * A0->c[j]; Q->l[c] = A0->l[j]; Q->u[c] = A0->u[j]; }
+        for (int c = 0; c < nc; c++) { const int j = crep[c]; Q->c[c] = csz[c] * V->c[j]; Q->l[c] = V->l[j]; Q->u[c] = V->u[j]; }
         Q->rl = xmalloc(sizeof(double) * (nr + 1)); Q->ru = xmalloc(sizeof(double) * (nr + 1));
-        for (int R = 0; R < nr; R++) { Q->rl[R] = A0->rl[rrep[R]]; Q->ru[R] = A0->ru[rrep[R]]; }
+        for (int R = 0; R < nr; R++) { Q->rl[R] = V->rl[rrep[R]]; Q->ru[R] = V->ru[rrep[R]]; }
         snprintf(Q->name, sizeof Q->name, "classes");
         SxSym *M = xcalloc(1, sizeof(SxSym));
         M->m = m; M->n = n; M->mq = nr; M->nq = nc; M->rcls = rc; M->ccls = cc; rc = cc = NULL;
@@ -2844,11 +3515,50 @@ int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double
 /* the point of the problem from that of the problem on the classes: each column at the value of its class, each row's
  * dual that of its class divided by the class' size (the class' row stands for the sum of its rows) */
 void sxpre_sym_lift(const SxSym *M, const double *xq, const double *yq, double *x, double *y) {
-    for (int j = 0; j < M->n; j++) x[j] = xq[M->ccls[j]];
+    for (int j = 0; j < M->n; j++) x[j] = xq[M->ccls[j]] * (M->cs ? M->cs[j] : 1.0);
     if (!yq || !y) return;
     int *sz = xcalloc(M->mq + 1, sizeof(int));
     for (int i = 0; i < M->m; i++) sz[M->rcls[i]]++;
-    for (int i = 0; i < M->m; i++) y[i] = yq[M->rcls[i]] / sz[M->rcls[i]];
+    for (int i = 0; i < M->m; i++) y[i] = yq[M->rcls[i]] / sz[M->rcls[i]] * (M->rs ? M->rs[i] : 1.0);
     free(sz);
 }
-void sxpre_sym_free(SxSym *M) { if (!M) return; free(M->rcls); free(M->ccls); free(M); }
+void sxpre_sym_free(SxSym *M) { if (!M) return; free(M->rcls); free(M->ccls); free(M->rs); free(M->cs); free(M); }
+/* (7 November 2026) BRISK_LPFOLDSCALE=1: when the data as given have no symmetry of use, the partition of the data on the
+ * scaling that does not depend on the input's (sxpre_canon_problem; lpsolve.c, lp_canon_scale): the problem on the classes
+ * is then that of the scaled data, and its point is carried back through the scaling (x_j = cs_j x~_j, y_i = rs_i y~_i).
+ * Tried on the problem as read only (sym_first), after sxpre_symmetry finds nothing there */
+int sxpre_symmetry(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double budget) { return sym_core(A0, Q, out, verbose, budget, NULL, 0); }
+int sxpre_symmetry_cap(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double budget, double maxcls) { return sym_core(A0, Q, out, verbose, budget, NULL, maxcls); }
+int sxpre_symmetry_canon(const LpProb *A0, LpProb *Q, SxSym **out, int verbose, double budget, SxCanon *shared) {
+    static int fsc = -1; if (fsc < 0) fsc = getenv("BRISK_LPFOLDSCALE") && atoi(getenv("BRISK_LPFOLDSCALE")) > 0;
+    if (!fsc || A0->m == 0 || A0->n == 0 || SXPRE_STOPPED()) return 0;
+    const double ratio = getenv("BRISK_SXSYM") ? atof(getenv("BRISK_SXSYM")) : 0.7;
+    const int m = A0->m, n = A0->n;
+    const LpProb *Sp = NULL; const double *rs0 = NULL, *cs0 = NULL;
+    LpProb S; double *rso = NULL, *cso = NULL;
+    const int g = sxpre_canon_get(shared, A0, &Sp, &rs0, &cs0, verbose && getenv("BRISK_LPDBG"));
+    if (g < 0) { if (!canon_core(A0, &S, &rso, &cso, fmin(ratio, 0.5), verbose && getenv("BRISK_LPDBG"))) return 0; Sp = &S; rs0 = rso; cs0 = cso; }
+    else if (g == 0) return 0;
+    /* (7 November 2026, evening; BRISK_LPFOLDSCALEQV=1, off) the problem on the classes from the scaled values before the
+     * grouping (sym_core's V) */
+    static int fqv = -1; if (fqv < 0) fqv = getenv("BRISK_LPFOLDSCALEQV") && atoi(getenv("BRISK_LPFOLDSCALEQV")) > 0;
+    LpProb U; int hasu = 0;
+    if (fqv) {
+        U = *A0; const int nz = A0->Ap[n]; hasu = 1;
+        U.Ax = xmalloc(sizeof(double) * (nz + 1)); U.rl = xmalloc(sizeof(double) * (2 * m + 1)); U.ru = U.rl + m; U.c = xmalloc(sizeof(double) * (n + 1)); U.l = xmalloc(sizeof(double) * (2 * n + 1)); U.u = U.l + n;
+        for (int j = 0; j < n; j++) for (int k = A0->Ap[j]; k < A0->Ap[j + 1]; k++) U.Ax[k] = rs0[A0->Ai[k]] * A0->Ax[k] * cs0[j];
+        for (int i = 0; i < m; i++) { U.rl[i] = fabs(A0->rl[i]) < 1e29 ? rs0[i] * A0->rl[i] : A0->rl[i]; U.ru[i] = fabs(A0->ru[i]) < 1e29 ? rs0[i] * A0->ru[i] : A0->ru[i]; }
+        for (int j = 0; j < n; j++) { U.c[j] = cs0[j] * A0->c[j]; U.l[j] = fabs(A0->l[j]) < 1e29 ? A0->l[j] / cs0[j] : A0->l[j]; U.u[j] = fabs(A0->u[j]) < 1e29 ? A0->u[j] / cs0[j] : A0->u[j]; }
+    }
+    const int r = sym_core(Sp, Q, out, verbose, budget, hasu ? &U : NULL, 0);
+    if (hasu) { free(U.Ax); free(U.rl); free(U.c); free(U.l); }
+    if (r) {
+        double *rs = xmalloc(sizeof(double) * (m + 1)), *cs = xmalloc(sizeof(double) * (n + 1));
+        memcpy(rs, rs0, sizeof(double) * m); memcpy(cs, cs0, sizeof(double) * n);
+        (*out)->rs = rs; (*out)->cs = cs;
+        snprintf(Q->name, sizeof Q->name, "classes (scaled)");
+        if (verbose) printf("symmetry: on the scaled data%s\n", g > 0 ? " (shared with the folding check of the problem as read)" : "");
+    }
+    if (g < 0) { free(S.Ax); free(S.rl); free(S.c); free(S.l); free(rso); free(cso); }
+    return r;
+}

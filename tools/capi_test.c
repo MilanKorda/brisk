@@ -40,6 +40,14 @@ int brisk_solve_qp(int n, int m, const int *Hp, const int *Hi, const double *Hx,
 int brisk_result_sn(const BriskResult *r);
 long brisk_qp_lower(int n, const int *Hp, const int *Hi, const double *Hx, int *Lp, int *Li, double *Lx);
 const double *brisk_result_sx(const BriskResult *r);
+int brisk_solve_lp(int n, int m, const int *Ap, const int *Ai, const double *Ax, const double *c, double c0,
+                   const double *rl, const double *ru, const double *xl, const double *xu,
+                   int nopt, const char *const *opts, BriskResult *res);
+int brisk_result_have_x(const BriskResult *r);
+int brisk_solve_socp(int n, int m, const int *Ap, const int *Ai, const double *Ax, const double *c, double c0,
+                     const double *rl, const double *ru, const double *xl, const double *xu,
+                     int nq, const int *qp, const int *qi, int nr, const int *rp, const int *ri,
+                     int nopt, const char *const *opts, BriskResult *res);
 const double *brisk_result_sz(const BriskResult *r);
 void *brisk_qp_create(int n, int m, const int *Hp, const int *Hi, const double *Hx, const double *c, double c0,
                       const int *Ap, const int *Ai, const double *Ax, const double *rl, const double *ru,
@@ -335,6 +343,116 @@ int main(void) {
         k = brisk_qp_lower(2, Lp0, Li0, Lx0, Lp, Li, Lx);
         CHECK(k == 3 && Lp[1] == 2 && Lx[1] == 1, "QP lower triangle: the lower triangle as it is (%ld)", k);
         CHECK(brisk_qp_lower(2, Fp, Fi, Nx, Lp, Li, Lx) == -1, "QP lower triangle: an unsymmetric matrix refused");
+    }
+    {   /* (10 November 2026) brisk_solve_socp: an SOCP in general form (rows rl <= A x <= ru, bounds xl <= x <= xu, cones as lists of
+         * variables), all answers known exactly */
+        const char *qo[] = { "-q" }; const double I_ = INFINITY;
+        /* 1. min t  s.t.  |(x1, x2)| <= t,  x1 + x2 >= 1: x1 = x2 = 1/2, t = 1/sqrt(2) */
+        { const int Ap1[] = { 0, 0, 1, 2 }, Ai1[] = { 0, 0 }; const double Ax1[] = { 1, 1 }, c1[] = { 1, 0, 0 }, rl1[] = { 1 }, ru1[] = { I_ };
+          const int qp1[] = { 0, 3 }, qi1[] = { 0, 1, 2 };
+          int rc = brisk_solve_socp(3, 1, Ap1, Ai1, Ax1, c1, 0.0, rl1, ru1, NULL, NULL, 1, qp1, qi1, 0, NULL, NULL, 1, qo, rm);
+          const double *x = brisk_result_sx(rm), *y = brisk_result_y(rm);
+          CHECK(rc == 0 && brisk_result_status(rm) == 0 && fabs(brisk_result_pobj(rm) - sqrt(0.5)) < 1e-7 && x && fabs(x[1] - 0.5) < 1e-6 && fabs(x[2] - 0.5) < 1e-6
+                && y && y[0] > 0 && fabs(brisk_result_dobj(rm) - sqrt(0.5)) < 1e-7, "general SOCP 1: rc %d status %d obj %.10g", rc, brisk_result_status(rm), brisk_result_pobj(rm)); }
+        /* 2. min 10 - x1 - x2  s.t.  |(x1, x2)| <= t,  t <= 1 (a cone head's upper bound),  0 <= x1 <= 1/2 (a box),  -2 <= x1 - x2 <= 2 (a ranged
+         *    row, inactive),  x1 + 7 x2 free (a row with no bound: dropped): x1 = 1/2, x2 = sqrt(3)/2, the value 10 - (1 + sqrt(3)) / 2 */
+        { const int Ap2[] = { 0, 0, 2, 4 }, Ai2[] = { 0, 1, 0, 1 }; const double Ax2[] = { 1, 1, -1, 7 }, c2[] = { 0, -1, -1 };
+          const double rl2[] = { -2, -I_ }, ru2[] = { 2, I_ }, xl2[] = { -I_, 0, -I_ }, xu2[] = { 1, 0.5, I_ };
+          const int qp2[] = { 0, 3 }, qi2[] = { 0, 1, 2 };
+          int rc = brisk_solve_socp(3, 2, Ap2, Ai2, Ax2, c2, 10.0, rl2, ru2, xl2, xu2, 1, qp2, qi2, 0, NULL, NULL, 1, qo, rm);
+          const double *x = brisk_result_sx(rm), *y = brisk_result_y(rm), *z = brisk_result_sz(rm); const double v = 10 - (1 + sqrt(3.0)) / 2;
+          CHECK(rc == 0 && fabs(brisk_result_pobj(rm) - v) < 1e-6 && x && fabs(x[1] - 0.5) < 1e-6 && fabs(x[2] - sqrt(0.75)) < 1e-5 && fabs(x[0] - 1) < 1e-6
+                && y && fabs(y[0]) < 1e-6 && y[1] == 0.0 && z && z[1] < -1e-3, "general SOCP 2: rc %d obj %.10g (%.10g)", rc, brisk_result_pobj(rm), v); }
+        /* 3. min x2  s.t.  2 x0 x1 >= x2^2 (rotated),  x0 = 1 (fixed),  x1 <= 2: x2 = -2 */
+        { const int Ap3[] = { 0, 0, 0, 0 }; const double c3[] = { 0, 0, 1 }, xl3[] = { 1, -I_, -I_ }, xu3[] = { 1, 2, I_ };
+          const int rp3[] = { 0, 3 }, ri3[] = { 0, 1, 2 };
+          int rc = brisk_solve_socp(3, 0, Ap3, NULL, NULL, c3, 0.0, NULL, NULL, xl3, xu3, 0, NULL, NULL, 1, rp3, ri3, 1, qo, rm);
+          const double *x = brisk_result_sx(rm);
+          CHECK(rc == 0 && fabs(brisk_result_pobj(rm) + 2) < 1e-6 && x && fabs(x[0] - 1) < 1e-7 && fabs(x[1] - 2) < 1e-6, "general SOCP 3 (rotated): rc %d obj %.10g", rc, brisk_result_pobj(rm)); }
+        /* 4. primal infeasible: 0 <= x1 <= 1, x1 >= 2, |x2| <= t */
+        { const int Ap4[] = { 0, 1, 1, 1 }, Ai4[] = { 0 }; const double Ax4[] = { 1 }, c4[] = { 0, 1, 0 }, rl4[] = { 2 }, xl4[] = { 0, -I_, -I_ }, xu4[] = { 1, I_, I_ };
+          const int qp4[] = { 0, 2 }, qi4[] = { 1, 2 };
+          int rc = brisk_solve_socp(3, 1, Ap4, Ai4, Ax4, c4, 0.0, rl4, NULL, xl4, xu4, 1, qp4, qi4, 0, NULL, NULL, 1, qo, rm);
+          CHECK(brisk_result_status(rm) == 1, "general SOCP 4 (infeasible): rc %d status %d", rc, brisk_result_status(rm)); }
+        /* 5. dual infeasible (unbounded): min -t  s.t.  |x| <= t,  x <= 1 */
+        { const int Ap5[] = { 0, 0, 0 }; const double c5[] = { -1, 0 }, xu5[] = { I_, 1 };
+          const int qp5[] = { 0, 2 }, qi5[] = { 0, 1 };
+          int rc = brisk_solve_socp(2, 0, Ap5, NULL, NULL, c5, 0.0, NULL, NULL, NULL, xu5, 1, qp5, qi5, 0, NULL, NULL, 1, qo, rm);
+          const double *x = brisk_result_sx(rm);
+          CHECK(brisk_result_status(rm) == 2 && x && x[0] > 0, "general SOCP 5 (unbounded): rc %d status %d", rc, brisk_result_status(rm)); }
+        /* 6. bad data: a variable in two cones, an index out of range, rl > ru */
+        { const int Ap6[] = { 0, 0, 0, 0 }; const double c6[] = { 1, 0, 0 };
+          const int qp6[] = { 0, 2, 4 }, qi6[] = { 0, 1, 0, 2 }, qi6b[] = { 0, 3 }; const double rl6[] = { 1 }, ru6[] = { 0 };
+          const int Ap6r[] = { 0, 1, 1, 1 }, Ai6r[] = { 0 }; const double Ax6r[] = { 1 };
+          CHECK(brisk_solve_socp(3, 0, Ap6, NULL, NULL, c6, 0.0, NULL, NULL, NULL, NULL, 2, qp6, qi6, 0, NULL, NULL, 1, qo, rm) == 2, "general SOCP: a variable in two cones refused");
+          CHECK(brisk_solve_socp(3, 0, Ap6, NULL, NULL, c6, 0.0, NULL, NULL, NULL, NULL, 1, qp6, qi6b, 0, NULL, NULL, 1, qo, rm) == 2, "general SOCP: a cone index out of range refused");
+          CHECK(brisk_solve_socp(3, 1, Ap6r, Ai6r, Ax6r, c6, 0.0, rl6, ru6, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, 1, qo, rm) == 2, "general SOCP: rl > ru refused"); }
+    }
+    {   /* (10 November 2026) brisk_solve_lp: an LP in general form (rows rl <= A x <= ru, bounds xl <= x <= xu), the path of an MPS file */
+        const double I_ = INFINITY;
+        /* min -x1 - 2 x2 + c0  s.t.  x1 + x2 <= 4,  x1 + 3 x2 <= 6,  -1 <= x1 - x2 <= 3 (ranged),  0 <= x1 <= 3,  x2 >= 0:  x = (3, 1), -5 + c0 */
+        const int Ap[] = { 0, 3, 6 }, Ai[] = { 0, 1, 2, 0, 1, 2 }; const double Ax[] = { 1, 1, 1, 1, 3, -1 }, c[] = { -1, -2 };
+        const double rl[] = { -I_, -I_, -1 }, ru[] = { 4, 6, 3 }, xl[] = { 0, 0 }, xu[] = { 3, I_ };
+        const char *lq[] = { "-q", "-threads", "1" };
+        int rc = brisk_solve_lp(2, 3, Ap, Ai, Ax, c, 10.0, rl, ru, xl, xu, 3, lq, rm);
+        const double *x = brisk_result_sx(rm);
+        CHECK(rc == 0 && brisk_result_status(rm) == 0 && fabs(brisk_result_pobj(rm) - 5.0) < 1e-9 && x && fabs(x[0] - 3) < 1e-9 && fabs(x[1] - 1) < 1e-9,
+              "general LP: rc %d status %d obj %.12g", rc, brisk_result_status(rm), brisk_result_pobj(rm));
+        /* the duals from the dual simplex method: z = c - A'y, y <= 0 at the rows' upper sides, 0 on the inactive row, z_2 = 0, z_1 <= 0
+         * at x1's upper bound, and the dual value 4 y0 + 6 y1 + 3 z1 equal to the optimum -5 */
+        {   const char *l2[] = { "-q", "-threads", "1", "-lpmethod", "2" };
+            rc = brisk_solve_lp(2, 3, Ap, Ai, Ax, c, 0.0, rl, ru, xl, xu, 5, l2, rm);
+            const double *y = brisk_result_y(rm), *z = brisk_result_sz(rm);
+            CHECK(rc == 0 && y && z && fabs(z[0] - (-1 - y[0] - y[1] - y[2])) < 1e-12 && fabs(z[1] - (-2 - y[0] - 3 * y[1] + y[2])) < 1e-12
+                  && y[0] <= 1e-9 && y[1] <= 1e-9 && fabs(y[2]) <= 1e-9 && fabs(z[1]) <= 1e-9 && z[0] <= 1e-9 && fabs(4 * y[0] + 6 * y[1] + 3 * z[0] + 5) < 1e-9,
+                  "general LP: the duals (rc %d, y %p, z %p)", rc, (const void *)y, (const void *)z); }
+        /* (11 November 2026) the interior-point method alone (-lpmethod 1, one thread): its duals through the presolves' dual postsolve,
+         * z = c - A'y and the dual value equal to the optimum within the method's accuracy */
+        {   const char *l1[] = { "-q", "-threads", "1", "-lpmethod", "1" };
+            rc = brisk_solve_lp(2, 3, Ap, Ai, Ax, c, 0.0, rl, ru, xl, xu, 5, l1, rm);
+            const double *y = brisk_result_y(rm), *z = brisk_result_sz(rm);
+            CHECK(rc == 0 && y && z && fabs(z[0] - (-1 - y[0] - y[1] - y[2])) < 1e-12 && fabs(z[1] - (-2 - y[0] - 3 * y[1] + y[2])) < 1e-12
+                  && fabs(4 * y[0] + 6 * y[1] + 3 * z[0] + 5) < 1e-6,
+                  "general LP: the interior-point method's duals (rc %d, y %p, z %p)", rc, (const void *)y, (const void *)z); }
+        /* every method gives the same optimum */
+        const char *meth[] = { "1", "2", "3", "4", "5" };
+        for (int k = 0; k < 5; k++) {
+            const char *lo[] = { "-q", "-threads", "1", "-lpmethod", meth[k] };
+            rc = brisk_solve_lp(2, 3, Ap, Ai, Ax, c, 0.0, rl, ru, xl, xu, 5, lo, rm); x = brisk_result_sx(rm);
+            CHECK(rc == 0 && fabs(brisk_result_pobj(rm) + 5.0) < 1e-7 && x && fabs(x[0] - 3) < 1e-6 && fabs(x[1] - 1) < 1e-6, "general LP, -lpmethod %s: rc %d obj %.12g", meth[k], rc, brisk_result_pobj(rm));
+        }
+        /* the same LP as an MPS file through brisk_solve_file: the same status, objective and x, bit for bit (one thread, and the default) */
+        {   char fn[256]; const char *td = getenv("TMPDIR"); snprintf(fn, sizeof fn, "%s/brisk_capi_lp_%d.mps", td && *td ? td : "/tmp", (int)getpid());
+            FILE *f = fopen(fn, "w");
+            if (f) {
+                fputs("NAME T\nROWS\n N obj\n L r0\n L r1\n G r2\nCOLUMNS\n x1 obj -1 r0 1\n x1 r1 1 r2 1\n x2 obj -2 r0 1\n x2 r1 3 r2 -1\n"
+                      "RHS\n rhs r0 4 r1 6\n rhs r2 -1\nRANGES\n rng r2 4\nBOUNDS\n UP bnd x1 3\nENDATA\n", f);
+                fclose(f);
+                for (int t = 0; t < 2; t++) {
+                    const char *o1[] = { "-q", "-threads", "1" }; const int no = t ? 1 : 3;
+                    int r1 = brisk_solve_file(fn, no, o1, rf);
+                    int r2 = brisk_solve_lp(2, 3, Ap, Ai, Ax, c, 0.0, rl, ru, xl, xu, no, o1, rm);
+                    const double *xa = brisk_result_sx(rf), *xb = brisk_result_sx(rm);
+                    CHECK(r1 == r2 && brisk_result_status(rf) == brisk_result_status(rm) && brisk_result_pobj(rf) == brisk_result_pobj(rm) && xa && xb
+                          && !memcmp(xa, xb, 2 * sizeof(double)), "general LP: the MPS file's result, bit for bit (%s)", t ? "the default threads" : "one thread");
+                }
+                remove(fn);
+            }
+        }
+        /* primal infeasible: x1 >= 2 with x1 <= 1 */
+        {   const int Ap2[] = { 0, 1 }, Ai2[] = { 0 }; const double Ax2[] = { 1 }, c2[] = { 1 }, rl2[] = { 2 }, xl2[] = { 0 }, xu2[] = { 1 };
+            rc = brisk_solve_lp(1, 1, Ap2, Ai2, Ax2, c2, 0.0, rl2, NULL, xl2, xu2, 3, lq, rm);
+            CHECK(brisk_result_status(rm) == 1, "general LP (infeasible): rc %d status %d", rc, brisk_result_status(rm)); }
+        /* dual infeasible: min -x1  s.t.  x1 - x2 <= 1,  x >= 0 */
+        {   const int Ap3[] = { 0, 1, 2 }, Ai3[] = { 0, 0 }; const double Ax3[] = { 1, -1 }, c3[] = { -1, 0 }, ru3[] = { 1 }, xl3[] = { 0, 0 };
+            rc = brisk_solve_lp(2, 1, Ap3, Ai3, Ax3, c3, 0.0, NULL, ru3, xl3, NULL, 3, lq, rm);
+            CHECK(brisk_result_status(rm) == 2, "general LP (unbounded): rc %d status %d", rc, brisk_result_status(rm)); }
+        /* bad data: a value not finite, an index out of range, columns out of order, rl > ru */
+        {   const double cn[] = { NAN, -2 }; const int Aib[] = { 0, 1, 3, 0, 1, 2 }, Apb[] = { 0, 4, 3 }; const double rlb[] = { 5, -I_, -1 };
+            CHECK(brisk_solve_lp(2, 3, Ap, Ai, Ax, cn, 0.0, rl, ru, xl, xu, 3, lq, rm) == 2, "general LP: a NaN cost refused");
+            CHECK(brisk_solve_lp(2, 3, Ap, Aib, Ax, c, 0.0, rl, ru, xl, xu, 3, lq, rm) == 2, "general LP: a row index out of range refused");
+            CHECK(brisk_solve_lp(2, 3, Apb, Ai, Ax, c, 0.0, rl, ru, xl, xu, 3, lq, rm) == 2, "general LP: columns out of order refused");
+            CHECK(brisk_solve_lp(2, 3, Ap, Ai, Ax, c, 0.0, rlb, ru, xl, xu, 3, lq, rm) == 2, "general LP: rl > ru refused"); }
     }
     brisk_result_delete(rf);
     brisk_result_delete(rm);

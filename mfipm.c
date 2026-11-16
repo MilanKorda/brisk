@@ -772,7 +772,14 @@ int mfipm_solve(Problem *P, const Params *par, Result *R, double *yout, double *
                  * hundred times below it: the factored method needs fewer iterations from a closer point (tru11, SDP:
                  * 9.4 -> 5.5 s; tru13 58.7 -> 44.8 s), while a fixed lower threshold that the attempt never reaches left it
                  * no point at all (07-04 sparse PCA at 1e-6: a start from nothing) */
-                if (merit <= hand_merit && (!hand_done || (hand_snap_m > 1e-2 * hand_merit && merit < hand_snap_m))) {
+                /* (9 November 2026) the first snapshot from 30 times the hand-over merit: an attempt stopped by its time budget
+                 * between the two left the factored method no point and it started from nothing (an outside tester's
+                 * a_optimal_design, SDP + nonnegative: 1.8e-3 after 108 s, then 17 iterations of the self-dual embedding, 785
+                 * s; at n = 180 on this host 147 -> 88 s, 15 -> 6 iterations, the same value). The snapshots are refreshed at
+                 * each better iterate down to the same floor as before, so an attempt that goes below the hand-over merit
+                 * hands over the same iterate as before. BRISK_MFHANDFIRST: the factor (1: as before) */
+                static double hfirst = -1; if (hfirst < 0) { const char *e = getenv("BRISK_MFHANDFIRST"); hfirst = e ? atof(e) : 30.0; }
+                if (merit <= hfirst * hand_merit && (!hand_done || (hand_snap_m > 1e-2 * hand_merit && merit < hand_snap_m))) {
                     for (int k = 0; k < nb; k++) { memcpy(hand_X[k], S.b[k].X, sizeof(double) * blen(&S.b[k])); memcpy(hand_Z[k], S.b[k].Z, sizeof(double) * blen(&S.b[k])); }
                     memcpy(hand_y, y, sizeof(double) * m); hand_done = 1; hand_snap_m = merit;
                 }

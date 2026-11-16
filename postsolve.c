@@ -37,6 +37,7 @@ static void *pcalloc(size_t n, size_t s) {
     return p;
 }
 int g_ps_need_x = 0;      /* set by main: the caller needs X itself (files, crossover) */
+int g_ps_rebuild = 0;     /* 7 November 2026: the level-by-level rebuild of the duals the facial reduction removed (-frdual 2); off: they are not rebuilt */
 int g_ps_fr_correct = 0;  /* set by main (5.17, ISSUES 93): correct the lift of the reduced dual through complementarity when the
                            * certificate passes fail; opt-in since the owner's policy of 16 October 2026 (main.c sets it from BRISK_FRFIX=1),
                            * so that the message that the recovery failed is unambiguous and the default path pays nothing */
@@ -56,6 +57,26 @@ void postsolve_set_time_left(double left) { g_ps_deadline = left < INFINITY ? ps
  * (31 October 2026, ISSUES 734) */
 static double g_ps_tol = 0;
 void postsolve_set_tol(double tol) { g_ps_tol = tol > 0 ? tol : 0; }
+/* 10 November 2026: the search over the recovery's margins ends once the best pass meets the solve's tolerance (a further
+ * pass cannot change the status; each costs an eigenvalue test per removed constraint: 0.8 s a pass on cancer_100, SDP, 198
+ * constraints removed from a block of order 569, four passes 3.5 s for a solve of 2.3 s; the first pass was at 7.8e-9 against
+ * the tolerance 1e-8). Before: 1e-10 relative, whatever the tolerance. BRISK_PSMARGINSTOP=0: as before */
+/* 10 November 2026: the margins are tried in the order 3, 1, 10, 0.1; the violation left by a pass is unimodal in the margin
+ * in practice, so the side that lost is not tried further: when margin 1 beats margin 3, margin 10 is skipped, and when margin
+ * 10 beats margin 1, margin 0.1 is. tiger_texture (Mittelmann, SDP; one constraint, a face of rank 600 in a block of order
+ * 1801): 1.9 s a pass, lambda_min -1.0 (3), -0.50 (1), -2.8 (10), -0.28 (0.1). mres[k]: the violation after margin k's pass,
+ * infinite when not run or diverged. BRISK_PSMARGINSKIP=0: every margin */
+static int ps_margin_skip(int k, const double *mres) {
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_PSMARGINSKIP"); on = e ? atoi(e) != 0 : 1; }
+    if (!on) return 0;
+    if (k == 2) return mres[1] < mres[0];
+    if (k == 3) return mres[2] < mres[1];
+    return 0;
+}
+static double ps_margin_stop(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("BRISK_PSMARGINSTOP"); on = e ? atoi(e) != 0 : 1; }
+    return on && g_ps_tol > 0 ? fmax(g_ps_tol, 1e-10) : 1e-10;
+}
 static int ps_late(void) { return g_ps_deadline > 0 && ps_now() > g_ps_deadline; }
 /* the final measure as past the time limit (ISSUES 744; a test switch: BRISK_PSLATE=1 compares the bounded test with the
  * full measure on the same point) */
@@ -307,6 +328,36 @@ void ps_record_part(Problem *P, PSRecord *r, const Block *B, int kind, const cha
 }
 
 /* ------------------------------------------------------------------ original data */
+/* 9 November 2026: a hash of everything ps_orig_build copies (the sizes, b0, every entry's constraint, block, indices and
+ * value bits, tbR, obj_off), so that a copy made earlier can be taken again when the problem has not changed since
+ * (main.c, orig_take): a pass of reads over the entries instead of a copy and a release. */
+static inline unsigned long long ps_mix(unsigned long long h, unsigned long long v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); return h; }
+unsigned long long ps_orig_hash(const Problem *P) {
+    unsigned long long h = ps_mix(1469598103934665603ULL, (unsigned long long)P->m);
+    h = ps_mix(h, (unsigned long long)P->nblk);
+    for (int i = 0; i < P->m; i++) { unsigned long long u; memcpy(&u, &P->b0[i], 8); h = ps_mix(h, u); }
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k];
+        h = ps_mix(h, (unsigned long long)(B->type == BLK_LP ? -B->n : B->n) & 0xffffffffULL);
+        /* (each constraint's hash on the threads, combined in order: the same value at any thread count) */
+        unsigned long long *hc = malloc(sizeof(unsigned long long) * ((size_t)B->ncon + 2));
+        #pragma omp parallel for schedule(dynamic, 16) if (B->ncon > 64)
+        for (int t = -1; t < B->ncon; t++) {
+            const SpSym *S = t < 0 ? &B->C : &B->A[t];
+            unsigned long long g = ps_mix(0x51ed270b27f3a1c5ULL, ((unsigned long long)(unsigned)(t < 0 ? -1 : B->con[t]) << 32) | (unsigned)S->nnz);
+            for (int q = 0; q < S->nnz; q++) {
+                unsigned long long u; memcpy(&u, &S->val[q], 8);
+                g = ps_mix(g, ((unsigned long long)(unsigned)S->row[q] << 32) | (unsigned)S->col[q]);
+                g = ps_mix(g, u);
+            }
+            hc[t + 1] = g;
+        }
+        for (int t = 0; t <= B->ncon; t++) h = ps_mix(h, hc[t]);
+        free(hc);
+    }
+    { unsigned long long u; memcpy(&u, &P->tbR, 8); h = ps_mix(h, u); memcpy(&u, &P->obj_off, 8); h = ps_mix(h, u); }
+    return h;
+}
 PSOrig *ps_orig_build(const Problem *P) {
     PSOrig *O = pcalloc(1, sizeof(PSOrig));
     O->m = P->m;
@@ -2334,6 +2385,13 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
     if (ps && ps->nrec > 0 && ps_late()) {
         res->unrecovered = ps->nrec; res->late = 1;
         if (verbose >= 0) printf("postsolve: the time limit is reached: the duals of the %d constraint(s) the presolve removed are not recovered\n", ps->nrec);
+    } else if (ps && ps->nrec > 0 && !g_ps_rebuild) {
+        /* 7 November 2026 (the owner: "No need to rebuild moments that the relaxation does not determine. Just do not return
+         * them"): the duals of the constraints the facial reduction removed are left at zero here, which is a dual of the
+         * problem as read when Z stays in the cone with them (then they are returned); otherwise main.c returns them as NaN
+         * (the reduced problem does not determine them) and judges the dual on the face. -frdual 2: the level-by-level rebuild
+         * below, as up to 1.6.5 */
+        res->unrecovered = ps->nrec;
     } else if (ps && ps->nrec > 0 && spx.o >= 0) {
         /* sparse mode: the recovery passes of the dense path, the sparse block's slack on
          * its data pattern (diagonal-type reductions; others are left unrecovered) */
@@ -2369,8 +2427,10 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 memcpy(zs0, spx.zs, sizeof(double) * spx.ne);
                 int brec = 0, bunrec = ps->nrec;
                 double prevlz = -1;
+                double mres[4] = { INFINITY, INFINITY, INFINITY, INFINITY };
                 for (int k = 0; k < 4; k++) {
                     if (k > 0 && ps_late()) { res->late = 1; break; }   /* (ISSUES 284: the best margin so far) */
+                    if (ps_margin_skip(k, mres)) continue;
                     if (k > 0) {
                         memcpy(yo, y0, sizeof(double) * mo);
                         memcpy(spx.zs, zs0, sizeof(double) * spx.ne);
@@ -2383,13 +2443,14 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                     if (!(lz == lz)) lz = -INFINITY;
                     if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yo));
                     if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: recovery margin %g: lambda_min(Z) %.2e (%d recovered, %d not)\n", margins[k], lz, rc, un);
+                    mres[k] = -lz;
                     if (k == 0 && fabs(-lz - best) <= 1e-3 * best) break;
                     /* (23 October 2026: not after a pass that diverged, prevlz = inf, where inf <= 1e-3 inf held and
                      * the search stopped before the next margin's result was kept; ISSUES 259) */
                     if (k > 0 && isfinite(prevlz) && fabs(-lz - prevlz) <= 1e-3 * fmax(prevlz, 1e-300)) break;
                     prevlz = -lz;
                     if (-lz < best) { best = -lz; brec = rc; bunrec = un; memcpy(ybest, yo, sizeof(double) * mo); }
-                    if (best <= 1e-10 * (1.0 + O->nC1)) break;
+                    if (best <= ps_margin_stop() * (1.0 + O->nC1)) break;
                 }
                 memcpy(yo, ybest, sizeof(double) * mo);
                 /* rebuild Z from the kept y */
@@ -2479,8 +2540,10 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 prevlz = -1;
             }
             bestr = INFINITY;   /* the round's best pass result; a diverging chain leaves its partial lift as the next base */
+            double mres[4] = { INFINITY, INFINITY, INFINITY, INFINITY };
             for (int k = 0; k < nm && best > 1e-9 * (1.0 + O->nC1); k++) {
                 if ((k > 0 || round > 0) && ps_late()) { res->late = 1; break; }   /* (ISSUES 284: the best so far) */
+                if (nm == 4 && ps_margin_skip(k, mres)) continue;
                 if (k > 0 || round > 0) {
                     memcpy(yo, y0, sizeof(double) * mo);
                     for (int o = 0; o < nbo; o++) memcpy(Zo[o], Z0[o], sizeof(double) * ps_zlen(O, zc, o));
@@ -2494,6 +2557,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                 if (!(lz == lz)) lz = -INFINITY;
                 if (lz > -INFINITY) lz = fmin(lz, -z_round_est(O, yo));
                 if (verbose >= 2 || getenv("BRISK_PSTIME")) printf("postsolve: recovery margin %g: lambda_min(Z) %.2e\n", me ? atof(me) : margins[k], lz);
+                if (k < 4) mres[k] = -lz;
                 /* the removed constraints do not matter for lambda_min (same value as with
                  * their duals at zero): the violation comes from elsewhere, stop (each pass
                  * costs dense factorizations: 7 s on the 3228 x 3228 AC-OPF block) */
@@ -2510,7 +2574,7 @@ int postsolve(const Problem *P, const PSOrig *O, double **Xred, const double *yr
                     best = -lz; brec = rc; bunrec = un; bround = round;
                     memcpy(ybest, yo, sizeof(double) * mo);
                 }
-                if (best <= 1e-10 * (1.0 + O->nC1)) break;
+                if (best <= ps_margin_stop() * (1.0 + O->nC1)) break;
             }
             }   /* rounds */
             /* 31 October 2026 (the owner's external SDP benchmark, kernel SDPs; ISSUES 731): the dual optimum of the problem as

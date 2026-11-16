@@ -683,6 +683,9 @@ static int hp_from_data(const BriskData *d, HPJob *J) {
     J->bs = (int *)malloc(sizeof(int) * (size_t)d->nblk);
     for (int k = 0; k < d->nblk; k++) { J->bs[k] = d->bs[k]; if (!J->bs[k]) { hp_fail("bad block sizes"); return 1; } }
     J->b = (uint64_t *)calloc((size_t)J->m * Wm, sizeof(uint64_t));
+    /* 9 November 2026 (an outside tester): a NaN or infinite right-hand side was read as zero (mpx_setd maps non-finite
+     * values to zero) and the solve returned OPTIMAL; the double-precision path reports an input error */
+    for (int i = 0; i < J->m; i++) if (!isfinite(d->c[i])) { hp_fail("a right-hand side is not a finite number"); return 1; }
     for (int i = 0; i < J->m; i++) mpx_setd(J->b + (size_t)i * Wm, d->c[i]);
     HEnt *E = (HEnt *)malloc(sizeof(HEnt) * (d->nnz + 1));
     uint64_t *vals = (uint64_t *)malloc(sizeof(uint64_t) * (d->nnz + 1) * Wm);

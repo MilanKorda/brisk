@@ -43,7 +43,7 @@ LONG = {"threads": 1, "fom": 1, "tol": 1e-14, "fomtol": 1e-14, "fommaxit": 10**8
 
 
 def test_version():
-    assert brisk.version() == "1.6.5"
+    assert brisk.version() == "1.7"
     assert os.path.exists(brisk.library_path())
 
 
@@ -834,7 +834,7 @@ def test_solve_sedumi_cone_and_sdp_solver_agree():
     K = dict(f=3, l=5, q=[4, 7, 3], r=[5, 3])
     A, b, c = _sedumi_problem(K, 10, seed=3)
     r1 = brisk.solve_sedumi(A, b, c, K, verbose=False)
-    r2 = brisk.solve_sedumi(A, b, c, K, {"conesolver": 0}, verbose=False)
+    r2 = brisk.solve_sedumi(A, b, c, K, {"socpsolver": 0}, verbose=False)
     r3 = brisk.solve_sedumi(A, b, c, K, {"prec": "dd"}, verbose=False)
     assert r1.status == 0 and r2.status in (0, 5) and r3.status == 0
     assert abs(r1.pobj - r2.pobj) < 1e-6 * (1 + abs(r1.pobj))
@@ -857,6 +857,104 @@ def test_solve_sedumi_infeasible_and_unbounded():
     assert r.status == 2 and abs(r.x[0] + 2 * r.x[2] + 1) < 1e-8 and r.x[0] >= np.linalg.norm(r.x[1:]) - 1e-9
     with pytest.raises(ValueError):
         brisk.solve_sedumi(sp.csc_matrix([[1.0, 0, 0]]), [1.0], [1.0, 0, 0], dict(q=[4]), verbose=False)
+
+
+def test_solve_socp_general_form():
+    """(10 November 2026) brisk.solve_socp: rows l <= A x <= u, bounds lb <= x <= ub, cones as lists of variables"""
+    import scipy.sparse as sp
+    inf = np.inf
+    # min t  s.t.  |(x1, x2)| <= t,  x1 + x2 >= 1: x1 = x2 = 1/2, t = 1/sqrt(2); y > 0 at the row's lower bound
+    r = brisk.solve_socp([1.0, 0, 0], A=sp.csc_matrix([[0.0, 1, 1]]), l=[1.0], u=[inf], q=[[0, 1, 2]], verbose=False)
+    assert r.status == 0 and abs(r.pobj - np.sqrt(0.5)) < 1e-7 and np.allclose(r.x[1:], 0.5, atol=1e-6) and r.y[0] > 0
+    assert np.allclose(r.z, np.array([1.0, 0, 0]) - sp.csc_matrix([[0.0, 1, 1]]).T @ r.y, atol=1e-12)
+    # boxes, a ranged row, a row with no bound, an upper bound on a cone's head, c0: min 10 - x1 - x2 with |(x1, x2)| <= t <= 1, 0 <= x1 <= 1/2
+    A = sp.csc_matrix([[0.0, 1, -1], [0.0, 1, 7]])
+    r = brisk.solve_socp([0.0, -1, -1], A=A, l=[-2.0, -inf], u=[2.0, inf], lb=[-inf, 0, -inf], ub=[1.0, 0.5, inf], q=[[0, 1, 2]],
+                         c0=10.0, verbose=False)
+    assert r.status == 0 and abs(r.pobj - (10 - (1 + np.sqrt(3)) / 2)) < 1e-6 and abs(r.x[1] - 0.5) < 1e-6 and r.y[1] == 0.0
+    # a rotated cone with a fixed head: min x2  s.t.  2 x0 x1 >= x2^2,  x0 = 1,  x1 <= 2: x2 = -2
+    r = brisk.solve_socp([0.0, 0, 1], lb=[1.0, -inf, -inf], ub=[1.0, 2.0, inf], r=[[0, 1, 2]], verbose=False)
+    assert r.status == 0 and abs(r.pobj + 2) < 1e-6 and abs(r.x[0] - 1) < 1e-7
+    # primal infeasible and unbounded
+    r = brisk.solve_socp([0.0, 1, 0], A=sp.csc_matrix([[1.0, 0, 0]]), l=[2.0], lb=[0, -inf, -inf], ub=[1.0, inf, inf], q=[[1, 2]],
+                         verbose=False)
+    assert r.status == 1
+    r = brisk.solve_socp([-1.0, 0], ub=[inf, 1.0], q=[[0, 1]], verbose=False)
+    assert r.status == 2 and r.x[0] > 0
+    # bad data: a variable in two cones
+    with pytest.raises((ValueError, RuntimeError)):
+        brisk.solve_socp([1.0, 0, 0], q=[[0, 1], [0, 2]], verbose=False)
+
+
+def test_solve_lp_general_form():
+    """(10 November 2026) brisk.solve_lp: rows l <= A x <= u, bounds lb <= x <= ub, the path of an MPS file"""
+    import scipy.sparse as sp
+    inf = np.inf
+    # min -x1 - 2 x2 + 10  s.t.  x1 + x2 <= 4,  x1 + 3 x2 <= 6,  -1 <= x1 - x2 <= 3,  0 <= x1 <= 3,  x2 >= 0:  x = (3, 1), 5
+    A = sp.csc_matrix([[1.0, 1], [1, 3], [1, -1]])
+    kw = dict(A=A, l=[-inf, -inf, -1], u=[4.0, 6, 3], lb=[0.0, 0], ub=[3.0, inf], c0=10.0, verbose=False)
+    r = brisk.solve_lp([-1.0, -2], options=["-threads", "1"], **kw)
+    assert r.status == 0 and abs(r.obj - 5) < 1e-9 and np.allclose(r.x, [3, 1], atol=1e-9)
+    for meth in ("1", "2", "3", "4", "5"):
+        r = brisk.solve_lp([-1.0, -2], options=["-threads", "1", "-lpmethod", meth], **kw)
+        assert r.status == 0 and abs(r.obj - 5) < 1e-7, meth
+        if r.y is not None:      # the duals: z = c - A'y, y <= 0 at the upper sides, 0 on the inactive row, z_2 = 0, z_1 <= 0 at x1's bound
+            assert np.allclose(r.z, np.array([-1.0, -2]) - A.T @ r.y, atol=1e-9) and r.y[0] <= 1e-9 and r.y[1] <= 1e-9 and abs(r.y[2]) <= 1e-9
+            assert abs(r.z[1]) <= 1e-7 and r.z[0] <= 1e-7 and abs(4 * r.y[0] + 6 * r.y[1] + 3 * r.z[0] + 10 - r.obj) < 1e-7, meth
+    r = brisk.solve_lp([-1.0, -2], options=["-threads", "1", "-lpmethod", "2"], **kw)
+    assert r.y is not None and r.z is not None
+    # a dense A and a free variable (no lb): min x  s.t.  x >= 1 (a row): x = 1
+    r = brisk.solve_lp([1.0], A=np.array([[1.0]]), l=[1.0], verbose=False)
+    assert r.status == 0 and abs(r.x[0] - 1) < 1e-9
+    # primal infeasible, unbounded
+    r = brisk.solve_lp([1.0], A=sp.csc_matrix([[1.0]]), l=[2.0], lb=[0.0], ub=[1.0], verbose=False)
+    assert r.status == 1
+    r = brisk.solve_lp([-1.0, 0], A=sp.csc_matrix([[1.0, -1]]), u=[1.0], lb=[0.0, 0], verbose=False)
+    assert r.status == 2
+    # bad data: a NaN cost, crossed bounds
+    with pytest.raises((ValueError, RuntimeError)):
+        brisk.solve_lp([np.nan, 1.0], A=A[:, :2], verbose=False)
+    with pytest.raises((ValueError, RuntimeError)):
+        brisk.solve_lp([1.0, 1.0], lb=[2.0, 0], ub=[1.0, 1], verbose=False)
+
+
+def test_solve_lp_agrees_with_mps_file(tmp_path):
+    """the same LP as an MPS file and as arrays: the same status and objective (one thread)"""
+    import scipy.sparse as sp
+    p = tmp_path / "t.mps"
+    p.write_text("NAME T\nROWS\n N obj\n L r0\n L r1\n G r2\nCOLUMNS\n x1 obj -1 r0 1\n x1 r1 1 r2 1\n x2 obj -2 r0 1\n x2 r1 3 r2 -1\n"
+                 "RHS\n rhs r0 4 r1 6\n rhs r2 -1\nRANGES\n rng r2 4\nBOUNDS\n UP bnd x1 3\nENDATA\n")
+    f = brisk.solve_file(str(p), options=["-threads", "1"], verbose=False)
+    r = brisk.solve_lp([-1.0, -2], A=sp.csc_matrix([[1.0, 1], [1, 3], [1, -1]]), l=[-np.inf, -np.inf, -1], u=[4.0, 6, 3],
+                       lb=[0.0, 0], ub=[3.0, np.inf], options=["-threads", "1"], verbose=False)
+    assert f.status == r.status == 0 and f.pobj == r.obj
+
+
+def test_solve_socp_agrees_with_sedumi_form():
+    """the same random SOCP with boxes and inequality rows written by hand in SeDuMi's form (slacks, shifts) and given to
+    solve_socp: the same optimal value"""
+    import scipy.sparse as sp
+    rng = np.random.default_rng(7)
+    n, m = 12, 5
+    A = rng.standard_normal((m, n))
+    x0 = np.r_[3.0, 0.2 * rng.standard_normal(5), np.abs(rng.standard_normal(6)) * 0.3]   # a strictly feasible point
+    lo, up = A @ x0 - 1.0, A @ x0 + 1.0
+    c = rng.standard_normal(n); c[0] = 1.0
+    lb = np.r_[-np.inf * np.ones(6), np.zeros(6)]; ub = np.r_[np.inf * np.ones(6), np.ones(6)]
+    r = brisk.solve_socp(c, A=sp.csc_matrix(A), l=lo, u=up, lb=lb, ub=ub, q=[[0, 1, 2, 3, 4, 5]], verbose=False)
+    # the SeDuMi form by hand: variables [cone (6) | s = x[6:] >= 0 (6) | t box slacks (6) | row slacks below (m) | above (m)]
+    N = 6 + 6 + 6 + m + m
+    Aeq = np.zeros((m + 6 + m, N)); b = np.zeros(m + 6 + m); cc = np.zeros(N)
+    Aeq[:m, :12] = A; Aeq[:m, 18:18 + m] = -np.eye(m); b[:m] = lo            # A x - s1 = lo
+    Aeq[m:m + 6, 6:12] = np.eye(6); Aeq[m:m + 6, 12:18] = np.eye(6); b[m:m + 6] = 1.0     # x + t = 1 on the boxed variables
+    Aeq[m + 6:, 18:18 + m] = np.eye(m); Aeq[m + 6:, 18 + m:] = np.eye(m); b[m + 6:] = up - lo   # s1 + s2 = up - lo
+    cc[:12] = c
+    K = dict(l=N - 6, q=[6])
+    perm = np.r_[np.arange(6, N), np.arange(6)]           # SeDuMi's order: the nonnegative block first, then the cone
+    rs = brisk.solve_sedumi(sp.csc_matrix(Aeq[:, perm]), b, cc[perm], K, verbose=False)
+    assert r.status == 0 and rs.status == 0
+    assert abs(r.pobj - rs.pobj) <= 1e-6 * (1 + abs(rs.pobj))
+    assert np.all(r.x[6:] >= -1e-8) and np.all(r.x[6:] <= 1 + 1e-8) and np.all(A @ r.x >= lo - 1e-6) and np.all(A @ r.x <= up + 1e-6)
 
 
 @pytest.mark.parametrize("compress", [True, False])
@@ -940,7 +1038,7 @@ def test_cvxpy_cone_solver():
     v1 = prob.solve(solver=brisk.BRISK())
     assert prob.status == "optimal" and prob.solver_stats.extra_stats["form"] == "cone"
     x1, d1 = x.value.copy(), [np.atleast_1d(c.dual_value).copy() for c in cons[1:3]]
-    v2 = prob.solve(solver=brisk.BRISK(), conesolver=0)
+    v2 = prob.solve(solver=brisk.BRISK(), socpsolver=0)
     assert prob.solver_stats.extra_stats["form"] != "cone" and abs(v1 - v2) < 1e-6 * (1 + abs(v1))
     assert np.allclose(x1, x.value, atol=1e-4)
     for a, c in zip(d1, cons[1:3]):

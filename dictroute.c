@@ -75,9 +75,15 @@ static int dict_gate(const Block *B, int *cnt, int *mark) {
     double tot = 0;
     for (int t = 0; t < B->ncon; t++) tot += B->A[t].ef;
     if (tot / B->ncon <= 8) return 0;                   /* already sparse: nothing to gain */
-    int step = B->ncon / DICT_SAMPLE > 1 ? B->ncon / DICT_SAMPLE : 1, tried = 0, ok = 0;
+    /* 8 November 2026: every constraint, not a sample of 16 taken with a stride in the given order: the verdict depended
+     * on the constraints' order (a control LMI, poly_slack_n32, SDP, and its copy with the rows permuted: the dictionary on
+     * four blocks of order 64 against two, the other two on the low-rank route, 0.16 -> 0.65 s of assembly). The test is
+     * linear in a constraint's entries. BRISK_DICTSAMPLE=1: the sample, as before */
+    static int sample = -1; if (sample < 0) { const char *e = getenv("BRISK_DICTSAMPLE"); sample = e && atoi(e) != 0; }
+    const int nsamp = sample ? DICT_SAMPLE : B->ncon;
+    int step = B->ncon / nsamp > 1 ? B->ncon / nsamp : 1, tried = 0, ok = 0;
     int H[DICT_HMAX];
-    for (int t = 0; t < B->ncon && tried < DICT_SAMPLE; t += step) {
+    for (int t = 0; t < B->ncon && tried < nsamp; t += step) {
         tried++;
         int nh = cover(&B->A[t], H, cnt, mark);
         if (nh >= 1 && B->A[t].nnz >= 3 * nh) ok++;     /* hub rows must carry vector content */

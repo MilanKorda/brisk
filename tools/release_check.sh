@@ -14,7 +14,8 @@ have() { command -v "$1" > /dev/null 2>&1; }
 JULIA=${JULIA:-$(command -v julia || ls "$HOME"/tools/julia-*/bin/julia 2>/dev/null | head -1)}
 echo "release_check: $(pwd), log in $LOG"
 run "build (solver, library)"                make -s brisk libbrisk
-run "examples (as the public CI)"             bash -c 'for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat examples/*.qps; do [ "$f" = examples/pop_wood_20.dat-s ] && continue; ./brisk "$f" -q || { echo "$f failed"; exit 1; }; done'
+run "examples (as the public CI)"             bash -c 'for f in examples/*.dat-s examples/*.mps examples/*.cbf examples/*.mat examples/*.qps; do [ "$f" = examples/pop_wood_20.dat-s ] && continue; [ "$f" = examples/socp_touch.cbf ] && continue; ./brisk "$f" -q || { echo "$f failed"; exit 1; }; done'
+run "-x, -y, -z on a CBF file (R20)"          bash -c 'd=$(mktemp -d); trap "rm -rf $d" EXIT; for f in examples/*.cbf; do ./brisk -q "$f" -x $d/x -y $d/y -z $d/z; python3 -I tools/cbf_dualcheck.py "$f" $d/x $d/y $d/z || exit 1; rm -f $d/x $d/y $d/z; done'
 run "command-line suites (R1, R4)"           make hpredtest restoretest advicetest frtest bindtest timetest
 run "-threads on every LP method (R11)"       bash -c 'for k in 2 3 4 5; do ./brisk examples/afiro.mps -lpmethod $k -threads 1 -v | grep -q "^Number of threads: 1" || { echo "-lpmethod $k ignores -threads"; exit 1; }; done'
 run "C API (R5)"                              make capitest
@@ -26,7 +27,7 @@ run "Python and CVXPY"                        make pytest
 run "MATLAB's ILP64 BLAS layer (R2, R3)"      make blas64test
 run "library under AddressSanitizer (R5)"     make asantest
 run "clang + bundled OpenMP (R6)"             bash -c 'have() { command -v "$1" > /dev/null; }; have clang && make omptest'
-run "solver with the bundled OpenMP (R14)"    bash -c 'command -v clang > /dev/null || exit 1; d=$(mktemp -d); trap "rm -rf $d" EXIT; cp -r Makefile ./*.c ./*.h ./*.inc libbrisk.map libbrisk.exp amd omp tools "$d" && make -s -C "$d" clean && make -s -C "$d" -j4 OMP=bundled CC=clang brisk && "$d/brisk" examples/afiro.mps -q && "$d/brisk" examples/theta1.dat-s -q'
+run "solver with the bundled OpenMP (R14)"    bash -c 'command -v clang > /dev/null || exit 1; d=$(mktemp -d); trap "rm -rf $d" EXIT; cp -r Makefile ./*.c ./*.h ./*.inc libbrisk.map libbrisk.exp amd metis omp tools "$d" && make -s -C "$d" clean && make -s -C "$d" -j4 OMP=bundled CC=clang brisk && "$d/brisk" examples/afiro.mps -q && "$d/brisk" examples/theta1.dat-s -q'
 run "Octave: MEX build and test_brisk"        bash -c 'command -v octave-cli > /dev/null && cd matlab && octave-cli --eval "build_brisk_mex; test_brisk" | tee /dev/stderr | grep -q "test_brisk: all checks passed"'
 run "Julia + JuMP + full MOI suite (R7)"      bash -c "[ -x '$JULIA' ] && cd julia/Brisk && BRISK_TEST_MOI=1 '$JULIA' --project=. -e 'import Pkg; Pkg.test(\"Brisk\")'"
 echo "passed: ${#pass[@]}, failed: ${#fail[@]}"

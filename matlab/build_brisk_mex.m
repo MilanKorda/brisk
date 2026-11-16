@@ -34,6 +34,7 @@ p.addParameter('cpu', 'apple-m1');
 p.addParameter('openmp', 'auto');   % 'auto' | 'bundled' | 'system' | false
 p.addParameter('verbose', false);
 p.addParameter('blas', 'auto');     % 'auto' | 'matlab' | 'system' | 'system64'
+p.addParameter('metis', true);      % METIS's nested dissection (../metis, bundled), as the Makefile's METIS ?= 1
 p.parse(varargin{:});
 o = p.Results;
 
@@ -140,6 +141,44 @@ switch omp
         cflags = [cflags ' -include ' fullfile(src, 'omp', 'ompstub.h')];
         files{end + 1} = fullfile(src, 'omp', 'ompstub.c');
         fprintf('OpenMP: off (BLAS threads only)\n');
+end
+
+% METIS (nested dissection, a second fill-reducing order; METIS 5.2.1 with GKlib, Apache License 2.0) is bundled in
+% ../metis, as the Makefile builds it (METIS ?= 1; ../metis/README.md). Its sources need their own flags, and GKlib and
+% libmetis both have a graph.c: they are compiled first, each set into its own folder, and their objects linked below.
+% (13 November 2026, ISSUES 874 (d): before, this build left METIS out and ordered by AMD alone.)
+if o.metis
+    mflags = '-DNDEBUG2 -DUSE_GKRAND -D_GNU_SOURCE -DIDXTYPEWIDTH=32 -DREALTYPEWIDTH=32';
+    % (its symbols hidden, so that the MEX file's calls bind to this copy, never to a METIS the host already loaded: MATLAB
+    % ships its own, and an Octave whose sparse libraries link one; gcc and clang)
+    if ~(ispc && ~isoct), mflags = [mflags ' -fvisibility=hidden']; end
+    minc = {['-I' fullfile(src, 'metis', 'GKlib')], ['-I' fullfile(src, 'metis', 'include')], ['-I' fullfile(src, 'metis', 'libmetis')]};
+    objroot = fullfile(here, 'metis_obj');
+    ext = ternary(ispc && ~isoct, '.obj', '.o');
+    for part = {'GKlib', 'libmetis'}
+        od = fullfile(objroot, part{1});
+        if ~exist(od, 'dir'), mkdir(od); end
+        ms = dir(fullfile(src, 'metis', part{1}, '*.c'));
+        for k = 1:numel(ms)
+            cf = fullfile(src, 'metis', part{1}, ms(k).name);
+            of = fullfile(od, [ms(k).name(1:end-2) ext]);
+            if exist(of, 'file')
+                so = dir(cf); oo = dir(of);
+                if oo.datenum >= so.datenum, files{end + 1} = of; continue; end   % (up to date)
+            end
+            if isoct
+                setenv('CFLAGS', [cflags ' ' mflags ' -w']);
+                [out, status] = mkoctfile('-c', minc{:}, cf, '-o', of);
+                if status ~= 0, error('brisk:build', 'METIS: mkoctfile -c %s failed:\n%s', cf, out); end
+            else
+                mex('-c', '-outdir', od, ['CFLAGS=$CFLAGS ' cflags ' ' mflags ' -w'], minc{:}, cf);
+            end
+            files{end + 1} = of;
+        end
+    end
+    defs = [defs, {'-DHAVE_METIS', '-DIDXTYPEWIDTH=32', '-DREALTYPEWIDTH=32'}];
+    incs{end + 1} = ['-I' fullfile(src, 'metis', 'include')];
+    fprintf('METIS: bundled (../metis, compiled into %s)\n', objroot);
 end
 
 % AMD (the fill-reducing ordering of sparse Schur complements) is bundled in ../amd

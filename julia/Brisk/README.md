@@ -135,10 +135,24 @@ r = Brisk.solve_sedumi("problem.mat")        # a MAT-file with A (or At), b, c, 
 ```
 
 Without semidefinite blocks the problem is solved by BRISK's SOCP solver; with them, or with
-`conesolver = 0`, `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm`, by the semidefinite
+`socpsolver = 0`, `prec`, `bound`, `certify`, `fom`, `mfipm`, `lralm`, by the semidefinite
 solver (second-order cones as arrow blocks). In JuMP, `SecondOrderCone` and
 `RotatedSecondOrderCone` constraints are supported; a model without PSD constraints goes to
-the SOCP solver (`set_attribute(model, "conesolver", 0)` forces the semidefinite solver).
+the SOCP solver (`set_attribute(model, "socpsolver", 0)` forces the semidefinite solver).
+
+**Linear programs.**
+
+```julia
+# min c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub   (nothing: no bounds of that kind; no default lower bound 0)
+r = Brisk.solve_lp(c, A, l, u, lb, ub; c0 = 0.0, lpmethod = 2)
+r.status, r.status_string, r.objective, r.x, r.y, r.z, r.iterations      # z = c - A'y
+```
+
+The LP takes the path of an MPS file of the same LP (the default choice of method, the presolves, the crossover;
+`lpmethod = 1`-`5` as on the command line). `x` is `nothing` when no point is returned; `y` (the rows' multipliers:
+>= 0 at a row's lower side, <= 0 at its upper side) and `z` are `nothing` when the route gives no exact duals (the
+simplex methods and the crossover always give them; the interior-point method's point when its duals, carried through
+the presolves, pass the measure of optimality: signs and a duality gap within 1e-6).
 
 **Quadratic programs.**
 
@@ -156,8 +170,10 @@ r = Brisk.solve_file("problem.qps")                 # a QPS file: a convex QP or
 
 `H` symmetric, or one triangle of it, dense or sparse. By default a small QP with `H` positive definite is solved by
 the dual active-set method and any other by the interior-point method for QPs (`qpas = true`, `qpipm = true`: that
-method); a `Brisk.QpModel` uses the active-set method (`qpipm = true`: the interior-point method, each solve from the
-start). A QP that is not convex is refused (a `Brisk.BriskError`). `Brisk.solve_file` reads every format the command
+method); a `Brisk.QpModel` chooses its method for the stream of solves: the active-set method, each solve from the
+previous active set, for a small QP and where eliminating the equality rows leaves a problem that the stream pays for;
+the interior-point method otherwise, which keeps its setup between the solves and starts from the last solution
+(`qpas = true`, `qpipm = true`: that method). A QP that is not convex is refused (a `Brisk.BriskError`). `Brisk.solve_file` reads every format the command
 line reads and returns the result of its kind (`Brisk.Result`, `Brisk.ConeResult` for a MAT-file, `Brisk.QpResult`).
 
 **Very large chordal problems.** When BRISK decomposes a large sparse block into cliques
@@ -200,7 +216,15 @@ to BRISK in one of two SDPA forms:
   - A *variable block* is a cone constraint whose rows are distinct variables with
     coefficient 1 and no constant, which is what JuMP creates for
     `@variable(model, X[1:n,1:n], PSD)` and for `x >= 0`. Its variables are entries of X.
-  - Every other cone constraint gets a slack block S = A x + b, with one row per entry.
+  - Every other cone constraint gets a slack block S = A x + b, with one row per entry. A
+    Nonnegatives row that repeats another's bound on one variable (the same variable, coefficient
+    and constant) is written once; its dual is 0 and the first row carries the bound's
+    multiplier. `X .>= 0` on a symmetric matrix variable states each off-diagonal bound twice:
+    written once, the bounds on X's entries reach BRISK as its first-order method takes them
+    natively (the k-means relaxation with 90 points: 0.11 s against 3.1 s). The automatic form
+    takes the kernel form for such bounds when they are at least half of at least 4,000 rows
+    (BRISK's rule for that method); below, the rule above with the repeats counted as rows (the
+    bounds are then cheaper in the image form: theta-plus with 70 vertices).
   - Every Zeros row is a row.
   - Free variables become split pairs.
   - This is the natural form of SOS programs and of SDPs over matrix variables. BRISK's

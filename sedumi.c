@@ -437,7 +437,7 @@ static int cmp_strip(const void *a, const void *b) {
 static const int g_exit_of_status[8] = { 0, 11, 12, 13, 14, 10, 15, 2 };
 
 /* options of the SOCP solver from the command line's words; returns 0, 1 with a message, or 2:
- * the options ask for the semidefinite solver (-conesolver 0, high precision, bounds, first-order methods) */
+ * the options ask for the semidefinite solver (-socpsolver 0, high precision, bounds, first-order methods) */
 extern int brisk_options_valid(int argc, char **argv);   /* (main.c) */
 /* 2 November 2026: the command line's and the interfaces' default log (main.c sets it for a run of the SOCP solver): the
  * solver's own lines (its header, status and errors) are the diagnosis (-v); the run prints the problem, the method and
@@ -448,10 +448,10 @@ static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nm
     socp_default_opts(o);
     if (g_cone_brief) o->verbose = 0;
     {   /* 31 October 2026 (the SOCP audit's A3): every word checked by the one option parser; an unknown option is an
-         * error here as on the other routes (-coneretry, the QCQP route's internal option, is this parser's own) */
+         * error here as on the other routes (-socpretry, the QCQP route's internal option, is this parser's own) */
         char **av = malloc(sizeof(char *) * ((size_t)argc + 1)); int ac = 0;
         for (int i = 0; av && i < argc; i++) {
-            if (argv[i] && (!strcmp(argv[i], "-coneretry") || !strcmp(argv[i], "-lpmethod"))) { i++; continue; }   /* (-lpmethod 0: the SOCP solver directly for a problem without cones, below) */
+            if (argv[i] && (!strcmp(argv[i], "-socpretry") || !strcmp(argv[i], "-lpmethod"))) { i++; continue; }   /* (-lpmethod 0: the SOCP solver directly for a problem without cones, below) */
             av[ac++] = argv[i];
         }
         const int ok = !av || brisk_options_valid(ac, av);
@@ -467,15 +467,16 @@ static int socp_options(int argc, char **argv, SocpOpts *o, char *msg, size_t nm
         else if (!strcmp(a, "-acc") && i + 1 < argc) { const char *l = argv[++i]; o->tol = !strcmp(l, "low") ? 1e-6 : !strcmp(l, "high") ? 1e-10 : 1e-8; }
         else if (!strcmp(a, "-maxit") && i + 1 < argc) o->maxit = atoi(argv[++i]);
         else if (!strcmp(a, "-timelimit") && i + 1 < argc) o->timelimit = atof(argv[++i]);
-        else if (!strcmp(a, "-coneretry") && i + 1 < argc) o->noretry = atoi(argv[++i]) == 0;     /* (internal: the QCQP route's call, qcqp.c; the command line does not take it) */
+        else if (!strcmp(a, "-socpretry") && i + 1 < argc) o->noretry = atoi(argv[++i]) == 0;     /* (internal: the QCQP route's call, qcqp.c; the command line does not take it) */
         else if (!strcmp(a, "-threads") && i + 1 < argc) {
 #ifdef _OPENMP
-            const int k = atoi(argv[i + 1]); if (k > 0) omp_set_num_threads(k);
+            const int k = atoi(argv[i + 1]); if (k > 0) brisk_user_threads(k);
 #endif
             i++;
         }
         else if (!strcmp(a, "-x") || !strcmp(a, "-y") || !strcmp(a, "-z")) i++;
-        else if (!strcmp(a, "-conesolver") && i + 1 < argc) { if (atoi(argv[++i]) == 0) return 2; }
+        else if ((!strcmp(a, "-socpsolver") || !strcmp(a, "-conesolver")) && i + 1 < argc) { if (atoi(argv[++i]) == 0) return 2; }   /* (-conesolver: the earlier spelling, accepted) */
+        else if (!strcmp(a, "-socpfr") && i + 1 < argc) o->fr = atoi(argv[++i]);     /* (11 November 2026: facial reduction, socp.h) */
         else if (!strcmp(a, "-prec") || !strcmp(a, "-bound") || !strcmp(a, "-certify") || !strcmp(a, "-fom") || !strcmp(a, "-mfipm") || !strcmp(a, "-lralm")) return 2;   /* features of the semidefinite solver */
         else if (a[0] == '-' && i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-') i++;      /* an option of the semidefinite solver with a value: no effect here */
     }
@@ -707,8 +708,8 @@ static int sedumi_solve_body(const SedumiProb *P, int argc, char **argv, SedumiR
     free(T);
     BriskData D = { m, nblk, bs, P->b, nt, tm, tb, ti, tj, tv };
     BriskResult B; memset(&B, 0, sizeof B);
-    /* (26 October 2026: -conesolver is passed on: the semidefinite solver gives a problem whose blocks are all cones in
-     * disguise to the SOCP solver unless -conesolver 0; until then the option was taken out here) */
+    /* (26 October 2026: -socpsolver (earlier -conesolver) is passed on: the semidefinite solver gives a problem whose blocks are all
+     * cones in disguise to the SOCP solver unless -socpsolver 0; until then the option was taken out here) */
     char **av = (char **)malloc(sizeof(char *) * ((size_t)argc + 1)); int ac = 0;
     for (int i = 0; i < argc; i++) av[ac++] = argv[i];
     /* 23 October 2026: the cones' blocks come back as their cone vectors when the solve kept them so (main.c, g_xcone_res):

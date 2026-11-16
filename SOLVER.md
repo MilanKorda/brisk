@@ -1,4 +1,4 @@
-# BRISK 1.6.5: the solver in detail
+# BRISK 1.7: the solver in detail
 
 BRISK solves block-diagonal semidefinite programs with LP blocks:
 
@@ -20,7 +20,7 @@ cones), K.r (rotated second-order cones) and K.s (semidefinite blocks). The same
 taken by `brisk.solve_sedumi` (Python), `Brisk.solve_sedumi` (Julia), `brisk_sedumi`
 (MATLAB/Octave) and `brisk_solve_sedumi` (C). A problem without semidefinite blocks is solved
 by a separate SOCP solver for linear and second-order cone programs; with semidefinite blocks
-(or with `-conesolver 0`, `-prec`, `-bound`, `-certify`) the semidefinite solver takes the
+(or with `-socpsolver 0`, `-prec`, `-bound`, `-certify`) the semidefinite solver takes the
 second-order cones as arrow blocks. CVXPY and JuMP models with second-order cone constraints
 are routed the same way.
 
@@ -28,8 +28,9 @@ are routed the same way.
 
 `./brisk problem.mps` reads a linear program in MPS format (free or fixed), presolves it and
 solves it by an interior-point method for linear programs (upper bounds kept as bounds, normal
-equations); with two threads or more, the dual simplex method runs beside it on one thread and the
-first of the two to finish gives the result (`-lpmethod 1`: the interior-point method alone);
+equations); with two threads or more, the dual simplex method runs beside it on one thread (on a problem
+with many more rows than columns and four threads or more (five elsewhere than on Linux), two dual simplex methods, one on the problem and
+one on its dual) and the first to finish gives the result (`-lpmethod 1`: the interior-point method alone);
 infeasible and unbounded problems are handed to the SOCP solver, which returns the
 certificate. `-x file` writes x of the problem as read. The solution is an interior one (a basic one when the
 simplex method finished first);
@@ -52,7 +53,7 @@ solvers are called by `brisk.solve_qp` and `brisk.solve_file` (Python), `brisk.B
 (CVXPY) and `brisk_solve_qp` (C). For branch and bound, `brisk.QpModel` and `brisk_qp_create` keep a
 QP and re-solve it after changes of its bounds and costs from the previous active set, and
 `brisk.SocpModel` and `brisk_socp_create` do the same for an SOCP, warm-started from the previous
-point. The QP and QCQP solvers are not yet available from Julia and MATLAB.
+point. The QP solver is also called from Julia (`Brisk.solve_qp`, `Brisk.QpModel`, JuMP) and MATLAB/Octave (`brisk_qp`, `BriskQpModel`).
 
 ## Interfaces
 
@@ -198,6 +199,13 @@ Every automatic choice below can be overridden from the command line.
   and the interior-point solve is estimated at 20 s or more:
   with `-fomrace 0.2` it gets 20% of that time (off by default), and the interior-point method
   follows if it has not reached the tolerance.
+  At the default tolerance or looser the engine also runs *first*, whether the Schur complement fits
+  or not, on such problems whose constraints almost all fix a single entry of X (at least 99 %, a
+  few dense rows such as the trace allowed: theta problems, matrix completion) and barely overlap,
+  when the interior-point solve is estimated at 20 s or more from the sizes (`-fomfirst 1`, the
+  default); it hands over to the interior-point method when its projected work exceeds the
+  interior-point method's, unless its errors are already at most 1e-6, in which case its result is
+  returned at reduced accuracy and the log names `-fomfirst 0`. Not at `-acc high`.
 
 - **The matrix-free method first.** On problems with one to four dense blocks of order 100 or
   more that the presolve leaves unchanged and whose Schur factorization is estimated at 3.5

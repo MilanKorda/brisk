@@ -25,6 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <unistd.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #if defined(__AVX512F__) && defined(__AVX512VL__)
 #include <immintrin.h>
 #endif
@@ -36,6 +40,8 @@
  * instructions. Changes of the environment between solves are seen (the Python tests set variables in the process);
  * other names go to getenv. */
 extern char **environ;
+#include <time.h>
+static double lu_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }   /* (as simplex.c's now) */
 static atomic_long g_sx_env_gen = 1;
 void sx_env_refresh(void) { atomic_fetch_add_explicit(&g_sx_env_gen, 1, memory_order_relaxed); }
 static int sx_env_ours(const char *s) { return (s[0] == 'B' && !strncmp(s, "BRISK_", 6)) || (s[0] == 'S' && s[1] == 'X'); }
@@ -137,6 +143,8 @@ typedef struct {
     double ptol;                                            /* the absolute pivot tolerance */
     double *cmax0, canc;                                    /* largest |entry| of each column in B; a pivot below canc times it is refused */
     int nrej; long nrejnz;                                  /* columns dropped by the search (no acceptable pivot) and their entries */
+    int kmax;                                               /* no count exceeds it (the count lists above it stay empty) */
+    int nccomp, nrcomp;                                     /* compactions of the column and row storage (new arrays) */
 } Act;
 
 static void lst_ins(int *head, int *next, int *prev, int k, int j) { next[j] = head[k]; prev[j] = -1; if (head[k] >= 0) prev[head[k]] = j; head[k] = j; }
@@ -156,7 +164,7 @@ static void col_compact(Act *A, int extra) {
         memcpy(ni + e, A->ci + A->cs[j], sizeof(int) * A->cl[j]); memcpy(nv + e, A->cv + A->cs[j], sizeof(double) * A->cl[j]);
         A->cs[j] = e; A->cc[j] = A->cl[j] + 2; e += A->cc[j];
     }
-    free(A->ci); free(A->cv); A->ci = ni; A->cv = nv; A->cend = e; A->ccap = (int)cap;
+    free(A->ci); free(A->cv); A->ci = ni; A->cv = nv; A->cend = e; A->ccap = (int)cap; A->nccomp++;
 }
 static void col_reserve(Act *A, int j, int need) {
     if (A->cl[j] + need <= A->cc[j]) return;
@@ -179,7 +187,7 @@ static void row_compact(Act *A, int extra) {
         for (int p = A->rs[i]; p < A->rs[i] + A->rp[i]; p++) if (A->cact[A->ri[p]]) ni[e + k++] = A->ri[p];
         A->rp[i] = k; A->rs[i] = e; A->rc[i] = k + 2; e += A->rc[i];
     }
-    free(A->ri); A->ri = ni; A->rend = e; A->rcap = (int)cap;
+    free(A->ri); A->ri = ni; A->rend = e; A->rcap = (int)cap; A->nrcomp++;
 }
 static void row_reserve(Act *A, int i, int need) {
     if (A->rp[i] + need <= A->rc[i]) return;
@@ -228,7 +236,7 @@ static int find_pivot(Act *A, double u, int *pr, int *pc) {
      * s; chromaticindex512-7 2.2 -> 1.1 s; the dual simplex method on dfl001, pilot87, sing44 the same). A column always
      * has an acceptable entry (its largest), so the search still ends. BRISK_SXLUROWLIM: the cap (0: none) */
     static int rowlim = -1; if (rowlim < 0) { const char *e = getenv("BRISK_SXLUROWLIM"); rowlim = e ? atoi(e) : 8; }
-    for (int k = 1; k <= A->m; k++) {
+    for (int k = 1; k <= A->kmax; k++) {
         for (int j = A->chead[k], jn; j >= 0; j = jn) {
             jn = A->cnext[j];
             const double cm = col_max(A, j);
@@ -282,8 +290,12 @@ done:
 
 /* the U entries recorded during the elimination: (row r pivoted, position j, value) */
 typedef struct { int *r, *j; double *v; int n, cap; } Trip;
-static void trip_add(Trip *T, int r, int j, double v) {
-    if (T->n == T->cap) { T->cap = 2 * T->cap + 1024; T->r = xrealloc(T->r, sizeof(int) * T->cap); T->j = xrealloc(T->j, sizeof(int) * T->cap); T->v = xrealloc(T->v, sizeof(double) * T->cap); }
+static void __attribute__((noinline)) trip_grow(Trip *T, long need) {
+    long cap = 2 * (long)T->cap + 1024; if (cap < need) cap = need;
+    T->cap = (int)cap; T->r = xrealloc(T->r, sizeof(int) * T->cap); T->j = xrealloc(T->j, sizeof(int) * T->cap); T->v = xrealloc(T->v, sizeof(double) * T->cap);
+}
+static inline void trip_add(Trip *T, int r, int j, double v) {
+    if (T->n == T->cap) trip_grow(T, 0);
     T->r[T->n] = r; T->j[T->n] = j; T->v[T->n] = v; T->n++;
 }
 static void l_add(SxLU *F, int i, double v) {   /* to the column being built: lstart[nl] its start, lstart[nl + 1] its end */
@@ -294,10 +306,12 @@ static void l_add(SxLU *F, int i, double v) {   /* to the column being built: ls
 
 /* (22 October 2026) a copy of a factorization with its updates (lpmodel.c: the state before a trial of bound changes,
  * restored without a new factorization); dst's arrays are freed first */
+struct SxFws; static void fws_free(struct SxFws *W);
 static void *dup_arr(const void *p, size_t bytes) { if (!p) return NULL; void *q = xmalloc(bytes); memcpy(q, p, bytes); return q; }
 void sxlu_copy(SxLU *dst, const SxLU *src) {
     sxlu_free(dst);
     *dst = *src;
+    dst->fws = NULL;      /* (the factorization's work arrays: its own, made at its first factorization) */
     const size_t m = (size_t)src->m, I = sizeof(int), D = sizeof(double);
     dst->stack = dup_arr(src->stack, I * (2 * m + 2)); dst->wmark = dup_arr(src->wmark, I * (m + 1)); dst->wlist = dup_arr(src->wlist, I * (m + 1));
     dst->wval = dup_arr(src->wval, D * (m + 1)); dst->dfs_pos = dup_arr(src->dfs_pos, I * (m + 1)); dst->dmark = dup_arr(src->dmark, m + 1);
@@ -328,7 +342,7 @@ void sxlu_free(SxLU *F) {
     free(F->urs); free(F->url); free(F->urc); free(F->uri); free(F->urv);
     free(F->rpiv); free(F->rstart); free(F->ridx); free(F->rval); free(F->rthead); free(F->rtcnt); free(F->rnext); free(F->reta);
     free(F->stack); free(F->wmark); free(F->wlist); free(F->wval); free(F->dfs_pos); free(F->dmark); free(F->ubm); free(F->ubs);
-    free(F->lcs_row); free(F->lcl_row); free(F->lrorder); free(F->lrlen);
+    free(F->lcs_row); free(F->lcl_row); free(F->lrorder); free(F->lrlen); fws_free(F->fws);
     memset(F, 0, sizeof *F);
 }
 
@@ -353,43 +367,121 @@ void SXL_BL(dgemm_)(const char *, const char *, const int *, const int *, const 
                     const double *, const int *, const double *, double *, const int *);
 void SXL_BL(dtrsm_)(const char *, const char *, const char *, const char *, const int *, const int *, const double *, const double *,
                     const int *, double *, const int *);
-#define SX_DENSE_NB 48
+#define SX_DENSE_NB 128      /* (10 November 2026) the panel's columns: 128 from 2,048 active (a rank-48 update of a large trailing
+                                matrix is bound by memory), 48 below (a block narrower than the panel is factored by the panel's
+                                unblocked loop alone: supportcase34, LP, 1.11 -> 1.27 s with 128 throughout) */
 /* BRISK_SXDENSEBLK=0: the column kernel only, and the switch at SX_DENSE_FRAC */
+/* (10 November 2026) the dense kernel's parallel blocks: not inside another parallel region (the race's jobs run the simplex
+ * method on one thread of their own), BRISK_SXDENSEPAR=0: off */
+static int dense_par(void) {
+    static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXDENSEPAR"); c = !(e && atoi(e) == 0); }
+#ifdef _OPENMP
+    return c && !omp_in_parallel() && omp_get_max_threads() > 1;
+#else
+    return 0;
+#endif
+}
+/* (10 November 2026) the largest dense array of the blocked kernel: a twentieth of the physical memory in doubles (15 GB: 94
+ * million entries, a matrix of 9,700), at least the 25 million of before. With the old fixed cap a dense active matrix
+ * larger than 5,000 went on by the sparse elimination at 30-70 % density: the crossover's first factorization of the outside
+ * LP benchmark's regression LP E0000_5 took 142.6 s, 120 s of it in the 642 sparse pivots from 5,642 active rows down to the
+ * cap's 5,000. BRISK_SXDENSECAP=<entries>: the cap */
+static double dense_cap(void) {
+    static double c = -1;
+    if (c < 0) {
+        const char *e = getenv("BRISK_SXDENSECAP");
+        if (e) c = atof(e);
+        else { const double mem = (double)sysconf(_SC_PHYS_PAGES) * (double)sysconf(_SC_PAGESIZE); c = mem > 0 ? fmax(2.5e7, 0.05 * mem / 8.0) : 2.5e7; }
+    }
+    return c;
+}
 static int dense_blk_on(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_SXDENSEBLK"); c = !(e && atoi(e) == 0); } return c; }
-static int dense_kernel_blocked(SxLU *F, Act *A, Trip *T, int *rowof, int *prow, int *pcol, double *pval, int *np) {
+static int dense_kernel_blocked(SxLU *F, Act *A, Trip *T, int *rowof, int *prow, double *pval, int *np) {
     const int m = A->m;
     int n = 0, nc = 0;
     for (int i = 0; i < m; i++) n += A->ract[i] != 0;
     for (int j = 0; j < m; j++) nc += A->cact[j] != 0;
-    if (n != nc || n == 0) return 0;
+    if (n != nc || n == 0) { if (getenv("SXDBG") && atoi(getenv("SXDBG")) > 1) printf("    [the blocked dense kernel declined: %d active rows, %d columns]\n", n, nc); return 0; }
     int *rid = xmalloc(sizeof(int) * (n + 1)), *cid = xmalloc(sizeof(int) * (n + 1)), *rmap = xmalloc(sizeof(int) * (m + 1)), *perm = xmalloc(sizeof(int) * (n + 1));
     int k = 0;
     for (int i = 0; i < m; i++) { rmap[i] = -1; if (A->ract[i]) { rmap[i] = k; rid[k++] = i; } }
     k = 0; for (int j = 0; j < m; j++) if (A->cact[j]) cid[k++] = j;
+    struct timespec tdk0_; clock_gettime(CLOCK_MONOTONIC, &tdk0_);
     double *D = xcalloc((size_t)n * n, sizeof(double));
     #define DE(i, j) D[(size_t)(j) * n + (i)]
     for (int jj = 0; jj < n; jj++) { const int j = cid[jj]; for (int p = A->cs[j]; p < A->cs[j] + A->cl[j]; p++) DE(rmap[A->ci[p]], jj) = A->cv[p]; }
     for (int i = 0; i < n; i++) perm[i] = i;
-    int ok = 1;
+    int ok = 1, nce = n;      /* (nce: the columns still active; a column without a pivot goes to the end, as the column kernel
+                                * skips it: left active, its position a logical later) */
     const double mone = -1.0, one = 1.0;
-    for (int k0 = 0; k0 < n && ok; k0 += SX_DENSE_NB) {
-        const int kb = n - k0 < SX_DENSE_NB ? n - k0 : SX_DENSE_NB, k1 = k0 + kb;
+    int piv_rows[SX_DENSE_NB];
+    const int NB = n >= 2048 ? SX_DENSE_NB : 48;
+    for (int k0 = 0; k0 < nce && ok; k0 += NB) {
+        int kb = nce - k0 < NB ? nce - k0 : NB, k1 = k0 + kb;
         for (int j = k0; j < k1; j++) {
             int pr = -1; double best = 0;
-            for (int i = j; i < n; i++) { const double a = fabs(DE(i, j)); if (a > best) { best = a; pr = i; } }
-            if (pr < 0 || best < A->ptol || best < A->canc * A->cmax0[cid[j]]) { ok = 0; break; }
-            if (pr != j) { for (int c = 0; c < n; c++) { const double t = DE(j, c); DE(j, c) = DE(pr, c); DE(pr, c) = t; } const int t = perm[j]; perm[j] = perm[pr]; perm[pr] = t; }
+            for (;;) {
+                pr = -1; best = 0;
+                for (int i = j; i < n; i++) { const double a = fabs(DE(i, j)); if (a > best) { best = a; pr = i; } }
+                if (!(pr < 0 || best < A->ptol || best < A->canc * A->cmax0[cid[j]])) break;
+                /* (10 November 2026) no pivot in this column (a singular active matrix: the crossover's start basis of the
+                 * outside LP benchmark's regression LP E0000_5, 5,642 active, the column kernel took 18 s): it goes to the end
+                 * and the last active column takes its place, after the panel's swaps and eliminations so far (the earlier
+                 * panels' updates it has, from the trailing part); declined only when that column is inside the panel */
+                const int last = nce - 1;
+                if (last < k1) {
+                    /* (the last active column inside the panel: it has the panel's swaps and eliminations already; the panel
+                     * ends there) */
+                    for (int i = 0; i < n; i++) { const double t = DE(i, j); DE(i, j) = DE(i, last); DE(i, last) = t; }
+                    { const int t = cid[j]; cid[j] = cid[last]; cid[last] = t; }
+                    nce--; k1 = nce; kb = k1 - k0;
+                    if (j >= k1) break;
+                    continue;
+                }
+                for (int i = 0; i < n; i++) { const double t = DE(i, j); DE(i, j) = DE(i, last); DE(i, last) = t; }
+                { const int t = cid[j]; cid[j] = cid[last]; cid[last] = t; }
+                nce--;
+                double *col = &DE(0, j);
+                for (int t = k0; t < j; t++) { const int a = t, b = piv_rows[t - k0]; if (a != b) { const double v = col[a]; col[a] = col[b]; col[b] = v; } }
+                for (int t = k0; t < j; t++) { const double xt = col[t]; if (xt != 0) for (int i = t + 1; i < n; i++) col[i] -= DE(i, t) * xt; }
+            }
+            if (j >= k1) break;            /* (no active column left) */
+            /* (10 November 2026) the swap within the panel's columns only; the other columns take the panel's swaps once
+             * after it (below), column by column: a swap across all n columns of the column-major array was a strided pass
+             * per pivot */
+            if (pr != j) { for (int c = k0; c < k1; c++) { const double t = DE(j, c); DE(j, c) = DE(pr, c); DE(pr, c) = t; } const int t = perm[j]; perm[j] = perm[pr]; perm[pr] = t; }
+            piv_rows[j - k0] = pr;
             const double rp = 1.0 / DE(j, j);
             for (int i = j + 1; i < n; i++) DE(i, j) *= rp;
             for (int c = j + 1; c < k1; c++) { const double ujc = DE(j, c); if (ujc != 0) for (int i = j + 1; i < n; i++) DE(i, c) -= DE(i, j) * ujc; }
         }
-        if (!ok || k1 >= n) break;
-        const int nr2 = n - k1;
-        SXL_BL(dtrsm_)("L", "L", "N", "U", &kb, &nr2, &one, &DE(k0, k0), &n, &DE(k0, k1), &n);
-        SXL_BL(dgemm_)("N", "N", &nr2, &nr2, &kb, &mone, &DE(k1, k0), &n, &DE(k0, k1), &n, &one, &DE(k1, k1), &n);
+        if (!ok) break;
+        {   /* the panel's swaps to the active columns before it and after it, in the panel's order */
+            const int kbn = k1 - k0;
+            #pragma omp parallel for schedule(static) if (n >= 1024 && dense_par())
+            for (int c = 0; c < nce; c++) {
+                if (c >= k0 && c < k1) continue;
+                double *col = &DE(0, c);
+                for (int t = 0; t < kbn; t++) { const int a = k0 + t, b = piv_rows[t]; if (a != b) { const double v = col[a]; col[a] = col[b]; col[b] = v; } }
+            }
+        }
+        if (k1 >= nce) break;
+        const int nr2 = n - k1, wc = nce - k1;
+        /* (10 November 2026) the block row's solve and the trailing update by chunks of columns on the threads: each column's
+         * arithmetic is that of one call (the same operations in the same order), so the result does not depend on the thread
+         * count. A dense active matrix of 5,000 on one thread took 7.6 s (the outside LP benchmark's regression LP E0000_5,
+         * its crossover's first factorization) */
+        const int CH = 256, nch = (wc + CH - 1) / CH;
+        #pragma omp parallel for schedule(static) if (wc >= 1024 && dense_par())
+        for (int ch = 0; ch < nch; ch++) {
+            const int c0 = k1 + ch * CH, w = nce - c0 < CH ? nce - c0 : CH;
+            SXL_BL(dtrsm_)("L", "L", "N", "U", &kb, &w, &one, &DE(k0, k0), &n, &DE(k0, c0), &n);
+            SXL_BL(dgemm_)("N", "N", &nr2, &w, &kb, &mone, &DE(k1, k0), &n, &DE(k0, c0), &n, &one, &DE(k1, c0), &n);
+        }
     }
     if (!ok) { free(rid); free(cid); free(rmap); free(perm); free(D); return 0; }
-    for (int kk = 0; kk < n; kk++) {
+    struct timespec tdk1_; clock_gettime(CLOCK_MONOTONIC, &tdk1_);
+    for (int kk = 0; kk < nce; kk++) {      /* (the rows and columns left without a pivot stay active, as the column kernel leaves them) */
         const int r = rid[perm[kk]], c = cid[kk];
         const double piv = DE(kk, kk);
         int nl = 0;
@@ -399,18 +491,21 @@ static int dense_kernel_blocked(SxLU *F, Act *A, Trip *T, int *rowof, int *prow,
             for (int i = kk + 1; i < n; i++) if (DE(i, kk) != 0) l_add(F, rid[perm[i]], DE(i, kk));
             F->nl++;
         }
-        for (int jj = kk + 1; jj < n; jj++) if (DE(kk, jj) != 0) trip_add(T, r, cid[jj], DE(kk, jj));
+        for (int jj = kk + 1; jj < nce; jj++) if (DE(kk, jj) != 0) trip_add(T, r, cid[jj], DE(kk, jj));
         F->factor_work += (double)(n - kk - 1) * (n - kk);
         A->ract[r] = 0; A->cact[c] = 0;
-        rowof[c] = r; prow[*np] = r; pcol[*np] = c; pval[*np] = piv; (*np)++;
+        rowof[c] = r; prow[*np] = r; pval[*np] = piv; (*np)++;
     }
     #undef DE
+    if (getenv("SXDBG") && atoi(getenv("SXDBG")) > 1) { struct timespec t2_; clock_gettime(CLOCK_MONOTONIC, &t2_);
+        printf("    [the blocked dense kernel, wall: the copy and the factorization %.3f s, the factors recorded %.3f s]\n",
+               (tdk1_.tv_sec - tdk0_.tv_sec) + 1e-9 * (tdk1_.tv_nsec - tdk0_.tv_nsec), (t2_.tv_sec - tdk1_.tv_sec) + 1e-9 * (t2_.tv_nsec - tdk1_.tv_nsec)); }
     free(rid); free(cid); free(rmap); free(perm); free(D);
     return 1;
 }
-static void dense_kernel(SxLU *F, Act *A, Trip *T, double u, int *rowof, int *prow, int *pcol, double *pval, int *np) {
+static void dense_kernel(SxLU *F, Act *A, Trip *T, double u, int *rowof, int *prow, double *pval, int *np) {
     (void)u;
-    if (dense_blk_on() && dense_kernel_blocked(F, A, T, rowof, prow, pcol, pval, np)) return;
+    if (dense_blk_on() && dense_kernel_blocked(F, A, T, rowof, prow, pval, np)) return;
     const int m = A->m;
     int nr = 0, nc = 0;
     int *rid = xmalloc(sizeof(int) * (m + 1)), *cid = xmalloc(sizeof(int) * (m + 1)), *rmap = xmalloc(sizeof(int) * (m + 1));
@@ -446,7 +541,7 @@ static void dense_kernel(SxLU *F, Act *A, Trip *T, double u, int *rowof, int *pr
         F->factor_work += (double)nl * (nc - jj);
         const int r = rid[ii], c = cid[jj];
         A->ract[r] = 0; A->cact[c] = 0;
-        rowof[c] = r; prow[*np] = r; pcol[*np] = c; pval[*np] = piv; (*np)++;
+        rowof[c] = r; prow[*np] = r; pval[*np] = piv; (*np)++;
     }
     free(rid); free(cid); free(rmap); free(D); free(left); free(lr); free(lv);
 }
@@ -487,8 +582,57 @@ static void defer_back(SxLU *F, Act *A, Trip *T, int m, const int *Ap, const int
     }
     free(x);
 }
+/* (5 November 2026) the factorization's work arrays, kept between factorizations of the same dimension (SxLU.fws): the
+ * arrays of the rows and positions, the active matrix's lists and storage, the U entries recorded. They were allocated,
+ * zeroed and freed at every factorization, and most passes over them ran over all m rows and positions; on savsched1's
+ * dual (LP, 247,801 rows) a factorization of the logicals' basis took 6-8 ms, more than half of it in allocation and
+ * passes over rows that the logicals had already pivoted. Now the passes after the logicals run over the structural
+ * positions and the rows left, and the passes over all rows that remain are plain fills. The same pivots, factors and
+ * order of entries as before */
+struct SxFws {
+    int m;
+    int *rowof, *sj, *apos, *arow, *cnt, *rptr, *rcnt, *rfill, *stk, *upos;
+    double *pval;
+    char *rdone, *umk;
+    unsigned long long *bits;
+    int *rj; long rjcap;
+    int *bp, *bi, *apt; double *bx; long bcap;
+    Trip T;
+    /* the active matrix's arrays (Act), kept with their storage */
+    int *cs, *cl, *cc, *rs, *rl, *rc, *rp, *chead, *cnext, *cprev, *rhead, *rnext, *rprev;
+    double *cmax, *cmax0;
+    char *cact, *ract;
+    int *ci, *ri; double *cv; long cicap, ricap;
+};
+static void fws_free(struct SxFws *W) {
+    if (!W) return;
+    free(W->rcnt); free(W->rfill); free(W->rowof); free(W->sj); free(W->apos); free(W->arow); free(W->cnt); free(W->rptr); free(W->stk); free(W->upos);
+    free(W->pval); free(W->rdone); free(W->umk); free(W->bits); free(W->rj); free(W->bp); free(W->bi); free(W->bx); free(W->apt); free(W->T.r); free(W->T.j); free(W->T.v);
+    free(W->cs); free(W->cl); free(W->cc); free(W->rs); free(W->rl); free(W->rc); free(W->rp); free(W->chead); free(W->cnext); free(W->cprev);
+    free(W->rhead); free(W->rnext); free(W->rprev); free(W->cmax); free(W->cmax0); free(W->cact); free(W->ract); free(W->ci); free(W->ri); free(W->cv);
+    free(W);
+}
+static struct SxFws *fws_get(SxLU *F, int m) {
+    if (F->fws && F->fws->m == m) return F->fws;
+    fws_free(F->fws);
+    struct SxFws *W = xcalloc(1, sizeof *W);
+    const size_t M = (size_t)m + 2;
+    W->m = m;
+    W->rcnt = xmalloc(sizeof(int) * M); W->rfill = xmalloc(sizeof(int) * M); W->rowof = xmalloc(sizeof(int) * M); W->sj = xmalloc(sizeof(int) * M);
+    W->apos = xmalloc(sizeof(int) * M); W->arow = xmalloc(sizeof(int) * M); W->cnt = xmalloc(sizeof(int) * M); W->rptr = xmalloc(sizeof(int) * M);
+    W->stk = xmalloc(sizeof(int) * M); W->upos = xmalloc(sizeof(int) * M); W->bp = xmalloc(sizeof(int) * M); W->apt = xmalloc(sizeof(int) * M);
+    W->pval = xmalloc(sizeof(double) * M); W->rdone = xcalloc(M, 1); W->umk = xcalloc(M, 1);
+    W->bits = xcalloc(M / 64 + 2, sizeof(unsigned long long));
+    W->cs = xmalloc(sizeof(int) * M); W->cl = xmalloc(sizeof(int) * M); W->cc = xmalloc(sizeof(int) * M);
+    W->rs = xmalloc(sizeof(int) * M); W->rl = xmalloc(sizeof(int) * M); W->rc = xmalloc(sizeof(int) * M); W->rp = xmalloc(sizeof(int) * M);
+    W->chead = xmalloc(sizeof(int) * M); W->cnext = xmalloc(sizeof(int) * M); W->cprev = xmalloc(sizeof(int) * M);
+    W->rhead = xmalloc(sizeof(int) * M); W->rnext = xmalloc(sizeof(int) * M); W->rprev = xmalloc(sizeof(int) * M);
+    W->cmax = xmalloc(sizeof(double) * M); W->cmax0 = xmalloc(sizeof(double) * M); W->cact = xcalloc(M, 1); W->ract = xcalloc(M, 1);
+    F->fws = W;
+    return W;
+}
 int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const double *Ax, int *var, int *out) {
-    if (F->m != m) { const double pt = F->pivthr, pc = F->pivcanc; sxlu_free(F); F->m = m; F->pivthr = pt; F->pivcanc = pc; }   /* (the settings kept) */
+    if (F->m != m) { const double pt = F->pivthr, pc = F->pivcanc, dl = F->deadline; const volatile int *sf = F->stopf; sxlu_free(F); F->m = m; F->pivthr = pt; F->pivcanc = pc; F->deadline = dl; F->stopf = sf; }   /* (the settings kept, the stop and the deadline too: ISSUES 884) */
     const double u = F->pivthr > 0 ? F->pivthr : 0.1, ptol = SX_PIVTOL;
     /* work arrays kept between factorizations */
     if (!F->stack) {
@@ -503,81 +647,129 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         F->ucs = xmalloc(sizeof(int) * ((size_t)m + 1)); F->ucl = xmalloc(sizeof(int) * ((size_t)m + 1)); F->ucc = xmalloc(sizeof(int) * ((size_t)m + 1));
         F->urs = xmalloc(sizeof(int) * ((size_t)m + 1)); F->url = xmalloc(sizeof(int) * ((size_t)m + 1)); F->urc = xmalloc(sizeof(int) * ((size_t)m + 1));
     }
-    int *prow = xmalloc(sizeof(int) * m), *pcol = xmalloc(sizeof(int) * m); double *pval = xmalloc(sizeof(double) * m);
-    int *rowof = xmalloc(sizeof(int) * m);       /* pivot row of each position (-1: none yet) */
-    char *rdone = xcalloc(m, 1);
-    int np = 0;
+    struct SxFws *W = fws_get(F, m);
+    /* the pivot rows in pivot order (prow) are stored as U's order at once */
+    if (F->ordcap < 2 * m + 16) { F->ordcap = 2 * m + 16; F->uord = xrealloc(F->uord, sizeof(int) * F->ordcap); }
+    int *prow = F->uord, *rowof = W->rowof; double *pval = W->pval;
+    char *rdone = W->rdone;
+    int *sj = W->sj, *apos = W->apos, *arow = W->arow;   /* the structural positions, the positions left to the elimination, its rows */
+    int np = 0, ns = 0, nap = 0, nar = 0;
     F->nl = 0; F->lstart[0] = 0; F->nr = 0; F->nupd = 0; F->rank_deficient = 0; F->factor_work = 0;
-    Trip T = {0};
-    for (int j = 0; j < m; j++) rowof[j] = -1;
-    /* 1. logicals first (bulk): their rows leave the active matrix; entries of other columns there go to U */
+    Trip T = W->T; T.n = 0;
+    memset(rowof, 0xff, sizeof(int) * (size_t)m);       /* pivot row of each position (-1: none yet) */
+    memset(rdone, 0, (size_t)m);
+    /* 1. logicals first (bulk): their rows leave the active matrix; entries of other columns there go to U. A second
+     * logical of the same row (singular) is left to the elimination as an empty column (apos, merged below) */
+    int *dupl = W->upos, ndup = 0;     /* (upos is free until the elimination) */
     for (int j = 0; j < m; j++) {
-        if (var[j] < n) continue;
+        if (var[j] < n) { sj[ns++] = j; continue; }
         const int i = var[j] - n;
-        if (rdone[i]) continue;          /* a second logical of the same row: singular, left to the end */
-        rdone[i] = 1; rowof[j] = i; prow[np] = i; pcol[np] = j; pval[np] = 1.0; np++;
+        if (rdone[i]) { dupl[ndup++] = j; continue; }
+        rdone[i] = 1; rowof[j] = i; prow[np] = i; np++;     /* (its pivot 1: pval is not set for the first nlog) */
     }
+    const int nlog = np;
     /* 1b. column singletons (structural columns with one entry in the rows left), in bulk like the logicals: no
      * elimination, their rows leave the active matrix (entries of other columns there go to U, the column's own entries
      * in rows pivoted before it too), and the counts of the columns with an entry in such a row drop, which can make
-     * more singletons. Counts and a row-wise copy of the structural entries make it linear in the basis' entries. */
+     * more singletons. Counts and a row-wise copy of the structural entries in the rows left make it linear in the
+     * basis' entries. */
+    /* (5 November 2026) the basis' structural columns first copied together, without explicit zeros (bp, bi, bx: column t
+     * is position sj[t]): the passes below read them in one block instead of the columns of A scattered over its storage */
+    long nzs = 0;
+    int *bp = W->bp, *bi; double *bx;
     {
-        int *cnt = xcalloc(m, sizeof(int)), *rptr = xcalloc(m + 2, sizeof(int)), *stk = xmalloc(sizeof(int) * (m + 1)); int nst = 0;
-        long nzb = 0;
-        for (int j = 0; j < m; j++) {
-            if (var[j] >= n) continue;
-            for (int p = Ap[var[j]]; p < Ap[var[j] + 1]; p++) if (Ax[p] != 0) { rptr[Ai[p] + 1]++; nzb++; if (!rdone[Ai[p]]) cnt[j]++; }
+        for (int t = 0; t < ns; t++) { const int v = var[sj[t]]; nzs += Ap[v + 1] - Ap[v]; }
+        if (W->bcap < nzs + 1) { W->bcap = nzs + 1 + nzs / 4; free(W->bi); free(W->bx); W->bi = xmalloc(sizeof(int) * W->bcap); W->bx = xmalloc(sizeof(double) * W->bcap); }
+        bi = W->bi; bx = W->bx;
+    }
+    {
+        int *cnt = W->cnt, *stk = W->stk; int nst = 0;     /* cnt by t */
+        /* the rows left after the logicals, in increasing order (a word of eight rows skipped at once when all are done);
+         * their counts, starts and fill pointers in the row-wise copy (rcnt, rbeg, fill: set for these rows only) */
+        {
+            const unsigned long long all = 0x0101010101010101ULL;
+            int i = 0;
+            for (; i + 8 <= m; i += 8) {
+                unsigned long long w; memcpy(&w, rdone + i, 8);
+                if (w == all) continue;
+                for (int k = i; k < i + 8; k++) if (!rdone[k]) arow[nar++] = k;
+            }
+            for (; i < m; i++) if (!rdone[i]) arow[nar++] = i;
         }
-        for (int i = 0; i < m; i++) rptr[i + 1] += rptr[i];
-        int *rj = xmalloc(sizeof(int) * (nzb + 1)), *fill = xmalloc(sizeof(int) * (m + 1));
-        memcpy(fill, rptr, sizeof(int) * m);
-        for (int j = 0; j < m; j++) {
-            if (var[j] >= n) continue;
-            for (int p = Ap[var[j]]; p < Ap[var[j] + 1]; p++) if (Ax[p] != 0) rj[fill[Ai[p]]++] = j;
-            if (cnt[j] == 1) stk[nst++] = j;
+        int *rcnt = W->rcnt, *rbeg = W->rptr, *fill = W->rfill;
+        for (int t = 0; t < nar; t++) rcnt[arow[t]] = 0;
+        long nzb = 0; int q = 0;
+        bp[0] = 0;
+        for (int t = 0; t < ns; t++) {
+            const int v = var[sj[t]]; int c = 0;
+            for (int p = Ap[v]; p < Ap[v + 1]; p++) {
+                if (Ax[p] == 0) continue;
+                const int i = Ai[p];
+                bi[q] = i; bx[q] = Ax[p]; q++;
+                if (!rdone[i]) { rcnt[i]++; c++; }
+            }
+            bp[t + 1] = q; cnt[t] = c; nzb += c;
+        }
+        { int run = 0; for (int t = 0; t < nar; t++) { const int i = arow[t]; rbeg[i] = run; fill[i] = run; run += rcnt[i]; } }
+        if (W->rjcap < nzb + 1) { W->rjcap = nzb + 1 + nzb / 4; free(W->rj); W->rj = xmalloc(sizeof(int) * W->rjcap); }
+        int *rj = W->rj;      /* the columns (t) of each row left */
+        for (int t = 0; t < ns; t++) {
+            for (int p = bp[t]; p < bp[t + 1]; p++) if (!rdone[bi[p]]) rj[fill[bi[p]]++] = t;
+            if (cnt[t] == 1) stk[nst++] = t;
         }
         while (nst > 0) {
-            const int j = stk[--nst];
-            if (rowof[j] >= 0 || cnt[j] != 1) continue;
-            const int v = var[j];
+            const int t = stk[--nst], j = sj[t];
+            if (rowof[j] >= 0 || cnt[t] != 1) continue;
             int i = -1; double a = 0;
-            for (int p = Ap[v]; p < Ap[v + 1]; p++) if (Ax[p] != 0 && !rdone[Ai[p]]) { i = Ai[p]; a = Ax[p]; break; }
+            for (int p = bp[t]; p < bp[t + 1]; p++) if (!rdone[bi[p]]) { i = bi[p]; a = bx[p]; break; }
             if (i < 0 || fabs(a) < ptol) continue;    /* (left to the elimination) */
-            if (F->pivcanc > 0) { double cm = 0; for (int p = Ap[v]; p < Ap[v + 1]; p++) cm = fmax(cm, fabs(Ax[p])); if (fabs(a) < F->pivcanc * cm) continue; }
-            for (int p = Ap[v]; p < Ap[v + 1]; p++) if (Ax[p] != 0 && Ai[p] != i) trip_add(&T, Ai[p], j, Ax[p]);
-            rdone[i] = 1; rowof[j] = i; prow[np] = i; pcol[np] = j; pval[np] = a; np++;
-            for (int p = rptr[i]; p < rptr[i + 1]; p++) { const int k = rj[p]; if (rowof[k] < 0 && --cnt[k] == 1) stk[nst++] = k; }
+            if (F->pivcanc > 0) { double cm = 0; for (int p = bp[t]; p < bp[t + 1]; p++) cm = fmax(cm, fabs(bx[p])); if (fabs(a) < F->pivcanc * cm) continue; }
+            if (T.n + (bp[t + 1] - bp[t]) > T.cap) trip_grow(&T, T.n + (bp[t + 1] - bp[t]));
+            for (int p = bp[t]; p < bp[t + 1]; p++) if (bi[p] != i) { T.r[T.n] = bi[p]; T.j[T.n] = j; T.v[T.n] = bx[p]; T.n++; }
+            rdone[i] = 1; rowof[j] = i; prow[np] = i; pval[np] = a; np++;
+            for (int p = rbeg[i]; p < rbeg[i] + rcnt[i]; p++) { const int k = rj[p]; if (rowof[sj[k]] < 0 && --cnt[k] == 1) stk[nst++] = k; }
         }
-        free(cnt); free(rptr); free(stk); free(rj); free(fill);
+        /* the positions left, in increasing order: the structural ones not pivoted (apt: their t) and the duplicate logicals
+         * (apt -1) */
+        int a = 0, b = 0;
+        while (a < ns || b < ndup) {
+            if (b >= ndup || (a < ns && sj[a] < dupl[b])) { const int j = sj[a++]; if (rowof[j] >= 0) continue; W->apt[nap] = a - 1; apos[nap++] = j; }
+            else { W->apt[nap] = -1; apos[nap++] = dupl[b++]; }
+        }
+        /* the rows left after the singletons */
+        int k = 0;
+        for (int t = 0; t < nar; t++) if (!rdone[arow[t]]) arow[k++] = arow[t];
+        nar = k;
     }
     /* 2. the active matrix: structural columns, entries in rows not yet pivoted */
-    Act A; memset(&A, 0, sizeof A); A.m = m; A.ptol = ptol; A.canc = F->pivcanc; A.cmax0 = xcalloc(m, sizeof(double));
-    long nzs = 0;
-    for (int j = 0; j < m; j++) if (var[j] < n) nzs += Ap[var[j] + 1] - Ap[var[j]];
-    A.ccap = (int)(2 * nzs + 4 * (long)m + 16); A.ci = xmalloc(sizeof(int) * A.ccap); A.cv = xmalloc(sizeof(double) * A.ccap);
-    A.rcap = A.ccap; A.ri = xmalloc(sizeof(int) * A.rcap);
-    A.cs = xmalloc(sizeof(int) * m); A.cl = xcalloc(m, sizeof(int)); A.cc = xcalloc(m, sizeof(int));
-    A.rs = xmalloc(sizeof(int) * m); A.rl = xcalloc(m, sizeof(int)); A.rc = xcalloc(m, sizeof(int)); A.rp = xcalloc(m, sizeof(int));
-    A.chead = xmalloc(sizeof(int) * (m + 1)); A.cnext = xmalloc(sizeof(int) * m); A.cprev = xmalloc(sizeof(int) * m);
-    A.rhead = xmalloc(sizeof(int) * (m + 1)); A.rnext = xmalloc(sizeof(int) * m); A.rprev = xmalloc(sizeof(int) * m);
-    A.cmax = xmalloc(sizeof(double) * m); A.cact = xcalloc(m, 1); A.ract = xcalloc(m, 1);
-    for (int k = 0; k <= m; k++) A.chead[k] = A.rhead[k] = -1;
+    Act A; memset(&A, 0, sizeof A); A.m = m; A.ptol = ptol; A.canc = F->pivcanc; A.cmax0 = W->cmax0;
+    A.ccap = (int)(2 * nzs + 4 * (long)m + 16);
+    if (W->cicap < A.ccap) { free(W->ci); free(W->cv); W->cicap = A.ccap; W->ci = xmalloc(sizeof(int) * W->cicap); W->cv = xmalloc(sizeof(double) * W->cicap); }
+    A.ci = W->ci; A.cv = W->cv;
+    A.rcap = A.ccap;
+    if (W->ricap < A.rcap) { free(W->ri); W->ricap = A.rcap; W->ri = xmalloc(sizeof(int) * W->ricap); }
+    A.ri = W->ri;
+    A.cs = W->cs; A.cl = W->cl; A.cc = W->cc; A.rs = W->rs; A.rl = W->rl; A.rc = W->rc; A.rp = W->rp;
+    A.chead = W->chead; A.cnext = W->cnext; A.cprev = W->cprev; A.rhead = W->rhead; A.rnext = W->rnext; A.rprev = W->rprev;
+    A.cmax = W->cmax; A.cact = W->cact; A.ract = W->ract;
+    memset(A.cact, 0, (size_t)m); memset(A.ract, 0, (size_t)m);
+    for (int t = 0; t < nar; t++) A.rl[arow[t]] = 0;
     int e = 0;
-    for (int j = 0; j < m; j++) {
-        A.cs[j] = e; A.cmax[j] = -1;
-        if (rowof[j] >= 0) continue;
+    for (int t = 0; t < nap; t++) {
+        const int j = apos[t];
+        A.cs[j] = e; A.cmax[j] = -1; A.cmax0[j] = 0; A.cl[j] = 0;
+        const int bt = W->apt[t];
         /* (28 October 2026) the largest entries of the columns left to the elimination only (the searches read no other):
          * the pass over every column of the basis was 3.5 % of the dual simplex method's time on the tester's largest
          * coupled network (LP, 575,040 rows), whose columns are mostly pivoted in bulk above */
-        if (var[j] < n) for (int p = Ap[var[j]]; p < Ap[var[j] + 1]; p++) A.cmax0[j] = fmax(A.cmax0[j], fabs(Ax[p]));
-        if (var[j] >= n) { /* a duplicate logical: an empty active column */ A.cact[j] = 1; A.cc[j] = 2; e += 2; continue; }
+        if (bt < 0) { /* a duplicate logical: an empty active column */ A.cact[j] = 1; A.cc[j] = 2; e += 2; continue; }
+        for (int p = bp[bt]; p < bp[bt + 1]; p++) A.cmax0[j] = fmax(A.cmax0[j], fabs(bx[p]));
         A.cact[j] = 1;
-        const int v = var[j];
-        for (int p = Ap[v]; p < Ap[v + 1]; p++) {
-            const int i = Ai[p];
-            if (Ax[p] == 0) continue;
-            if (rdone[i]) trip_add(&T, i, j, Ax[p]);
-            else { A.ci[e] = i; A.cv[e] = Ax[p]; e++; A.cl[j]++; A.rl[i]++; }
+        if (T.n + (bp[bt + 1] - bp[bt]) > T.cap) trip_grow(&T, T.n + (bp[bt + 1] - bp[bt]));
+        for (int p = bp[bt]; p < bp[bt + 1]; p++) {
+            const int i = bi[p];
+            if (rdone[i]) { T.r[T.n] = i; T.j[T.n] = j; T.v[T.n] = bx[p]; T.n++; }
+            else { A.ci[e] = i; A.cv[e] = bx[p]; e++; A.cl[j]++; A.rl[i]++; }
         }
         A.cc[j] = A.cl[j] + 2; e += 2;
     }
@@ -589,11 +781,11 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
      * took 1.2 s each, the searches and scatters of the dense columns at every pivot */
     int ndef = 0, *defj = NULL;
     {
-        long nza = 0; int nr0 = 0;
-        for (int j = 0; j < m; j++) if (A.cact[j]) nza += A.cl[j];
-        for (int i = 0; i < m; i++) nr0 += !rdone[i];
-        for (int j = 0; j < m; j++) {
-            if (!A.cact[j] || var[j] >= n || A.cl[j] < SX_DENSE_MIN) continue;
+        long nza = 0; const int nr0 = nar;
+        for (int t = 0; t < nap; t++) nza += A.cl[apos[t]];
+        for (int t = 0; t < nap; t++) {
+            const int j = apos[t];
+            if (var[j] >= n || A.cl[j] < SX_DENSE_MIN) continue;
             if ((double)A.cl[j] * A.cl[j] <= (double)nr0 + (double)nza) continue;
             if (!defj) defj = xmalloc(sizeof(int) * m);
             defj[ndef++] = j; A.cact[j] = 0;
@@ -601,39 +793,48 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
             A.cl[j] = 0;
         }
     }
+    /* no column count exceeds the rows left, no row count the positions left */
+    A.kmax = nar > nap ? nar : nap;
+    for (int k = 0; k <= A.kmax; k++) A.chead[k] = A.rhead[k] = -1;
     e = 0;
-    for (int i = 0; i < m; i++) { A.rs[i] = e; if (!rdone[i]) { A.ract[i] = 1; A.rc[i] = A.rl[i] + 2; e += A.rc[i]; } A.rl[i] = 0; }
+    for (int t = 0; t < nar; t++) { const int i = arow[t]; A.rs[i] = e; A.ract[i] = 1; A.rc[i] = A.rl[i] + 2; e += A.rc[i]; A.rl[i] = 0; }
     A.rend = e;
-    for (int j = 0; j < m; j++) if (A.cact[j]) for (int p = A.cs[j]; p < A.cs[j] + A.cl[j]; p++) { const int i = A.ci[p]; A.ri[A.rs[i] + A.rl[i]++] = j; }
-    for (int i = 0; i < m; i++) A.rp[i] = A.rl[i];
-    for (int j = 0; j < m; j++) if (A.cact[j]) lst_ins(A.chead, A.cnext, A.cprev, A.cl[j], j);
-    for (int i = 0; i < m; i++) if (A.ract[i]) lst_ins(A.rhead, A.rnext, A.rprev, A.rl[i], i);
+    for (int t = 0; t < nap; t++) { const int j = apos[t]; if (A.cact[j]) for (int p = A.cs[j]; p < A.cs[j] + A.cl[j]; p++) { const int i = A.ci[p]; A.ri[A.rs[i] + A.rl[i]++] = j; } }
+    for (int t = 0; t < nar; t++) A.rp[arow[t]] = A.rl[arow[t]];
+    /* the entries, rows and columns of the active matrix, for the switch to the dense kernel */
+    long nzact = 0; int nca = 0, nra = nar;
+    for (int t = 0; t < nap; t++) { const int j = apos[t]; if (A.cact[j]) { lst_ins(A.chead, A.cnext, A.cprev, A.cl[j], j); nca++; nzact += A.cl[j]; } }
+    for (int t = 0; t < nar; t++) lst_ins(A.rhead, A.rnext, A.rprev, A.rl[arow[t]], arow[t]);
     /* 3. elimination */
     int *wpos = F->wmark;          /* row -> position in the column being updated (+1; 0 none) */
     int *lrows = F->wlist; double *lmul = F->wval; int *ucols = F->lrorder;   /* (lrorder is rebuilt after the elimination) */
     /* (25 October 2026) the column updates in one pass over each column (lu_onepass): wpos holds the pivot column's rows
      * (k + 1 for lrows[k]) for the whole pivot step, umk marks the rows of the column met, upos the positions to update */
     const int onepass = lu_onepass();
-    char *umk = onepass ? xcalloc(m + 1, 1) : NULL; int *upos = onepass ? xmalloc(sizeof(int) * (m + 1)) : NULL;
+    char *umk = W->umk; int *upos = W->upos;     /* (umk is kept zero) */
     int r, c;
-    /* the entries, rows and columns of the active matrix, for the switch to the dense kernel */
-    long nzact = 0; int nca = 0, nra = 0;
-    for (int j = 0; j < m; j++) if (A.cact[j]) { nca++; nzact += A.cl[j]; }
-    for (int i = 0; i < m; i++) nra += A.ract[i];
+    const char *de = getenv("SXDENSE");      /* (experiments; read at each factorization: no static, ISSUES 422) */
+    unsigned lu_chk = 0; int lu_stopped = 0;
     for (;;) {
         /* (25 October 2026) with the blocked dense kernel the switch at 30 % instead of 70 %: a blocked step costs about a tenth
          * of a sparse elimination step per multiply-add, and the sparse work falls with the square of the density, so the
          * two meet near sqrt(0.1); pilot87's crossover (LP) 1.12 -> 0.84 s at 20 %, qap15's 4.62 -> 4.48 s */
         /* (the dense array at most 25 million entries, 200 MB, three times the active entries at 30 %; above, as before) */
-        const char *de = getenv("SXDENSE"); const double dfrac = de ? atof(de) : dense_blk_on() && (double)nca * nra <= 2.5e7 ? SX_DENSE_FRAC_BLK : SX_DENSE_FRAC;   /* (experiments; read each time: no static, ISSUES 422) */
+        const double dfrac = de ? atof(de) : dense_blk_on() && (double)nca * nra <= dense_cap() ? SX_DENSE_FRAC_BLK : SX_DENSE_FRAC;
         if (nca >= SX_DENSE_MIN && nra >= SX_DENSE_MIN && (double)nzact >= dfrac * (double)nca * nra) {
             if (ndef) { defer_back(F, &A, &T, m, Ap, Ai, Ax, var, rdone, defj, ndef, &nca, &nzact); ndef = 0; }
             { const double td = (double)clock() / CLOCKS_PER_SEC;
-              dense_kernel(F, &A, &T, u, rowof, prow, pcol, pval, &np);
+              dense_kernel(F, &A, &T, u, rowof, prow, pval, &np);
               if (getenv("SXDBG") && atoi(getenv("SXDBG")) > 1) printf("    [dense kernel: %d x %d active, %.3f s]\n", nra, nca, (double)clock() / CLOCKS_PER_SEC - td); }
             break;
         }
-        const int fp = find_pivot(&A, u, &r, &c);
+        /* (14 November 2026, ISSUES 884) the stop request and the deadline, every 4 pivots: the crossover's start basis on
+         * highschool1-aigio (LP, 72,004 rows from a list ahead of 192,975 candidates) was factorized for over 70 s past the
+         * time limit, which the crossover checks only between its pushes; stopped, the columns left are replaced by logicals */
+        if (!lu_stopped && (F->stopf || F->deadline > 0) && (++lu_chk & 3) == 0) {
+            if ((F->stopf && __atomic_load_n(F->stopf, __ATOMIC_ACQUIRE)) || (F->deadline > 0 && lu_now() > F->deadline)) lu_stopped = 1;
+        }
+        const int fp = lu_stopped ? 0 : find_pivot(&A, u, &r, &c);
         nca -= A.nrej; nzact -= A.nrejnz; A.nrej = 0; A.nrejnz = 0;
         if (!fp) {
             if (ndef) {     /* the columns set aside come back, updated by L, for the rest of the elimination */
@@ -727,7 +928,7 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         }
         A.ract[r] = 0;
         for (int k = 0; k < nlr; k++) lst_ins(A.rhead, A.rnext, A.rprev, A.rl[lrows[k]], lrows[k]);
-        rowof[c] = r; prow[np] = r; pcol[np] = c; pval[np] = piv; np++;
+        rowof[c] = r; prow[np] = r; pval[np] = piv; np++;
     }
     /* 4. a singular basis: the positions left get the logicals of the rows left */
     int nout = 0;
@@ -743,58 +944,81 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
             const int i = ir++;
             out[nout++] = var[j]; repl[j] = 1;
             var[j] = n + i; rowof[j] = i; A.ract[i] = 0;
-            prow[np] = i; pcol[np] = j; pval[np] = 1.0; np++;
+            prow[np] = i; pval[np] = 1.0; np++;
         }
         F->rank_deficient = nout;
     }
+    /* 6. U: columns and rows keyed by the pivot rows; its order and diagonal (the rows of L below need the order) */
+    if (F->uzcap < 2 * m + 16) { F->uzcap = 2 * m + 16; F->uz = xrealloc(F->uz, sizeof(int) * F->uzcap); }
+    if (!F->uzpos) F->uzpos = xmalloc(sizeof(int) * ((size_t)m + 1));
+    int nu = 0;
+    memset(F->ucl, 0, sizeof(int) * (size_t)m); memset(F->url, 0, sizeof(int) * (size_t)m);
+    /* drop the entries of replaced positions; translate positions to their pivot rows; count */
+    if (!repl) {
+        for (int t = 0; t < T.n; t++) { const int rc = rowof[T.j[t]]; T.j[t] = rc; F->ucl[rc]++; F->url[T.r[t]]++; }
+        nu = T.n;
+    } else
+        for (int t = 0; t < T.n; t++) {
+            const int j = T.j[t];
+            if (repl[j]) continue;      /* a replaced column: the logical has no entries in other rows */
+            const int rc = rowof[j];
+            T.j[nu] = rc; T.r[nu] = T.r[t]; T.v[nu] = T.v[t]; F->ucl[rc]++; F->url[T.r[nu]]++; nu++;
+        }
+    const int need = 2 * nu + 8 * m + 64;
+    if (F->ucap < need) { F->ucap = need; F->uci = xrealloc(F->uci, sizeof(int) * need); F->ucv = xrealloc(F->ucv, sizeof(double) * need); }
+    if (F->urcap < need) { F->urcap = need; F->uri = xrealloc(F->uri, sizeof(int) * need); F->urv = xrealloc(F->urv, sizeof(double) * need); }
+    /* (3 November 2026) the columns stored in pivot order and without spare room: an update never adds to a column (its
+     * spike is a new column, stored at the end of the storage, which is also the end of the order), so the forward
+     * solve with U reads the columns in one backward sweep through memory. The row lists keep their room (the spikes
+     * add to them). satellites2-25 (LP), dual simplex method: the forward solves 3.27 -> 2.88 s, the same bits */
+    /* the pivots that do something in the forward solve with U (a column or a diagonal other than 1), in pivot order */
+    F->nord = np; F->nuz = 0;
+    if (np < m) memset(F->uzpos, 0xff, sizeof(int) * (size_t)m);
+    {
+        int ec = 0;
+        for (int k = 0; k < np; k++) {
+            const int i = prow[k], c0 = F->ucl[i];
+            const double d = k < nlog ? 1.0 : pval[k];
+            F->uordpos[i] = k; F->udiag[i] = d; F->urecip[i] = 1.0 / d;
+            F->ucs[i] = ec; F->ucc[i] = c0; ec += c0; F->ucl[i] = 0;
+            if (c0 > 0 || d != 1.0) { F->uzpos[i] = F->nuz; F->uz[F->nuz++] = i; } else F->uzpos[i] = -1;
+        }
+        F->ucend = ec;
+    }
     /* 5. L by rows, and the per-row access of L columns (for the searches) */
-    for (int i = 0; i < m; i++) { F->lpos[i] = -1; F->lcs_row[i] = 0; F->lcl_row[i] = 0; }
+    memset(F->lpos, 0xff, sizeof(int) * (size_t)m); memset(F->lcs_row, 0, sizeof(int) * (size_t)m); memset(F->lcl_row, 0, sizeof(int) * (size_t)m);
     for (int k = 0; k < F->nl; k++) { const int rr = F->lrow[k]; F->lpos[rr] = k; F->lcs_row[rr] = F->lstart[k]; F->lcl_row[rr] = F->lstart[k + 1] - F->lstart[k]; }
     const int nlz = F->lstart[F->nl];
     F->lridx = xrealloc(F->lridx, sizeof(int) * (nlz + 1)); F->lrval = xrealloc(F->lrval, sizeof(double) * (nlz + 1));
     {
-        int *cnt = F->dfs_pos;
-        for (int i = 0; i <= m; i++) F->lrstart[i] = 0;
-        for (int p = 0; p < nlz; p++) F->lrstart[F->lidx[p] + 1]++;
-        for (int i = 0; i < m; i++) F->lrstart[i + 1] += F->lrstart[i];
-        for (int i = 0; i < m; i++) F->lrlen[i] = F->lrstart[i + 1] - F->lrstart[i];
-        for (int i = 0; i < m; i++) cnt[i] = F->lrstart[i];
+        int *cnt = F->dfs_pos, *lrr = W->sj, nlrr = 0;     /* lrr: the rows with entries in L (sj is free now) */
+        memset(F->lrstart, 0, sizeof(int) * ((size_t)m + 1));
+        for (int p = 0; p < nlz; p++) { const int i = F->lidx[p]; if (F->lrstart[i + 1]++ == 0) lrr[nlrr++] = i; }
+        { int run = 0; for (int i = 0; i < m; i++) { const int c0 = F->lrstart[i + 1]; F->lrlen[i] = c0; cnt[i] = run; run += c0; F->lrstart[i + 1] = run; } }
         for (int k = 0; k < F->nl; k++)
             for (int p = F->lstart[k]; p < F->lstart[k + 1]; p++) { const int i = F->lidx[p]; F->lridx[cnt[i]] = F->lrow[k]; F->lrval[cnt[i]] = F->lval[p]; cnt[i]++; }
-        /* rows with entries in L, by decreasing pivot step */
+        /* rows with entries in L, by decreasing pivot step: their steps marked in a bitmap, read from the top */
         int nro = 0;
-        for (int k = np - 1; k >= 0; k--) { const int rr = prow[k]; if (F->lrstart[rr + 1] > F->lrstart[rr]) F->lrorder[nro++] = rr; }
+        if (np == m) {
+            unsigned long long *bits = W->bits;
+            for (int t = 0; t < nlrr; t++) { const int k = F->uordpos[lrr[t]]; bits[k >> 6] |= 1ULL << (k & 63); }
+            for (int w = (np - 1) >> 6; w >= 0; w--) {
+                unsigned long long b = bits[w];
+                if (!b) continue;
+                bits[w] = 0;
+                while (b) { const int h = 63 - __builtin_clzll(b); F->lrorder[nro++] = prow[(w << 6) + h]; b &= ~(1ULL << h); }
+            }
+        } else
+            for (int k = np - 1; k >= 0; k--) { const int rr = prow[k]; if (F->lrstart[rr + 1] > F->lrstart[rr]) F->lrorder[nro++] = rr; }
         F->nlrorder = nro;
     }
-    /* 6. U: the order, the diagonal, columns and rows keyed by the pivot rows */
-    if (F->ordcap < 2 * m + 16) { F->ordcap = 2 * m + 16; F->uord = xrealloc(F->uord, sizeof(int) * F->ordcap); }
-    F->nord = np;
-    for (int k = 0; k < np; k++) { F->uord[k] = prow[k]; F->uordpos[prow[k]] = k; F->udiag[prow[k]] = pval[k]; F->urecip[prow[k]] = 1.0 / pval[k]; }
-    int nu = 0;
+    /* 6b. U's rows; the entries into the columns and rows */
     {
-        /* drop the entries of replaced positions; translate positions to their pivot rows */
-        for (int t = 0; t < T.n; t++) {
-            const int j = T.j[t];
-            if (repl && repl[j]) continue;      /* a replaced column: the logical has no entries in other rows */
-            T.j[nu] = rowof[j]; T.r[nu] = T.r[t]; T.v[nu] = T.v[t]; nu++;
-        }
-    }
-    {
-        for (int i = 0; i < m; i++) { F->ucl[i] = 0; F->url[i] = 0; }
-        for (int t = 0; t < nu; t++) { F->ucl[T.j[t]]++; F->url[T.r[t]]++; }
-        const int need = 2 * nu + 8 * m + 64;
-        if (F->ucap < need) { F->ucap = need; F->uci = xrealloc(F->uci, sizeof(int) * need); F->ucv = xrealloc(F->ucv, sizeof(double) * need); }
-        if (F->urcap < need) { F->urcap = need; F->uri = xrealloc(F->uri, sizeof(int) * need); F->urv = xrealloc(F->urv, sizeof(double) * need); }
-        int ec = 0, er = 0;
-        /* (3 November 2026) the columns stored in pivot order and without spare room: an update never adds to a column (its
-         * spike is a new column, stored at the end of the storage, which is also the end of the order), so the forward
-         * solve with U reads the columns in one backward sweep through memory. The row lists keep their room (the spikes
-         * add to them). satellites2-25 (LP), dual simplex method: the forward solves 3.27 -> 2.88 s, the same bits */
-        for (int k = 0; k < np; k++) { const int i = prow[k]; F->ucs[i] = ec; F->ucc[i] = F->ucl[i]; ec += F->ucc[i]; F->ucl[i] = 0; }
+        int er = 0;
         for (int i = 0; i < m; i++) {
             F->urs[i] = er; F->urc[i] = F->url[i] + 4; er += F->urc[i]; F->url[i] = 0;
         }
-        F->ucend = ec; F->urend = er;
+        F->urend = er;
         for (int t = 0; t < nu; t++) {
             const int rc = T.j[t], rr = T.r[t];
             int p = F->ucs[rc] + F->ucl[rc]++; F->uci[p] = rr; F->ucv[p] = T.v[t];
@@ -808,12 +1032,6 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
         memcpy(var, nv, sizeof(int) * m);
     }
     F->nnz_l = nlz; F->nnz_u0 = nu; F->nnz_u = nu; F->nnz_r = 0;
-    /* the pivots that do something in the forward solve with U (a column or a diagonal other than 1), in pivot order */
-    if (F->uzcap < 2 * m + 16) { F->uzcap = 2 * m + 16; F->uz = xrealloc(F->uz, sizeof(int) * F->uzcap); }
-    if (!F->uzpos) F->uzpos = xmalloc(sizeof(int) * ((size_t)m + 1));
-    F->nuz = 0;
-    for (int i = 0; i < m; i++) F->uzpos[i] = -1;
-    for (int k = 0; k < np; k++) { const int r = F->uord[k]; if (F->ucl[r] > 0 || F->udiag[r] != 1.0) { F->uzpos[r] = F->nuz; F->uz[F->nuz++] = r; } }
     /* the work of the factorization in entries touched: the elimination's updates (counted above), and the passes
      * over the basis' entries and over the rows that every factorization makes (setting up the active matrix and the
      * count lists, the transposes of L and U, the reordering: about a dozen per row and four per entry) */
@@ -823,12 +1041,13 @@ int sxlu_factor(SxLU *F, int m, int n, const int *Ap, const int *Ai, const doubl
     if (!F->ridx) { F->rcap = 4 * m + 1024; F->ridx = xmalloc(sizeof(int) * F->rcap); F->rval = xmalloc(sizeof(double) * F->rcap); }
     if (!F->rnext) { F->rnext = xmalloc(sizeof(int) * F->rcap); F->reta = xmalloc(sizeof(int) * F->rcap); }
     if (!F->rthead) { F->rthead = xmalloc(sizeof(int) * ((size_t)m + 1)); F->rtcnt = xmalloc(sizeof(int) * ((size_t)m + 1)); }
-    for (int i = 0; i < m; i++) { F->rthead[i] = -1; F->rtcnt[i] = 0; }
-    for (int i = 0; i < m; i++) F->wmark[i] = 0;
-    free(T.r); free(T.j); free(T.v);
-    free(A.cs); free(A.cl); free(A.cc); free(A.ci); free(A.cv); free(A.rs); free(A.rl); free(A.rc); free(A.rp); free(A.ri);
-    free(A.chead); free(A.cnext); free(A.cprev); free(A.rhead); free(A.rnext); free(A.rprev); free(A.cmax); free(A.cmax0); free(defj); free(A.cact); free(A.ract);
-    free(prow); free(pcol); free(pval); free(rowof); free(rdone); free(repl); free(umk); free(upos);
+    memset(F->rthead, 0xff, sizeof(int) * (size_t)m); memset(F->rtcnt, 0, sizeof(int) * (size_t)m);
+    memset(F->wmark, 0, sizeof(int) * (size_t)m);
+    /* the work arrays back to the store (the recorded entries and the active matrix's storage may have moved) */
+    W->T = T;
+    if (A.nccomp) { W->ci = A.ci; W->cv = A.cv; W->cicap = A.ccap; }
+    if (A.nrcomp) { W->ri = A.ri; W->ricap = A.rcap; }
+    free(defj); free(repl);
     return nout;
 }
 
@@ -880,6 +1099,44 @@ static int dfs(SxWs *W, const SxVec *x, const int *start, const int *len, const 
     return nout;
 }
 static void unmark(SxWs *W, int nout) { for (int k = 0; k < nout; k++) W->dmark[W->wlist[k]] = 0; }
+/* (14 November 2026, ISSUES 881; the dual simplex method's sparsest-member rule, BRISK_SXDEGBOUND=1) the number of nonzeros of
+ * B^-1 a for the column whose rows are seed[0..ns-1], counted on the patterns (no cancellation): the rows reached through L's
+ * pattern, then the row etas' pivot rows reached (in their order), then the rows reached through U's pattern. Each stage's set
+ * holds the one before, so the count can stop once it passes bound: the result is then bound + 1 (a member that cannot be the
+ * sparsest is known as such for the work of reaching bound + 1 rows, where the numeric solve reaches all of them) */
+long sxlu_count_bounded(SxLU *F, SxWs *W, const int *seed, int ns, long bound) {
+    unsigned char *mark = W->dmark; int *stk = W->stack, *pos = W->dfs_pos, *vis = W->wlist;
+    long nv = 0, ed = 0;
+    /* a depth-first search from root over (start, len, adj), marking and listing what it reaches; returns 1 when past bound */
+#define CB_DFS(root, start, len, adj) do { \
+        int top_ = 0; stk[0] = (root); pos[0] = 0; \
+        while (top_ >= 0) { \
+            const int r_ = stk[top_]; const int s_ = (start)[r_], l_ = (len)[r_]; int p_ = pos[top_]; \
+            while (p_ < l_ && mark[(adj)[s_ + p_]]) p_++; \
+            ed += p_ - pos[top_] + 1; \
+            if (p_ < l_) { const int nx_ = (adj)[s_ + p_]; pos[top_] = p_ + 1; mark[nx_] = 1; vis[nv++] = nx_; if (nv > bound) goto cb_done; top_++; stk[top_] = nx_; pos[top_] = 0; } \
+            else top_--; \
+        } } while (0)
+    for (int k = 0; k < ns; k++) {
+        const int r0 = seed[k]; if (mark[r0]) continue;
+        mark[r0] = 1; vis[nv++] = r0; if (nv > bound) goto cb_done;
+        CB_DFS(r0, F->lcs_row, F->lcl_row, F->lidx);
+    }
+    for (int e = 0; e < F->nr; e++) {
+        const int r = F->rpiv[e]; if (mark[r]) continue;
+        for (int p = F->rstart[e]; p < F->rstart[e + 1]; p++) if (mark[F->ridx[p]]) { mark[r] = 1; vis[nv++] = r; break; }
+        ed += F->rstart[e + 1] - F->rstart[e];
+        if (nv > bound) goto cb_done;
+    }
+    {   const long n1 = nv;
+        for (long k = 0; k < n1; k++) CB_DFS(vis[k], F->ucs, F->ucl, F->uci);
+    }
+cb_done:
+#undef CB_DFS
+    for (long k = 0; k < nv; k++) mark[vis[k]] = 0;
+    W->nedges += ed;
+    return nv > bound ? bound + 1 : nv;
+}
 /* the factorization's own scratch space, as a workspace */
 static SxWs own_ws(SxLU *F) { SxWs W; W.m = F->m; W.stack = F->stack; W.wmark = F->wmark; W.wlist = F->wlist; W.dfs_pos = F->dfs_pos; W.dmark = F->dmark; W.nflops = 0; W.nedges = 0; W.ubm = F->ubm; W.ubs = F->ubs; return W; }
 void sxws_init(SxWs *W, int m) {
@@ -1088,6 +1345,12 @@ static void ftran_u(SxLU *F, SxWs *W, SxVec *x, int hyper, int track) {
         W->nflops += F->nuz;
     }
 }
+/* (8 November 2026, a diagnostic: BRISK_SXFTPARTS=1) the forward solves' work and time by part (L, the row etas, U), at exit */
+static double ftp_w[3], ftp_t[3], ftp_in[3], ftp_out[3]; static long ftp_n, ftp_hyp;
+static void ftp_print(void) { fprintf(stderr, "[ftparts] %ld solves (%ld hypersparse): L work %.3g time %.3f s, in %.3g; R work %.3g time %.3f s, in %.3g; U work %.3g time %.3f s, in %.3g out %.3g\n",
+    ftp_n, ftp_hyp, ftp_w[0], ftp_t[0], ftp_in[0], ftp_w[1], ftp_t[1], ftp_in[1], ftp_w[2], ftp_t[2], ftp_in[2], ftp_out[2]); }
+static int ftp_on(void) { static int c = -1; if (c < 0) { c = getenv("BRISK_SXFTPARTS") != NULL; if (c) atexit(ftp_print); } return c; }
+static double ftp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + 1e-9 * ts.tv_nsec; }
 void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike) {
     const int m = F->m;
     if (x->cnt < 0) sxv_reindex(x);
@@ -1095,16 +1358,21 @@ void sxlu_ftran_ws(SxLU *F, SxWs *W, SxVec *x, double expdens, SxVec *spike) {
     const int own = W->stack == F->stack;
     const int hyper = x->cnt < ht * m && expdens < ht && (!own || hy_allow(F, 0));
     const long e0 = W->nedges;
+    const int fp = ftp_on(); double t_ = 0; long w_ = 0;
+    if (fp) { ftp_n++; ftp_hyp += hyper; t_ = ftp_now(); w_ = W->nflops + W->nedges; ftp_in[0] += x->cnt; }
     ftran_l(F, W, x, hyper);
     if (x->cnt >= 0) sxv_prune(x);
     if (F->nr && x->cnt < 0) sxv_reindex(x);
+    if (fp) { const double t2 = ftp_now(); const long w2 = W->nflops + W->nedges; ftp_t[0] += t2 - t_; ftp_w[0] += w2 - w_; t_ = t2; w_ = w2; ftp_in[1] += x->cnt >= 0 ? x->cnt : m; }
     if (F->nr) ftran_r(F, W, x);
     if (x->cnt < 0) sxv_reindex(x);
     else sxv_prune(x);
+    if (fp) { const double t2 = ftp_now(); const long w2 = W->nflops + W->nedges; ftp_t[1] += t2 - t_; ftp_w[1] += w2 - w_; t_ = t2; w_ = w2; ftp_in[2] += x->cnt; }
     if (spike) sxv_copy(spike, x);
     /* (22 October 2026) the result's nonzeros tracked during the solve only when it is expected sparse; a dense one (the
      * entering columns of lp_setcover_5k, LP: 59 % of the rows) takes the plain loop and one pass to list it */
     ftran_u(F, W, x, hyper && x->cnt < ht * m, expdens < 0.3);
+    if (fp) { ftp_t[2] += ftp_now() - t_; ftp_w[2] += W->nflops + W->nedges - w_; ftp_out[2] += x->cnt >= 0 ? x->cnt : m; }
     if (own && hyper) hy_note(F, 0, W->nedges - e0);
 }
 

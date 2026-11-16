@@ -8,6 +8,7 @@
  *   brisk_mex('qp_set_row_bounds', h, i, lo, hi); brisk_mex('qp_set_cost', h, f);
  *   [x, y, z, info] = brisk_mex('qp_solve', h); brisk_mex('qp_free', h)
  *   [x, y, z, info] = brisk_mex('qp_file', 'problem.qps', args)
+ *   [x, y, z, info] = brisk_mex('lp', H, f, A, l, u, lb, ub, args)     (H ignored: the LP's data in the QP's form)
  *
  * filename   an SDPA sparse file (.dat-s)
  * m          number of constraints
@@ -23,14 +24,16 @@
  * Outputs: y (m x 1); X, Z cell arrays (SDP block: n x n; LP block: n x 1); info struct.
  * 'sedumi': the problem in SeDuMi format, min c'x s.t. A x = b, x in K: A sparse m x n, the
  * cone as K.f, K.l (scalars) and K.q, K.r, K.s (vectors of dimensions); x, y and z = c - A'y
- * are returned. Problems without semidefinite blocks go to the second-order cone solver.
+ * are returned. Problems without semidefinite blocks go to the SOCP solver.
  * The MATLAB wrappers brisk_sdpa.m and brisk_sedumi.m build these arguments.
  * 'qp': the convex QP min 1/2 x'Hx + f'x s.t. l <= A x <= u, lb <= x <= ub (H and A sparse, H symmetric or one
  * triangle of it; the vectors full, +-Inf for an absent bound), solved by the C library's brisk_solve_qp; 'qp_create'
  * keeps it as a QP model (brisk_qp_create) whose bounds, row bounds and cost can be changed and which 'qp_solve'
  * re-solves from the previous active set (j and i 1-based; h the model's number); 'qp_file' solves a QPS file as the command
  * line does (brisk_solve_file). brisk_qp.m and BriskQpModel.m
- * build these arguments.
+ * build these arguments. 'lp': the LP min f'x s.t. l <= A x <= u, lb <= x <= ub by the C library's brisk_solve_lp (the path
+ * of an MPS file of the same LP); y and z are empty when the route gives no exact duals, x empty when no point is returned;
+ * brisk_lp.m builds the arguments (11 November 2026).
  *
  * The data goes to brisk_run_data in memory (4.39; until 4.38 a temporary SDPA file) and is
  * solved by the same code as the command-line solver (brisk_run in main.c, built with
@@ -275,6 +278,8 @@ const double *brisk_result_sz(const BriskResult *r);
 const double *brisk_result_y(const BriskResult *r);
 void brisk_set_output(int mode, int (*cb)(const char *s, int is_err));
 int brisk_solve_file(const char *fname, int nopt, const char *const *opts, BriskResult *res);
+int brisk_solve_lp(int n, int m, const int *Ap, const int *Ai, const double *Ax, const double *c, double c0,
+                   const double *rl, const double *ru, const double *xl, const double *xu, int nopt, const char *const *opts, BriskResult *res);
 int brisk_solve_qp(int n, int m, const int *Hp, const int *Hi, const double *Hx, const double *c, double c0,
                    const int *Ap, const int *Ai, const double *Ax, const double *rl, const double *ru,
                    const double *xl, const double *xu, int nopt, const char *const *opts, BriskResult *res);
@@ -292,7 +297,7 @@ void brisk_qp_destroy(void *h);
 #define QP_MODELS 4096
 static void *g_qp[QP_MODELS];
 static int g_qp_silent[QP_MODELS], g_qp_n[QP_MODELS];
-static const char *const qp_modes[] = { "qp", "qp_create", "qp_set_var_bounds", "qp_set_row_bounds", "qp_set_cost", "qp_solve", "qp_free", "qp_file" };
+static const char *const qp_modes[] = { "qp", "lp", "qp_create", "qp_set_var_bounds", "qp_set_row_bounds", "qp_set_cost", "qp_solve", "qp_free", "qp_file" };
 static void qp_free_all(void) { for (int k = 0; k < QP_MODELS; k++) if (g_qp[k]) { brisk_qp_destroy(g_qp[k]); g_qp[k] = NULL; } }
 
 /* a QP's data from H, f, A, l, u, lb, ub (prhs[0..6]): H's lower triangle and A by columns as int arrays */
@@ -343,7 +348,7 @@ static char **qp_args(const mxArray *acell, int *na, int *silent) {
 static void qp_outputs(int nlhs, mxArray *plhs[], BriskResult *r) {
     if (brisk_result_status(r) < 0) {
         brisk_result_delete(r);
-        mexErrMsgIdAndTxt("brisk:input", "BRISK did not solve the QP (not convex, or an unknown option): see the messages above");
+        mexErrMsgIdAndTxt("brisk:input", "BRISK did not solve the problem (a QP that is not convex, invalid data, or an unknown option): see the messages above");
     }
     const int n = brisk_result_sn(r), m = brisk_result_m(r);
     plhs[0] = vec_or_empty(brisk_result_sx(r), n);
@@ -386,12 +391,18 @@ static void mex_qp(const char *mode, int nlhs, mxArray *plhs[], int nrhs, const 
         qp_outputs(nlhs, plhs, r);
         return;
     }
-    if (!strcmp(mode, "qp") || !strcmp(mode, "qp_create")) {
-        if (nrhs < 8 || nrhs > 9) fail("brisk:input", "brisk_mex: usage brisk_mex('qp', H, f, A, l, u, lb, ub, args)");
+    if (!strcmp(mode, "qp") || !strcmp(mode, "lp") || !strcmp(mode, "qp_create")) {
+        if (nrhs < 8 || nrhs > 9) fail("brisk:input", "brisk_mex: usage brisk_mex('qp' or 'lp', H, f, A, l, u, lb, ub, args)");
         MexQp Q; qp_data(prhs + 1, &Q);
         int na, silent; char **av = qp_args(nrhs == 9 ? prhs[8] : NULL, &na, &silent);
         g_silent = silent;
         if (silent) av[na++] = "-q";
+        if (!strcmp(mode, "lp")) {
+            BriskResult *r = brisk_result_new();
+            brisk_solve_lp(Q.n, Q.m, Q.Ap, Q.Ai, Q.Ax, Q.f, 0.0, Q.l, Q.u, Q.lb, Q.ub, na, (const char *const *)av, r);
+            qp_outputs(nlhs, plhs, r);
+            return;
+        }
         if (!strcmp(mode, "qp")) {
             BriskResult *r = brisk_result_new();
             brisk_solve_qp(Q.n, Q.m, Q.Hp, Q.Hi, Q.Hx, Q.f, 0.0, Q.Ap, Q.Ai, Q.Ax, Q.l, Q.u, Q.lb, Q.ub, na, (const char *const *)av, r);

@@ -8,7 +8,9 @@
 /* (4 November 2026) the race's log: the simplex method stores its iteration count (all of a solve's rounds counted) at each
  * iteration, one plain store, and its objective and largest violation on the problem as read at the end of an optimal solve,
  * which it computes anyway; nothing is computed for the log. The default route's log reads them (main.c) for display only */
-typedef struct { volatile long it; volatile double obj, pinf; volatile int started, ended; } SimplexProgress;
+typedef struct { volatile long it; volatile double obj, pinf; volatile int started, ended;
+                 volatile long ninf, nsamp; volatile double tpub, ninf0, tpub0; } SimplexProgress;   /* (10 November 2026: the infeasible rows every
+                 1,000 dual iterations (ninf at tpub; the first sample ninf0 at tpub0; nsamp the samples), for the race's retirement rule) */
 
 typedef struct {
     int method;                 /* 0 automatic (the dual simplex method; with two free threads or more the interior-point
@@ -54,6 +56,14 @@ typedef struct {
     int no_dual_route;          /* (28 October 2026) 1: not through the dual problem of a tall problem (the direct job beside
                                    another simplex job that takes that route) */
     SimplexProgress *prog;      /* (4 November 2026) if not NULL: the progress the race's log shows (above) */
+    volatile int *volatile direct_peer;  /* (7 November 2026) if not NULL: set to 1 when this solve declines its route
+                                   through the dual problem (the presolved problem or its dual fails the route's tests), so
+                                   that a job beside it that solves the problem itself, which would repeat this solve, stops;
+                                   read by simplex_solve at its top level only (its routes get NULL) */
+    int *dr_declined;           /* (internal, set by simplex_solve for dual_route: 1 when the route declines) */
+    struct SxCanon *canon;      /* (7 November 2026, BRISK_LPFOLDSCALE) if not NULL: the problem as read on its scaling that does not
+                                   depend on the input's, shared with the caller's folding check (simplex_pre.h, sxpre_canon_get) */
+    int in_rowsift;             /* (internal) a solve on a set of rows of the row sifting */
 } SimplexOpts;
 
 /* basis status of a column or row */
@@ -86,6 +96,8 @@ typedef struct {
     int asread_check;           /* 1: the presolved problem was found infeasible (st_presolved 1) or unbounded (2) in t_presolved
                                    seconds, and the result is that of the problem as read solved without the presolve */
     int st_presolved; double t_presolved;
+    int fin_target;             /* status 4 only from the final check on the problem as given: its violations stayed above the
+                                   target while the basis is optimal by the method's own tolerances */
 } SimplexInfo;
 
 /* x (n), the row activities ax (m, may be NULL), the row duals y (m) and the reduced costs z (n) with z = c - A'y
@@ -96,6 +108,9 @@ typedef struct {
 int simplex_aggb_possible(const LpProb *L);
 /* (28 October 2026) whether the simplex method would solve L through its dual problem (its size rule on L as read) */
 int simplex_dual_route_possible(const LpProb *L);
+/* every column at the bound its cost prefers, when that point satisfies every row: optimal (1, the outputs filled as
+ * simplex_solve fills them, every row's logical basic, y = 0), else 0; any output may be NULL. BRISK_SXBOUNDPT=0: off */
+int sx_bound_point(const LpProb *L, double *x, double *ax, double *y, double *z, int *cstat, int *rstat, SimplexInfo *info);
 int simplex_solve(const LpProb *L, const SimplexOpts *o, double *x, double *ax, double *y, double *z, int *cstat, int *rstat,
                   SimplexInfo *info);
 /* (4 November 2026) the crossover of a tall problem through its dual: the point x0 (n) and the row duals y0 (m, as

@@ -771,6 +771,7 @@ int dual_solve(Problem *P, const Params *par, Result *R, double *yout, double **
             if (phi < phibest) { phibest = phi; abest = a; }
         }
         if (abest == 0) abest = amax * 0.5;
+        if (getenv("BRISK_DUALSTEP")) printf("     [step: amax %.3e (%d halvings), taken %.3e, mu %.3e, |dy| %.3e, slope %.3e, a_db %.3e, cert %s]\n", amax, tries, abest, muk, sqrt(({double q=0; for (int i=0;i<mm;i++) q+=dy[i]*dy[i]; q;})), slope, a_db, cert_now ? "yes" : "no");
         for (int i = 0; i < mm; i++) y[i] += abest * dy[i];
         if (!have_ub) mu *= (abest > 0.9 ? 0.3 : abest > 0.5 ? 0.6 : 0.9);
     }

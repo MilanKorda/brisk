@@ -580,6 +580,7 @@ typedef struct {
     char *mark; dd *w, *t;
     int ndep;                   /* rows found dependent in the last factorization */
     double flops;               /* of the last factorization */
+    double gam;                 /* 15 November 2026 (ISSUES 887): > 0 when M + gam Af Af' is factored (the augmented form) */
 } DSp;
 static void dsp_free(DSp *S) {
     if (!S->perm) return;
@@ -794,9 +795,10 @@ static int dsp_factor(DSp *S, const dd *M) {
     S->flops = fl;
     return 0;
 }
-static void dsp_solve(const DSp *S, dd *x) {
+/* (9 November 2026) the solve with a work array of the caller's, so that several columns can be solved on the threads */
+static void dsp_solve_w(const DSp *S, dd *x, dd *t) {
     if (S->dense) { dd_solve_chol(S->m, S->LD, x); return; }
-    const int m = S->m; const int *p = S->perm; dd *t = S->t; const dd *L = S->L;
+    const int m = S->m; const int *p = S->perm; const dd *L = S->L;
     for (int i = 0; i < m; i++) t[i] = x[p[i]];
     for (int i = 0; i < m; i++) {
         dd s = t[i]; const int *r = S->rs[i]; const dd *Li = L + (size_t)i * m;
@@ -810,6 +812,7 @@ static void dsp_solve(const DSp *S, dd *x) {
     }
     for (int i = 0; i < m; i++) x[p[i]] = t[i];
 }
+static void dsp_solve(const DSp *S, dd *x) { dsp_solve_w(S, x, S->t); }
 
 /* 5.9: the bordered solve for free variables. On entry dy = M^-1 rhs; on exit dy and f_new solve
  * M dy + A_f f_new = rhs, A_f' dy = g, with V = M^-1 A_f and the Cholesky factor of A_f' V. */
@@ -944,6 +947,17 @@ static void ddqr_solve(const Problem *P, DBlk *b, int nb, const DDQR *q, const d
     }
     free(w); free(r); free(t);
 }
+/* M += gam Af Af' (both triangles), by the nonzeros of each free column (ISSUES 887) */
+static void dd_aug(int m, int nf, const dd *Af, double gam, dd *M) {
+    int *nz = malloc(sizeof(int) * (m + 1));
+    for (int f = 0; f < nf; f++) {
+        const dd *a = Af + (size_t)f * m; int k = 0;
+        for (int i = 0; i < m; i++) if (a[i].h != 0 || a[i].l != 0) nz[k++] = i;
+        for (int p = 0; p < k; p++) { const dd gp = dd_muld(a[nz[p]], gam);
+            for (int q = 0; q < k; q++) M[nz[q] + (size_t)nz[p] * m] = dd_add(M[nz[q] + (size_t)nz[p] * m], dd_mul(gp, a[nz[q]])); }
+    }
+    free(nz);
+}
 /* 5.16: the Schur complement assembled, factored, and the free-pair border prepared (Vf = M^-1 Af,
  * S = Af' Vf, its dd Cholesky). Returns 1 on failure (message printed). */
 static int dd_build_factor(const Problem *P, const DBlk *b, int nb, int m, dd *M, DSp *SP, int nf, const dd *Af, dd *Vf, dd *Sf, dd *LSf, int verbose) {
@@ -953,15 +967,61 @@ static int dd_build_factor(const Problem *P, const DBlk *b, int nb, int m, dd *M
         for (int i = j + 1; i < m; i++) M[j + (size_t)i * m] = M[i + (size_t)j * m];
     if (!SP->perm) dsp_init(SP, m, M);
     const double tf = dd_now();
-    const int rf = dsp_factor(SP, M);
+    int rf = SP->gam > 0 ? 1 : dsp_factor(SP, M);   /* (the augmented form, once in use, is factored below) */
     g_ddf_fact += dd_now() - tf;
+    if (rf && nf > 0 && !(SP->gam > 0)) {
+        /* 15 November 2026 (ISSUES 887): with free variables M (the cones' part alone) can be singular while the bordered
+         * system [M Af; Af' 0] is not: constraints that only free variables touch (attr_vdp_d14_K after its sign symmetry,
+         * SDP: 192 free variables, the endgame stopped in its first iteration). The system has the same solution as
+         * [M + gam Af Af', Af; Af' 0] [dy; f] = [rhs + gam Af g; g], whose leading block is positive definite whenever
+         * the bordered system is nonsingular (the augmented-Lagrangian form). gam = max diag M / max diag Af Af' (1 when
+         * M's diagonal is 0). From here on the endgame factors that form (dd_solve_b adds gam Af g to every right-hand
+         * side; the refinement's residuals are those of the original system); the symbolic setup is made again for its
+         * pattern. BRISK_DDAUG=0: off */
+        static int aug_env = -1; if (aug_env < 0) { const char *e = getenv("BRISK_DDAUG"); aug_env = !(e && atoi(e) == 0); }
+        if (aug_env) {
+            double mm = 0, ma = 0;
+            for (int i = 0; i < m; i++) mm = fmax(mm, dd_d(M[i + (size_t)i * m]));
+            for (int i = 0; i < m; i++) { double t = 0; for (int f = 0; f < nf; f++) { const double v = dd_d(Af[i + (size_t)f * m]); t += v * v; } ma = fmax(ma, t); }
+            SP->gam = ma > 0 ? (mm > 0 ? mm / ma : 1.0) : 0.0;
+            if (SP->gam > 0) {
+                dd_aug(m, nf, Af, SP->gam, M);
+                dsp_free(SP); memset(SP, 0, sizeof(*SP)); dsp_init(SP, m, M);
+                SP->gam = mm > 0 ? mm / ma : 1.0;
+                rf = dsp_factor(SP, M);
+                if (verbose > 0) printf("   dd endgame: the cones' Schur complement is singular; the augmented form M + %.2e Af Af' of the free variables' system %s\n", SP->gam, rf ? "fails too" : "is factored");
+            }
+        }
+    } else if (SP->gam > 0) {
+        dd_aug(m, nf, Af, SP->gam, M);
+        rf = dsp_factor(SP, M);
+    }
     if (rf) {                                  /* tiny shift if needed */
         for (int i = 0; i < m; i++) M[i + (size_t)i * m] = dd_add(M[i + (size_t)i * m], dd_muld(M[i + (size_t)i * m], 1e-24));
         if (dsp_factor(SP, M)) { if (verbose > 0) printf("   dd endgame: the Schur complement is not positive definite: stopping\n"); return 1; }
     }
     if (nf > 0) {
+        /* (9 November 2026) the free variables' columns V = M^-1 A_f and A_f' V on the threads: each column and each entry
+         * by itself, in a fixed order, the same bits at any thread count (attr_henon_d10_K, SDP, 198 pairs: 1.28 of the
+         * endgame's 1.69 s at one thread, a column at a time). BRISK_DDBORDPAR=0: serial */
+        static int bpar = -1; if (bpar < 0) { const char *e = getenv("BRISK_DDBORDPAR"); bpar = !(e && atoi(e) == 0); }
+        int nthr = 1;
+#ifdef _OPENMP
+        if (bpar) nthr = omp_get_max_threads();
+#endif
+        if (nthr < 1) nthr = 1;
+        dd *tw = dalloc((size_t)m * nthr);
         memcpy(Vf, Af, sizeof(dd) * (size_t)m * nf);
-        for (int f = 0; f < nf; f++) dsp_solve(SP, Vf + (size_t)f * m);
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr) if (nthr > 1)
+        for (int f = 0; f < nf; f++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            dsp_solve_w(SP, Vf + (size_t)f * m, tw + (size_t)tid * m);
+        }
+        free(tw);
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr) if (nthr > 1)
         for (int f = 0; f < nf; f++) for (int g = 0; g <= f; g++) {
             dd s = dd_of(0.0);
             for (int i = 0; i < m; i++) s = dd_add(s, dd_mul(Af[i + (size_t)f * m], Vf[i + (size_t)g * m]));
@@ -970,6 +1030,11 @@ static int dd_build_factor(const Problem *P, const DBlk *b, int nb, int m, dd *M
         if (dd_chol(nf, Sf, LSf)) { if (verbose > 0) printf("   dd endgame: the free variables' system is not positive definite: stopping\n"); return 1; }
     }
     return 0;
+}
+/* x += gam Af g (ISSUES 887) */
+static void dd_addaf(int m, int nf, const dd *Af, double gam, const dd *g, dd *x) {
+    for (int f = 0; f < nf; f++) { const dd gg = dd_muld(g[f], gam); const dd *a = Af + (size_t)f * m;
+        for (int i = 0; i < m; i++) if (a[i].h != 0 || a[i].l != 0) x[i] = dd_add(x[i], dd_mul(a[i], gg)); }
 }
 /* 5.16: the (bordered) Newton system [M Af; Af' 0] [dy; f] = [rhs; g] solved with the factor SP (and
  * Vf, LSf) and refined with the residual of the dd system computed through the operator (ddqr_mv:
@@ -981,6 +1046,7 @@ static int dd_solve_b(const Problem *P, DBlk *b, int nb, const DSp *SP, int nf, 
                       const dd *rhs, const dd *g, dd *dy, dd *fnew, int maxpass, double *rel_out) {
     const int m = P->m;
     memcpy(dy, rhs, sizeof(dd) * m);
+    if (nf > 0 && SP->gam > 0) dd_addaf(m, nf, Af, SP->gam, g, dy);   /* (the augmented form, ISSUES 887) */
     dsp_solve(SP, dy);
     if (nf > 0) dd_border(m, nf, Af, Vf, LSf, g, dy, fnew);
     if (maxpass <= 0) { if (rel_out) *rel_out = -1; return 0; }
@@ -1005,6 +1071,7 @@ static int dd_solve_b(const Problem *P, DBlk *b, int nb, const DSp *SP, int nf, 
         if (rel <= 1e-24) break;
         if (prev >= 0 && rel > 0.9 * prev) { ok = 0; break; }      /* not converging: the factor is too stale */
         prev = rel;
+        if (nf > 0 && SP->gam > 0) dd_addaf(m, nf, Af, SP->gam, r2, r);
         dsp_solve(SP, r);
         if (nf > 0) dd_border(m, nf, Af, Vf, LSf, r2, r, df);
         for (int i = 0; i < m; i++) dy[i] = dd_add(dy[i], r[i]);
@@ -1247,7 +1314,14 @@ int dd_endgame(const Problem *P, double **Xio, double **Zio, double *y, const Pa
          * the primal residual over the last four steps, applied over the steps the budget still allows, ends above ten
          * times the bar (the full benchmark: 22 of 100 endgames rejected, 33-41 steps creeping at 0.95 a step on Kocvara's
          * moment problems; the accepted ones that run long gain 0.7 a step) */
-        if (meas && bar > 0 && it >= 10 && it <= maxit + maxit / 2 + 2 && brest[it] > bar && brest[it - 4] > 0 && !ENV_ON("BRISK_DDNOPROJ")) {
+        /* (8 November 2026: from the fourth step when the budget allows fewer than ten, so that a short budget does not end
+         * before the rule can act; the inner region-of-attraction files, SDP, ran their whole budget of 6-8 steps at 0.9 s
+         * each and were rejected, ISSUES 760. On 234 files where the endgame runs (the occupation measures, the control
+         * LMIs, SDPLIB-like, option pricing) no status, iteration count or endgame outcome changed, 423.6 -> 421.1 s;
+         * dlyap_30, whose endgame starts with three short steps, kept. BRISK_DDPROJ4=0: from the tenth step only) */
+        static int proj4 = -1; if (proj4 < 0) { const char *e = getenv("BRISK_DDPROJ4"); proj4 = !(e && atoi(e) == 0); }
+        const int pit0 = proj4 && maxit0 < 10 ? 4 : 10;
+        if (meas && bar > 0 && it >= pit0 && it <= maxit + maxit / 2 + 2 && brest[it] > bar && brest[it - 4] > 0 && !ENV_ON("BRISK_DDNOPROJ")) {
             double r = pow(brest[it] / brest[it - 4], 0.25); if (!(r < 1)) r = 1;
             const double proj = brest[it] * pow(r, (double)(maxit - it));
             /* (a tenth of the way short is not evidence: the runs that end accepted speed up after their first steps;

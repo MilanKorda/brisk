@@ -215,6 +215,23 @@ as the Julia package and BRISK's own dual form. The form used is reported in
 BRISK's statuses refer to its own (P) and (D). The interface translates them, since in the image
 form BRISK's (P) is CVXPY's dual problem.
 
+## Linear programs
+
+```python
+import numpy as np, scipy.sparse as sp, brisk
+# min c'x + c0  s.t.  l <= A x <= u,  lb <= x <= ub   (None or +-inf: no bound; a variable without lb is free)
+A = sp.csc_matrix([[1.0, 1], [1, 3], [1, -1]])
+r = brisk.solve_lp([-1.0, -2], A=A, l=[-np.inf, -np.inf, -1], u=[4.0, 6, 3], lb=[0.0, 0], ub=[3.0, np.inf])
+print(r.status_str, r.obj, r.x)      # OPTIMAL -5.0 [3. 1.]
+```
+
+`solve_lp` solves the LP as an MPS file of the same LP would be solved (the default race of the interior-point and dual
+simplex methods, `options=["-lpmethod", "2"]` and the other LP options of the command line) and returns an `LpResult`: status,
+status_str, obj, x (None when no point is returned), y (the rows' multipliers: >= 0 at l, <= 0 at u) and z = c - A'y (>= 0 at
+lb, <= 0 at ub), iterations, time. y and z come from the simplex methods and the crossover always, from the interior-point
+method when its duals, carried through the presolves, pass the measure of optimality (signs, and a duality gap within 1e-6;
+otherwise None: `options=["-lpmethod", "4"]` gives them).
+
 ## Convex quadratic programs
 
 ```python
@@ -248,9 +265,12 @@ prob.solve(solver=brisk.BRISK_QP(), active_set=False)  # the interior-point meth
 
 (other options as keywords: `tol`, `maxit`, `timelimit`, `threads`; the duals in CVXPY's convention).
 
-For branch and bound on a mixed-integer QP, `brisk.QpModel` keeps the problem and re-solves it after changes of
-bounds, row bounds or the cost, each solve from the previous active set (the dual active-set method; `active_set=False`:
-the interior-point method, every solve cold):
+For a receding horizon (model predictive control) or branch and bound on a mixed-integer QP, `brisk.QpModel` keeps the
+problem and re-solves it after changes of bounds, row bounds or the cost. BRISK chooses the model's method: the dual
+active-set method, each solve from the previous active set, when the QP is small or when eliminating its equality rows
+leaves a problem that a stream of solves pays for (an MPC QP written with its states); the interior-point method
+otherwise, which keeps its setup between solves and starts from the last solution. `active_set=True` or `False` asks for
+one of the two:
 
 ```python
 mdl = brisk.QpModel(P, q, A, l, u, lb, ub)
@@ -353,14 +373,14 @@ r = brisk.solve_file("problem.mat")          # a MAT-file with A (or At), b, c, 
 
 Without semidefinite blocks the problem is solved by BRISK's SOCP solver (a separate
 interior-point code for linear and second-order cone programs); its options are `tol`, `acc`,
-`maxit`, `timelimit`, `threads`. With semidefinite blocks, or with `conesolver=0`, `prec`,
+`maxit`, `timelimit`, `threads`. With semidefinite blocks, or with `socpsolver=0`, `prec`,
 `bound`, `certify`, `fom`, `mfipm`, `lralm`, the semidefinite solver is used (second-order
 cones as arrow blocks) with all its options. The result is a `brisk.ConeResult`: `x`, `y`,
 `z = c - A'y` in the SeDuMi order; for an infeasible problem `y` (status 1, b'y = 1) or `x`
 (status 2, c'x = −1) is the certificate.
 
 In CVXPY nothing changes: a model without PSD constraints (LP, QP, SOCP) goes to the cone
-solver, `prob.solve(solver=brisk.BRISK(), conesolver=0)` forces the semidefinite solver.
+solver, `prob.solve(solver=brisk.BRISK(), socpsolver=0)` forces the semidefinite solver.
 
 ## Interrupting a solve
 
@@ -389,9 +409,10 @@ threads run one after the other.
 |---|---|
 | `brisk.BRISK()` | the CVXPY solver |
 | `brisk.BRISK_QP()` | the CVXPY solver for QPs (a quadratic objective, linear constraints) |
-| `brisk.QpModel(P, q, A, l, u, lb, ub, active_set=True)` | a QP re-solved warm after `set_var_bounds`, `set_row_bounds`, `set_cost` (`solve()`, `close()`) |
+| `brisk.QpModel(P, q, A, l, u, lb, ub)` | a QP re-solved after `set_var_bounds`, `set_row_bounds`, `set_cost` (`solve()`, `close()`) |
 | `brisk.SocpModel(A, b, c, K)` | an SOCP re-solved warm after `set_var_bounds`, `set_cost`, `set_cutoff` (`solve()`, `save_point()`, `restore_point(p)`, `close()`) |
 | `brisk.solve_file(path, options=None, verbose=True)` | solve an SDPA file, a SeDuMi MAT-file (`ConeResult`) or a QPS file (`QpResult`) |
+| `brisk.solve_lp(c, A, l, u, lb, ub, c0=0.0, options=None, verbose=True)` | solve an LP in general form (above) |
 | `brisk.solve_qp(P, q, A, l, u, lb, ub, c0=0.0, options=None, verbose=True)` | solve a convex QP (above) |
 | `brisk.solve_sdpa(blocksizes, c, mat, blk, i, j, v, options=None, verbose=True)` | solve SDPA data |
 | `brisk.write_sdpa(path, blocksizes, c, mat, blk, i, j, v)` | write an SDPA file |

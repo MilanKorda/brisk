@@ -28,6 +28,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 double wtime(void);
 
 static void *sx(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fprintf(stderr, "brisk: out of memory (symmetry reduction)\n"); exit(1); } return p; }
@@ -79,6 +82,9 @@ typedef struct {
     SEnt *Es; size_t nes;           /* the entries of S (see sym_auto), sorted, for the verification */
     int nb, *kof, *kc;              /* the block of each index; the block of such a constraint (-1: none) */
     char *cconst; double *kal, *kbt, *cal, *cbt;   /* C is such a matrix on block k (alpha, beta); a constraint's alpha, beta */
+    /* 8 November 2026: the hashes updated by their changed terms (as_individualize_inc): per entry the round that last
+     * updated it, per node the round its colour change applies to and its colour before */
+    long *emk, *isch, rs; int *prevc;
 } ASearch;
 /* the search stops on its work budget (the same point on any machine), on an interrupt, or on the clock at twice
  * the budget in seconds (22 October 2026: fap25, DIMACS, an SDP with 4.5 million indices, ran at 0.6 of the
@@ -111,9 +117,13 @@ static void kn_sort(KN *a, int n, KN *tmp) {
     if (src != a) memcpy(a, src, sizeof(KN) * (size_t)n);
 }
 
+static int g_symrdbg = -1; static long g_symr_rounds = 0, g_symr_calls = 0; static double g_symr_changed = 0, g_symr_items = 0;   /* (experiment: BRISK_SYMRDBG=1) */
+static double g_symr_tgain = 0, g_symr_thash = 0, g_symr_tsort = 0;
+static void symr_report(void) { fprintf(stderr, "[symmetry refinement: %ld calls, %ld rounds, %.3g of %.3g vertex colours changed; gain tests %.3f s, hashing %.3f s, sorting %.3f s]\n", g_symr_calls, g_symr_rounds, g_symr_changed, g_symr_items, g_symr_tgain, g_symr_thash, g_symr_tsort); }
 /* refine col in place to a stable colouring (colours 0..K-1 ranked canonically); returns K */
 static int as_refine(ASearch *A, int *col) {
     const int N = A->N;
+    if (g_symrdbg < 0) { g_symrdbg = getenv("BRISK_SYMRDBG") != NULL; if (g_symrdbg) atexit(symr_report); }
     KN *kn = sx(sizeof(KN) * N), *kn2 = N >= 512 ? malloc(sizeof(KN) * N) : NULL;
     int K = 0;
     { uint64_t *tmp = sx(sizeof(uint64_t) * N); for (int u = 0; u < N; u++) tmp[u] = col[u]; qsort(tmp, N, sizeof(uint64_t), cmp_u64); for (int u = 0; u < N; u++) if (u == 0 || tmp[u] != tmp[u - 1]) K++; free(tmp); }
@@ -134,8 +144,12 @@ static int as_refine(ASearch *A, int *col) {
         /* 23 October 2026: the initial refinement's first round when it alone costs more than the whole budget: the
          * search could not start afterwards, so nothing it finds is lost (bf_40_28, SDP: 0.23 s against 0.05 s) */
         if (round == 0 && A->work == 0 && A->nodes == 0 && wround > A->wmax && !(getenv("BRISK_SYMR0") && atoi(getenv("BRISK_SYMR0")) == 0)) { A->budget_hit = 1; break; }
-        if (A->gain_check && round > 0 && !as_gain_possible(A, col)) { A->no_gain = 1; break; }
+        { const double tg0 = g_symrdbg ? wtime() : 0;
+          const int ng_ = A->gain_check && round > 0 && !as_gain_possible(A, col);
+          if (g_symrdbg) g_symr_tgain += wtime() - tg0;
+          if (ng_) { A->no_gain = 1; break; } }
         A->work += wround;
+        const double th0 = g_symrdbg ? wtime() : 0;
         /* per node: sorted list of item hashes */
         for (int u = 0; u < N; u++) {
             const int d0 = A->adjp[u], d1 = A->adjp[u + 1];
@@ -156,18 +170,183 @@ static int as_refine(ASearch *A, int *col) {
             kn[u].key = ((uint64_t)col[u] << 40) ^ (h64(acc) >> 24);   /* old colour first: refinement, not re-colouring */
             kn[u].node = u;
         }
+        const double ts0_ = g_symrdbg ? wtime() : 0; if (g_symrdbg) g_symr_thash += ts0_ - th0;
         kn_sort(kn, N, kn2);
+        if (g_symrdbg) g_symr_tsort += wtime() - ts0_;
         int K2 = 0;
         for (int q = 0; q < N; q++) { if (q > 0 && kn[q].key != kn[q - 1].key) K2++; A->ncol[kn[q].node] = K2; }
         K2++;
+        if (g_symrdbg) { long ch = 0; for (int u = 0; u < N; u++) ch += A->ncol[u] != col[u]; g_symr_rounds++; g_symr_changed += ch; g_symr_items += N; }
         memcpy(col, A->ncol, sizeof(int) * N);
         if (K2 == K) break;
         K = K2;
     }
+    if (g_symrdbg) g_symr_calls++;
     free(kn); free(kn2);
     return K;
 }
-static int as_individualize(ASearch *A, const int *col, int v, int *out) {
+/* the hash of node u's entries under the colouring col (the multiset of its entries, each with the colours of its other
+ * nodes, its value and kind), as one round of as_refine computes it, without u's own colour */
+/* the term of entry e in node u's hash, given the colours of the entry's ends (a, b, c) */
+static inline uint64_t as_term_c(const ASearch *A, int e, int u, uint64_t ca, uint64_t cb, uint64_t cc) {
+    const int a = A->ea[e], c = A->ec[e];
+    uint64_t h;
+    if (u == c) h = h64((ca < cb ? ca : cb) * 1000003ull + (ca < cb ? cb : ca)) ^ hval(A->ev[e]) ^ (A->ed[e] ? 0x5bd1e995ull : 0);
+    else { const uint64_t co = (u == a) ? cb : ca; h = h64(co * 7919ull + (c >= 0 ? cc * 104729ull + 17 : 0x3c6ef372fe94f82bull)) ^ hval(A->ev[e]) ^ (A->ed[e] ? 0x5bd1e995ull : 0); }
+    return h64(h + 0x632be59bd9b4e019ull);
+}
+static uint64_t as_nhash(const ASearch *A, const int *col, int u) {
+    const int d0 = A->adjp[u], d1 = A->adjp[u + 1];
+    uint64_t acc = 1469598103934665603ull + (uint64_t)(d1 - d0) * 0x9e3779b97f4a7c15ull;
+    for (int q = d0; q < d1; q++) {
+        const int e = A->adj[q];
+        const int a = A->ea[e], b = A->eb[e], c = A->ec[e];
+        acc += as_term_c(A, e, u, (uint64_t)col[a], (uint64_t)col[b], c >= 0 ? (uint64_t)col[c] : 0);
+    }
+    return acc;
+}
+static int cmp_int_asc(const void *a, const void *b) { const int x = *(const int *)a, y = *(const int *)b; return x < y ? -1 : x > y; }
+typedef struct { uint64_t key; int node; } IKN;
+static int cmp_ikn(const void *a, const void *b) { const IKN *x = a, *y = b; return x->key < y->key ? -1 : x->key > y->key ? 1 : x->node - y->node; }
+/* 8 November 2026 (experiments, BRISK_SYMPROF=1): the search's time by part: node invariants, target cells, leaf
+ * certificates, constraint maps, verifications, individualizations with their refinement */
+static double g_sp[8]; static long g_spn[8]; static int g_sp_on = -1;
+static void sp_print(void) { static const char *nm[8] = { "invariants", "target cells", "certificates", "constraint maps", "verifications", "individualize+refine", "of which the setup", "of which the rounds" }; fprintf(stderr, "[symmetry search by part:"); for (int k = 0; k < 8; k++) fprintf(stderr, " %s %.3fs/%ld", nm[k], g_sp[k], g_spn[k]); fprintf(stderr, "]\n"); }
+#define SP_T(k, stmt) do { if (g_sp_on < 0) { g_sp_on = getenv("BRISK_SYMPROF") != NULL; if (g_sp_on) atexit(sp_print); } if (g_sp_on) { const double t_ = wtime(); stmt; g_sp[k] += wtime() - t_; g_spn[k]++; } else { stmt; } } while (0)
+/* 7 November 2026: the refinement after an individualisation, incremental. The parent's colouring is stable (every node of
+ * a class has the same multiset of entry hashes); individualising v gives v a colour of its own and changes nothing else.
+ * A round re-hashes only the nodes that share an entry with a node whose colour changed in the round before (the others'
+ * multisets are unchanged, and in each class they are equal: one of them stands for all); each class holding such a node
+ * is split by the hashes; its largest part keeps the class's colour (ties: the smallest hash), the other parts get new
+ * colours in the order of their hashes, and their nodes are the changed ones of the next round. The result is the stable
+ * colouring the global refinement reaches (the same partition), numbered canonically in another way (a function of the
+ * parent's colours and the hashes alone, so the same in every branch). The global refinement re-hashed all 25,000 nodes
+ * and their entries in every round: a user's unsteady Navier-Stokes relaxation, SDP, 194 refinements of 1.24 rounds, 1.2 s.
+ * BRISK_SYMINC=0: the global refinement */
+static int as_individualize_inc(ASearch *A, const int *col, const uint64_t *pkey, int v, int *out, uint64_t *key) {
+    const int N = A->N;
+    const double tsp0 = g_sp_on > 0 ? wtime() : 0;
+    memcpy(out, col, sizeof(int) * (size_t)N);
+    memcpy(key, pkey, sizeof(uint64_t) * (size_t)N);      /* (8 November 2026: the parent's hashes, each node's as_nhash) */
+    if (getenv("BRISK_SYMDCHK")) { static long nb2 = 0; for (int u = 0; u < N && nb2 < 10; u++) if (as_nhash(A, col, u) != pkey[u]) { nb2++; fprintf(stderr, "[SYMDCHK entry (rs %ld, v %d): node %d's parent hash wrong]\n", A->rs, v, u); } }
+    int K = 0; for (int u = 0; u < N; u++) if (out[u] + 1 > K) K = out[u] + 1;
+    /* the classes as segments of lab (a counting sort by colour); start and size per colour; room for N colours */
+    int *start = sx(sizeof(int) * ((size_t)N + 1)), *size = calloc((size_t)N + 1, sizeof(int)), *lab = sx(sizeof(int) * (size_t)N), *pos = sx(sizeof(int) * (size_t)N);
+    for (int u = 0; u < N; u++) size[out[u]]++;
+    { int t = 0; for (int c = 0; c < K; c++) { start[c] = t; t += size[c]; } int *fill = sx(sizeof(int) * ((size_t)K + 1)); memcpy(fill, start, sizeof(int) * (size_t)K);
+      for (int u = 0; u < N; u++) { lab[fill[out[u]]] = u; pos[u] = fill[out[u]]++; } free(fill); }
+    int *chg = sx(sizeof(int) * (size_t)N), nchg = 0;
+    /* v alone: the rest of its class keeps the colour */
+    { const int c = out[v], s0 = start[c], n0 = size[c];
+      /* (a refinement the budget stopped inside a round left marks of the round to come: a call starts past them) */
+      A->rs++;
+      if (n0 > 1) { const int last = s0 + n0 - 1, w = lab[last]; lab[pos[v]] = w; pos[w] = pos[v]; lab[last] = v; pos[v] = last; size[c] = n0 - 1; start[K] = last; size[K] = 1; out[v] = K; K++; chg[nchg++] = v;
+                    A->prevc[v] = c; A->isch[v] = A->rs + 1; } }
+    int *mark = calloc((size_t)N, sizeof(int)), *cmark = calloc((size_t)N + 1, sizeof(int)), stamp = 0;
+    int *aff = sx(sizeof(int) * (size_t)N), *tcls = sx(sizeof(int) * ((size_t)N + 1)), *trep = sx(sizeof(int) * ((size_t)N + 1));
+    uint64_t *tkey = sx(sizeof(uint64_t) * ((size_t)N + 1));
+    IKN *kn = sx(sizeof(IKN) * (size_t)N);
+    const double tsp1 = g_sp_on > 0 ? wtime() : 0;
+    if (g_sp_on > 0) { g_sp[6] += tsp1 - tsp0; g_spn[6]++; }
+    while (nchg > 0) {
+        if (brisk_stop_flag || A->work > A->wmax || wtime() - A->t0 > A->tclock) { A->budget_hit = 1; break; }
+        stamp++;
+        const long rs = ++A->rs;
+        int naff = 0, nt = 0;
+        double wk = 0;
+        /* 8 November 2026: each node's hash is a sum of one term per entry (as_nhash), so a colour change updates the
+         * hashes by the terms of the entries at the changed nodes alone: each such entry once, its terms for each end under
+         * the colours before and after (an end that changed in the last round has its colour before in prevc). The
+         * hashes are those as_nhash gives, so the classes and their colours are the same; the work is that of the
+         * changed nodes' entries, not of every entry of every node next to them (a constraint of thousands of entries
+         * re-hashed whole whenever one of its indices changed colour). BRISK_SYMDELTA=0: the nodes re-hashed whole */
+        static int sdelta = -1; if (sdelta < 0) { const char *e = getenv("BRISK_SYMDELTA"); sdelta = !(e && atoi(e) == 0); }
+#define AS_OLDC(y) ((uint64_t)(A->isch[y] == rs ? A->prevc[y] : out[y]))
+        for (int k = 0; k < nchg; k++) {
+            const int w = chg[k];
+            for (int q = A->adjp[w]; q < A->adjp[w + 1]; q++) {
+                const int e = A->adj[q], ends[3] = { A->ea[e], A->eb[e], A->ec[e] };
+                if (sdelta) {
+                    if (A->emk[e] == rs) continue;
+                    A->emk[e] = rs;
+                    const int a = ends[0], b = ends[1], c = ends[2];
+                    const uint64_t na = out[a], nb = out[b], ncc = c >= 0 ? (uint64_t)out[c] : 0, oa = AS_OLDC(a), ob = AS_OLDC(b), oc = c >= 0 ? AS_OLDC(c) : 0;
+                    for (int t = 0; t < 3; t++) {
+                        const int x = ends[t];
+                        if (x < 0 || (t == 1 && b == a)) continue;
+                        key[x] += as_term_c(A, e, x, na, nb, ncc) - as_term_c(A, e, x, oa, ob, oc);
+                        if (mark[x] != stamp) { mark[x] = stamp; aff[naff++] = x; }
+                        wk += 2;     /* (two terms: the work unit is one term of a hash, as in the re-hashing it replaces) */
+                    }
+                } else
+                    for (int t = 0; t < 3; t++) { const int x = ends[t]; if (x < 0 || mark[x] == stamp) continue; mark[x] = stamp; aff[naff++] = x; }
+            }
+            wk += A->adjp[w + 1] - A->adjp[w];
+        }
+#undef AS_OLDC
+        if (sdelta && getenv("BRISK_SYMDCHK")) {    /* (debug: the updated hashes against as_nhash) */
+            static long nbad = 0;
+            for (int k = 0; k < naff; k++) { const int x = aff[k]; const uint64_t h = as_nhash(A, out, x); if (h != key[x] && nbad < 20) { nbad++; fprintf(stderr, "[SYMDCHK round %ld: node %d (NI %d) hash differs; changed %d, deg %d]\n", rs, x, A->NI, nchg, A->adjp[x + 1] - A->adjp[x]); } }
+        }
+        for (int k = 0; k < naff; k++) { const int x = aff[k]; if (!sdelta) { key[x] = as_nhash(A, out, x); wk += A->adjp[x + 1] - A->adjp[x]; } if (cmark[out[x]] != stamp) { cmark[out[x]] = stamp; tcls[nt++] = out[x]; } }
+        /* the touched classes in colour order (a canonical order for the new colours) */
+        qsort(tcls, (size_t)nt, sizeof(int), cmp_int_asc);
+        /* each touched class's unaffected representative and its hash, under the round's colours (before any split) */
+        for (int ti = 0; ti < nt; ti++) {
+            const int c = tcls[ti], s0 = start[c], n0 = size[c];
+            trep[ti] = -1;
+            for (int p2 = s0; p2 < s0 + n0; p2++) if (mark[lab[p2]] != stamp) { trep[ti] = lab[p2]; break; }
+            if (trep[ti] >= 0) { if (sdelta) tkey[ti] = key[trep[ti]]; else { tkey[ti] = as_nhash(A, out, trep[ti]); wk += A->adjp[trep[ti] + 1] - A->adjp[trep[ti]]; } }
+        }
+        nchg = 0;
+        for (int ti = 0; ti < nt; ti++) {
+            const int c = tcls[ti], s0 = start[c], n0 = size[c];
+            if (n0 <= 1) continue;
+            /* the members: the affected ones with their hashes, one unaffected one standing for the rest */
+            int nk = 0, nun = 0;
+            const int rep = trep[ti]; const uint64_t krep = rep >= 0 ? tkey[ti] : 0;
+            for (int p2 = s0; p2 < s0 + n0; p2++) { const int x = lab[p2]; if (mark[x] == stamp) { kn[nk].key = key[x]; kn[nk].node = x; nk++; } else nun++; }
+            /* all the same: no split */
+            int same = 1; for (int k = 0; k < nk && same; k++) if (kn[k].key != (rep >= 0 ? krep : kn[0].key)) same = 0;
+            if (same) continue;
+            qsort(kn, (size_t)nk, sizeof(IKN), cmp_ikn);
+            wk += nk * (log2((double)nk + 2.0) + 1.0);
+            /* the parts: runs of equal hash among the affected, and the unaffected (hash krep, nun members) */
+            int np = 0; int *pk0 = sx(sizeof(int) * ((size_t)nk + 2)), *pn = sx(sizeof(int) * ((size_t)nk + 2)); uint64_t *ph = sx(sizeof(uint64_t) * ((size_t)nk + 2));
+            int inserted = rep < 0;
+            for (int k = 0; k < nk; ) {
+                int k2 = k; while (k2 < nk && kn[k2].key == kn[k].key) k2++;
+                if (!inserted && krep < kn[k].key) { pk0[np] = -1; pn[np] = nun; ph[np] = krep; np++; inserted = 1; }
+                if (!inserted && krep == kn[k].key) { pk0[np] = k; pn[np] = (k2 - k) + nun; ph[np] = krep; np++; inserted = 1; k = k2; continue; }
+                pk0[np] = k; pn[np] = k2 - k; ph[np] = kn[k].key; np++; k = k2;
+            }
+            if (!inserted) { pk0[np] = -1; pn[np] = nun; ph[np] = krep; np++; }
+            /* the part that keeps the colour: the largest, ties by the smallest hash (the parts are in hash order) */
+            int keep = 0; for (int p2 = 1; p2 < np; p2++) if (pn[p2] > pn[keep]) keep = p2;
+            /* rewrite the segment: the kept part first, then the others in hash order, each a class */
+            int *seg = sx(sizeof(int) * (size_t)n0), w2 = 0;
+            for (int pass = 0; pass < 2; pass++)
+                for (int p2 = 0; p2 < np; p2++) {
+                    if ((pass == 0) != (p2 == keep)) continue;
+                    const int st = w2;
+                    const int hasun = rep >= 0 && ph[p2] == krep;
+                    if (hasun) for (int p3 = s0; p3 < s0 + n0; p3++) { const int x = lab[p3]; if (mark[x] != stamp) seg[w2++] = x; }
+                    if (pk0[p2] >= 0) { int k = pk0[p2]; while (k < nk && kn[k].key == ph[p2]) seg[w2++] = kn[k++].node; }
+                    if (pass == 0) { start[c] = s0 + st; size[c] = w2 - st; }
+                    else { const int nc = K++; start[nc] = s0 + st; size[nc] = w2 - st; for (int p3 = st; p3 < w2; p3++) { A->prevc[seg[p3]] = c; A->isch[seg[p3]] = rs + 1; out[seg[p3]] = nc; chg[nchg++] = seg[p3]; } }
+                }
+            for (int p3 = 0; p3 < n0; p3++) { lab[s0 + p3] = seg[p3]; pos[seg[p3]] = s0 + p3; }
+            free(seg); free(pk0); free(pn); free(ph);
+        }
+        A->work += wk;
+    }
+    if (g_sp_on > 0) { g_sp[7] += wtime() - tsp1; g_spn[7]++; }
+    free(start); free(size); free(lab); free(pos); free(chg); free(mark); free(cmark); free(aff); free(tcls); free(trep); free(tkey); free(kn);
+    return K;
+}
+static int as_individualize(ASearch *A, const int *col, const uint64_t *pkey, int v, int *out, uint64_t *key) {
+    static int inc = -1; if (inc < 0) { const char *e = getenv("BRISK_SYMINC"); inc = !(e && atoi(e) == 0); }
+    if (inc) return as_individualize_inc(A, col, pkey, v, out, key);
     const int N = A->N;
     for (int u = 0; u < N; u++) out[u] = 2 * col[u] + (col[u] == col[v] && u != v ? 1 : 0);
     return as_refine(A, out);
@@ -462,24 +641,26 @@ static uint64_t as_ninv(const ASearch *A, const int *col) {
  * already searched, so the search returns to the deepest node of the path on the first path (A->unwind);
  * there the new generator fixes the path above it and prunes the orbit of the node it maps (22 October 2026:
  * hamming_11_2, DIMACS, SDP, searched every leaf below each such node: 47 nodes in 32 s, one generator) */
-static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const SEnt *E, size_t ne, const int *cnt, int *path, int onfirst) {
+static void as_dfs(ASearch *A, const int *col, const uint64_t *key, int depth, const double *b, const SEnt *E, size_t ne, const int *cnt, int *path, int onfirst) {
     if (A->nodes > A->maxnodes || as_out(A)) return;
     if (A->finv) {
-        const uint64_t h = as_ninv(A, col);
+        uint64_t h; SP_T(0, h = as_ninv(A, col));
         if (onfirst) A->finv[depth] = h;
         else if (h != A->finv[depth]) { A->pruned++; return; }
     }
     int *cell = sx(sizeof(int) * A->NI);
-    const int nc = as_target(A, col, cell);
+    int nc; SP_T(1, nc = as_target(A, col, cell));
     if (nc == 0) {
         /* leaf */
         if (A->leaf_ref) {
-            if (as_cert(A, col) == A->cert_ref) {
+            uint64_t ct_; SP_T(2, ct_ = as_cert(A, col));
+            if (ct_ == A->cert_ref) {
                 int *g = sx(sizeof(int) * A->NI), *cp = sx(sizeof(int) * (A->m + 1));
                 for (int u = 0; u < A->NI; u++) g[u] = A->inv_ref[col[u]];
-                as_conperm(A, col, cp);
+                SP_T(3, as_conperm(A, col, cp));
                 int ident = 1; for (int u = 0; u < A->NI && ident; u++) if (g[u] != u) ident = 0;
-                if (!ident && as_verify(A, g, cp, b, E, ne, cnt)) {
+                int ok_ = 0; if (!ident) SP_T(4, ok_ = as_verify(A, g, cp, b, E, ne, cnt));
+                if (ok_) {
                     if (A->ngen == A->gcap) { A->gcap *= 2; A->gens = realloc(A->gens, sizeof(int) * (size_t)A->gcap * A->NI); A->gcps = realloc(A->gcps, sizeof(int) * (size_t)A->gcap * (A->m + 1)); }
                     memcpy(A->gens + (size_t)A->ngen * A->NI, g, sizeof(int) * A->NI);
                     memcpy(A->gcps + (size_t)A->ngen * (A->m + 1), cp, sizeof(int) * A->m); A->ngen++;
@@ -493,7 +674,7 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
         free(cell);
         return;
     }
-    int *child = sx(sizeof(int) * A->N);
+    int *child = sx(sizeof(int) * A->N); uint64_t *ckey = sx(sizeof(uint64_t) * A->N);
     /* orbit pruning with the generators that fix the path pointwise (a subgroup of the
      * stabilizer of this node: pruning by its orbits is valid and conservative) */
     int *uf = sx(sizeof(int) * A->NI);
@@ -512,11 +693,12 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
             for (int r = 0; r < q && !skip; r++) if (uf_find(uf, cell[r]) == uf_find(uf, w)) skip = 1;
             if (skip) continue;
         }
-        as_individualize(A, col, w, child); A->nodes++;
+        SP_T(5, as_individualize(A, col, key, w, child, ckey)); A->nodes++;
         path[depth] = w;
         if (!A->leaf_ref && q == 0) {
             /* the reference leaf: leftmost path */
             int *cur = sx(sizeof(int) * A->N); memcpy(cur, child, sizeof(int) * A->N);
+            uint64_t *curk = sx(sizeof(uint64_t) * A->N); memcpy(curk, ckey, sizeof(uint64_t) * A->N);
             int *cc = sx(sizeof(int) * A->NI);
             /* 4 November 2026: the reference descent ends at a leaf, where every index has a colour of its own; a descent
              * that cannot get there within the node cap finds nothing (a user's unsteady Navier-Stokes relaxation, SDP: 501
@@ -524,7 +706,7 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
              * twice what its rate so far separates in the nodes left. BRISK_SYMDESC=0: off */
             static int dstop = -1; if (dstop < 0) { const char *e = getenv("BRISK_SYMDESC"); dstop = !(e && atoi(e) == 0); }
             int *seenc = dstop ? calloc((size_t)A->N + 1, sizeof(int)) : NULL; int stamp = 0, c0 = -1, t0n = 0;
-            for (;;) { const int k = as_target(A, cur, cc); if (k == 0) break; if (A->nodes > A->maxnodes || as_out(A)) { A->nodes = A->maxnodes + 1; break; }
+            for (;;) { int k; SP_T(1, k = as_target(A, cur, cc)); if (k == 0) break; if (A->nodes > A->maxnodes || as_out(A)) { A->nodes = A->maxnodes + 1; break; }
                 if (seenc) {
                     int cells = 0; stamp++;
                     for (int u = 0; u < A->NI; u++) if (seenc[cur[u]] != stamp) { seenc[cur[u]] = stamp; cells++; }
@@ -537,19 +719,20 @@ static void as_dfs(ASearch *A, const int *col, int depth, const double *b, const
                         }
                     }
                 }
-                int *nx = sx(sizeof(int) * A->N); as_individualize(A, cur, cc[0], nx); A->nodes++; memcpy(cur, nx, sizeof(int) * A->N); free(nx); }
+                int *nx = sx(sizeof(int) * A->N); uint64_t *nxk = sx(sizeof(uint64_t) * A->N); SP_T(5, as_individualize(A, cur, curk, cc[0], nx, nxk)); A->nodes++; memcpy(cur, nx, sizeof(int) * A->N); memcpy(curk, nxk, sizeof(uint64_t) * A->N); free(nx); free(nxk); }
             free(seenc);
+            free(curk);
             if (A->nodes > A->maxnodes) { free(cur); free(cc); break; }   /* capped inside the reference descent: no leaf, no automorphisms */
-            A->leaf_ref = cur; A->cert_ref = as_cert(A, cur);
+            A->leaf_ref = cur; SP_T(2, A->cert_ref = as_cert(A, cur));
             A->inv_ref = sx(sizeof(int) * A->N); for (int u = 0; u < A->N; u++) A->inv_ref[u] = -1;
             for (int u = 0; u < A->NI; u++) A->inv_ref[cur[u]] = u;
             free(cc);
         }
-        as_dfs(A, child, depth + 1, b, E, ne, cnt, path, onfirst && q == 0);
+        as_dfs(A, child, ckey, depth + 1, b, E, ne, cnt, path, onfirst && q == 0);
         if (A->unwind) { if (!onfirst) break; A->unwind = 0; }
         if (A->nodes > A->maxnodes || as_out(A)) break;
     }
-    free(child); free(cell); free(uf);
+    free(child); free(ckey); free(cell); free(uf);
 }
 
 /* returns generators (ngen x NI, malloc) of a subgroup of the automorphism group */
@@ -571,14 +754,17 @@ static double sym_cost_gain(const Problem *P, int m, int mr, double c0, double c
 static int as_gain_possible(const ASearch *A, const int *col) {
     if (!(A->symmin > 1)) return 1;
     const Problem *P = A->P; const int m = A->m, NI = A->NI, nb = P->nblk;
+    /* (8 November 2026: the classes counted with a stamp per block instead of clearing an array of all N nodes for
+     * every block: case6468_rte, AC power flow, SDP, thousands of blocks: 0.76 s of the 1.6 s refinement were these
+     * clearings; the same counts) */
     int *seen = calloc(A->N, sizeof(int)); int ccls = 0;
-    for (int c = 0; c < m; c++) if (!seen[col[NI + c]]++) ccls++;
+    for (int c = 0; c < m; c++) if (seen[col[NI + c]] != 1) { seen[col[NI + c]] = 1; ccls++; }
     int can = (double)m / ccls >= A->symmin;
     double c0 = 0, c1 = 0;
     for (int k = 0; k < nb && !can; k++) {
         if (P->blk[k].type != BLK_SDP) continue;
-        memset(seen, 0, sizeof(int) * A->N); int bc = 0;
-        for (int i = A->off[k]; i < A->off[k + 1]; i++) if (!seen[col[i]]++) bc++;
+        const int stamp = k + 2; int bc = 0;
+        for (int i = A->off[k]; i < A->off[k + 1]; i++) if (seen[col[i]] != stamp) { seen[col[i]] = stamp; bc++; }
         c0 += pow((double)P->blk[k].n, 3.0); c1 += pow((double)bc, 3.0);
     }
     if (!can && c1 > 0 && c0 / c1 >= A->symmin) can = 1;
@@ -606,18 +792,40 @@ static int sym_pretest_no_gain(const Problem *P, const int *off, int NI, double 
     uint64_t *ch = calloc((size_t)m, sizeof(uint64_t)), *ih = calloc((size_t)NI + 1, sizeof(uint64_t));
     uint64_t *ch2 = calloc((size_t)m, sizeof(uint64_t)), *ih2 = calloc((size_t)NI + 1, sizeof(uint64_t));
     uint64_t *w = sx(sizeof(uint64_t) * ((size_t)(m > NI ? m : NI) + 1));
-    for (int k = 0; k < nb; k++) {
+    /* (9 November 2026) the passes over the entries on the threads: every class hash is a sum modulo 2^64, independent of
+     * the order, so each thread sums into its own copy and the copies are added: the same bits at any thread count. A
+     * D-optimal design (SDP with SOCP, 18.8 million entries): the pretest 0.88 s on one thread. BRISK_SYMPREPAR=0: serial */
+    static int ppar = -1; if (ppar < 0) { const char *e = getenv("BRISK_SYMPREPAR"); ppar = !(e && atoi(e) == 0); }
+    size_t nitem = 0, nent = 0;
+    for (int k = 0; k < nb; k++) { nitem += (size_t)P->blk[k].ncon + 1; for (int t = 0; t < P->blk[k].ncon; t++) nent += (size_t)P->blk[k].A[t].nnz; }
+    int *itk = sx(sizeof(int) * (nitem + 1)), *itt = sx(sizeof(int) * (nitem + 1));
+    { size_t a = 0; for (int k = 0; k < nb; k++) for (int t = -1; t < P->blk[k].ncon; t++) { itk[a] = k; itt[a] = t; a++; } }
+    int nthr = 1;
+#ifdef _OPENMP
+    if (ppar && nent >= 1000000) nthr = omp_get_max_threads();
+#endif
+    if (nthr < 1) nthr = 1;
+    uint64_t *cacc = nthr > 1 ? calloc((size_t)m * nthr, sizeof(uint64_t)) : NULL, *iacc = nthr > 1 ? calloc(((size_t)NI + 1) * nthr, sizeof(uint64_t)) : NULL;
+    #pragma omp parallel for schedule(dynamic, 64) num_threads(nthr) if (nthr > 1)
+    for (size_t a = 0; a < nitem; a++) {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        uint64_t *chT = nthr > 1 ? cacc + (size_t)m * tid : ch, *ihT = nthr > 1 ? iacc + ((size_t)NI + 1) * tid : ih;
+        const int k = itk[a], t = itt[a];
         const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP;
         const uint64_t hk = h64((uint64_t)B->n * 3 + (uint64_t)lp + 0x2545f4914f6cdd1dull);
-        for (int t = -1; t < B->ncon; t++) {
-            const SpSym *S = t < 0 ? &B->C : &B->A[t];
-            for (int q = 0; q < S->nnz; q++) {
-                const int i = S->row[q], j = lp ? i : S->col[q];
-                const uint64_t h = h64(hval(fabs(S->val[q])) + (i == j ? 0x1111ull : 0x77ull) + (t < 0 ? 0x9e3779b97f4a7c15ull : 0));
-                if (t >= 0) ch[B->con[t]] += h64(h ^ hk);
-                ih[off[k] + i] += h64(h ^ hk); if (i != j) ih[off[k] + j] += h64(h ^ hk);
-            }
+        const SpSym *S = t < 0 ? &B->C : &B->A[t];
+        for (int q = 0; q < S->nnz; q++) {
+            const int i = S->row[q], j = lp ? i : S->col[q];
+            const uint64_t h = h64(hval(fabs(S->val[q])) + (i == j ? 0x1111ull : 0x77ull) + (t < 0 ? 0x9e3779b97f4a7c15ull : 0));
+            if (t >= 0) chT[B->con[t]] += h64(h ^ hk);
+            ihT[off[k] + i] += h64(h ^ hk); if (i != j) ihT[off[k] + j] += h64(h ^ hk);
         }
+    }
+    if (nthr > 1) {
+        for (int th = 0; th < nthr; th++) { for (int c = 0; c < m; c++) ch[c] += cacc[(size_t)m * th + c]; for (int i = 0; i < NI; i++) ih[i] += iacc[((size_t)NI + 1) * th + i]; }
     }
     for (int c = 0; c < m; c++) ch[c] += h64(hval(fabs(P->b[c])) + 0x5bd1e995ull);
     /* the rounds of a refinement without the search's canonical ranks: each class's hash from its own and its
@@ -638,24 +846,33 @@ static int sym_pretest_no_gain(const Problem *P, const int *off, int NI, double 
         ccls_prev = ccls; icls_prev = icls;
         for (int c = 0; c < m; c++) ch2[c] = h64(ch[c] + 0x51ed270b27ull);
         for (int i = 0; i < NI; i++) ih2[i] = h64(ih[i] + 0x2d358dccaa6c78a5ull);
-        for (int k = 0; k < nb; k++) {
+        if (nthr > 1) { memset(cacc, 0, sizeof(uint64_t) * (size_t)m * nthr); memset(iacc, 0, sizeof(uint64_t) * ((size_t)NI + 1) * nthr); }
+        #pragma omp parallel for schedule(dynamic, 64) num_threads(nthr) if (nthr > 1)
+        for (size_t a = 0; a < nitem; a++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            uint64_t *chT = nthr > 1 ? cacc + (size_t)m * tid : ch2, *ihT = nthr > 1 ? iacc + ((size_t)NI + 1) * tid : ih2;
+            const int k = itk[a], t = itt[a];
             const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP;
-            for (int t = -1; t < B->ncon; t++) {
-                const SpSym *S = t < 0 ? &B->C : &B->A[t];
-                const uint64_t hc = t < 0 ? 0x8f1bbcdcbfa53e0bull : ch[B->con[t]];
-                for (int q = 0; q < S->nnz; q++) {
-                    const int i = S->row[q], j = lp ? i : S->col[q];
-                    const uint64_t hv = hval(fabs(S->val[q])) + (i == j ? 0x1111ull : 0x77ull);
-                    const uint64_t ui = ih[off[k] + i], uj = ih[off[k] + j];
-                    if (t >= 0) ch2[B->con[t]] += h64(h64((ui < uj ? ui : uj) * 0x9e3779b97f4a7c15ull + (ui < uj ? uj : ui)) ^ hv);
-                    ih2[off[k] + i] += h64(h64(hc * 0xbf58476d1ce4e5b9ull + uj) ^ hv);
-                    if (i != j) ih2[off[k] + j] += h64(h64(hc * 0xbf58476d1ce4e5b9ull + ui) ^ hv);
-                }
+            const SpSym *S = t < 0 ? &B->C : &B->A[t];
+            const uint64_t hc = t < 0 ? 0x8f1bbcdcbfa53e0bull : ch[B->con[t]];
+            for (int q = 0; q < S->nnz; q++) {
+                const int i = S->row[q], j = lp ? i : S->col[q];
+                const uint64_t hv = hval(fabs(S->val[q])) + (i == j ? 0x1111ull : 0x77ull);
+                const uint64_t ui = ih[off[k] + i], uj = ih[off[k] + j];
+                if (t >= 0) chT[B->con[t]] += h64(h64((ui < uj ? ui : uj) * 0x9e3779b97f4a7c15ull + (ui < uj ? uj : ui)) ^ hv);
+                ihT[off[k] + i] += h64(h64(hc * 0xbf58476d1ce4e5b9ull + uj) ^ hv);
+                if (i != j) ihT[off[k] + j] += h64(h64(hc * 0xbf58476d1ce4e5b9ull + ui) ^ hv);
             }
+        }
+        if (nthr > 1) {
+            for (int th = 0; th < nthr; th++) { for (int c = 0; c < m; c++) ch2[c] += cacc[(size_t)m * th + c]; for (int i = 0; i < NI; i++) ih2[i] += iacc[((size_t)NI + 1) * th + i]; }
         }
         { uint64_t *tt = ch; ch = ch2; ch2 = tt; tt = ih; ih = ih2; ih2 = tt; }
     }
-    free(ch); free(ih); free(ch2); free(ih2); free(w);
+    free(ch); free(ih); free(ch2); free(ih2); free(w); free(itk); free(itt); free(cacc); free(iacc);
     return no_gain;
 }
 double g_sym_est_div = 1.0;   /* 4 November 2026 (ISSUES 759): the facial reduction's cost ratio, measured on a copy (main.c) */
@@ -845,6 +1062,10 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
     }
     A.ngen = nseed;
     { const char *e = getenv("BRISK_SYMMCKAY"); if (!e || atoi(e) != 0) A.finv = calloc((size_t)NI + 2, sizeof(uint64_t)); }   /* 0: the search as before */
+    /* 8 November 2026: the arrays of the hash updates (as_individualize_inc) and the root's hashes */
+    A.emk = calloc(A.ne + 1, sizeof(long)); A.isch = calloc((size_t)A.N + 1, sizeof(long)); A.prevc = sx(sizeof(int) * ((size_t)A.N + 1)); A.rs = 0;
+    uint64_t *rkey = NULL;
+    if (ncls < NI) { rkey = sx(sizeof(uint64_t) * ((size_t)A.N + 1)); for (int u = 0; u < A.N; u++) rkey[u] = as_nhash(&A, col, u); }
     if (ncls < NI) {
         int *path = sx(sizeof(int) * (NI + 1));
         /* (ISSUES 759: above) a search with a budget over half a second first runs within half a second; one that is still
@@ -855,7 +1076,7 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
         const int sliced = g_sym_fr_div && g_sym_est_now > 0 && A.tmax > slice && g_sym_est_div == 0;
         const double wmax0 = A.wmax, tclock0 = A.tclock;
         if (sliced) { A.wmax = fmin(wmax0, A.work + slice * SYM_WORK_RATE); A.tclock = fmin(tclock0, wtime() - A.t0 + 2.0 * slice + 0.5); }
-        as_dfs(&A, col, 0, P->b, E, ne, cnt, path, 1);
+        as_dfs(&A, col, rkey, 0, P->b, E, ne, cnt, path, 1);
         /* (5 November 2026) a refinement the slice's work cap cut short (budget_hit, set before a round that would pass
          * the cap) is an exhausted slice as well: as_out alone missed it, and the search ended without its generator
          * (shmup5, Mittelmann, SDP: order 2 lost, 157.8 -> 365.2 s) */
@@ -874,11 +1095,12 @@ static int *sym_auto(const Problem *P, const int *off, int NI, int nsdp, const S
                  * lost, 157.8 -> 365.2 s) */
                 if (A.finv) memset(A.finv, 0, sizeof(uint64_t) * ((size_t)NI + 2));
                 A.unwind = 0; A.budget_hit = 0;
-                as_dfs(&A, col, 0, P->b, E, ne, cnt, path, 1);
+                as_dfs(&A, col, rkey, 0, P->b, E, ne, cnt, path, 1);
             }
         } else if (sliced) { A.wmax = wmax0; A.tclock = tclock0; }
         free(path);
     }
+    free(rkey); free(A.emk); free(A.isch); free(A.prevc); A.emk = A.isch = NULL; A.prevc = NULL;
     int norb = 0; for (int u = 0; u < NI; u++) if (uf_find(A.ufp, u) == u) norb++;
     if (verbose > 0) printf("   symmetry search: %ld nodes, %d generator(s), %d index orbits, %.2fs\n", A.nodes, A.ngen, norb, wtime() - A.t0);
     if (verbose > 1 && A.finv) printf("   [symmetry search: %ld nodes pruned by their invariant]\n", A.pruned);
@@ -1168,6 +1390,197 @@ static const char *bd_block(int k, int n, int nh, int **hg, signed char **hs, BD
     return why;
 }
 
+/* 13 November 2026: a block whose irreducible representations are too large for the intertwiner systems above (their
+ * cost grows like d^4). The block is split by the eigenspaces of random elements of the commutant instead. On each index
+ * orbit a generic symmetric element M (constant on the orbitals, the orbits of the group on the pairs; with signed
+ * generators, M(g a, g b) = s_a s_b M(a, b), and an orbital that meets itself with the sign -1 carries 0) acts on the
+ * copies of an irreducible of multiplicity m as M_rho (x) I_d with M_rho generic of order m: each eigenspace is one copy
+ * of one irreducible, whatever its dimension d. Which copies are of the same type, and how to align them, follows from
+ * one product: for copies U (orbit o0) and V (orbit o) and K a generic element of the commutant's (o0, o) part,
+ * C = U' K V is an intertwiner, so by Schur's lemma C = 0 for different types and C = c Q with Q orthogonal for the same
+ * real type; V Q' then transforms by U's matrices. Checks: C'C = c^2 I; each aligned copy transforms like its
+ * reference under the first generators; on each orbit, the commutant's dimension (its orbitals that carry a value)
+ * equals the sum of the squared multiplicities found, which holds only when every irreducible is of real type and the
+ * copies were grouped right. Any failed check gives up (the orbit aggregation alone remains). 1zc.1024 (DIMACS, SDP):
+ * six orbits, irreducibles of dimension up to 90. BRISK_SYMMFM0=1: off. */
+/* a random element of the commutant's (o0, o) part: s0 x s, column-major; sym (o0 == o): M + M' (symmetric); *r_out:
+ * the orbitals that carry a value */
+static double *bd_comm_rand(int s0, const int *idx0, int s, const int *idx, int nh, int **hg, signed char **hs, const int *pos, int sym, size_t *r_out) {
+    const size_t sp = (size_t)s0 * s;
+    int *p = sx(sizeof(int) * (sp + 1)), *par = calloc(sp + 1, sizeof(int)); char *z = calloc(sp + 1, 1);
+    for (size_t q = 0; q < sp; q++) p[q] = (int)q;
+    PUF U; U.p = p; U.par = par;
+    for (int g = 0; g < nh; g++) for (int b2 = 0; b2 < s; b2++) {
+        const int gb = pos[hg[g][idx[b2]]]; const int sb = hs && hs[g] && hs[g][idx[b2]] < 0;
+        for (int a = 0; a < s0; a++) {
+            const int ga = pos[hg[g][idx0[a]]]; const int sa = hs && hs[g] && hs[g][idx0[a]] < 0;
+            if (!puf_union(&U, a + b2 * s0, ga + gb * s0, sa ^ sb)) z[a + (size_t)b2 * s0] = 1;
+        }
+    }
+    for (size_t q = 0; q < sp; q++) if (z[q] == 1) { int pr; z[puf_find(&U, (int)q, &pr)] = 2; }
+    double *rr = sx(sizeof(double) * (sp + 1)); size_t r = 0;
+    for (size_t q = 0; q < sp; q++) { rr[q] = 0.0; if (p[q] == (int)q) { const double v = bd_rand(); if (z[q] != 2) { rr[q] = v; r++; } } }
+    double *M = sx(sizeof(double) * (sp + 1));
+    for (int b2 = 0; b2 < s; b2++) for (int a = 0; a < s0; a++) {
+        int p1; const int r1 = puf_find(&U, a + b2 * s0, &p1); double v = p1 ? -rr[r1] : rr[r1];
+        if (sym) { int p2; const int r2 = puf_find(&U, b2 + a * s0, &p2); v += p2 ? -rr[r2] : rr[r2]; }
+        M[a + (size_t)b2 * s0] = v;
+    }
+    free(p); free(par); free(z); free(rr);
+    if (r_out) *r_out = r;
+    return M;
+}
+
+/* C = U0' K V (d x d) tested: 0 when c^2 = |C|^2/d is at most 1e-14 |K|^2, else 1 with C scaled to an isometry, or -1 when C'C is not c^2 I */
+static int bd_match(int d, double *C, double kn) {
+    double c2 = 0; for (int q = 0; q < d * d; q++) c2 += C[q] * C[q];
+    c2 /= d;
+    if (c2 <= 1e-14 * kn) return 0;
+    double res = 0;
+    for (int jj = 0; jj < d; jj++) for (int ii = 0; ii < d; ii++) { double w = 0; for (int q = 0; q < d; q++) w += C[q + (size_t)ii * d] * C[q + (size_t)jj * d]; if (ii == jj) w -= c2; res += w * w; }
+    if (sqrt(res) > 1e-6 * c2 * sqrt((double)d)) return -1;
+    const double sc = 1.0 / sqrt(c2); for (int q = 0; q < d * d; q++) C[q] *= sc;
+    return 1;
+}
+
+static const char *bd_block_mfm(int k, int n, int nh, int **hg, signed char **hs, BDCopy **cpp, int *ncp, int *cpcap, int *ntype_out, int **dt_out, int verbose) {
+    if (nh == 0) return "no generators";
+    const char *why = NULL;
+    const double one = 1.0, zero = 0.0;
+    int *par = sx(sizeof(int) * (n + 1)); for (int i = 0; i < n; i++) par[i] = i;
+    for (int g = 0; g < nh; g++) for (int i = 0; i < n; i++) { const int a = uf_find(par, i), b2 = uf_find(par, hg[g][i]); if (a != b2) par[a] = b2; }
+    int *ord = sx(sizeof(int) * (n + 1)), *root = sx(sizeof(int) * (n + 1));
+    for (int i = 0; i < n; i++) root[i] = uf_find(par, i);
+    { int *cnt = calloc(n + 1, sizeof(int)); for (int i = 0; i < n; i++) cnt[root[i] + 1]++;
+      for (int i = 0; i < n; i++) cnt[i + 1] += cnt[i];
+      for (int i = 0; i < n; i++) ord[cnt[root[i]]++] = i;
+      free(cnt); }
+    int norb = 0; int *ostart = sx(sizeof(int) * (n + 2));
+    for (int q = 0; q < n; q++) if (q == 0 || root[ord[q]] != root[ord[q - 1]]) ostart[norb++] = q;
+    ostart[norb] = n;
+    int *pos = sx(sizeof(int) * (n + 1));
+    for (int o = 0; o < norb; o++) for (int q = ostart[o]; q < ostart[o + 1]; q++) pos[ord[q]] = q - ostart[o];
+    for (int o = 0; o < norb && !why; o++) if (ostart[o + 1] - ostart[o] > SYM_BDMAXORB) why = "an orbit is too large";
+    double **E = calloc(norb + 1, sizeof(double *)), **E2 = calloc(norb + 1, sizeof(double *));
+    int **cs = calloc(norb + 1, sizeof(int *)), *ncl = calloc(norb + 1, sizeof(int)); size_t *rorb = calloc(norb + 1, sizeof(size_t));
+    /* each orbit: a generic symmetric element of its commutant, its eigenspaces */
+    for (int o = 0; o < norb && !why; o++) {
+        const int s = ostart[o + 1] - ostart[o]; const int *idx = ord + ostart[o];
+        double *lam = sx(sizeof(double) * (s + 1)); int ok = 0;
+        for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+            size_t r = 0; double *M = bd_comm_rand(s, idx, s, idx, nh, hg, hs, pos, 1, &r);
+            int info = 0, nn = s, lw = -1, liw = -1, iq; double wq;
+            BL(dsyevd_)("V", "U", &nn, M, &nn, lam, &wq, &lw, &iq, &liw, &info);
+            lw = (int)wq + 1; liw = iq + 1; double *wk = sx(sizeof(double) * lw); int *iwk = sx(sizeof(int) * liw);
+            BL(dsyevd_)("V", "U", &nn, M, &nn, lam, wk, &lw, iwk, &liw, &info);
+            free(wk); free(iwk);
+            if (info) { free(M); break; }
+            double lmax = 0; for (int a = 0; a < s; a++) if (fabs(lam[a]) > lmax) lmax = fabs(lam[a]);
+            const double gap = 1e-7 * (1 + lmax);
+            size_t nclu = 0; for (int j0 = 0; j0 < s; ) { int j1 = j0 + 1; while (j1 < s && lam[j1] - lam[j1 - 1] <= gap) j1++; nclu++; j0 = j1; }
+            if (nclu > r) { free(M); continue; }   /* at most r = sum m^2 >= sum m clusters */
+            cs[o] = sx(sizeof(int) * (nclu + 1)); ncl[o] = (int)nclu;
+            int c = 0; for (int j0 = 0; j0 < s; ) { int j1 = j0 + 1; while (j1 < s && lam[j1] - lam[j1 - 1] <= gap) j1++; cs[o][c++] = j0; j0 = j1; }
+            cs[o][nclu] = s;
+            E[o] = M; rorb[o] = r; ok = 1;
+        }
+        free(lam);
+        if (!ok) why = "no generic eigendecomposition of an orbit was found";
+        else if (ncl[o] > 1) E2[o] = bd_comm_rand(s, idx, s, idx, nh, hg, hs, pos, 0, NULL);   /* relates the copies within the orbit */
+    }
+    /* types: each copy against the reference copies of the earlier orbits, then of its own orbit */
+    int ntype = 0, tcap = 16; int *dt = sx(sizeof(int) * tcap), *tro = sx(sizeof(int) * tcap), *trc = sx(sizeof(int) * tcap);
+    const int ncp0 = *ncp;
+    for (int o = 0; o < norb && !why; o++) {
+        const int s = ostart[o + 1] - ostart[o]; const int *idx = ord + ostart[o]; const int nc = ncl[o];
+        int *mt = sx(sizeof(int) * (nc + 1)); double **Q = calloc(nc + 1, sizeof(double *));
+        for (int j = 0; j < nc; j++) mt[j] = -1;
+        for (int o0 = 0; o0 < o && !why; o0++) {
+            int any = 0; for (int t = 0; t < ntype; t++) if (tro[t] == o0) any = 1;
+            if (!any) continue;
+            const int s0 = ostart[o0 + 1] - ostart[o0]; const int *idx0 = ord + ostart[o0];
+            double *Kc = bd_comm_rand(s0, idx0, s, idx, nh, hg, hs, pos, 0, NULL);
+            double kn = 0; for (size_t q = 0; q < (size_t)s0 * s; q++) kn += Kc[q] * Kc[q];
+            double *Y = sx(sizeof(double) * ((size_t)s0 * s + 1));
+            BL(dgemm_)("N", "N", &s0, &s, &s, &one, Kc, &s0, E[o], &s, &zero, Y, &s0);
+            free(Kc);
+            for (int j = 0; j < nc && !why; j++) {
+                const int d = cs[o][j + 1] - cs[o][j];
+                for (int t = 0; t < ntype && !why; t++) {
+                    if (tro[t] != o0 || dt[t] != d) continue;
+                    double *C = sx(sizeof(double) * ((size_t)d * d + 1));
+                    BL(dgemm_)("T", "N", &d, &d, &s0, &one, E[o0] + (size_t)trc[t] * s0, &s0, Y + (size_t)cs[o][j] * s0, &s0, &zero, C, &d);
+                    const int m = bd_match(d, C, kn);
+                    if (m == 0) { free(C); continue; }
+                    if (m < 0) { free(C); why = "two irreducibles are not aligned by an isometry"; break; }
+                    if (mt[j] >= 0) { free(C); why = "an irreducible matches two types"; break; }
+                    mt[j] = t; Q[j] = C;
+                }
+            }
+            free(Y);
+        }
+        double kn2 = 0; if (E2[o]) for (size_t q = 0; q < (size_t)s * s; q++) kn2 += E2[o][q] * E2[o][q];
+        for (int j = 0; j < nc && !why; j++) {
+            const int d = cs[o][j + 1] - cs[o][j];
+            const double *V = E[o] + (size_t)cs[o][j] * s;
+            /* the types made by the earlier copies of this orbit, with its second element */
+            for (int t = 0; t < ntype && !why && E2[o]; t++) {
+                if (tro[t] != o || dt[t] != d) continue;
+                double *Y2 = sx(sizeof(double) * ((size_t)s * d + 1)), *C = sx(sizeof(double) * ((size_t)d * d + 1));
+                BL(dgemm_)("N", "N", &s, &d, &s, &one, E2[o], &s, V, &s, &zero, Y2, &s);
+                BL(dgemm_)("T", "N", &d, &d, &s, &one, E[o] + (size_t)trc[t] * s, &s, Y2, &s, &zero, C, &d);
+                free(Y2);
+                const int m = bd_match(d, C, kn2);
+                if (m == 0) { free(C); continue; }
+                if (m < 0) { free(C); why = "two irreducibles are not aligned by an isometry"; break; }
+                if (mt[j] >= 0) { free(C); why = "an irreducible matches two types"; break; }
+                mt[j] = t; Q[j] = C;
+            }
+            if (why) break;
+            if (*ncp == *cpcap) { *cpcap *= 2; *cpp = realloc(*cpp, sizeof(BDCopy) * *cpcap); }
+            BDCopy *c = &(*cpp)[(*ncp)++];
+            c->k = k; c->s = s; c->d = d; c->idx = sx(sizeof(int) * s); memcpy(c->idx, idx, sizeof(int) * s); c->U = sx(sizeof(double) * (size_t)s * d);
+            if (mt[j] < 0) {
+                if (ntype == tcap) { tcap *= 2; dt = realloc(dt, sizeof(int) * tcap); tro = realloc(tro, sizeof(int) * tcap); trc = realloc(trc, sizeof(int) * tcap); }
+                const int t = ntype++; dt[t] = d; tro[t] = o; trc[t] = cs[o][j]; c->t = t; mt[j] = t;
+                memcpy(c->U, V, sizeof(double) * (size_t)s * d);
+            } else {
+                c->t = mt[j];
+                BL(dgemm_)("N", "T", &s, &d, &d, &one, V, &s, Q[j], &d, &zero, c->U, &s);   /* V Q' */
+                /* the aligned copy transforms like its reference: P_g (V Q') = (V Q') R_ref, (P_g U)(g a) = s_a U(a) */
+                const int t = mt[j], s0 = ostart[tro[t] + 1] - ostart[tro[t]]; const int *idx0 = ord + ostart[tro[t]]; const double *U0 = E[tro[t]] + (size_t)trc[t] * s0;
+                double *PU = sx(sizeof(double) * ((size_t)(s > s0 ? s : s0) * d + 1)), *R = sx(sizeof(double) * ((size_t)d * d + 1));
+                for (int g = 0; g < nh && g < 4 && !why; g++) {
+                    for (int a = 0; a < s0; a++) { const int ga = pos[hg[g][idx0[a]]]; const double sa = hs && hs[g] ? (double)hs[g][idx0[a]] : 1.0; for (int i = 0; i < d; i++) PU[ga + (size_t)i * s0] = sa * U0[a + (size_t)i * s0]; }
+                    BL(dgemm_)("T", "N", &d, &d, &s0, &one, U0, &s0, PU, &s0, &zero, R, &d);
+                    for (int a = 0; a < s; a++) { const int ga = pos[hg[g][idx[a]]]; const double sa = hs && hs[g] ? (double)hs[g][idx[a]] : 1.0; for (int i = 0; i < d; i++) PU[ga + (size_t)i * s] = sa * c->U[a + (size_t)i * s]; }
+                    double res = 0;
+                    for (int jj = 0; jj < d; jj++) for (int a = 0; a < s; a++) { double w = PU[a + (size_t)jj * s]; for (int i = 0; i < d; i++) w -= c->U[a + (size_t)i * s] * R[i + (size_t)jj * d]; res += w * w; }
+                    if (res > 1e-14 * d) why = "an aligned copy does not transform like its reference";
+                }
+                free(PU); free(R);
+            }
+        }
+        if (!why) {   /* real type, copies grouped right: the commutant of the orbit has dimension sum m_t^2 exactly */
+            size_t sm = 0;
+            for (int t = 0; t < ntype; t++) { size_t m = 0; for (int j = 0; j < nc; j++) if (mt[j] == t) m++; sm += m * m; }
+            if (sm != rorb[o]) why = "a representation is not of real type";
+        }
+        for (int j = 0; j < nc; j++) free(Q[j]);
+        free(Q); free(mt);
+    }
+    if (why) { for (int q = ncp0; q < *ncp; q++) { free((*cpp)[q].U); free((*cpp)[q].idx); } *ncp = ncp0; free(dt); *ntype_out = 0; *dt_out = NULL; }
+    else {
+        *ntype_out = ntype; *dt_out = dt;
+        if (verbose > 0) { int dmax = 0; for (int t = 0; t < ntype; t++) if (dt[t] > dmax) dmax = dt[t];
+            printf("   symmetry-adapted basis: block %d, %d orbits, by the eigenspaces of the commutant: %d irreducible types (dimension up to %d), %d copies%s\n", k + 1, norb, ntype, dmax, *ncp - ncp0, hs ? " (signed generators)" : ""); }
+    }
+    for (int o = 0; o < norb; o++) { free(E[o]); free(E2[o]); free(cs[o]); }
+    free(E); free(E2); free(cs); free(ncl); free(rorb); free(tro); free(trc);
+    free(par); free(ord); free(root); free(ostart); free(pos);
+    return why;
+}
+
 /* triplets sorted, duplicates summed, entries below 1e-13 of the largest of their constraint dropped */
 typedef struct { int c, b, i, j; double v; } STrip;
 static int cmp_strip(const void *x, const void *y) { const STrip *a = x, *b = y;
@@ -1239,7 +1652,18 @@ static int sym_blockdiag(const Problem *P, PSSym *S, const int *cls, const int *
             if (anyneg) { if (!bsgn) bsgn = calloc(nb + 1, sizeof(signed char *)); bsgn[b] = sx(n + 1); for (int i = 0; i < n; i++) bsgn[b][i] = su[b][off[k] + i]; } }
         for (int q = 0; q < no; q++) { free(u[orb[q]]); free(su[orb[q]]); }
         free(u); free(su); free(orb);
-        why = bd_block(k, n, nh, hg, hs, &cp, &ncp, &cpcap, &nbt[k], &bdt[k], verbose);
+        {   const int ncpb = ncp;
+            why = bd_block(k, n, nh, hg, hs, &cp, &ncp, &cpcap, &nbt[k], &bdt[k], verbose);
+            /* 13 November 2026: refused for a large irreducible: several orbits, each multiplicity-free (bd_block_mfm) */
+            int signed_ = 0; for (int t = 0; t < nh; t++) if (hs[t]) signed_ = 1;
+            if (why && strcmp(why, "an irreducible representation is too large") == 0 && !getenv("BRISK_SYMMFM0") && !(signed_ && getenv("BRISK_SYMMFMSIGN0"))) {
+                for (int q = ncpb; q < ncp; q++) { free(cp[q].U); free(cp[q].idx); }
+                ncp = ncpb;
+                const char *w2 = bd_block_mfm(k, n, nh, hg, signed_ ? hs : NULL, &cp, &ncp, &cpcap, &nbt[k], &bdt[k], verbose);
+                if (!w2) why = NULL;
+                else if (verbose > 0) printf("   symmetry-adapted basis: block %d not split by orbits either (%s)\n", k + 1, w2);
+            }
+        }
         for (int t = 0; t < nh; t++) { free(hg[t]); free(hs[t]); }
         free(hg); free(hs); free(hh);
     }
@@ -1629,7 +2053,14 @@ PSSym *sym_reduce(Problem *P, const char *fname, int verbose, double symtime, lo
             int *nl = sx(sizeof(int) * (nab + 1)), nnl = 0, nlift = 0, nsgn = 0;
             int *gg = sx(sizeof(int) * (NI + 1)), *cc = sx(sizeof(int) * (m + 1));
             const double tl0 = wtime();
+            /* (7 November 2026) the lifts count against what is left of the second search's budget, in its work units (a
+             * lift reads the entries about twice): with the incremental refinement the search reaches many more generators of
+             * |data| within its nodes, and those that do not lift were then tried in pairs without a limit (clique_60_k20_3_3,
+             * SDP: 23 generators, 276 products, 0.29 s for a solve of 0.25 s; none lifts) */
+            const double wlmax = fmax(0.0, tb2 - g_sym_work_s) * SYM_WORK_RATE; double wl = 0;
             for (int s = 0; s < nab + nnl * (nnl + 1) / 2 + 1; s++) {
+                if (wl > wlmax && !(getenv("BRISK_SYMLIFTCAP") && atoi(getenv("BRISK_SYMLIFTCAP")) == 0)) break;
+                wl += 2.0 * (double)ne + NI + m;
                 const int *g, *cpp;
                 if (s < nab) { g = gab + (size_t)s * NI; cpp = gcb + (size_t)s * (m + 1); }
                 else {   /* the products of pairs of non-liftable generators (s - nab enumerates a <= b) */
@@ -2048,31 +2479,103 @@ void sym_free(PSSym *S) {
  * inside one component fixes e_c and turns the constraint's other entries into two-variable
  * equations); what remains is eliminated densely over the components. The kernel's basis
  * gives the generators; the sign pattern of an index over them is its block.               */
+/* 14 November 2026 (ISSUES 885): the split free pairs of the LP blocks (columns a and -a, costs c and -c: x = x+ - x-), as
+ * the embedding's free_detect finds them. A pair's sign flip is the swap of its two columns, which leaves the problem the
+ * same; the sign search below gives the '+' index a sign of its own and the '-' index follows it. fp[g]: 1 '+', 2 '-', 0
+ * otherwise (global indices); mate[g]: the other index of the pair. Returns the number of pairs. */
+typedef struct { uint64_t h; int g, neg; } SFKey;
+static int cmp_sfkey(const void *a, const void *b) { const SFKey *x = a, *y = b; return x->h < y->h ? -1 : x->h > y->h ? 1 : x->g - y->g; }
+static int sign_pairs(const Problem *P, const int *off, int NI, char *fp, int *mate) {
+    int npair = 0;
+    for (int k = 0; k < P->nblk; k++) {
+        const Block *B = &P->blk[k]; if (B->type != BLK_LP || B->n < 2) continue;
+        const int n = B->n;
+        int *cnt = calloc(n + 1, sizeof(int)); double *cost = calloc(n, sizeof(double));
+        for (int q = 0; q < B->C.nnz; q++) cost[B->C.row[q]] += B->C.val[q];
+        for (int t = 0; t < B->ncon; t++) for (int q = 0; q < B->A[t].nnz; q++) cnt[B->A[t].row[q] + 1]++;
+        for (int i = 0; i < n; i++) cnt[i + 1] += cnt[i];
+        int *ec = sx(sizeof(int) * (cnt[n] + 1)); double *ev = sx(sizeof(double) * (cnt[n] + 1)); int *fill = sx(sizeof(int) * (n + 1)); memcpy(fill, cnt, sizeof(int) * n);
+        for (int t = 0; t < B->ncon; t++) for (int q = 0; q < B->A[t].nnz; q++) { const int i = B->A[t].row[q], w = fill[i]++; ec[w] = B->con[t]; ev[w] = B->A[t].val[q]; }
+        /* each column's entries by constraint (B->con is increasing in t only by construction of the block: sort to be sure) */
+        for (int i = 0; i < n; i++) for (int a = cnt[i] + 1; a < cnt[i + 1]; a++) { int c = ec[a]; double v = ev[a]; int b = a - 1; while (b >= cnt[i] && ec[b] > c) { ec[b + 1] = ec[b]; ev[b + 1] = ev[b]; b--; } ec[b + 1] = c; ev[b + 1] = v; }
+        /* a hash of (entries, cost) and of the negated pair; matched columns are compared entry by entry */
+        SFKey *K = sx(sizeof(SFKey) * (2 * (size_t)n + 1)); int nk = 0;
+        for (int i = 0; i < n; i++) {
+            if (cnt[i + 1] == cnt[i]) continue;
+            for (int sgn = 0; sgn < 2; sgn++) {
+                const double f = sgn ? -1.0 : 1.0; uint64_t h = 1469598103934665603ull;
+                for (int a = cnt[i]; a < cnt[i + 1]; a++) { double v = f * ev[a]; if (v == 0) v = 0.0; uint64_t u; memcpy(&u, &v, 8); h ^= (uint64_t)ec[a] * 0x9e3779b97f4a7c15ull; h = h64(h ^ u); }
+                { double v = f * cost[i]; if (v == 0) v = 0.0; uint64_t u; memcpy(&u, &v, 8); h = h64(h ^ u ^ 0x5851f42d4c957f2dull); }   /* (-0.0 and 0.0 alike) */
+                K[nk].h = h; K[nk].g = i; K[nk].neg = sgn; nk++;
+            }
+        }
+        qsort(K, nk, sizeof(SFKey), cmp_sfkey);
+        for (int a = 0; a < nk; ) {
+            int b = a; while (b < nk && K[b].h == K[a].h) b++;
+            /* in a group: columns i (as read) and j (negated) with the same key are candidates i = -j */
+            for (int x = a; x < b; x++) if (!K[x].neg && !fp[off[k] + K[x].g])
+                for (int y = a; y < b; y++) if (K[y].neg && K[y].g != K[x].g && !fp[off[k] + K[y].g]) {
+                    const int i = K[x].g, j = K[y].g; int same = cnt[i + 1] - cnt[i] == cnt[j + 1] - cnt[j] && cost[i] == -cost[j];
+                    for (int e = 0; same && e < cnt[i + 1] - cnt[i]; e++) same = ec[cnt[i] + e] == ec[cnt[j] + e] && ev[cnt[i] + e] == -ev[cnt[j] + e];
+                    if (same) { fp[off[k] + i] = 1; fp[off[k] + j] = 2; mate[off[k] + i] = off[k] + j; mate[off[k] + j] = off[k] + i; npair++; break; }
+                }
+            a = b;
+        }
+        free(cnt); free(cost); free(ec); free(ev); free(fill); free(K);
+    }
+    (void)NI;
+    return npair;
+}
 PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int chordal_minn, double chordal_density) {
     const int m = P->m, nb = P->nblk;
     int *off = sx(sizeof(int) * (nb + 1)); off[0] = 0;
     for (int k = 0; k < nb; k++) off[k + 1] = off[k] + P->blk[k].n;
     const int NI = off[nb];
-    char *issdp = sx(NI + 1);
+    char *issdp = sx(NI + 2);
     for (int k = 0; k < nb; k++) for (int i = off[k]; i < off[k + 1]; i++) issdp[i] = P->blk[k].type == BLK_SDP;
-    PUF U; U.p = sx(sizeof(int) * (NI + 1)); U.par = calloc(NI + 1, sizeof(int)); for (int i = 0; i < NI; i++) U.p[i] = i;
-    /* the entries of each constraint over all blocks (global indices), CSR */
+    /* 14 November 2026 (ISSUES 885): split free pairs take part (on by default since 15 November 2026; BRISK_SIGNFREE=0: every LP index fixed, as before): the
+     * '+' index gets a sign, tied to the virtual index Z0 = NI, which is fixed (+1): an entry a of the pair in constraint c
+     * gives s_+ = e_c (the pair Z0 - '+' as an off-diagonal entry), a cost gives s_+ = 0; the '-' index's entries are the
+     * same equations and are skipped. A pair whose sign is odd under the group is zero in the reduced problem (dropped). */
+    static int sfree = -1; if (sfree < 0) { const char *e_ = getenv("BRISK_SIGNFREE"); sfree = e_ ? atoi(e_) != 0 : 1; }   /* (on since 15 November 2026, with ISSUES 886 and 887: bench/signfree_1115b) */
+    char *fp = calloc((size_t)NI + 2, 1); int *mate = sx(sizeof(int) * (NI + 2));
+    const int npair = sfree ? sign_pairs(P, off, NI, fp, mate) : 0;
+    const int Z0 = NI, NIx = NI + (npair ? 1 : 0);
+    if (npair) { for (int i = 0; i < NI; i++) if (fp[i] == 1) issdp[i] = 1; issdp[Z0] = 1; }
+    if (verbose > 0 && sfree) printf("   sign symmetry: %d split free pair(s) found in the LP blocks\n", npair);
+    PUF U; U.p = sx(sizeof(int) * (NI + 2)); U.par = calloc(NI + 2, sizeof(int)); for (int i = 0; i < NIx; i++) U.p[i] = i;
+    /* the entries of each constraint over all blocks (global indices), CSR: only the off-diagonal entries of the
+     * semidefinite blocks, which carry the sign equations; a diagonal or LP entry only fixes e_c = 0 (fixed[c]).
+     * (9 November 2026: a D-optimal design's 18.8 million entries, nearly all in its LP block, were all listed; the step
+     * 0.45 s. BRISK_SIGNALL=1: every entry listed, as before) */
+    static int sall = -1; if (sall < 0) sall = getenv("BRISK_SIGNALL") && atoi(getenv("BRISK_SIGNALL")) != 0;
     int *cp = calloc(m + 2, sizeof(int));
-    for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; for (int t = 0; t < B->ncon; t++) cp[B->con[t] + 1] += B->A[t].nnz; }
+    char *fixed = calloc((size_t)m + 1, 1);
+    for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP, sdp = B->type == BLK_SDP;
+        for (int t = 0; t < B->ncon; t++) { const SpSym *A = &B->A[t]; const int c = B->con[t];
+            if (sall) { cp[c + 1] += A->nnz; continue; }
+            for (int q = 0; q < A->nnz; q++) {
+                if (lp && fp[off[k] + A->row[q]]) { if (fp[off[k] + A->row[q]] == 1) cp[c + 1]++; continue; }   /* a free pair's entry */
+                if (lp || !sdp || A->row[q] == A->col[q]) fixed[c] = 1; else cp[c + 1]++; } } }
     for (int c = 0; c < m; c++) cp[c + 1] += cp[c];
     const int nce = cp[m];
     int *ci = sx(sizeof(int) * (nce + 1)), *cj = sx(sizeof(int) * (nce + 1));
     { int *fill = sx(sizeof(int) * (m + 1)); memcpy(fill, cp, sizeof(int) * m);
-      for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP;
+      for (int k = 0; k < nb; k++) { const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP, sdp = B->type == BLK_SDP;
           for (int t = 0; t < B->ncon; t++) { const SpSym *A = &B->A[t]; const int c = B->con[t];
-              for (int q = 0; q < A->nnz; q++) { const int w = fill[c]++; ci[w] = off[k] + A->row[q]; cj[w] = off[k] + (lp ? A->row[q] : A->col[q]); } } }
+              for (int q = 0; q < A->nnz; q++) {
+                  if (lp && fp[off[k] + A->row[q]]) { if (fp[off[k] + A->row[q]] == 1) { const int w = fill[c]++; ci[w] = off[k] + A->row[q]; cj[w] = Z0; } continue; }
+                  if (!sall && (lp || !sdp || A->row[q] == A->col[q])) continue;
+                  const int w = fill[c]++; ci[w] = off[k] + A->row[q]; cj[w] = off[k] + (lp ? A->row[q] : A->col[q]); } } }
       free(fill); }
     /* e_c: -1 unknown, 0, 1 (bit 2: its entries are in the union-find) */
-    int *e = sx(sizeof(int) * (m + 1)); for (int c = 0; c < m; c++) e[c] = fabs(P->b[c]) > 0 ? 0 : -1;
+    int *e = sx(sizeof(int) * (m + 1)); for (int c = 0; c < m; c++) e[c] = (fabs(P->b[c]) > 0 || fixed[c]) ? 0 : -1;
+    free(fixed);
     int ok = 1;
     for (int k = 0; k < nb && ok; k++) {
         const Block *B = &P->blk[k]; const int lp = B->type == BLK_LP;
-        for (int q = 0; q < B->C.nnz && ok; q++) { const int i = off[k] + B->C.row[q], j = off[k] + (lp ? B->C.row[q] : B->C.col[q]); if (!lp && i != j) ok = puf_union(&U, i, j, 0); }
+        for (int q = 0; q < B->C.nnz && ok; q++) { const int i = off[k] + B->C.row[q], j = off[k] + (lp ? B->C.row[q] : B->C.col[q]); if (!lp && i != j) ok = puf_union(&U, i, j, 0);
+            if (lp && fp[i] == 1 && B->C.val[q] != 0) ok = puf_union(&U, i, Z0, 0); }   /* a free pair with a cost keeps its sign */
     }
     for (int c = 0; c < m; c++) for (int q = cp[c]; q < cp[c + 1]; q++) if (ci[q] == cj[q] || !issdp[ci[q]]) { e[c] = 0; break; }   /* a diagonal or LP entry */
     /* rounds: known e_c -> two-variable equations; an entry within a component -> e_c known */
@@ -2091,8 +2594,8 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
     }
     /* the components (roots) and the constraints still unknown */
     int *root = sx(sizeof(int) * (NI + 1)), *rpar = sx(sizeof(int) * (NI + 1)), *rid = sx(sizeof(int) * (NI + 1)); int K = 0;
-    for (int i = 0; i < NI; i++) { root[i] = puf_find(&U, i, &rpar[i]); rid[i] = -1; }
-    for (int i = 0; i < NI; i++) if (rid[root[i]] < 0) rid[root[i]] = K++;
+    for (int i = 0; i < NIx; i++) { root[i] = puf_find(&U, i, &rpar[i]); rid[i] = -1; }
+    for (int i = 0; i < NIx; i++) if (rid[root[i]] < 0) rid[root[i]] = K++;
     /* LP indices are fixed (+1): each LP index is its own component with s = 0: equations r = 0 */
     /* sparse GF(2) elimination on the K root variables (rows as sorted column lists; the
      * systems are local, dense bitsets cost K^2 on TSSOS files with 20 000 components) */
@@ -2117,6 +2620,7 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
     } while (0)
     if (ok) {
         for (int i = 0; i < NI && ok; i++) if (!issdp[i]) { int cc[1] = { rid[root[i]] }; ADDROW(cc, 1); }
+        if (npair && ok) { int cc[1] = { rid[root[Z0]] }; ADDROW(cc, 1); }   /* Z0 fixed */
         for (int c = 0; c < m && ok; c++) {
             if (e[c] >= 0) continue;
             for (int q = cp[c] + 1; q < cp[c + 1] && ok; q++) {
@@ -2174,13 +2678,16 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
         /* the sign pattern of an index: that of its component (a hash collision only merges
          * two classes: still exact, since constraints are kept only when all their entries
          * stay inside one class) */
-        uint64_t *pat = sx(sizeof(uint64_t) * (NI + 1));
-        for (int i = 0; i < NI; i++) pat[i] = rpar[i] ? h64(cpat[rid[root[i]]] ^ 0x5bd1e9955bd1e995ull) : cpat[rid[root[i]]];   /* (parity 1: the complementary pattern; never here) */
+        uint64_t *pat = sx(sizeof(uint64_t) * (NI + 2));
+        for (int i = 0; i < NIx; i++) pat[i] = rpar[i] ? h64(cpat[rid[root[i]]] ^ 0x5bd1e9955bd1e995ull) : cpat[rid[root[i]]];   /* (parity 1: the complementary pattern; never here) */
+        /* the free pairs odd under the group: zero in the reduced problem, both columns dropped */
+        char *drop = calloc((size_t)NI + 1, 1); int ndrop = 0;
+        for (int i = 0; i < NI; i++) if (fp[i] == 1 && pat[i] != pat[Z0]) { drop[i] = drop[mate[i]] = 1; ndrop++; }
         int *cls = sx(sizeof(int) * (NI + 1)); int ncls = 0;
         int *bcls0 = sx(sizeof(int) * (nb + 1));
         for (int k = 0; k < nb; k++) {
             bcls0[k] = ncls;
-            if (P->blk[k].type == BLK_LP) { for (int i = off[k]; i < off[k + 1]; i++) cls[i] = ncls; ncls++; continue; }
+            if (P->blk[k].type == BLK_LP) { for (int i = off[k]; i < off[k + 1]; i++) cls[i] = drop[i] ? -1 : ncls; ncls++; continue; }
             /* distinct patterns in the block, numbered in order of first appearance */
             { const int n = off[k + 1] - off[k]; KN *kn = sx(sizeof(KN) * (n + 1));
               for (int i = 0; i < n; i++) { kn[i].key = pat[off[k] + i]; kn[i].node = off[k] + i; }
@@ -2198,7 +2705,7 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
               ncls += ng2; free(kn); free(first); free(ord2); }
         }
         int *csz = calloc(ncls + 1, sizeof(int)), *cpos = sx(sizeof(int) * (NI + 1));
-        for (int i = 0; i < NI; i++) cpos[i] = csz[cls[i]]++;
+        for (int i = 0; i < NI; i++) cpos[i] = cls[i] < 0 ? -1 : csz[cls[i]]++;
         char *keep = sx(m + 1); int mk = 0;
         for (int c = 0; c < m; c++) keep[c] = 1;
         for (int c = 0; c < m; c++) for (int q = cp[c]; q < cp[c + 1]; q++) if (pat[ci[q]] != pat[cj[q]]) { keep[c] = 0; break; }
@@ -2244,7 +2751,7 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
                     const int c = t < 0 ? -1 : newc[B->con[t]]; if (t >= 0 && c < 0) continue;
                     for (int q = 0; q < A->nnz; q++) {
                         const int i = S->off[k] + A->row[q], j = S->off[k] + (lp ? A->row[q] : A->col[q]);
-                        if (S->cls[i] != S->cls[j]) continue;   /* C: never (invariant); kept constraints: never */
+                        if (S->cls[i] != S->cls[j] || S->cls[i] < 0) continue;   /* C: never (invariant); kept constraints: never; dropped free pairs */
                         const int qq = S->cls[i];
                         tc[nt] = c; tb[nt] = qblk[qq]; ti[nt] = S->cpos[i] + qpos0[qq]; tj[nt] = S->cpos[j] + qpos0[qq]; tv[nt] = A->val[q]; nt++;
                     }
@@ -2266,12 +2773,13 @@ PSSign *sign_reduce(Problem *P, int verbose, int auto_mode, double symmin, int c
                 for (int k = 0; k < nb; k++) { if (S->bs[k] < 0) continue; if (npr == 8) { nsk++; continue; } npr++; printf(" %d ->", S->bs[k]); int c1 = 0; for (int q = bcls0[k]; q < (k + 1 < nb ? bcls0[k + 1] : ncls); q++) { if (S->csz[q] >= 2) printf(" %d", S->csz[q]); else c1++; } if (c1) printf(" %dx1", c1); printf(k + 1 < nb && S->bs[k + 1] > 0 ? "," : ""); }
                 if (nsk) printf(" ... (%d more block(s))", nsk);
                 printf("%s\n", n1 ? " (1 x 1 pieces are LP variables)" : "");
+                if (npair) printf("   sign symmetry: %d split free pair(s) taken as free variables, %d of them odd under the group (zero, dropped)\n", npair, ndrop);
             }
             free(newc); free(tc); free(tb); free(ti); free(tj); free(tv); free(bsz); free(bn);
         }
-        free(pat); free(cls); free(cpos); free(csz); free(keep); free(bcls0);
+        free(pat); free(cls); free(cpos); free(csz); free(keep); free(bcls0); free(drop);
     } else if (verbose > 0 && !ok) printf("   sign symmetry: the system has no solution beyond the identity\n");
-    free(cpat); free(U.p); free(U.par); free(e); free(root); free(rpar); free(rid); free(off); free(cp); free(ci); free(cj); free(issdp);
+    free(cpat); free(U.p); free(U.par); free(e); free(root); free(rpar); free(rid); free(off); free(cp); free(ci); free(cj); free(issdp); free(fp); free(mate);
     return S;
 }
 
@@ -2281,7 +2789,7 @@ void sign_unmap(const PSSign *S, double **Xred, const double *yred, double **Xo,
     if (!Xred || !Xo) return;
     for (int k = 0; k < S->nblk; k++) {
         const int n = abs(S->bs[k]);
-        if (S->bs[k] < 0) { for (int i = 0; i < n; i++) { const int q = S->cls[S->off[k] + i]; Xo[k][i] = Xred[S->qblk[q]][S->cpos[S->off[k] + i] + S->qpos0[q]]; } continue; }
+        if (S->bs[k] < 0) { for (int i = 0; i < n; i++) { const int q = S->cls[S->off[k] + i]; Xo[k][i] = q < 0 ? 0.0 : Xred[S->qblk[q]][S->cpos[S->off[k] + i] + S->qpos0[q]]; } continue; }   /* (a dropped free pair: x+ = x- = 0) */
         memset(Xo[k], 0, sizeof(double) * (size_t)n * n);
         for (int j = 0; j < n; j++) { const int cj = S->cls[S->off[k] + j], pj = S->cpos[S->off[k] + j];
             if (S->csz[cj] == 1) { Xo[k][j + (size_t)j * n] = Xred[S->qblk[cj]][S->qpos0[cj]]; continue; }

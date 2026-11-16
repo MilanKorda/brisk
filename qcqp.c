@@ -724,7 +724,7 @@ int qcqp_solve(const QpProb *P, const QpOpts *o, QpRes *Res) {
      * second attempt started again from the beginning: QCFIXQTWIN_2000 32 + 48 iterations, QCTOUCH_2000 54 + 81, 16.6 s,
      * QCVAR_NEAR_2000 30 + 33 with the same results as 32, 54 (6.6 s) and 30 without it). BRISK_QCCONERETRY=1: as before */
     { static int cr = -1; if (cr < 0) { const char *e_ = getenv("BRISK_QCCONERETRY"); cr = e_ ? atoi(e_) : 0; }
-      if (!cr) { av[ac++] = "-coneretry"; av[ac++] = "0"; } }
+      if (!cr) { av[ac++] = "-socpretry"; av[ac++] = "0"; } }
     /* the SOCP solver at the QCQP's tolerance; its errors are measured on the reformulation, so the status below is
      * set by the errors on the problem as read (QPLIB_3029: the dual error there 4.3e-6 at the SOCP solver's 1e-8; a
      * tighter SOCP tolerance costs much on some files, QPLIB_2468: 19, 35, 97 iterations for 1e-8, 1e-9, 1e-10 -- the

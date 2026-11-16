@@ -19,7 +19,7 @@ function [x, y, info, z] = brisk_sedumi(A, b, c, K, opts)
 %
 % A may be m x N or N x m (N = K.f + K.l + sum(K.q) + sum(K.r) + sum(K.s.^2)), sparse or full.
 % A problem without PSD blocks (a linear or second-order cone program) is solved by BRISK's
-% second-order cone solver; opts.conesolver = 0 sends it to the semidefinite solver, as do
+% SOCP solver; opts.socpsolver = 0 sends it to the semidefinite solver, as do
 % opts.prec (high precision) and opts.bound. With PSD blocks the semidefinite solver is used
 % (second-order cones as arrow blocks, free variables as split pairs x = x+ - x-, which
 % BRISK detects and eliminates or handles natively).

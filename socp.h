@@ -28,6 +28,9 @@ typedef struct { double tol; int maxit; double timelimit; int verbose; int equil
                  int noretry;        /* (25 October 2026) 1: no second attempt with shorter steps after a first attempt that ends at
                                         reduced accuracy (errors within 1e-6; the QCQP route, whose polishing and second pass
                                         recover such a point); one that ends in numerical difficulties is repeated; default 0 */
+                 int fr;             /* (11 November 2026) facial reduction (-conefr): 0 none (default; a failed solve that shows a face
+                                        of the feasible set says so, socp_face_advice); 1 the face a failed solve shows is solved again;
+                                        2 also the faces single rows prove, removed before the solve */
 } SocpOpts;
 typedef struct {
     int status, iters;
@@ -37,6 +40,8 @@ typedef struct {
     long lnz;
     double *cx, *cy, *cz;           /* the centred iterate kept with SocpOpts.wsave (NULL when none) */
     int stalled;                    /* (3 November 2026) the solve stopped by the stall rule: no second attempt */
+    double start_err[2];            /* (15 November 2026) the start's primal and dual residuals on the equilibrated problem, relative to
+                                       1 + the sizes of its b and c (a measure that rescaled rows do not change; the dual form's test) */
 } SocpRes;
 void socp_default_opts(SocpOpts *o);
 int socp_solve(const SocpProb *P, const SocpOpts *opt, SocpRes *R);

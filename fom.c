@@ -60,6 +60,7 @@ static int g_fom_srange = 1;         /* 4.39: single-precision projections by ss
 static double g_rr_tol = 1e-6;       /* 4.39: their relative accuracy (follows the residual) */
 static int g_rr_refresh = 40;        /* 4.39: a full decomposition at least every this many projections */
 static FILE *g_ftrace = NULL;        /* 4.37: BRISK_FOMTRACE (both phases) */
+double g_fom_it_work = 0, g_fom_work = 0; int g_fom_handover = 0;   /* (13 November 2026: the hand-over rule's counts, read by main.c) */
 static double g_split_rate = 0;      /* 4.37: the splitting's recent rate (log residual per second) at phase II entry */
 
 void brisk_fom_oom_advice(void);
@@ -1943,6 +1944,13 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
         aa_w = fo_malloc(sizeof(double) * N2); aa_g = fo_malloc(sizeof(double) * N2); aa_r = fo_malloc(sizeof(double) * N2); aa_rlast = fo_malloc(sizeof(double) * N2);
         aa_dR = fo_malloc(sizeof(double) * N2 * aa_mem); aa_dG = fo_malloc(sizeof(double) * N2 * aa_mem);
     }
+    int hw_it0 = -1, hw_strikes = 0; double hw_res0 = 0;   /* (the hand-over rule's window) */
+    {   /* the work of a splitting iteration, in operations: an eigendecomposition per semidefinite block (10 n^3), the products
+         * with A and A' (4 entries), an LP block's n */
+        double w = 0;
+        for (int k = 0; k < P->nblk; k++) { const Block *B = &P->blk[k]; const double nk = B->n; w += B->type == BLK_SDP ? 10.0 * nk * nk * nk : nk; for (int t = 0; t < B->ncon; t++) w += 4.0 * B->A[t].nnz; }
+        g_fom_it_work = w; g_fom_work = 0; g_fom_handover = 0;
+    }
     int ssn_block_until = 0, nresume = 0;   /* 4.35: phase II is not re-entered before this iteration after a stall */
     it = 1;
     /* 4.37: the blocks in decreasing size for the parallel loops (largest first: the dynamic
@@ -1994,6 +2002,7 @@ int fom_solve(Problem *P, const Params *par, Result *R, double *yout, double **X
         size_t o = 0; for (int k = 0; k < nb; k++) { AvXa[k] = AvX + o; AvZa[k] = AvZ + o; o += fbsz(&P->blk[k]); }
     }
 resume_splitting:
+    hw_it0 = -1; hw_strikes = 0;   /* (the hand-over rule's windows restart with the splitting) */
     for (; it <= maxit; it++) {
         if (!single_off && best <= par->fom_single) single_off = 1;       /* double precision from here on */
         if (!single_off) {
@@ -2194,6 +2203,25 @@ resume_splitting:
             if (db <= tol) { dinf = db; status = ST_OPTIMAL; if (verbose) printf("first-order: the best Z for y meets the tolerance at iteration %d\n", it); break; }
         }
         if (brisk_time_up(par)) { status = ST_TIME; break; }
+        g_fom_work += g_fom_it_work;
+        /* 13 November 2026 (the owner): the hand-over to the interior-point method by a stall rule, not a budget. Over windows
+         * of 50 iterations the best residual's rate q = (best now / best then)^(1/50); the iterations still needed,
+         * log(tol / best) / log q, times the work of an iteration are the projected work; when it exceeds the interior-point
+         * method's estimate (par->fom_handover_ipm) in two windows in a row (a rising or flat residual projects without
+         * end), the engine stops (g_fom_handover); a run about to converge projects few iterations and goes on. The windows
+         * restart after phase II. Counted in operations, the same on every machine */
+        if (par->fom_handover > 0) {
+            if (hw_it0 < 0 || it < hw_it0) { hw_it0 = it; hw_res0 = best; }
+            else if (it - hw_it0 >= 50) {
+                const double q = best > 0 && hw_res0 > 0 ? pow(best / hw_res0, 1.0 / (it - hw_it0)) : 1.0;
+                const double need = (q < 1 && best > tol) ? log(tol / best) / log(q) : (best <= tol ? 0 : INFINITY);
+                const double proj = need * g_fom_it_work;
+                hw_strikes = proj > par->fom_handover_ipm ? hw_strikes + 1 : 0;
+                if (verbose > 1) printf("      [hand-over rule: rate %.4f a step, %.3g iterations to go, %.2e operations against the interior-point method's %.2e%s]\n", q, need, proj, par->fom_handover_ipm, hw_strikes >= 2 ? ": stop" : "");
+                hw_it0 = it; hw_res0 = best;
+                if (hw_strikes >= 2) { g_fom_handover = 1; status = ST_MAXIT; break; }
+            }
+        }
         if (par->fom_bm && (it >= par->fom_ssn_after || res <= par->fom_ssn_res)) { status = -2; break; }   /* to kernel B */
         /* to phase II: at a residual of fom_ssn_res, or after fom_ssn_after iterations once the
          * splitting stalls (4.37: its best residual improved by less than 1.3x since iteration
@@ -2518,10 +2546,17 @@ static int bpairs_detect(const Problem *P, BPair **out) {
         const double a = As->val[0], alpha = Al->val[0];
         if (a == 0 || alpha == 0) continue;
         const int i = As->row[0] < As->col[0] ? As->row[0] : As->col[0], j = As->row[0] < As->col[0] ? As->col[0] : As->row[0];
-        if (!tk[sdk[r]]) tk[sdk[r]] = calloc((size_t)Bs->n * Bs->n, 1);
-        unsigned char *mk = tk[sdk[r]] + i + (size_t)j * Bs->n;
-        if (*mk) continue;                    /* one bound row per entry */
-        *mk = 1;
+        /* (11 November 2026: several bound rows on one entry are all taken, the tightest of each side setting the bound
+         * (fom_bound_solve): X .>= 0 on a symmetric matrix variable through JuMP gives each off-diagonal bound twice, and a
+         * lower and an upper bound on the same entry are two rows; one row per entry left the others as rows of the
+         * linear system, and the problem below the rule's half. BRISK_FOMBOUNDONE=1: one row per entry, as before) */
+        static int one = -1; if (one < 0) one = getenv("BRISK_FOMBOUNDONE") ? 1 : 0;
+        if (one) {
+            if (!tk[sdk[r]]) tk[sdk[r]] = calloc((size_t)Bs->n * Bs->n, 1);
+            unsigned char *mk = tk[sdk[r]] + i + (size_t)j * Bs->n;
+            if (*mk) continue;                    /* one bound row per entry */
+            *mk = 1;
+        }
         BPair *p = &pr[np++];
         p->row = r; p->blk = sdk[r]; p->i = i; p->j = j; p->lpb = lpk[r]; p->lpv = v; p->a = a; p->g = i == j ? a : 2.0 * a; p->alpha = alpha;
     }
@@ -2533,6 +2568,104 @@ static int bpairs_detect(const Problem *P, BPair **out) {
 int fom_bound_rows(const Problem *P) {
     for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SOC) return 0;
     BPair *pr = NULL; const int np = bpairs_detect(P, &pr); free(pr);
+    return np;
+}
+static int cmp_ll_fom(const void *a, const void *b) { const long long x = *(const long long *)a, y = *(const long long *)b; return x < y ? -1 : x > y; }
+typedef struct { int r; int s; double v; } IKf;
+static int cmp_ik_fom(const void *a, const void *b) { const IKf *x = a, *y = b; if (x->r != y->r) return x->r < y->r ? -1 : 1; if (x->s != y->s) return x->s < y->s ? -1 : 1; return x->v < y->v ? -1 : x->v > y->v; }
+/* 11 November 2026: bounds on entries of X stated in SDPA's primal form (the image form: min c'x s.t. sum_i x_i F_i - F0 >= 0
+ * with x_i >= l as an LP entry; a file written that way by hand, CVXPY's and YALMIP's exports). In BRISK's (P) such a bound is
+ * an LP variable (not of a free pair) with one nonzero, in a row whose semidefinite part is one entry of one block that no
+ * other row touches; the dual form, with its pairs of y eliminated, makes it a row of one entry of X and a private slack,
+ * which the first-order method takes as a bound. Returns the distinct such bounds (a repeat of the same row, sign and value
+ * counted once) and, in *mD, the rows of the dual form after the elimination (dualize.c's count) */
+int fom_image_bounds(const Problem *P, long *mD) {
+    *mD = 0;
+    const int m = P->m, nb = P->nblk;
+    for (int k = 0; k < nb; k++) if (P->blk[k].type != BLK_SDP && P->blk[k].type != BLK_LP) return 0;
+    long N = 0, nlp = 0;
+    for (int k = 0; k < nb; k++) { const long n = P->blk[k].n; if (P->blk[k].type == BLK_SDP) N += n * (n + 1) / 2; else nlp += n; }
+    FreePair *fp = NULL; const int np = free_pairs_detect(P, &fp);
+    *mD = N + (nlp - 2L * np) + np - m;
+    const size_t m1 = (size_t)m + 1;
+    int *nsd = calloc(m1, sizeof(int)), *sdk = calloc(m1, sizeof(int)), *sdi = calloc(m1, sizeof(int)), *sdj = calloc(m1, sizeof(int));
+    int **occ = calloc((size_t)nb + 1, sizeof(int *)), **ocr = calloc((size_t)nb + 1, sizeof(int *)); double **ova = calloc((size_t)nb + 1, sizeof(double *));
+    unsigned char **inpair = calloc((size_t)nb + 1, sizeof(unsigned char *));
+    for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_LP) { const int n = P->blk[k].n; occ[k] = calloc((size_t)n + 1, sizeof(int)); ocr[k] = calloc((size_t)n + 1, sizeof(int)); ova[k] = calloc((size_t)n + 1, sizeof(double)); inpair[k] = calloc((size_t)n + 1, 1); }
+    for (int q = 0; q < np; q++) { inpair[fp[q].blk][fp[q].ip] = inpair[fp[q].blk][fp[q].im] = 1; }
+    free(fp);
+    /* the rows touching each semidefinite entry: counted by a hash of (block, i, j) in a sorted list */
+    size_t nse = 0; for (int k = 0; k < nb; k++) if (P->blk[k].type == BLK_SDP) for (int t = 0; t < P->blk[k].ncon; t++) nse += (size_t)P->blk[k].A[t].nnz;
+    long long *sek = malloc(sizeof(long long) * (nse + 1)); size_t w = 0;
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k];
+        for (int t = 0; t < B->ncon; t++) {
+            const SpSym *S = &B->A[t]; const int r = B->con[t];
+            if (B->type == BLK_SDP) {
+                for (int e = 0; e < S->nnz; e++) {
+                    const int i = S->row[e] < S->col[e] ? S->row[e] : S->col[e], j = S->row[e] < S->col[e] ? S->col[e] : S->row[e];
+                    nsd[r]++; sdk[r] = k; sdi[r] = i; sdj[r] = j;
+                    sek[w++] = ((long long)k << 42) | ((long long)i << 21) | (long long)j;
+                }
+            } else for (int e = 0; e < S->nnz; e++) { const int l = S->row[e]; occ[k][l]++; ocr[k][l] = r; ova[k][l] = S->val[e]; }
+        }
+    }
+    qsort(sek, w, sizeof(long long), cmp_ll_fom);
+    typedef IKf IK;
+    IK *keys = malloc(sizeof(IK) * (nlp + 1)); long nk = 0;
+    for (int k = 0; k < nb; k++) {
+        const Block *B = &P->blk[k];
+        if (B->type != BLK_LP) continue;
+        double *cl = calloc((size_t)B->n + 1, sizeof(double));
+        for (int q = 0; q < B->C.nnz; q++) cl[B->C.row[q]] = B->C.val[q];
+        for (int l = 0; l < B->n; l++) {
+            if (inpair[k][l] || occ[k][l] != 1 || ova[k][l] == 0) continue;
+            const int r = ocr[k][l];
+            if (nsd[r] != 1) continue;
+            const long long key = ((long long)sdk[r] << 42) | ((long long)sdi[r] << 21) | (long long)sdj[r];
+            /* the entry touched by this row alone */
+            size_t lo = 0, hi = w; while (lo < hi) { const size_t mid = (lo + hi) / 2; if (sek[mid] < key) lo = mid + 1; else hi = mid; }
+            if (lo + 1 < w && sek[lo + 1] == key) continue;
+            keys[nk].r = r; keys[nk].s = ova[k][l] > 0 ? 1 : -1; keys[nk].v = cl[l] / ova[k][l]; nk++;
+        }
+        free(cl);
+    }
+    /* distinct: the same row, sign and value counted once; the repeats are not rows either: the dual form's count less them
+     * (11 November 2026: YALMIP's X(:) >= 0 on a symmetric matrix states each off-diagonal bound twice; with the repeats
+     * counted as rows the k-means relaxation with 120 points missed the rule by one row and the interior-point method took
+     * 66 s to reduced accuracy; the interfaces of CVXPY and JuMP write a repeat once, which this count matches) */
+    long nd = 0;
+    if (nk > 0) {
+        qsort(keys, (size_t)nk, sizeof(IK), cmp_ik_fom);
+        for (long a = 0; a < nk; a++) if (a == 0 || keys[a].r != keys[a - 1].r || keys[a].s != keys[a - 1].s || keys[a].v != keys[a - 1].v) nd++;
+    }
+    *mD -= nk - nd;
+    free(keys); free(sek);
+    for (int k = 0; k < nb; k++) { free(occ[k]); free(ocr[k]); free(ova[k]); free(inpair[k]); }
+    free(occ); free(ocr); free(ova); free(inpair); free(nsd); free(sdk); free(sdi); free(sdj);
+    return (int)nd;
+}
+/* 11 November 2026: the automatic rule's count: the bounded entries (one per entry, whatever its rows, as the rule was measured
+ * on the k-means and theta-plus relaxations) and the rows that repeat a bound already given on the same entry and side (JuMP's
+ * X .>= 0 on a symmetric matrix: each off-diagonal bound twice). The rule compares the entries with the rows less the repeats.
+ * fap09 (Mittelmann, SDP), a lower and an upper bound on 14,025 entries of 30,276 rows: counted by its rows it passed the rule
+ * and the first-order method ran to its cap (217 s) before the interior-point method's 60 s */
+int fom_bound_count(const Problem *P, int *entries, int *repeats) {
+    *entries = *repeats = 0;
+    for (int k = 0; k < P->nblk; k++) if (P->blk[k].type == BLK_SOC) return 0;
+    BPair *pr = NULL; const int np = bpairs_detect(P, &pr);
+    unsigned char **seen = calloc((size_t)P->nblk + 1, sizeof(unsigned char *));
+    for (int q = 0; q < np; q++) {
+        const int k = pr[q].blk, n = P->blk[k].n;
+        if (!seen[k]) seen[k] = calloc((size_t)n * n, 1);
+        unsigned char *s = seen[k] + pr[q].i + (size_t)pr[q].j * n;
+        const unsigned char side = (pr[q].g > 0) != (pr[q].alpha > 0) ? 1 : 2;   /* 1 lower, 2 upper */
+        if (!*s) (*entries)++;
+        if (*s & side) (*repeats)++;
+        *s |= side;
+    }
+    for (int k = 0; k < P->nblk; k++) free(seen[k]);
+    free(seen); free(pr);
     return np;
 }
 static void fb_free_all(FB *F, int nb) {
@@ -2613,7 +2746,7 @@ static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *you
         const double val = P->b[pr[q].row] / pr[q].g / Q.bs;
         const int lower = (pr[q].g > 0) != (pr[q].alpha > 0);
         const size_t e1 = pr[q].i + (size_t)pr[q].j * n, e2 = pr[q].j + (size_t)pr[q].i * n;
-        if (lower) { lo[k2][e1] = lo[k2][e2] = val; } else { hi[k2][e1] = hi[k2][e2] = val; }
+        if (lower) { const double v = fmax(lo[k2][e1], val); lo[k2][e1] = lo[k2][e2] = v; } else { const double v = fmin(hi[k2][e1], val); hi[k2][e1] = hi[k2][e2] = v; }   /* (the tightest row of each side) */
         hb[k2][e1] = hb[k2][e2] = 1;
     }
     if (verbose >= 0) printf("first-order engine: %d of the %d constraints are bounds on single entries of X (g X_ij + alpha s = b, s >= 0 in this constraint alone): solved as entrywise bounds, %d constraints left\n", np, m, m2);
@@ -2761,9 +2894,32 @@ static int fom_bound_solve(Problem *P, const Params *par, Result *R, double *you
     /* back to the problem with the bound rows (P's scaling): X_P = Q.bs X~; s from its row; y_r = (Z_B)_ij / a */
     double *yP = calloc(m + 1, sizeof(double));
     for (int r = 0; r < m; r++) if (rmap[r] >= 0) yP[r] = Q.cs * Q.d[rmap[r]] * y[rmap[r]];
-    for (int q = 0; q < np; q++) {
-        const int k2 = bmap[pr[q].blk], n = Q.blk[k2].n;
-        yP[pr[q].row] = Q.cs * ZB[k2][pr[q].i + (size_t)pr[q].j * n] / pr[q].a;
+    /* (11 November 2026: with several rows on an entry, the bound's multiplier goes to one row that sets the active side:
+     * Z_B >= 0 where a lower bound binds, <= 0 where an upper bound does (the dual slack of s, -alpha y_r, is nonnegative);
+     * the other rows get 0. One row per entry: as before) */
+    {
+        unsigned char **done = calloc(nb2, sizeof(unsigned char *)), **cnt = calloc(nb2, sizeof(unsigned char *));
+        for (int q = 0; q < np; q++) {
+            const int k2 = bmap[pr[q].blk], n = Q.blk[k2].n;
+            if (!cnt[k2]) cnt[k2] = calloc((size_t)n * n, 1);
+            unsigned char *c = cnt[k2] + pr[q].i + (size_t)pr[q].j * n; if (*c < 255) (*c)++;
+        }
+        for (int q = 0; q < np; q++) {
+            const int k2 = bmap[pr[q].blk], n = Q.blk[k2].n;
+            const size_t e1 = pr[q].i + (size_t)pr[q].j * n;
+            const double zb = ZB[k2][e1];
+            const int lower = (pr[q].g > 0) != (pr[q].alpha > 0);
+            const double val = P->b[pr[q].row] / pr[q].g / Q.bs;
+            if (cnt[k2][e1] == 1) { yP[pr[q].row] = Q.cs * zb / pr[q].a; continue; }   /* (one row on the entry: as before) */
+            yP[pr[q].row] = 0;
+            if (!done[k2]) done[k2] = calloc((size_t)n * n * 2, 1);
+            unsigned char *d = done[k2] + 2 * e1 + (lower ? 0 : 1);
+            if (*d || zb == 0 || (zb > 0) != lower || val != (lower ? lo[k2][e1] : hi[k2][e1])) continue;
+            *d = 1;
+            yP[pr[q].row] = Q.cs * zb / pr[q].a;
+        }
+        for (int k = 0; k < nb2; k++) { free(done[k]); free(cnt[k]); }
+        free(done); free(cnt);
     }
     if (yout) for (int r = 0; r < m; r++) yout[r] = P->cs * P->d[r] * yP[r];
     if (Xout) {

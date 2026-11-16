@@ -1,11 +1,14 @@
 classdef BriskQpModel < handle
-%BRISKQPMODEL  A convex QP kept for re-solves after changes of its bounds or cost, each solve from the
-% previous active set (BRISK's dual active-set method): model predictive control, branch and bound.
+%BRISKQPMODEL  A convex QP kept for re-solves after changes of its bounds or cost: model predictive
+% control, branch and bound. BRISK chooses the method for the stream of solves: its dual active-set
+% method, each solve from the previous active set, for a small QP and where eliminating the equality
+% rows leaves a problem that the stream pays for; its interior-point method otherwise, which keeps its
+% setup between the solves and starts from the last solution.
 %
 %   mdl = BriskQpModel(H, f, A, l, u, lb, ub)          the data as in brisk_qp
 %   mdl = BriskQpModel(H, f, A, l, u, lb, ub, opts)    opts.tol, maxit, timelimit, verbose;
-%                                                      opts.qpipm = true: the interior-point method,
-%                                                      every solve from the start
+%                                                      opts.qpas = true: the active-set method,
+%                                                      opts.qpipm = true: the interior-point method
 %   [x, info] = mdl.solve()                            info as in brisk_qp
 %   mdl.set_var_bounds(j, lo, hi)                      lb(j) = lo, ub(j) = hi
 %   mdl.set_row_bounds(i, lo, hi)                      l(i) = lo, u(i) = hi
@@ -21,7 +24,11 @@ classdef BriskQpModel < handle
             if nargin < 7, error('brisk:input', 'BriskQpModel: usage BriskQpModel(H, f, A, l, u, lb, ub, opts)'); end
             if nargin < 8, opts = struct(); end
             [H, f, A, l, u, lb, ub] = brisk_qp_data(H, f, A, l, u, lb, ub);
-            obj.handle = brisk_mex('qp_create', H, f, A, l, u, lb, ub, brisk_opts2args(opts, 'BriskQpModel'));
+            args = brisk_opts2args(opts, 'BriskQpModel');
+            % (the model's own choice of method unless one is asked for: -qpauto, as Python's QpModel and JuMP)
+            if ischar(args), args = strsplit(strtrim(args)); args = args(~cellfun(@isempty, args)); end
+            if ~any(strcmp(args, '-qpas')) && ~any(strcmp(args, '-qpipm')) && ~any(strcmp(args, '-qpauto')), args = [args(:).', {'-qpauto'}]; end
+            obj.handle = brisk_mex('qp_create', H, f, A, l, u, lb, ub, args);
         end
         function [x, info] = solve(obj)
             [x, y, z, info] = brisk_mex('qp_solve', obj.handle);

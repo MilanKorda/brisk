@@ -509,7 +509,7 @@ static void vertex_cover(const Gr *g, const char *part, char *sep) {
     }
     int *mb = malloc(sizeof(int) * (nb + 1)), *seen = calloc((size_t)nb + 1, sizeof(int)), *ma = malloc(sizeof(int) * (na + 1));
     for (int b = 0; b < nb; b++) mb[b] = -1;
-    static int hk = -1; if (hk < 0) { const char *e = getenv("BRISK_NDHK"); hk = e && atoi(e) != 0; }
+    static int hk = -1; if (hk < 0) { const char *e = getenv("BRISK_NDHK"); hk = !(e && atoi(e) == 0); }   /* (on by default since 9 November 2026; BRISK_NDHK=0: Kuhn's search) */
     if (hk) {
         if (hk_match(g, part, bidx, alist, na, nb, mb)) {      /* (past the budget, or stopped: the smaller side) */
             g_nd_abort = 1;
@@ -640,9 +640,10 @@ static void node_refine1(const Gr *g, char *st, int niter) {
     free(pw); free(mv); free(mp); free(pulled); pq_free(&H);
 }
 static void node_refine2(const Gr *g, char *st, int npass);
+static int nd_nodesep(void);
 static void node_refine(const Gr *g, char *st, int npass) {
     static int r1 = -1; if (r1 < 0) { const char *e = getenv("BRISK_NDREF"); r1 = !(e && atoi(e) == 0); }
-    if (r1) node_refine1(g, st, 10); else node_refine2(g, st, npass);
+    if (r1) { node_refine1(g, st, 10); if (nd_nodesep()) node_refine2(g, st, npass); } else node_refine2(g, st, npass);
 }
 static void node_refine2(const Gr *g, char *st, int npass) {
     const int n = g->n;
@@ -799,6 +800,76 @@ void nd_set_target(double flops) { g_nd_target = flops; }
 /* (20 October 2026, LP/SOCP) the number of bisections per level and the leaf size, set by a caller for one order (-1: the
  * defaults, 4 or 2 and 200, or BRISK_NDTRY / BRISK_NDLEAF); the cone solver's full system takes one try and leaves of
  * 5,000: the prism's order in 0.9 s instead of 10 s at 0.63 of AMD's work instead of 0.43 */
+/* (7 November 2026, BRISK_NDNODESEP=1; 0, the default: off) the separators of a graph whose vertices have very unequal degrees.
+ * ofi (LP): its normal equations (104,800 rows, median degree 7, largest 47,470) without the 256 longest columns: the edge
+ * bisection (mode 0) gave a first separator of 831 vertices (421 to 950 over sixteen tries), the bisection that refines the
+ * vertex separator at every level (mode 1) 28 to 40 (METIS: at most 50). The edge bisection is tried first, and the rule
+ * that makes another try only where the separator's dense block is worth a try's work stopped after it: the second kind
+ * was never tried there, and the order cost 4.7e9 flops (AMD 2.09e9, METIS 9.3e8, Gurobi's nested dissection 7.96e8).
+ * An edge cut is the wrong measure where a vertex of high degree joins the two sides: cutting its edges costs thousands,
+ * putting it into the separator one. With the switch: (1) both kinds are tried before that rule may stop the tries (each
+ * wins on other graphs: set coverings and meshes by the edge bisection), the smaller separator kept as before; (2) each
+ * level's refinement of the separator adds the two-sided pass after the one-sided ones (METIS refines its separators by
+ * moves from both sides; on ofi's full pattern the first separator 397 -> 196, METIS's about 195). ofi without its 256
+ * longest columns: 4.7e9 -> 1.06e9 flops. */
+static int nd_nodesep(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_NDNODESEP"); c = e ? atoi(e) : 0; } return c; }
+/* (7 November 2026, BRISK_NDSUBAMD=1, an experiment; 0: off) each dissected subgraph's order against AMD's order of the same
+ * subgraph, by the factorization's flops on that subgraph (the elimination tree and the column counts by the row subtrees);
+ * the cheaper kept. Where a region is a union of large cliques (an LP's long columns, each a clique of its rows) no small
+ * separator exists, and the separators stacked along a branch fill into one dense block: ofi (LP, full pattern), one branch
+ * with separators of 196, 328, 672, 308, 645, 371, 196 and 169 vertices on subgraphs of 63,142 down to 2,044 vertices
+ * (about 2,600^3/3 = 5.9e9 flops); with both switches ofi 2.06e9 flops (AMD 2.53e9, METIS 1.7e9-1.8e9), without its 256
+ * longest columns 9.3e8. Its work (an AMD order and two counts per subgraph) passes the dissection's budget in the LP
+ * method's analysis (mzzv11, sing17: the order lost), hence off. g_nd_loc: a caller's vertex's position in the subgraph */
+static _Thread_local int *g_nd_loc = NULL;
+static int nd_subamd(void) { static int c = -1; if (c < 0) { const char *e = getenv("BRISK_NDSUBAMD"); c = e ? atoi(e) : 0; } return c; }
+static double gr_order_flops(const Gr *g, const int *ord) {
+    const int n = g->n;
+    int *inv = malloc(sizeof(int) * (n + 1)), *par = malloc(sizeof(int) * (n + 1)), *anc = malloc(sizeof(int) * (n + 1)), *mark = malloc(sizeof(int) * (n + 1));
+    long *cnt = calloc((size_t)n + 1, sizeof(long));
+    if (!inv || !par || !anc || !mark || !cnt) { free(inv); free(par); free(anc); free(mark); free(cnt); return 1e300; }
+    for (int k = 0; k < n; k++) inv[ord[k]] = k;
+    for (int k = 0; k < n; k++) { par[k] = anc[k] = mark[k] = -1; }
+    for (int k = 0; k < n; k++) {
+        const int o = ord[k];
+        for (int p = g->xadj[o]; p < g->xadj[o + 1]; p++) {
+            int i = inv[g->adj[p]]; if (i >= k) continue;
+            while (i != -1 && i < k) { const int a = anc[i]; anc[i] = k; if (a == -1) { par[i] = k; break; } i = a; }
+        }
+    }
+    double wk = 0;
+    for (int k = 0; k < n; k++) {
+        const int o = ord[k]; mark[k] = k;
+        for (int p = g->xadj[o]; p < g->xadj[o + 1]; p++) {
+            int j = inv[g->adj[p]]; if (j >= k) continue;
+            while (j != -1 && mark[j] != k) { mark[j] = k; cnt[j]++; j = par[j]; wk += 1; }
+        }
+    }
+    double fl = 0;
+    for (int j = 0; j < n; j++) { const double c = (double)cnt[j] + 1; fl += c * c; }
+    g_nd_work += 2.0 * (g->xadj[n] + n) + wk; ND_WORK(2.0 * (g->xadj[n] + n) + wk);
+    free(inv); free(par); free(anc); free(mark); free(cnt);
+    return fl;
+}
+/* the dissection's order of g, perm[start .. start + n), against AMD's: AMD's written there when it is cheaper */
+static void nd_judge_sub(const Gr *g, const int *name, int *perm, int start) {
+    const int n = g->n;
+    if (!g_nd_loc || n < 3) return;
+    int *od = malloc(sizeof(int) * (n + 1)), *P = malloc(sizeof(int) * (n + 1));
+    if (!od || !P) { free(od); free(P); return; }
+    for (int v = 0; v < n; v++) g_nd_loc[name[v]] = v;
+    for (int k = 0; k < n; k++) od[k] = g_nd_loc[perm[start + k]];
+    double Control[AMD_CONTROL], Info[AMD_INFO];
+    amd_defaults(Control);
+    g_nd_work += 10.0 * (g->xadj[n] + n);
+    const int st = amd_order(n, g->xadj, g->adj, P, Control, Info);
+    if (st == AMD_OK || st == AMD_OK_BUT_JUMBLED) {
+        const double fd = gr_order_flops(g, od), fa = gr_order_flops(g, P);
+        if (getenv("BRISK_NDDBG") && atoi(getenv("BRISK_NDDBG")) >= 3 && n > 2000) fprintf(stderr, "   [nd: subgraph of %d vertices: the dissection %.3g flops, AMD %.3g%s]\n", n, fd, fa, fa < fd ? " (AMD taken)" : "");
+        if (fa < fd) for (int k = 0; k < n; k++) perm[start + k] = name[P[k]];
+    }
+    free(od); free(P);
+}
 static int g_nd_try_set = -1, g_nd_leaf_set = -1;
 void nd_set_params(int ntry, int leaf) { g_nd_try_set = ntry; g_nd_leaf_set = leaf; }
 static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
@@ -806,7 +877,7 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
     ND_WORK(n);
     if (!g_nd_abort && nd_over()) g_nd_abort = 1;
     if (g_nd_abort) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
-    if (n <= leaf || depth > 60) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
+    if (g->tvw <= leaf || depth > 60) { leaf_order(g, name, perm, np); gr_free(g); free(name); return; }   /* (7 November 2026: the weight, = n for unit weights) */
     /* hubs (vertices of many times the mean degree) go last without a search: they are in every
      * good separator of what they connect, and an edge bisection cannot afford to cut their edges */
     {
@@ -849,12 +920,12 @@ static void nd_rec(Gr *g, int *name, int *perm, int *np, int leaf, int depth) {
                 if (hub && h < nh) { loc[v] = -1; hubs[h++] = name[v]; } else { loc[v] = k++; nz += dv; }
             }
             nh = h;
-            Gr r; r.n = k; r.tvw = k;
+            Gr r; r.n = k; r.tvw = 0;
             r.xadj = malloc(sizeof(int) * (k + 1)); r.adj = malloc(sizeof(int) * (nz + 1)); r.ew = malloc(sizeof(int) * (nz + 1)); r.vw = malloc(sizeof(int) * (k + 1));
             int *rname = malloc(sizeof(int) * (k + 1)), w = 0; k = 0;
             for (int v = 0; v < n; v++) if (loc[v] >= 0) {
-                r.xadj[k] = w; r.vw[k] = 1; rname[k] = name[v]; k++;
-                for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) if (loc[g->adj[p]] >= 0) { r.adj[w] = loc[g->adj[p]]; r.ew[w] = 1; w++; }
+                r.xadj[k] = w; r.vw[k] = g->vw[v]; r.tvw += g->vw[v]; rname[k] = name[v]; k++;
+                for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) if (loc[g->adj[p]] >= 0) { r.adj[w] = loc[g->adj[p]]; r.ew[w] = g->ew[p]; w++; }
             }
             r.xadj[k] = w;
             if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: n %d, %d hubs (degree > %.0f) last]\n", depth, n, nh, hubf * avg);
@@ -885,14 +956,14 @@ nohubs:;
             for (int v = 0; v < n; v++) { loc[v] = csz[cc[v]]++; cnz[cc[v]] += g->xadj[v + 1] - g->xadj[v]; }
             Gr *sub = malloc(sizeof(Gr) * ncc); int **sname = malloc(sizeof(int *) * ncc), *fill = calloc((size_t)ncc + 1, sizeof(int)), *wpos = calloc((size_t)ncc + 1, sizeof(int));
             for (int c = 0; c < ncc; c++) {
-                sub[c].n = csz[c]; sub[c].tvw = csz[c];
+                sub[c].n = csz[c]; sub[c].tvw = 0;
                 sub[c].xadj = malloc(sizeof(int) * (csz[c] + 1)); sub[c].adj = malloc(sizeof(int) * (cnz[c] + 1)); sub[c].ew = malloc(sizeof(int) * (cnz[c] + 1)); sub[c].vw = malloc(sizeof(int) * (csz[c] + 1));
                 sname[c] = malloc(sizeof(int) * (csz[c] + 1));
             }
             for (int v = 0; v < n; v++) {
                 const int c = cc[v], k = fill[c]++;
-                sub[c].xadj[k] = wpos[c]; sub[c].vw[k] = 1; sname[c][k] = name[v];
-                for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { sub[c].adj[wpos[c]] = loc[g->adj[p]]; sub[c].ew[wpos[c]] = 1; wpos[c]++; }
+                sub[c].xadj[k] = wpos[c]; sub[c].vw[k] = g->vw[v]; sub[c].tvw += g->vw[v]; sname[c][k] = name[v];
+                for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { sub[c].adj[wpos[c]] = loc[g->adj[p]]; sub[c].ew[wpos[c]] = g->ew[p]; wpos[c]++; }
             }
             for (int c = 0; c < ncc; c++) sub[c].xadj[csz[c]] = wpos[c];
             free(cc); free(qq); free(csz); free(cnz); free(loc); free(fill); free(wpos);
@@ -916,9 +987,9 @@ nohubs:;
         const int ns = degree_sep(g, part);
         if (ns >= 0) {
             long c[3] = { 0, 0, 0 };
-            for (int v = 0; v < n; v++) c[(int)part[v]]++;
+            for (int v = 0; v < n; v++) c[(int)part[v]] += g->vw[v];
             const long big = c[0] > c[1] ? c[0] : c[1];
-            bestscore = c[2] * 100 + (c[2] + 1) * (100 * big / (n > 0 ? n : 1) - 50);
+            bestscore = c[2] * 100 + (c[2] + 1) * (100 * big / (g->tvw > 0 ? g->tvw : 1) - 50);
             for (int v = 0; v < n; v++) { bsep[v] = part[v] == 2; bpart[v] = part[v] == 2 ? 0 : part[v]; }
             if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: n %d, separator by degree %ld, sides %ld + %ld]\n", depth, n, c[2], c[0], c[1]);
         }
@@ -929,11 +1000,12 @@ nohubs:;
         if (bisect(g, part, t & 1)) break;
         const double wtry = g_nd_work - wt0;
         long c[3] = { 0, 0, 0 };
-        for (int v = 0; v < n; v++) c[(int)part[v]]++;
+        for (int v = 0; v < n; v++) c[(int)part[v]] += g->vw[v];
         if (c[0] == 0 || c[1] == 0) continue;
         /* (the separator, with a penalty for imbalance: the larger side decides the work below) */
         const long big = c[0] > c[1] ? c[0] : c[1];
-        const long score = c[2] * 100 + (c[2] + 1) * (100 * big / (n > 0 ? n : 1) - 50);
+        const long score = c[2] * 100 + (c[2] + 1) * (100 * big / (g->tvw > 0 ? g->tvw : 1) - 50);
+        if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: try %d (%s): separator %ld, sides %ld + %ld]\n", depth, t, t & 1 ? "the vertex separator refined at every level" : "the edge bisection", c[2], c[0], c[1]);
         if (bestscore < 0 || score < bestscore) { bestscore = score; for (int v = 0; v < n; v++) { bsep[v] = part[v] == 2; bpart[v] = part[v] == 2 ? 0 : part[v]; } }
         /* (24 October 2026, the night) the first bisection's separator, with the hubs put last above it, is ordered last and
          * fills into a dense block: its factorization alone costs (s^3)/3 flops. When that passes the order to beat, no
@@ -951,8 +1023,8 @@ nohubs:;
          * (negative: every try) */
         {
             static double tc = -2; if (tc < -1) { const char *e = getenv("BRISK_NDTRYC"); tc = e ? atof(e) : 10.0; }
-            if (tc >= 0 && t + 1 < ntry) {
-                long bs = 0; for (int v = 0; v < n; v++) bs += bsep[v];
+            if (tc >= 0 && t + 1 < ntry && !(nd_nodesep() && t == 0)) {
+                long bs = 0; for (int v = 0; v < n; v++) bs += bsep[v] * g->vw[v];
                 const double sb = (double)bs;
                 if (sb * sb * sb / 3.0 < tc * wtry) break;
             }
@@ -963,9 +1035,9 @@ nohubs:;
     if (bestscore < 0) { free(part); free(sep); free(bpart); free(bsep); leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     memcpy(part, bpart, (size_t)n); memcpy(sep, bsep, (size_t)n);
     free(bpart); free(bsep);
-    int cnt[3] = { 0, 0, 0 };
-    for (int v = 0; v < n; v++) cnt[sep[v] ? 2 : (int)part[v]]++;
-    if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: n %d -> %d + %d, separator %d]\n", depth, n, cnt[0], cnt[1], cnt[2]);
+    long cnt[3] = { 0, 0, 0 };   /* (7 November 2026: weights; = counts for unit weights) */
+    for (int v = 0; v < n; v++) cnt[sep[v] ? 2 : (int)part[v]] += g->vw[v];
+    if (getenv("BRISK_NDDBG") && depth <= atoi(getenv("BRISK_NDDBG"))) fprintf(stderr, "   [nd depth %d: n %d -> %ld + %ld, separator %ld]\n", depth, n, cnt[0], cnt[1], cnt[2]);
     /* a separator that does not separate, or is no smaller than what it leaves: this part by AMD */
     if (cnt[0] == 0 || cnt[1] == 0 || cnt[2] > (cnt[0] < cnt[1] ? cnt[0] : cnt[1])) { free(part); free(sep); leaf_order(g, name, perm, np); gr_free(g); free(name); return; }
     int *loc = malloc(sizeof(int) * (n + 1));
@@ -973,43 +1045,51 @@ nohubs:;
     for (int s = 0; s < 2; s++) {
         int k = 0, nz = 0;
         for (int v = 0; v < n; v++) if (!sep[v] && part[v] == s) { loc[v] = k++; nz += g->xadj[v + 1] - g->xadj[v]; }
-        sub[s].n = k; sub[s].tvw = k;
+        sub[s].n = k; sub[s].tvw = 0;
         sub[s].xadj = malloc(sizeof(int) * (k + 1)); sub[s].adj = malloc(sizeof(int) * (nz + 1)); sub[s].ew = malloc(sizeof(int) * (nz + 1)); sub[s].vw = malloc(sizeof(int) * (k + 1));
         sname[s] = malloc(sizeof(int) * (k + 1));
         int w = 0; k = 0;
         for (int v = 0; v < n; v++) if (!sep[v] && part[v] == s) {
-            sub[s].xadj[k] = w; sub[s].vw[k] = 1; sname[s][k] = name[v]; k++;
-            for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (!sep[u] && part[u] == s) { sub[s].adj[w] = u; sub[s].ew[w] = 1; w++; } }
+            sub[s].xadj[k] = w; sub[s].vw[k] = g->vw[v]; sub[s].tvw += g->vw[v]; sname[s][k] = name[v]; k++;
+            for (int p = g->xadj[v]; p < g->xadj[v + 1]; p++) { const int u = g->adj[p]; if (!sep[u] && part[u] == s) { sub[s].adj[w] = u; sub[s].ew[w] = g->ew[p]; w++; } }
         }
         sub[s].xadj[k] = w;
         for (int p = 0; p < w; p++) sub[s].adj[p] = loc[sub[s].adj[p]];
     }
-    int *sepname = malloc(sizeof(int) * (cnt[2] + 1)), ns = 0;
+    int *sepname = malloc(sizeof(int) * ((size_t)n + 1)), ns = 0;
     for (int v = 0; v < n; v++) if (sep[v]) sepname[ns++] = name[v];
     free(part); free(sep); free(loc);
-    gr_free(g); free(name);                          /* (this level's graph is no longer needed) */
+    const int judge = nd_subamd() && g_nd_loc;      /* (BRISK_NDSUBAMD: this level's graph kept to judge its order) */
+    const int start = *np;
+    if (!judge) { gr_free(g); free(name); }          /* (this level's graph is no longer needed) */
     for (int s = 0; s < 2; s++) nd_rec(&sub[s], sname[s], perm, np, leaf, depth + 1);
     for (int i = 0; i < ns; i++) perm[(*np)++] = sepname[i];
     free(sepname);
+    if (judge) { if (!g_nd_abort && *np - start == n) nd_judge_sub(g, name, perm, start); gr_free(g); free(name); }
 }
 
-int nd_order(int n, const int *xadj, const int *adjncy, int *perm) {
+/* 7 November 2026: with vertex and edge weights (vwgt, ewgt; NULL: 1), for a graph compressed by its indistinguishable
+ * vertices (a vertex the class, its weight the class's size, an edge's weight the original edges it stands for): the
+ * separators, the balance and the leaves are measured in weights. Unit weights give the unweighted order bit for bit. */
+int nd_order_w(int n, const int *xadj, const int *adjncy, const int *vwgt, const int *ewgt, int *perm) {
     if (n <= 0) return 1;
     nd_seed = 12345u;
     g_nd_first = 1; g_nd_top = 0;
-    Gr g; g.n = n; g.tvw = n;
+    Gr g; g.n = n; g.tvw = 0;
     const int nz = xadj[n];
     g.xadj = malloc(sizeof(int) * (n + 1)); g.adj = malloc(sizeof(int) * (nz + 1)); g.ew = malloc(sizeof(int) * (nz + 1)); g.vw = malloc(sizeof(int) * (n + 1));
     int *name = malloc(sizeof(int) * (n + 1));
     if (!g.xadj || !g.adj || !g.ew || !g.vw || !name) { gr_free(&g); free(name); return 1; }
     int w = 0;
     for (int v = 0; v < n; v++) {
-        g.xadj[v] = w; g.vw[v] = 1; name[v] = v;
-        for (int p = xadj[v]; p < xadj[v + 1]; p++) if (adjncy[p] != v) { g.adj[w] = adjncy[p]; g.ew[w] = 1; w++; }
+        g.xadj[v] = w; g.vw[v] = vwgt ? vwgt[v] : 1; g.tvw += g.vw[v]; name[v] = v;
+        for (int p = xadj[v]; p < xadj[v + 1]; p++) if (adjncy[p] != v) { g.adj[w] = adjncy[p]; g.ew[w] = ewgt ? ewgt[p] : 1; w++; }
     }
     g.xadj[n] = w;
     int np = 0;
+    if (nd_subamd()) g_nd_loc = malloc(sizeof(int) * ((size_t)n + 1));
     nd_rec(&g, name, perm, &np, g_nd_leaf_set > 0 ? g_nd_leaf_set : getenv("BRISK_NDLEAF") ? atoi(getenv("BRISK_NDLEAF")) : 200, 0);
+    free(g_nd_loc); g_nd_loc = NULL;
     /* (23 October 2026, a test: BRISK_NDPARTIAL=1) past the budget the rest is ordered by AMD (leaf_order): that order, the
      * top levels' separators and AMD below, is a valid permutation, offered to the caller, who keeps it when its factor is
      * cheaper than AMD's; without it the dissection's work up to the budget is thrown away */
@@ -1017,3 +1097,4 @@ int nd_order(int n, const int *xadj, const int *adjncy, int *perm) {
       if (part && np == n) return 0; }
     return np == n && !g_nd_abort ? 0 : 1;
 }
+int nd_order(int n, const int *xadj, const int *adjncy, int *perm) { return nd_order_w(n, xadj, adjncy, NULL, NULL, perm); }
