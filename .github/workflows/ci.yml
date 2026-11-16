@@ -63,7 +63,7 @@ jobs:
   macos:
     # the macOS build (Accelerate, bundled OpenMP runtime) has not yet been validated on a Mac:
     # this job reports without failing the workflow until it has
-    runs-on: macos-14
+    runs-on: macos-15
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
